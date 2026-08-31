@@ -1969,6 +1969,40 @@ async def api_artifact_delete(request: web.Request) -> web.Response:
         # reaches the delete() call below, which returns a clean 4xx (a bare
         # ArtifactNotFoundError catch here would leak ArtifactValidationError as a 500).
         _existing = None
+    # Withdraw the destination copy BEFORE the local delete, so the publication -- the
+    # only handle that can withdraw it -- still exists while the attempt is made. The
+    # reverse order was tried and reverted twice; this ordering is the one with the
+    # smaller crash residue. Die between the two steps here and the copy is withdrawn but
+    # the artifact remains, which the user simply deletes again. Die between them in the
+    # other order and the record is already gone while the content is still public, with
+    # nothing left to withdraw it by.
+    #
+    # The outcome decides whether the local delete may proceed, keyed on whether a RETRY
+    # of the withdrawal is meaningful. A destination that is gone for good (unregistered,
+    # or unreachable: credentials revoked / account closed) yields UNREACHABLE -- the
+    # documented escape hatch that strict `unpublish` points users at -- so the delete
+    # proceeds and only a log line is left; aborting there would make a user's own delete
+    # hostage to a remote system it can never reach again. But a destination that is
+    # reachable and merely REJECTS the withdrawal (FAILED) keeps the publication -- the
+    # only retry handle -- so we abort the local delete and return an error, rather than
+    # drop the record and strand a public copy with nothing able to withdraw it.
+    if _existing is not None and _existing.publication is not None:
+        withdrawal = await publish_sync.delete_for_artifact(_existing)
+        if withdrawal is publish_sync.DeleteWithdrawal.FAILED:
+            msg = (
+                "The destination did not confirm removal of the published copy, so this "
+                "artifact was NOT deleted: its publication record is kept as the only "
+                "handle able to withdraw that copy. Retry the delete once the destination "
+                "stops erroring."
+            )
+            _audit(
+                tool="artifact_delete",
+                request=request,
+                outcome="error",
+                error=msg,
+                extra={"slug": slug},
+            )
+            return _err(msg, status=502)
     try:
         get_default_store().delete(slug)
     except ArtifactNotFoundError as exc:
@@ -4196,6 +4230,10 @@ async def api_artifact_publish_providers(request: web.Request) -> web.Response:
                 # False + present in this list ⇒ installs on first publish; the
                 # FE may surface an "installs on first use" hint.
                 "available": avail,
+                # The remedy text for `available: false`. Without it the picker can only
+                # send the user somewhere generic, and a provider's own hint is the only
+                # thing that knows WHICH action makes it available.
+                "install_hint": str(getattr(p, "install_hint", "") or ""),
                 "sharing_model": _sharing_model_dict(sm),
                 "sync_model": {
                     "authority": sy.authority,
