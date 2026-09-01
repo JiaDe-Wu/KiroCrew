@@ -7,114 +7,31 @@
  * capture-apps.mjs, which this is modelled on.
  *
  * Captures:
- *   home.png            the accounts list
- *   account.png         one account's console
- *   account-payments.png  the same console with Payments opened
+ *   home.png                 the accounts list
+ *   account.png              one account's console
+ *   drive-root.png           the drive's three sections plus the share ledger
+ *   drive-files.png          the Files listing
+ *   drive-narrow.png         the same controls at 320px, measured for wrap
+ *   folder-delete-confirm.png  the folder delete confirmation
+ *   backup-idle.png          the backup rows with nothing in flight
+ *   backup-adopted.png       the same rows on a FRESH mount that adopted a
+ *                            snapshot run from the host's `_jobs/active`
  *
  * Usage: node scripts/capture-aws-control.mjs <outDir>
  */
 import { chromium } from 'playwright'
 import { mkdirSync } from 'node:fs'
 import { serveDist } from './lib/serve-dist.mjs'
+import {
+  answer, jobs, unmatchedPaths, ACCOUNTS, RUNNING_SNAPSHOT_RUN, STORAGE_SEEDS,
+} from './lib/aws-control-fixtures.mjs'
 
 const OUT = process.argv[2] || '/tmp/aws-control-shots'
 mkdirSync(OUT, { recursive: true })
 
 // ---- fixtures -------------------------------------------------------------
-// Three accounts so the list reads as a list, with one degraded key so the
-// health dot is not uniformly green.
-const ACCOUNTS = {
-  supported: true,
-  accounts: [
-    {
-      account: '217681647555', name: 'personal', health: 'ok',
-      profiles: [{ name: 'personal', kind: 'credential-process', region: 'us-west-2', account: '217681647555', default: true, identityOk: true }],
-    },
-    {
-      account: '740412361337', name: 'wombats-alpha', health: 'ok',
-      profiles: [
-        { name: 'wombats-alpha-admin', kind: 'sso', region: 'us-west-2', account: '740412361337', default: true, identityOk: true },
-        { name: 'wombats-alpha-ro', kind: 'sso', region: 'us-east-1', account: '740412361337', default: false, identityOk: true },
-      ],
-    },
-    {
-      account: '000417292745', name: 'beetlejuice-auth-syd', health: 'degraded',
-      profiles: [{ name: 'beetlejuice-syd', kind: 'sso', region: 'ap-southeast-2', account: '000417292745', default: true, identityOk: false }],
-    },
-  ],
-  totals: { accounts: 3, profiles: 4, profilesHealthy: 3 },
-}
-
-const CONSENT = (service) => ({
-  service,
-  serviceLabel: service === 's3' ? 'Amazon S3 (cloud drive storage)' : 'AWS Cost Explorer',
-  granted: true,
-  region: 'us-west-2',
-  credentialSource: 'profile personal',
-  account: '217681647555',
-  identityResolved: true,
-  revokedOnAccountChange: false,
-  // The account the grant was RECORDED for. The console only shows a receipt
-  // whose grant matches the console's own account, so this has to be the first
-  // account in ACCOUNTS or the console captures would show no receipt at all.
-  grant: { account: '217681647555', region: 'us-west-2', profile: 'personal', granted_at: '2026-08-28T00:00:00+00:00' },
-})
-
-const COSTS = { monthToDate: 2.25, currency: 'USD', fetchedAt: new Date().toISOString(), fresh: true, consentMissing: false }
-const DRIVE = { exists: true, bucket: 'kirocrew-drive-7f3a91c4', region: 'us-west-2', usage: { bytes: 44677427, objects: 18 } }
-const LISTING = {
-  folders: ['demos'],
-  files: [
-    { key: 'terrace-deck.pdf', size: 2516582, modified: '2026-08-26T09:12:00Z' },
-    { key: 'pr-watch-e2e.mp4', size: 19818086, modified: '2026-08-24T18:40:00Z' },
-    { key: 'session-storage-demo.mp4', size: 10380902, modified: '2026-08-21T11:05:00Z' },
-  ],
-}
-
-const BASE = '/api/apps/aws-control'
-const LIBRARY = { artifacts: [] }
-const BACKUP = { nightly: false, runs: {}, remote: { snapshot: [], sessions: [] } }
-const unmatched = new Set()
-const json = (route, body) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) })
-
-async function answer(route) {
-  const path = new URL(route.request().url()).pathname
-  if (path.endsWith('/accounts')) return json(route, ACCOUNTS)
-  if (path === '/api/aws/consent') {
-    const svc = new URL(route.request().url()).searchParams.get('service') || 's3'
-    return json(route, CONSENT(svc))
-  }
-  // Paths are BASE-prefixed (/api/apps/aws-control/...) and account-scoped, so
-  // match on the segment after the base rather than on a suffix.
-  const app = path.startsWith(BASE) ? path.slice(BASE.length) : ''
-  if (/^\/drive\/[^/]+\/list$/.test(app)) return json(route, LISTING)
-  if (/^\/drive\/[^/]+$/.test(app)) return json(route, DRIVE)
-  if (/^\/costs\/[^/]+$/.test(app)) return json(route, COSTS)
-  if (app === '/profiles/available') return json(route, { supported: true, profiles: [], max: 20 })
-  if (/^\/library\/[^/]+$/.test(app)) return json(route, LIBRARY)
-  if (/^\/backup\/[^/]+$/.test(app)) return json(route, BACKUP)
-  if (app.startsWith('/shares')) return json(route, { shares: [] })
-  // ---- dashboard shell, not this app. The shell mounts BEFORE the app page and
-  // several of these are consumed as ARRAYS, so a blanket {} crashes the app
-  // shell's error boundary ("x.filter is not a function") and the app page never
-  // mounts at all. Same fixture set capture-apps.mjs uses, for the same reason.
-  if (path === '/api/apps') return json(route, [])
-  if (path === '/api/auth/me') return json(route, { user: 'owner', app: '' })
-  if (path === '/api/status') return json(route, { sessions: 0, messages: 0, cron_jobs: 0, subagents: 0, lessons: 0, uptime: 1, version: '0.1.0' })
-  if (path === '/api/kiro-prerequisite') return json(route, { installed: true, authenticated: true, ready: true })
-  if (path === '/api/dashboard/branding') return json(route, { bot_name: 'Kiro Crew', avatar: '' })
-  if (path === '/api/theme/boot') return json(route, { mode: 'dark', theme: '' })
-  if (path === '/api/themes') return json(route, { themes: [], installed: [] })
-  if (path === '/api/notifications') return json(route, { notifications: [], unread: 0 })
-  if (path === '/api/chat/slots') return json(route, [])
-  if (path === '/api/models') return json(route, { models: [], default: 'auto' })
-  if (path.startsWith('/api/instances')) return json(route, { instances: [], active: '' })
-  // Unknown paths: object-ish names get {}, everything else an array, because a
-  // list endpoint answered with an object is what crashes the shell.
-  const objectish = /(config|tips|voice|autonudge|branding|status|themes|system)/.test(path)
-  unmatched.add(path)
-  return json(route, objectish ? {} : [])
-}
+// Shared with the video recorder, so the screenshots and the clip are answered
+// by the SAME server fixtures rather than two copies that can drift.
 
 // ---- run ------------------------------------------------------------------
 const { srv: server, base } = await serveDist()
@@ -123,12 +40,9 @@ const page = await browser.newPage({ viewport: { width: 1280, height: 900 }, dev
 await page.route('**/api/**', answer)
 await page.route('**/api/ws', (route) => route.abort())
 page.on('pageerror', (err) => console.log('PAGEERROR:', (err.stack || String(err)).slice(0, 400)))
-await page.addInitScript(() => {
-  localStorage.setItem('mc-onboarded', '1')
-  localStorage.setItem('mc-import-onboarded', '1')
-  localStorage.setItem('mc-privacy-acked', '1')
-  localStorage.setItem('mc-theme-mode', 'dark')
-})
+await page.addInitScript((seeds) => {
+  for (const [k, v] of Object.entries(seeds)) localStorage.setItem(k, v)
+}, STORAGE_SEEDS)
 
 await page.goto(`${base}/aws-control`, { waitUntil: 'domcontentloaded' })
 await page.waitForTimeout(1200)
@@ -265,7 +179,126 @@ if (await cap.count()) {
   console.log('NO drive capability row found')
 }
 
-if (unmatched.size) console.log('unmatched /api paths:', [...unmatched].join(', '))
+// ---- Backup: the row reads its running state from the SERVER ---------------
+// Two frames of the same row, distinguished only by what `_jobs/active` answers.
+// The second is reached by navigating AWAY from the section and back, so the
+// BackupSection that renders it is a fresh mount that started nothing: the
+// spinning row is adopted from the host's record, which is the whole change.
+const expectFlag = (label, got, want) => {
+  const ok = got === want
+  console.log(`ASSERT ${label} want=${want} got=${got} ${ok ? 'ok' : 'MISMATCH'}`)
+  if (!ok) failures.push(`${label}: want ${want}, got ${got}`)
+}
+
+// Leave whatever the Files section left open, then climb back to the drive root.
+const openCancel = page.locator('[data-testid="drive-folder-delete-cancel"]')
+if (await openCancel.count()) {
+  await openCancel.first().click()
+  await page.waitForTimeout(250)
+}
+if (await page.locator('[data-testid="drive-section-backup"]').count() === 0) {
+  await page.locator('[data-testid="drive-crumb-back"]').first().click()
+  await page.waitForTimeout(700)
+}
+
+const backupRow = page.locator('[data-testid="drive-section-backup"]')
+if (await backupRow.count()) {
+  // Frame 1: nothing in flight.
+  jobs.clear()
+  await backupRow.first().click()
+  await page.waitForTimeout(1100)
+  await expectCount('backup-section', 1)
+  await expectCount('backup-row-snapshot', 1)
+  await expectCount('backup-row-sessions', 1)
+  expectFlag('idle snapshot row enabled',
+    await page.locator('[data-testid="backup-run-snapshot"]').first().isDisabled(), false)
+  await page.screenshot({ path: `${OUT}/backup-idle.png`, fullPage: false })
+  console.log('shot backup-idle')
+
+  // Away, arm a run, and back. Nothing in this session clicked Back up now.
+  await page.locator('[data-testid="drive-crumb-back"]').first().click()
+  await page.waitForTimeout(600)
+  jobs.set([RUNNING_SNAPSHOT_RUN])
+  await page.locator('[data-testid="drive-section-backup"]').first().click()
+  await page.waitForTimeout(1400)
+
+  const snapBtn = page.locator('[data-testid="backup-run-snapshot"]').first()
+  expectFlag('adopted snapshot row disabled', await snapBtn.isDisabled(), true)
+  const label = ((await snapBtn.textContent()) || '').trim()
+  expectFlag('adopted snapshot row says Backing up', label.includes('Backing up'), true)
+  // The sibling row must stay usable: the host scopes a run to (kind, account),
+  // so a snapshot in flight says nothing about a sessions backup.
+  expectFlag('sessions row still enabled',
+    await page.locator('[data-testid="backup-run-sessions"]').first().isDisabled(), false)
+  // Nothing may be covering the row in the frame.
+  expectFlag('no dialog over the row',
+    await page.locator('[role="dialog"], [data-testid$="-confirm"]').count(), 0)
+  await page.screenshot({ path: `${OUT}/backup-adopted.png`, fullPage: false })
+  console.log('shot backup-adopted')
+} else {
+  console.log('NO backup section row found')
+  failures.push('backup section row not reachable')
+}
+
+// ---- the click is what starts the run ---------------------------------------
+// The adopted frame above proves the UI picks up a run it did NOT start. This
+// block proves the other half, and it is the half no screenshot can carry: that
+// the run the row follows is the run the start POST returned, rather than one
+// that merely appeared alongside it. Without the identity check the frames would
+// be a lookalike sequence; with it they are the code path.
+if (await page.locator('[data-testid="drive-section-backup"], [data-testid="backup-section"]').count()) {
+  let postedRunId = null
+  let lastStatus = null
+  page.on('response', async (res) => {
+    const p = new URL(res.url()).pathname
+    try {
+      if (/\/backup\/[^/]+\/run$/.test(p)) postedRunId = (await res.json()).runId
+      else if (/\/backup\/[^/]+$/.test(p)) lastStatus = await res.json()
+    } catch {
+      /* not a JSON body: leave it null so the assertions below report it */
+    }
+  })
+  const clientRunId = (kind) => lastStatus?.jobs?.[kind]?.active?.run_id ?? null
+
+  jobs.clear()
+  await page.goto(`${base}/aws-control`, { waitUntil: 'domcontentloaded' })
+  await page.waitForTimeout(1200)
+  await page.locator('[data-testid="account-card"]').first().click()
+  await page.waitForTimeout(1000)
+  await page.locator('[data-testid="capability-drive"]').first().click()
+  await page.waitForTimeout(900)
+  await page.locator('[data-testid="drive-section-backup"]').first().click()
+  await page.waitForTimeout(1000)
+
+  const snap = () => page.locator('[data-testid="backup-run-snapshot"]').first()
+  expectFlag('causal row starts enabled', await snap().isDisabled(), false)
+  expectFlag('causal nothing in flight before the click', clientRunId('snapshot'), null)
+
+  await snap().click()
+  await page.waitForTimeout(1800)
+
+  expectFlag('causal start POST returned a run id',
+    typeof postedRunId === 'string' && postedRunId.length === 32, true)
+  expectFlag('causal row busy after the click', await snap().isDisabled(), true)
+  expectFlag('causal the run the client follows IS the one the POST returned',
+    clientRunId('snapshot'), postedRunId)
+  // The account is the dedupe key and is caller-supplied. The app filters on it
+  // server-side; it must not come back out in the payload the browser reads.
+  expectFlag('causal the account does not cross to the client',
+    JSON.stringify(lastStatus?.jobs ?? {}).includes(ACCOUNTS.accounts[0].account), false)
+
+  // Same navigation as the adopted frame, but over a run this click created.
+  await page.locator('[data-testid="drive-crumb-back"]').first().click()
+  await page.waitForTimeout(700)
+  await page.locator('[data-testid="drive-section-backup"]').first().click()
+  await page.waitForTimeout(1600)
+  expectFlag('causal still busy on the fresh mount', await snap().isDisabled(), true)
+  expectFlag('causal same run after the re-mount', clientRunId('snapshot'), postedRunId)
+  expectFlag('causal sibling row untouched',
+    await page.locator('[data-testid="backup-run-sessions"]').first().isDisabled(), false)
+}
+
+if (unmatchedPaths().length) console.log('unmatched /api paths:', unmatchedPaths().join(', '))
 await browser.close()
 server.close()
 if (failures.length) {
