@@ -33,8 +33,9 @@ def test_seed_empty_happy_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
     out_file = target / "fixture.yaml"
     assert out_file.is_file(), f"expected {out_file} to exist after seed"
-    # Exact match guards against accidental fixture tampering.
-    assert out_file.read_text(encoding="utf-8").strip() == "schema-version: 2026-04-28"
+    src_file = Path(str(seed_mod._fixtures_root())) / "empty" / "fixture.yaml"
+    assert out_file.read_bytes() == src_file.read_bytes()
+    assert "schema-version:" in out_file.read_text(encoding="utf-8")
 
 
 def test_seed_unset_home_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -562,9 +563,8 @@ def test_seed_non_empty_rail_succeeds_with_replace(
     assert not (target / "subdir").exists()
     # Fixture content present.
     assert (target / "fixture.yaml").is_file()
-    assert (target / "fixture.yaml").read_text(encoding="utf-8").strip() == (
-        "schema-version: 2026-04-28"
-    )
+    src_file = Path(str(seed_mod._fixtures_root())) / "empty" / "fixture.yaml"
+    assert (target / "fixture.yaml").read_bytes() == src_file.read_bytes()
 
 
 @requires_symlinks

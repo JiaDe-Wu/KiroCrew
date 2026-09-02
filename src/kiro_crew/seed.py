@@ -94,6 +94,18 @@ def _fixtures_root() -> Path:
     return Path(str(_resource_files("kiro_crew") / _FIXTURES_PKG))
 
 
+FIXTURE_MANIFEST = "fixture.yaml"
+
+
+def available_fixtures() -> list[str]:
+    """Return every shipped fixture name in stable order."""
+    root = _fixtures_root()
+    try:
+        return sorted(p.name for p in root.iterdir() if p.is_dir() and not p.name.startswith("."))
+    except OSError:
+        return []
+
+
 def _resolve_fixture(name: str) -> Path:
     """Return the path to fixture ``name``, or raise ``SeedError``.
 
@@ -135,9 +147,7 @@ def _resolve_fixture(name: str) -> Path:
         # ``src/kiro_crew/tests_fixtures/`` or the PRD. Sorted for stable
         # test assertions and so ``empty`` / ``minimal`` / ``rich`` land
         # in the obvious order.
-        available = sorted(
-            p.name for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")
-        )
+        available = available_fixtures()
         available_str = ", ".join(available) if available else "(none)"
         raise SeedError(
             f"unknown fixture: {name!r}. Available fixtures: {available_str}.",

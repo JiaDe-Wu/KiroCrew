@@ -31,6 +31,7 @@ try:  # POSIX only; pods are refused on hosts without it (require_backend)
 except ImportError:  # pragma: no cover - Windows
     fcntl = None  # type: ignore[assignment]
 
+from kiro_crew import seed as seed_mod
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.platform_compat import (
@@ -45,6 +46,7 @@ from kiro_crew.pod import launchd
 from kiro_crew.pod import provision as prov
 from kiro_crew.pod import unit as unit_mod
 from kiro_crew.pod.config import PodConfig
+from kiro_crew.seed import SeedError, seed
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 # Pod names become systemd instance names and path segments; keep them strict.
@@ -1149,6 +1151,47 @@ def loaded_teardown_hook(cfg: PodConfig, name: str) -> bool | None:
     return bool((cp.stdout or "").strip())
 
 
+def _install_pod_dropin(cfg: PodConfig, name: str) -> subprocess.CompletedProcess | None:
+    """Pin pod *name* to its checkout binary, or return a start-blocking failure."""
+    checkout = read_env_file(cfg, name).get("CHECKOUT", "")
+    if not checkout:
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr=(
+                f"pod {name!r} has no pinned checkout, so its boot cannot use the "
+                f"worktree's own kirocrew. Run `kirocrew pod up {name}` from inside "
+                "the checkout."
+            ),
+        )
+    try:
+        unit_mod.install_dropin(cfg, name, Path(checkout).expanduser())
+    except OSError as exc:
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr=f"could not write the boot override for pod {name!r}: {exc}",
+        )
+    cp = systemctl("daemon-reload")
+    if cp.returncode == 0:
+        return None
+    unit_mod.remove_dropin(cfg, name)
+    detail = f" {cp.stderr.strip()}" if (cp.stderr or "").strip() else ""
+    return subprocess.CompletedProcess(
+        args=[],
+        returncode=cp.returncode or 1,
+        stdout=cp.stdout or "",
+        stderr=(
+            f"wrote the boot override for pod {name!r} but `systemctl --user "
+            f"daemon-reload` failed (rc={cp.returncode}), so systemd would still "
+            "boot the globally installed kirocrew. Refusing to start it; retry or "
+            f"run `kirocrew pod install`.{detail}"
+        ),
+    )
+
+
 def start_pod(cfg: PodConfig, name: str) -> subprocess.CompletedProcess:
     """Bring pod *name* up through whichever service manager this host uses."""
     with pod_name_mutex(cfg, name):
@@ -1168,6 +1211,9 @@ def start_pod(cfg: PodConfig, name: str) -> subprocess.CompletedProcess:
             refused = _refresh_stale_unit(cfg)
             if refused is not None:
                 return refused
+        refused = _install_pod_dropin(cfg, name)
+        if refused is not None:
+            return refused
         return systemctl("start", pod_unit(cfg, name))
 
 
@@ -1306,6 +1352,12 @@ def stop_pod(cfg: PodConfig, name: str) -> subprocess.CompletedProcess:
                 ),
             )
         rc = cleanup_home(cfg, name)
+        dropin_path = unit_mod.dropin_path(cfg, name)
+        had_dropin = dropin_path.exists() or dropin_path.is_symlink()
+        dropin_gone = unit_mod.remove_dropin(cfg, name)
+        reload_cp: subprocess.CompletedProcess | None = None
+        if had_dropin and dropin_gone:
+            reload_cp = systemctl("daemon-reload")
         if rc != 0 or leftover.exists():
             return subprocess.CompletedProcess(
                 args=[],
@@ -1316,6 +1368,30 @@ def stop_pod(cfg: PodConfig, name: str) -> subprocess.CompletedProcess:
                     f"teardown is incomplete, so this pod is NOT zero-residue. "
                     f"Reclaim it with `kirocrew pod down {name}` once nothing is "
                     "writing there."
+                ),
+            )
+        if not dropin_gone:
+            return subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout=cp.stdout or "",
+                stderr=(
+                    f"pod stopped and its HOME was reclaimed, but the boot override at "
+                    f"{unit_mod.dropin_path(cfg, name)} could not be removed — this pod "
+                    f"is NOT zero-residue. Delete it, then run `systemctl --user "
+                    "daemon-reload`."
+                ),
+            )
+        if reload_cp is not None and reload_cp.returncode != 0:
+            detail = f" {reload_cp.stderr.strip()}" if (reload_cp.stderr or "").strip() else ""
+            return subprocess.CompletedProcess(
+                args=[],
+                returncode=reload_cp.returncode or 1,
+                stdout=cp.stdout or "",
+                stderr=(
+                    "pod stopped and its on-disk override was removed, but `systemctl "
+                    "--user daemon-reload` failed, so systemd may still retain it in "
+                    f"memory — this pod is NOT zero-residue.{detail}"
                 ),
             )
         return cp
@@ -1725,6 +1801,105 @@ def sanitized_seed_config(seed_dir: Path) -> dict | None:
             data[section] = {}
         data[section]["enabled"] = False
     return data
+
+
+def is_scenario_ref(value: str) -> bool:
+    """Return whether a seed value is a fixture name rather than a directory path."""
+    if not value or value.startswith(("~", ".")):
+        return False
+    if "/" in value or "\\" in value or os.sep in value:
+        return False
+    return True
+
+
+def resolve_seed_scenario(value: str) -> str:
+    """Validate that *value* names a shipped fixture."""
+    available = seed_mod.available_fixtures()
+    if value in available:
+        return value
+    listed = ", ".join(available) if available else "(none)"
+    raise PodError(
+        f"unknown seed scenario {value!r}. Available scenarios: {listed}.\n"
+        f"  To seed from a directory instead, pass a path: "
+        f"--seed ./{value} or --seed /abs/path/{value}"
+    )
+
+
+def seed_home_from_scenario(cfg: PodConfig, name: str, scenario: str) -> bool:
+    """Atomically populate pod *name*'s empty home from fixture *scenario*."""
+    home_dir = cfg.home_dir(name)
+    resolve_seed_scenario(scenario)
+    if home_dir.exists() and not home_dir.is_dir():
+        raise PodError(
+            f"pod home {home_dir} exists but is not a directory; refusing to seed over it.\n"
+            f"  Remove it, then: kirocrew pod up {name} --seed <scenario>"
+        )
+    if home_dir.exists() and any(home_dir.iterdir()):
+        return False
+
+    staging = home_dir.parent / f".{home_dir.name}.seeding"
+    staging.parent.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(staging, ignore_errors=True)
+    previous = os.environ.get("KIROCREW_HOME")
+    os.environ["KIROCREW_HOME"] = str(staging)
+    try:
+        try:
+            seed(scenario)
+            if home_dir.exists():
+                home_dir.rmdir()
+            staging.rename(home_dir)
+        except (SeedError, OSError) as exc:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise PodError(
+                f"seeding pod {name!r} from scenario {scenario!r} failed: {exc}"
+            ) from exc
+    finally:
+        if previous is None:
+            os.environ.pop("KIROCREW_HOME", None)
+        else:
+            os.environ["KIROCREW_HOME"] = previous
+    return True
+
+
+def seeded_scenario_in_home(cfg: PodConfig, name: str) -> str | None:
+    """Return the fixture name recorded in a seeded pod home, if present."""
+    manifest = cfg.home_dir(name) / seed_mod.FIXTURE_MANIFEST
+    try:
+        text = manifest.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        import yaml  # type: ignore[import-untyped]
+
+        data = yaml.safe_load(text)
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    recorded = data.get("fixture-name")
+    return str(recorded) if recorded else ""
+
+
+def sanitize_home_config(home_dir: Path) -> None:
+    """Disable every self-activating section in a scenario's existing config."""
+    cfg_file = home_dir / "config.json"
+    try:
+        data = json.loads(cfg_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    for section in SEED_DISABLED_SECTIONS:
+        if not isinstance(data.get(section), dict):
+            data[section] = {}
+        data[section]["enabled"] = False
+    try:
+        atomic_write(cfg_file, json.dumps(data, indent=2), restrict_to_owner=True)
+    except OSError as exc:
+        raise PodError(
+            f"could not disable the seeded channel sections in {cfg_file}: {exc}. "
+            "Refusing to boot a pod with a config that still enables them."
+        ) from exc
 
 
 def build_pod_env(cfg: PodConfig, home_dir: Path, port: int, checkout: Path) -> dict[str, str]:
@@ -2229,9 +2404,23 @@ def boot(cfg: PodConfig, name: str) -> int:
             f"(expected one of: {', '.join(sorted(CRONS_TRUE))}); scheduler stays off"
         )
 
-    # Write the pod's isolated, tunnel-disabled config with owner-only perms.
-    # Creates the HOME (0o700) too. Never copies DB/sessions/crons.
-    write_pod_config(home_dir, seed)
+    # A named scenario owns the whole home and must land before the create-only
+    # config writer. Directory seeds keep their existing config-only behavior.
+    scenario = seed if is_scenario_ref(seed) else ""
+    if scenario:
+        try:
+            fresh = seed_home_from_scenario(cfg, name, scenario)
+        except PodError as exc:
+            print(f"FATAL: {exc}")
+            return 3
+        print(
+            f"kirocrew-pod: seeded home from scenario {scenario!r}"
+            if fresh
+            else f"kirocrew-pod: home already populated — scenario {scenario!r} not re-applied"
+        )
+    write_pod_config(home_dir, "" if scenario else seed)
+    if scenario:
+        sanitize_home_config(home_dir)
 
     print(f"kirocrew-pod: name={name} port={port} home={home_dir} checkout={checkout}")
 
