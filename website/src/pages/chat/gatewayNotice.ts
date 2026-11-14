@@ -10,7 +10,7 @@ import type { NoticeTone } from './NoticeCard'
  * tool, session stuck, session reconnect, model-session rebuild), the admission
  * `error` cards, and the `notice` rows (empty response, model fallback, a
  * cancelled recovery replay, the end-of-turn checks, the queue and agent-switch
- * notices).
+ * notices, and a Bot chat that keeps its agent after the Bot was set to another).
  *
  * Each such row carries a structured wire token in `meta.notice`
  * (`TRANSIENT_NOTICE_*` in `src/kiro_crew/dashboard/chat_utils.py` and
@@ -42,8 +42,11 @@ interface Family {
 /** `meta.notice` wire tokens → family. Mirrors the Python token constants. */
 const NOTICE_FAMILIES = {
   transient_retrying: { role: 'error', card: 'pending' },
+  transient_throttle_retrying: { role: 'error', card: 'pending' },
   transient_resuming: { role: 'error', card: 'pending' },
+  transient_throttle_resuming: { role: 'error', card: 'pending' },
   transient_give_up: { role: 'error', card: 'error' },
+  transient_throttle_give_up: { role: 'error', card: 'error' },
   connection_lost_retrying: { role: 'error', card: 'error' },
   connection_lost_give_up: { role: 'error', card: 'error' },
   session_busy_retrying: { role: 'error', card: 'error' },
@@ -102,6 +105,8 @@ const NOTICE_FAMILIES = {
   agent_switch_blocked_crew_mode: { role: 'notice', card: 'notice', tone: 'info' },
   agent_switch_blocked_channel: { role: 'notice', card: 'notice', tone: 'info' },
   channel_message_not_run: { role: 'notice', card: 'notice', tone: 'info' },
+  member_rebind_kept_agent: { role: 'notice', card: 'notice', tone: 'info' },
+  agent_no_tools: { role: 'notice', card: 'notice', tone: 'info' },
   crew_name_undispatchable: { role: 'error', card: 'error' },
   code_channel_worktree_not_ready: { role: 'error', card: 'error' },
   remote_crew_read_only: { role: 'error', card: 'error' },
@@ -120,6 +125,8 @@ const NOTICE_FAMILIES = {
   turn_interrupted_close: { role: 'error', card: 'error' },
   capability_tool_limits_unsupported: { role: 'error', card: 'error' },
   kas_signed_out: { role: 'error', card: 'error' },
+  windows_spawn_blocked: { role: 'error', card: 'error' },
+  tools_not_ready: { role: 'error', card: 'error' },
 } as const satisfies Record<string, Family>
 
 export type GatewayNoticeToken = keyof typeof NOTICE_FAMILIES
@@ -127,8 +134,11 @@ export type GatewayNoticeToken = keyof typeof NOTICE_FAMILIES
 /** Copy per token. Literal keys so `check-i18n-keys.mjs` resolves every lookup. */
 const COPY_KEY = {
   transient_retrying: 'pages.chat.transientNotice.retrying',
+  transient_throttle_retrying: 'pages.chat.transientNotice.throttle_retrying',
   transient_resuming: 'pages.chat.transientNotice.resuming',
+  transient_throttle_resuming: 'pages.chat.transientNotice.throttle_resuming',
   transient_give_up: 'pages.chat.transientNotice.give_up',
+  transient_throttle_give_up: 'pages.chat.transientNotice.throttle_give_up',
   connection_lost_retrying: 'pages.chat.gatewayNotice.connection_lost_retrying',
   connection_lost_give_up: 'pages.chat.gatewayNotice.connection_lost_give_up',
   session_busy_retrying: 'pages.chat.gatewayNotice.session_busy_retrying',
@@ -187,6 +197,8 @@ const COPY_KEY = {
   agent_switch_blocked_crew_mode: 'pages.chat.gatewayNotice.agent_switch_blocked_crew_mode',
   agent_switch_blocked_channel: 'pages.chat.gatewayNotice.agent_switch_blocked_channel',
   channel_message_not_run: 'pages.chat.gatewayNotice.channel_message_not_run',
+  member_rebind_kept_agent: 'pages.chat.gatewayNotice.member_rebind_kept_agent',
+  agent_no_tools: 'pages.chat.gatewayNotice.agent_no_tools',
   crew_name_undispatchable: 'pages.chat.gatewayNotice.crew_name_undispatchable',
   code_channel_worktree_not_ready: 'pages.chat.gatewayNotice.code_channel_worktree_not_ready',
   remote_crew_read_only: 'pages.chat.gatewayNotice.remote_crew_read_only',
@@ -205,6 +217,8 @@ const COPY_KEY = {
   turn_interrupted_close: 'pages.chat.gatewayNotice.turn_interrupted_close',
   capability_tool_limits_unsupported: 'pages.chat.gatewayNotice.capability_tool_limits_unsupported',
   kas_signed_out: 'pages.chat.gatewayNotice.kas_signed_out',
+  windows_spawn_blocked: 'pages.chat.gatewayNotice.windows_spawn_blocked',
+  tools_not_ready: 'pages.chat.gatewayNotice.tools_not_ready',
 } as const satisfies Record<GatewayNoticeToken, string>
 
 /** Copy for a row whose args carry a recovery ordinal (`n` of `max`). */
@@ -222,10 +236,27 @@ const RESUME_KEY = {
   session_busy_give_up: 'pages.chat.errorCard.retry_session_busy',
   turn_stalled_give_up: 'pages.chat.errorCard.retry_turn_stalled',
   tool_stalled_give_up: 'pages.chat.errorCard.retry_tool_stalled',
+  tools_not_ready: 'pages.chat.errorCard.retry_tools_not_ready',
 } as const satisfies Partial<Record<GatewayNoticeToken, string>>
 
 const RESTORED_KEY = 'pages.chat.transientNotice.restored'
 const INTERRUPTED_KEY = 'pages.chat.transientNotice.interrupted'
+
+/**
+ * Settled copy for a pending token whose cause is not the connection: a
+ * throttle is the provider's answer, so its card never reads "Connection
+ * restored" or "Connection interrupted".
+ */
+const SETTLED_KEY = {
+  transient_throttle_retrying: {
+    answered: 'pages.chat.transientNotice.throttle_restored',
+    failed: 'pages.chat.transientNotice.throttle_interrupted',
+  },
+  transient_throttle_resuming: {
+    answered: 'pages.chat.transientNotice.throttle_restored',
+    failed: 'pages.chat.transientNotice.throttle_interrupted',
+  },
+} as const satisfies Partial<Record<GatewayNoticeToken, { answered: string; failed: string }>>
 const BACKEND_HICCUP_RESUME_KEY = 'pages.chat.errorCard.retry_backend_hiccup'
 
 /**
@@ -464,7 +495,7 @@ const LEGACY: readonly Legacy[] = [
   },
   {
     // The first wording is what older transcripts stored; keep matching it.
-    re: /^📌 Agent switch to (?<agent>.+?) was blocked — this chat is in (?:Crew Mode, which stays on its conductor\. The next turn restarts on the conductor|Ultra Mode, which stays on its own agent\. The next turn restarts on that agent)\.$/u,
+    re: /^📌 Agent switch to (?<agent>.+?) was blocked — this chat is in (?:Crew Mode, which stays on its conductor\. The next turn restarts on the conductor|conductor mode, which stays on its own agent\. The next turn restarts on that agent)\.$/u,
     token: 'agent_switch_blocked_crew_mode',
   },
   {
@@ -560,12 +591,13 @@ function legacyKasSignedOutRoute(content: string): '' | 'relay' | 'bundle' | nul
   // row carries, never shown here (the token's catalog copy is).
   if (!content.endsWith(', then start a new chat.') && !content.endsWith(', then send your message again.')) return null
   const head = content.slice(0, content.lastIndexOf(', then '))
-  if (head === 'Not signed in to Kiro. Sign in from Settings → Agent Harness → Kiro sign-in') return ''
-  if (head === "KAS runs through kiro-cli's relay. Not signed in to Kiro. Sign in from Settings → Agent Harness → Kiro sign-in") return 'relay'
-  const bundle =
-    head.startsWith("KAS runs on Kiro Crew's own engine") &&
-    head.endsWith('. Not signed in to Kiro. Sign in from Settings → Agent Harness → Kiro sign-in')
-  return bundle ? 'bundle' : null
+  // The path names the Kiro Agent row the card sits in; older rows name it without.
+  const lead = /^(?<lead>.*?)Not signed in to Kiro\. Sign in from Settings → Agent Harness → (?:Kiro Agent → )?Kiro sign-in$/u
+    .exec(head)?.groups?.lead
+  if (lead === undefined) return null
+  if (lead === '') return ''
+  if (lead === "KAS runs through kiro-cli's relay. ") return 'relay'
+  return lead.startsWith("KAS runs on Kiro Crew's own engine") && lead.endsWith('. ') ? 'bundle' : null
 }
 
 interface Shape {
@@ -766,8 +798,9 @@ export function resolveGatewayNotice(
     return { card: 'error', text: copyOf(shape), ...(resumeText ? { resumeText } : {}) }
   }
   const outcome = outcomeAfter(messages, index)
-  if (outcome === 'answered') return { card: 'notice', text: i18nT(RESTORED_KEY), tone: 'info' }
-  if (outcome === 'failed') return { card: 'notice', text: i18nT(INTERRUPTED_KEY), tone: 'info' }
+  const settled = shape.token in SETTLED_KEY ? SETTLED_KEY[shape.token as keyof typeof SETTLED_KEY] : undefined
+  if (outcome === 'answered') return { card: 'notice', text: i18nT(settled?.answered ?? RESTORED_KEY), tone: 'info' }
+  if (outcome === 'failed') return { card: 'notice', text: i18nT(settled?.failed ?? INTERRUPTED_KEY), tone: 'info' }
   return { card: 'notice', text: copyOf(shape), tone: 'warn' }
 }
 
@@ -779,4 +812,16 @@ export function resolveGatewayNotice(
 export function resumeProseFor(content: string): string | null {
   const shape = legacyShape(content)
   return shape ? (resumeTextOf(shape) ?? null) : null
+}
+
+/**
+ * The agent a no-tools notice row names, or `null` for any other row. The row is
+ * the `agent_no_tools` family (`dashboard/agent_no_tools_notice.py`): its own
+ * renderer adds the link to that agent's page, so it is matched on the token and
+ * never on its words.
+ */
+export function agentNoToolsAgent(m: ChatMessage): string | null {
+  const shape = m.role === 'notice' ? shapeOf(m) : null
+  if (shape?.token !== 'agent_no_tools') return null
+  return typeof shape.args.agent === 'string' && shape.args.agent ? shape.args.agent : null
 }

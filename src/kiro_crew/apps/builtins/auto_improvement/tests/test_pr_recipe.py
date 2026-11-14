@@ -18,6 +18,7 @@ import pytest
 from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import pr_recipe as pr
 from kiro_crew.apps.builtins.auto_improvement.spine.pr_pipeline import CrPipeline
 from kiro_crew.apps.builtins.auto_improvement.spine.profile import PRRecipe, StubPRRecipe
+from kiro_crew.testing.synthetic_credentials import aws_secret
 
 
 def _broken_scanner(_text: str) -> str:
@@ -406,12 +407,13 @@ class TestPushedContentIsScanned:
         return recipe
 
     def test_a_credential_in_the_pushable_diff_refuses_the_push(self, tmp_path) -> None:
-        leaked = "+AWS_SECRET_ACCESS_KEY = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'\n"
+        # A synthetic secret: the documentation example key is kept visible.
+        leaked = f"+AWS_SECRET_ACCESS_KEY = '{aws_secret(seed=73)}'\n"
         ok, note = self._recipe(tmp_path, leaked)._scan_pushable_content()
         assert ok is False
         assert "credential" in note
         # The note must not quote the secret it is reporting.
-        assert "wJalrXUtnFEMI" not in note
+        assert aws_secret(seed=73)[:13] not in note
 
     def test_a_clean_diff_is_allowed(self, tmp_path) -> None:
         clean = "--- a/m.py\n+++ b/m.py\n@@ -1 +1 @@\n-return None\n+return 0\n"
@@ -547,7 +549,9 @@ class TestEveryPushPathScansContent:
         # must neutralize the external helper with ``--no-ext-diff``) or reads objects
         # directly (and so must not render a diff to scan).
         for rel, renders_diff in (
-            ("profiles/github_repo/pr_recipe.py", True),
+            # The recipes' push path lives in the shared base (both providers inherit
+            # it), so the pin follows the implementation there.
+            ("profiles/pr_recipe_base.py", True),
             ("spine/driver.py", False),
             ("backend/commit.py", True),
         ):
@@ -698,8 +702,9 @@ class TestEveryPushPathScansContent:
         git("add", "-A")
         git("commit", "-qm", "base")
         # The verified fix commits a credential (the exact thing the gate must catch).
+        # An AWS secret of the real shape: after its label only that shape is removed.
         (tmp_path / "f.txt").write_text(
-            "aws_secret_access_key=glpat-IOSFODNN7EXAMPLE\n", encoding="utf-8"
+            f"aws_secret_access_key={aws_secret(seed=74)}\n", encoding="utf-8"
         )
         git("add", "-A")
         git("commit", "-qm", "the fix")
@@ -710,7 +715,7 @@ class TestEveryPushPathScansContent:
 
         # The fixed range carries the commit, and the scanner refuses it.
         scanned = git("diff", "HEAD~1..HEAD").stdout
-        assert "glpat-IOSFODNN7EXAMPLE" in scanned, "the scanned range is empty — the gate is blind"
+        assert aws_secret(seed=74) in scanned, "the scanned range is empty — the gate is blind"
         assert scan_content_for_secrets(scanned)[0] is False, "the credential was not refused"
 
     def test_scanner_fails_closed_without_the_security_module(self, monkeypatch) -> None:
@@ -940,7 +945,8 @@ class TestAFailedDiffIsNeverVacuouslyClean:
 
         root = Path(__file__).resolve().parent.parent
         for rel, marker in (
-            ("profiles/github_repo/pr_recipe.py", "proc.returncode != 0"),
+            # Shared base: both provider recipes inherit this one scan implementation.
+            ("profiles/pr_recipe_base.py", "proc.returncode != 0"),
             ("backend/commit.py", "scanned.returncode == 0"),
         ):
             src = (root / rel).read_text(encoding="utf-8")
@@ -1307,3 +1313,49 @@ class TestPushedBranchActuallyContainsTheFix:
             cwd=cwd,
         ).stdout
         assert got.strip() == "original", "staging alone must not be mistaken for a commit"
+
+
+class TestProviderSeamsStayCompatible:
+    """The GitHub recipe is now a thin adapter over ``profiles/pr_recipe_base.py``.
+
+    These pins keep the split honest: the historical import surface of this module
+    must survive (established callers and tests reach the shared helpers through
+    it), and the safety machinery must remain the base's single implementation.
+    """
+
+    def test_historical_names_remain_importable_here(self) -> None:
+        """Renaming or dropping a re-export silently breaks external importers."""
+        for name in (
+            "GitHubPRRecipe",
+            "DRAFT_CMD",
+            "BRANCH_PREFIX",
+            "extract_pr_url",
+            "ProseRedactionUnavailable",
+            "_redact_prose",
+            "_strip_leading_h1",
+            "_kind_of",
+            "_prefer_authenticated_remote",
+            "_gh_prefers_ssh",
+        ):
+            assert hasattr(pr, name), f"pr_recipe no longer exposes {name}"
+
+    def test_the_recipe_inherits_the_shared_push_machinery(self) -> None:
+        """A GitHub-only override of the push/scan path would fork the safety half."""
+        from kiro_crew.apps.builtins.auto_improvement.profiles.pr_recipe_base import (
+            ProviderPRRecipe,
+        )
+
+        assert issubclass(pr.GitHubPRRecipe, ProviderPRRecipe)
+        for name in ("_push_fix_branch", "_scan_pushable_content", "_scannable_base", "draft"):
+            assert getattr(pr.GitHubPRRecipe, name) is getattr(ProviderPRRecipe, name)
+
+    def test_the_provider_seams_are_github_specific(self, tmp_path: Path) -> None:
+        recipe = pr.GitHubPRRecipe(
+            user="u", clone_path=tmp_path, pr_queue_dir=tmp_path / "q", base_ref="origin/main"
+        )
+        cmd = recipe._create_cmd(summary="fix: x", body_path=tmp_path / "b.md", branch="br")
+        assert cmd[0] == "gh"
+        assert "--draft" in cmd and "--head" in cmd and "--base" in cmd
+        assert recipe._extract_ref("https://github.com/o/r/pull/3\n") == (
+            "https://github.com/o/r/pull/3"
+        )

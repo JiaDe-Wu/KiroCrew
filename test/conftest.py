@@ -16,6 +16,7 @@ import sys
 import time
 import urllib.error
 import urllib.parse
+from collections.abc import Iterator
 
 import pytest
 from hypothesis import HealthCheck, settings
@@ -94,7 +95,8 @@ def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None):
     the test that left it. A hook rather than an autouse fixture because it must read
     the state after the test's ``monkeypatch`` has undone; autouse fixtures in one
     conftest are set up in alphabetical order and an earlier one already requests
-    ``monkeypatch``, so a fixture here would be torn down first.
+    ``monkeypatch``, so a fixture here would be torn down first. For the same reason
+    it empties the boot-checked caches (``forget_home_bound_caches``) here.
     """
     leaked: list[str] = []
     try:
@@ -105,6 +107,7 @@ def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None):
             if getattr(module, name, None) is not value:
                 setattr(module, name, value)
                 leaked.append(f"{module.__name__}.{name}")
+        forget_home_bound_caches()
     if leaked:
         pytest.fail(f"test left {', '.join(leaked)} rebound (restored)", pytrace=False)
     return result
@@ -265,6 +268,7 @@ from conftest_opt_in import (  # noqa: E402,F401 -- bound for pytest and importe
     named_cron_caller,
     opened,
     plant_day_link,
+    rss_runtimes_read_under_ceiling,
     short_sock_dir,
 )
 
@@ -277,10 +281,14 @@ from conftest_resets import (  # noqa: E402,F401 -- bound for pytest and importe
     _drop_live_config_snapshot,
     _ensure_event_loop,
     _fake_computer_use_backend,
+    _forget_app_turn_approver,
     _forget_enterprise_profile_pin,
     _forget_legacy_auth_sweep_clean_roots,
+    _forget_mount_source_sweep_pacing,
     _forget_sandbox_launch_mark,
+    _forget_tracing_switch,
     _fresh_aws_bin_dir_trust,
+    _fresh_hardlink_spec_warnings,
     _fresh_reexec_environment,
     _fresh_released_sessions_warning,
     _history_cleanup_throttle_closed,
@@ -288,6 +296,7 @@ from conftest_resets import (  # noqa: E402,F401 -- bound for pytest and importe
     _isolate_advertised_model_cache,
     _isolate_display_verdicts,
     _isolate_kiro_window_cache,
+    _ledger_create_ignores_live_memory,
     _no_boot_heap_freeze,
     _no_boot_sandbox_sweep,
     _no_carried_auto_update_effect,
@@ -315,6 +324,7 @@ from conftest_resets import (  # noqa: E402,F401 -- bound for pytest and importe
     _session_memory_scope_sample_unshared,
     _shut_down_shared_pools_in_session,
     _small_default_host,
+    forget_home_bound_caches,
 )
 
 # The in-memory Slack client and the Slack state resets.
@@ -325,6 +335,8 @@ from conftest_slack import (  # noqa: E402,F401 -- bound for pytest and importer
     _enterprise_bypass,
     _reset_options_control_state,
 )
+
+from kiro_crew.testing import synthetic_credentials as _synthetic_credentials  # noqa: E402
 
 # ``make_dir_link`` lives in kiro_crew.testing.links so the app-embedded test
 # packages, which never see this conftest, share the one copy. Re-exported so
@@ -377,20 +389,27 @@ _PEM_TAIL_HALF = f"ATE KEY{_PEM_DASHES}\nMIIBOgIBAAJBAKJ2\n"
 #: Shared because two suites pin the same table -- the primitive that decides where
 #: a cut may fall (``test_display_split_safety.py``) and the renderer that applies
 #: it (``test_wecom_renderer.py``) -- and a duplicated fixture table drifts.
+#:
+#: The key-shaped rows split a synthetic 40-character secret the redactor removes
+#: (letters and digits only, so no half carries markup of its own); an AWS key ID
+#: stays visible as an identifier and would prove nothing here.
+_STRADDLE_KEY = _synthetic_credentials.synth(40, seed=17)
 CREDENTIAL_STRADDLE_SHAPES = [
-    pytest.param("[AKIA](https://ex.test/a,b)", "IOSFODNN7EXAMPLE", id="link-target-comma"),
+    pytest.param(
+        f"[{_STRADDLE_KEY[:4]}](https://ex.test/a,b)", _STRADDLE_KEY[4:], id="link-target-comma"
+    ),
     pytest.param(
         "Authorization: Bearer",
         " abcdefghijklmnopqrstuvwxyz0123456789",
         id="header-whitespace",
     ),
-    pytest.param("AKIAIOSF_", "_ODNN7EXAMPLE", id="underscore-emphasis"),
-    pytest.param("AKIAIOSF~", "~ODNN7EXAMPLE", id="tilde-emphasis"),
+    pytest.param(f"{_STRADDLE_KEY[:8]}_", f"_{_STRADDLE_KEY[8:]}", id="underscore-emphasis"),
+    pytest.param(f"{_STRADDLE_KEY[:8]}~", f"~{_STRADDLE_KEY[8:]}", id="tilde-emphasis"),
     pytest.param("https://evil.test/?q=AKIAIOSFODNN7", "EXAMPLE.", id="url-punctuation"),
     pytest.param("[l](https://ex.test/x/AKIAIOSF", "ODNN7EXAMPLE)", id="cut-inside-a-url"),
     pytest.param(f"{_PEM_DASHES}BEGIN RSA PRIV", _PEM_TAIL_HALF, id="pem-anchor"),
     pytest.param(f"{_PEM_DASHES}BEG**IN** RSA PRIV", _PEM_TAIL_HALF, id="pem-anchor-markup-split"),
-    pytest.param("AKIAIOSF", "ODNN7EXAMPLE", id="no-markup-at-all"),
+    pytest.param(_STRADDLE_KEY[:8], _STRADDLE_KEY[8:], id="no-markup-at-all"),
 ]
 
 
@@ -531,6 +550,11 @@ def _fresh_update_ownership(_floor_monkeypatch):
     _floor_monkeypatch.setattr(update_ownership, "_deferred_restart_until", None)
     _floor_monkeypatch.setattr(update_ownership, "_restart_refusal", None)
     _floor_monkeypatch.setattr(update_ownership, "_refusal_probe_clears", True)
+    from kiro_crew import update_restart_ready
+
+    # The "restart to use it" note is process-wide too: one test's staged update
+    # must not light the next test's status frame.
+    _floor_monkeypatch.setattr(update_restart_ready, "_current", None)
     yield
     open_steps = [entry.step.label for entry in registry]
     assert not open_steps, f"the test left update steps open: {open_steps}"
@@ -600,13 +624,29 @@ def _relay_unless_a_test_opens_the_kas_route(_floor_monkeypatch):
     """
     from kiro_crew.acp import kas_engine_install, kas_route
 
-    _floor_monkeypatch.setattr(kas_route, "automatic_switch_allowed", lambda: False)
+    _floor_monkeypatch.setattr(kas_route, "automatic_switch_allowed", lambda pin="": False)
     _floor_monkeypatch.setattr(kas_route, "_LAST_SPAWN_ROUTE", None)
     _floor_monkeypatch.setattr(
         kas_engine_install,
         "_STATE",
         {"running": False, "done": 0, "total": 0, "error": ""},
     )
+
+
+@pytest.fixture(autouse=True)
+def _kas_projection_relays_no_runner_auth_env(_floor_monkeypatch):
+    """Project KAS agents without the runner's own ssh-agent socket or Kerberos cache.
+
+    The projection hands every stdio server the gateway's ``SSH_AUTH_SOCK`` and
+    ``KRB5CCNAME`` through Crew's launcher (``kas_env_launch.inherited_auth_env``).
+    Read from the host, that would route a projected server through the launcher
+    on any runner with an ssh-agent or a ``/tmp/krb5cc_<uid>`` file, and leave it
+    bare everywhere else. The tests of the relay put the real one back with
+    ``monkeypatch``.
+    """
+    from kiro_crew.acp import kas_env_launch
+
+    _floor_monkeypatch.setattr(kas_env_launch, "inherited_auth_env", lambda _forward: {})
 
 
 @pytest.fixture(autouse=True)
@@ -624,6 +664,45 @@ def _registry_governance_reachability_unknown(_floor_monkeypatch):
     _floor_monkeypatch.setattr(kiro_cli, "registry_governance_known_unreachable", lambda: False)
     _floor_monkeypatch.setattr(kiro_cli, "_governance_unreachable_cache", None)
     _floor_monkeypatch.setattr(kiro_cli, "_governance_warm_running", False)
+
+
+@pytest.fixture(autouse=True)
+def _tool_deferral_state_starts_empty(_floor_monkeypatch):
+    """Start every test with no tools-list refusal on record and no PATH probe answer.
+
+    Both are process slots that decide whether a kiro-cli spawn defers Kiro Crew's
+    own MCP servers: a refusal one test feeds the error classifier would keep
+    every later test's spawn on the full list, and the probe would run the
+    runner's own kiro-cli inside the sandbox on a thread. The boot hook that
+    warms the probe starts that thread from any test that boots a gateway, and it
+    would outlive the test, so it is off here too. The tests of each put their
+    own answer in with ``monkeypatch``.
+    """
+    from kiro_crew import kiro_cli, kiro_cli_path_probe
+
+    _floor_monkeypatch.setattr(kiro_cli, "_tools_list_refused_at", None)
+    _floor_monkeypatch.setattr(kiro_cli_path_probe, "_versions", {})
+    _floor_monkeypatch.setattr(kiro_cli_path_probe, "_in_flight", set())
+    _floor_monkeypatch.setattr(kiro_cli_path_probe, "_sandboxed_version", lambda _binary: None)
+    _floor_monkeypatch.setattr(kiro_cli_path_probe, "warm", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _config_content_check_off_unless_a_test_turns_it_on(_floor_monkeypatch):
+    """Turn the config content check off for tests that do not ask for it.
+
+    The real answer is "on" on a Linux runner with user namespaces and "off" elsewhere,
+    so whether every
+    config read serves the endorsed copy would differ between a Linux and a macOS or
+    Windows run. The provenance tests force the check on with
+    ``monkeypatch.setattr(lp, "enforcement_active", ...)``. The cached host answer is
+    pre-set too, so a gateway boot's ``prime_host_verdict`` never runs a real namespace
+    probe; a test that wants the probe sets ``lp._host_verdict`` back to ``None``.
+    """
+    from kiro_crew.config import loosening_provenance
+
+    _floor_monkeypatch.setattr(loosening_provenance, "enforcement_active", lambda: False)
+    _floor_monkeypatch.setattr(loosening_provenance, "_host_verdict", False)
 
 
 @pytest.fixture
@@ -793,6 +872,17 @@ def _isolate_aim_skills_dir(_floor_monkeypatch):
 TREE_SCAN_TIMEOUT_SECS = 300
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _drop_facade_scan_text_caches() -> Iterator[None]:
+    """Drop ``facade_mirror_scan``'s per-text caches after each module, so a corpus guard's
+    readings of the whole test tree are not held for the rest of the worker. Only clears
+    when a module has imported the scanner."""
+    yield
+    scan = sys.modules.get("facade_mirror_scan")
+    if scan is not None:
+        scan.clear_text_caches()
+
+
 def in_tree_scan_group(item: pytest.Item) -> bool:
     """Whether *item*'s closest ``xdist_group`` mark names a ``tree_scan`` group."""
     marker = item.get_closest_marker("xdist_group")
@@ -882,7 +972,10 @@ def pytest_configure(config: pytest.Config) -> None:
 # State lives at module level on the controller only: ``pytest_testnodedown``
 # and ``pytest_handlecrashitem`` are controller-side xdist hooks that never
 # fire inside a worker, and ``pytest_internalerror`` only emits when a crash
-# was recorded, so a non-xdist internal error is reported exactly as before.
+# was recorded or a worker finished while still assigned work, so a
+# non-xdist internal error is reported exactly as before.
+
+from conftest_xdist_clean_finish import format_clean_finish_report  # noqa: E402
 
 _crashed_workers: list[tuple[str, str]] = []  # (worker id, error text)
 _crash_victims: list[str] = []  # test nodeids running when their worker died
@@ -952,7 +1045,8 @@ def _format_abandoned_run_report(crashes: list[tuple[str, str]], victims: list[s
 
 
 def pytest_internalerror(excrepr, excinfo) -> None:
-    """Replay recorded worker crashes when an INTERNALERROR kills the run.
+    """Replay recorded worker crashes, or name a clean finish with work still
+    assigned, when an INTERNALERROR kills the run.
 
     Written to ``sys.stderr`` directly rather than through the terminal
     reporter: this hook runs on a path where pytest's own reporting machinery
@@ -961,6 +1055,9 @@ def pytest_internalerror(excrepr, excinfo) -> None:
     ``INTERNALERROR>`` traceback and exits 3 -- the goal is a diagnosable red,
     not a green.
     """
+    clean_finish = format_clean_finish_report(excinfo)
+    if clean_finish is not None:
+        print(clean_finish, file=sys.stderr, flush=True)
     if not _crashed_workers:
         return
     print(
@@ -1076,6 +1173,7 @@ def _reset_main_spec_episode_globals():
         _agent._main_spec_unreadable = False
         _agent._main_spec_episode_revision = 0
         _agent._main_spec_skip_generation = None
+        _agent._main_spec_held_pass_at = None
         _agent._main_spec_warned.clear()
 
     _clear()
@@ -1216,6 +1314,7 @@ _REAL_MCP_POST_MODULES = frozenset(
         "test_mcp_api_base_resolution",
         "test_mcp_core",
         "test_mcp_core_coverage",
+        "test_mcp_deploy_artifact_refusals",
         "test_mcp_internal_caller",
         "test_session_token_header_parity",
     }
@@ -1243,9 +1342,10 @@ class _InertGatewayPosts(list):
 def _exported_gateway_ports() -> frozenset[int]:
     """Client ports the shell that started pytest exports, read once at import.
 
-    ``KIROCREW_PORT`` is the first step of the client's port resolution and the
-    floor does not clear it, so a developer who exports it to reach their own
-    gateway sends every unconfigured test there. ``KIROCREW_BOUND_PORT`` names the
+    ``KIROCREW_PORT`` is the first step of the client's port resolution. The floor
+    clears it for each test, but a session or module fixture runs outside that, so a
+    developer who exports it to reach their own gateway can still send a test there.
+    ``KIROCREW_BOUND_PORT`` names the
     gateway that spawned the run when an agent session runs the suite. Read here,
     before any test edits the environment, so a test that sets either variable to
     its own server's port is not mistaken for the shell's choice.
@@ -1571,4 +1671,5 @@ def held_flag(monkeypatch):
     monkeypatch.setattr(agent_mod, "_main_spec_unreadable", False)
     monkeypatch.setattr(agent_mod, "_main_spec_episode_revision", 0)
     monkeypatch.setattr(agent_mod, "_main_spec_skip_generation", None)
+    monkeypatch.setattr(agent_mod, "_main_spec_held_pass_at", None)
     return agent_mod

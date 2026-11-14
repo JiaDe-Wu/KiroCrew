@@ -90,12 +90,17 @@ Available to all allowed users (no `!` prefix needed):
 
 When Kiro Crew needs to run a tool (file write, bash command, etc.):
 
-1. **Auto mode** (`!yolo on`): silently approves everything
-2. **Interactive mode** (default): posts Approve / Trust session / Reject buttons
-3. `agent.tool_approval_timeout_secs` timeout (default 600 seconds) —
-   auto-rejects if no click. The other five channels that prompt at all wait
-   five minutes, and four channels do not prompt. See [Channel capabilities](channel-capabilities.md).
-4. "Trust session" approves all remaining tools for that session
+1. **Auto mode** (default, `agent.approval_mode: "auto"`): approves every tool
+   call the tool gate allows, with no buttons. `!yolo on` switches a gateway
+   set to interactive to it, and `!yolo off` switches back.
+2. **Interactive mode** (opt in with `agent.approval_mode: "interactive"` or
+   `kirocrew gateway --approval interactive`, then restart the gateway): posts
+   Approve / Trust session / Reject buttons
+3. In interactive mode, a prompt nobody clicks is auto-rejected after
+   `agent.tool_approval_timeout_secs` (default 600 seconds). The other five
+   channels that prompt at all wait five minutes, and four channels do not
+   prompt. See [Channel capabilities](channel-capabilities.md).
+4. In interactive mode, "Trust session" approves all remaining tools for that session
 
 Approval buttons appear in both Slack and the dashboard. Approving in either
 place resolves both.
@@ -261,9 +266,11 @@ things about it are worth knowing before you use it:
 - **A token is verified against Slack before it is stored.** A rejected token is not
   written. If the host is offline the save succeeds with a warning instead, and clearing
   a token takes an explicit clear action rather than an empty field.
-- **Some changes need a restart** — the tokens, the owner ID, the slash command and the
-  enterprise-org allowlist are read at boot. Reactions and thinking-indicator toggles
-  apply immediately.
+- **New tokens apply when you click Reconnect**, without a gateway restart. A changed
+  owner ID, or a token for a different workspace, is refused there and still needs a
+  restart. The slash
+  command and the enterprise-org allowlist are read at boot.
+  Reactions and thinking-indicator toggles apply immediately.
 
 Secrets are written to `.env` in the config directory with owner-only permissions, never
 to `config.json`.
@@ -289,8 +296,8 @@ exactly as with the switch off, and the page says why under the switch.
   Slack code channels enabled.
 
 **Defaults for new code channels** (`slack.code_channel_defaults`, applied without a
-restart): a folder, an agent, a model and a reasoning effort. Set any of them; anything
-empty falls through:
+restart): a folder, an agent, a model, a reasoning effort and an approval mode. Set any of
+them; anything empty falls through:
 
 - folder: the default folder here, else a top-level **Code channels** folder. That folder is
   created the first time a code channel needs it, with `kirocrew-conductor` as its default
@@ -302,10 +309,29 @@ empty falls through:
   except background-only ones (`kirocrew-lite`, `kirocrew-guest`, `kirocrew-heartbeat`);
 - project: the folder's project directory, then the project of the thread the channel was
   opened from;
-- model and effort: set here, else the agent's own.
+- model and effort: set here, else the agent's own;
+- approval mode (`approval_mode`): `ask` (the default: look-ups such as file reads, web
+  searches and read-only shell commands run on their own, everything else waits for
+  approval), `trust_reads` (also searches of memory, past chats, skills and the knowledge
+  library) or `trust` (every tool
+  runs without asking). The page labels them Normal, Reads and Trust, as the session's own
+  approval picker does.
 
 The page previews what a new code channel will run with. A folder or agent deleted after
 you saved it is flagged on the page and skipped; the other defaults still apply.
+
+**What the agent in a code channel can do.** While **Code channels** is on, the agent bound
+to a code channel gets these tools. Each one acts on that agent's own channel only; none
+can name, create or archive a channel.
+
+| Tool | What it does |
+|---|---|
+| `code_channel_rename` | Renames the channel and its session (1-200 characters). |
+| `code_channel_set_status` | Sets the session status: `processing`, `active` or `suspended`. `suspended` means the agent asked the people in the channel something and waits for the answer; it stays after the turn ends, and the next turn clears it. |
+| `code_channel_set_view` | Adds or updates a view tab: a self-contained `html` page (up to 1 MB, nothing external loads) or a display-only `block_kit` surface (up to 50 blocks, no buttons or inputs). The same `view_key` updates the same tab; a channel holds up to five tabs. |
+| `code_channel_publish_plan_canvas` | Creates or replaces the channel's plan canvas from markdown and shows it as the **Plan** tab. Members can comment on it. |
+| `code_channel_set_context_bar` | Sets the agent's own items on the context bar, after the repo, branch, PR and CI items Kiro Crew keeps there (five items in all; the keys `repo`, `folder`, `branch`, `pr` and `ci` are taken). Each item has a key, a label, an optional icon and an optional `https` link. An empty list clears them. |
+| `code_channel_wrap_up` | Posts the wrap-up: the agent's summary (up to 2800 characters), the facts Kiro Crew knows (branch, PR, CI, changes) and an **Archive channel** button. `/wrap-up` asks for it. Only a person can press the button. |
 
 **Updating an existing Slack app.** A switch changes the manifest (scopes, events and
 feature blocks), and Slack grants scopes only when the app is (re)installed. The

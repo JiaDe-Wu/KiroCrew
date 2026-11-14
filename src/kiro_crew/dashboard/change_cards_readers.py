@@ -129,15 +129,16 @@ def cron_job_revision(job: Any) -> str:
     return _cron_job_revision(job)
 
 
-def next_run_at(cron_expr: str, timezone: str | None) -> float | None:
+def next_run_at(cron_expr: str, timezone: str | None, job_id: str = "card-preview") -> float | None:
     from kiro_crew.cron_service.model import CronJob, CronSchedule
-    from kiro_crew.cron_service.schedule import compute_next_run_ts
+    from kiro_crew.cron_service.schedule import compute_next_run_ts, pin_random_cron_fields
 
+    # A random (``R``) field is pinned per job id, as the job it previews is.
     job = CronJob(
-        id="card-preview",
+        id=job_id,
         name="preview",
         message="",
-        schedule=CronSchedule(kind="cron", cron_expr=cron_expr),
+        schedule=CronSchedule(kind="cron", cron_expr=pin_random_cron_fields(cron_expr, job_id)),
     )
     job.timezone = timezone or ""
     try:
@@ -416,13 +417,16 @@ def after_shows_the_write(
         written = ev[1].get("revision") if len(ev) > 1 else None
         return bool(written) and after.get("revision") == written
     if kind == catalog.KIND_TEMPLATE_MCP_SERVER:
-        # Undo removes the record this card wrote: the same card id and entry.
+        from kiro_crew.dashboard.handlers.member_capability_catalog import mask_settings
+
+        # Undo removes the record this card wrote: the same card id and entry,
+        # read as the card shows it (the snapshot masks env and header values).
         written = ev[0].get("card_id") if ev else None
         return (
             bool(written)
             and after.get("present") is True
             and after.get("card_id") == written
-            and same(after.get("entry"), p.get("entry"))
+            and same(after.get("entry"), mask_settings(p.get("entry")))
         )
     if kind == catalog.KIND_MCP_TOGGLE:
         return after.get("enabled") is bool(p.get("enabled"))
@@ -809,8 +813,11 @@ def _template_server_state(p: dict[str, Any]) -> dict[str, Any]:
         "template_has": template_declares(p["template"], p["server"]),
     }
     if added is not None:
+        from kiro_crew.dashboard.handlers.member_capability_catalog import mask_settings
+
         out["card_id"] = added.card_id
-        out["entry"] = _jsonable(dict(added.entry))
+        # A card never holds a setting value, its snapshots included.
+        out["entry"] = _jsonable(mask_settings(dict(added.entry)))
     return out
 
 
@@ -1232,23 +1239,34 @@ async def read_context(
         from kiro_crew.cron_service.schedule import (
             get_local_tz,
             is_valid_timezone,
+            pin_random_cron_fields,
             resolve_timezone_name,
         )
 
         tz = source.get("timezone") or ""
         if tz and not is_valid_timezone(tz):
             raise catalog.CardCatalogError("invalid_timezone", f"unknown timezone '{tz[:64]}'")
-        when = next_run_at(expr, tz)
+        target_id = str(p.get("id") or "") if kind == catalog.KIND_SCHEDULE_UPDATE else ""
+        when = next_run_at(expr, tz, target_id or "card-preview")
         if when is None:
             raise catalog.CardCatalogError("invalid_cron", "that cron expression never runs")
         # The IANA zone the scheduler runs it in now: a card with no zone takes
         # the default one, and "local" is the host's. The browser formats the
         # next run in this zone, and it cannot read "local".
         zone = (resolve_timezone_name(tz) or "UTC") if tz else get_local_tz()[0]
+        if not target_id and pin_random_cron_fields(expr, "card-preview") != expr:
+            # A new job's random pick depends on the id it is created with, which
+            # does not exist yet, so no next run is shown rather than a wrong one.
+            return {"timezone": zone}
         return {"next_run_at": when, "timezone": zone}
     if kind == catalog.KIND_CREWMATE_CAPABILITIES:
         from kiro_crew.agent_capabilities import CapabilityError
+        from kiro_crew.dashboard.handlers.member_capability_catalog import masks_unresolved
 
+        if masks_unresolved(p):
+            raise catalog.CardCatalogError(
+                "redacted_value_not_writable", "capabilities refused: redacted_value_not_writable"
+            )
         body = {"revision": before.get("revision"), **p["draft"]}
 
         def _preview() -> dict[str, Any]:
@@ -1292,6 +1310,9 @@ async def read_context(
             "impact": impact,
             "label": await asyncio.to_thread(_crewmate_label, p["member"]),
             "gateway": sorted(await asyncio.to_thread(gateway_matches, p)),
+            # A crewmate on its own file: the edit reaches its worker only, never
+            # the conductor its chat runs on (``mate_worker``).
+            "worker_kit": result.get("mode") == "mate",
         }
     if kind == catalog.KIND_TEMPLATE_UPDATE:
         from kiro_crew.config.loader import KiroCrewConfig
@@ -1345,20 +1366,32 @@ async def _workflow_state(kind: str, params: dict[str, Any], state: Any) -> dict
     overwrite; only the slash command it asks for must still be free. An update is pinned to the revision read here: Apply sends it as
     ``expected_revision``, and any save in between is a change since the preview.
     """
+    from kiro_crew.workflows.library import command_ref
+
     svc = _workflow_service(state)
     if kind == catalog.KIND_WORKFLOW_SAVE:
         # The command the card shows, asked for or derived from the name, and
         # whether it is free, read again before Apply, so a save that takes it in
         # between is a change since the preview.
         slug = catalog.workflow_save_slug(params)
-        taken = await asyncio.to_thread(svc.get_definition, slug)
-        return {"slug": slug, "slug_taken": taken is not None}
+        # The allocator's own check: a slug a removed workflow holds is taken
+        # though no ref reaches it.
+        taken = await asyncio.to_thread(svc.slug_taken, slug)
+        return {"slug": slug, "slug_taken": bool(taken)}
     definition = await asyncio.to_thread(svc.get_definition, params["workflow"])
     if not isinstance(definition, dict):
         return {"exists": False}
     return {
         "exists": True,
         "id": str(definition.get("id") or ""),
+        # The ref later reads and the Apply PATCH address: the id, unless the
+        # read lists it as shadowed (a copy restored beside its tombstone), then
+        # the free slug that still reaches it, pinned by ``id``.
+        "ref": (
+            str(definition.get("id") or "")
+            if definition.get("id") not in (definition.get("shadowed_refs") or [])
+            else command_ref(definition)
+        ),
         "slug": str(definition.get("slug") or ""),
         "name": str(definition.get("name") or ""),
         "description": str(definition.get("description") or ""),
@@ -1433,17 +1466,18 @@ def _unified_hunks(old: list[str], new: list[str]) -> Iterator[str]:
                 yield from ("+" + line for line in new[j1:j2])
 
 
-def _workflow_diff(old: str, new: str) -> str:
-    """Every changed line from the saved script *old* to *new*, or a refusal.
+def workflow_source_diff(old: str, new: str) -> str:
+    """Every changed line from the saved script *old* to *new*, at any size.
 
     A unified diff (:func:`_unified_hunks`, no file headers) with each ``@@``
     hunk header replaced by a separator row naming the lines the hunk spans.
     Hunk headers are matched by their exact shape, never by prefix, because a
     source line such as ``-- x`` or a markdown ``---`` rule is written as
     ``--- x`` / ``----`` once marked as removed, and every changed line must
-    reach the card. A removed line comes from a revision saved earlier, which
-    never passed the card's character checks, so its hidden characters are
-    spelled out (``catalog.escape_hidden_characters``) before it is shown.
+    be shown. Every line's hidden characters are spelled out
+    (``catalog.escape_hidden_characters``): neither a revision saved earlier nor
+    a run's script passed the card's character checks. A card's script did, so
+    on a card that changes only removed lines.
     """
     # Split at ``\n`` only: ``splitlines`` also breaks at U+2028, U+2029 and
     # U+0085, which Python's compiler reads as ordinary characters, so a line it
@@ -1453,11 +1487,14 @@ def _workflow_diff(old: str, new: str) -> str:
         header = _HUNK_HEADER_RE.fullmatch(line)
         if header is not None:
             shown.append(_hunk_separator(header))
-        elif line.startswith("-"):
-            shown.append(catalog.escape_hidden_characters(line))
         else:
-            shown.append(line)
-    diff = "\n".join(shown)
+            shown.append(catalog.escape_hidden_characters(line))
+    return "\n".join(shown)
+
+
+def _workflow_diff(old: str, new: str) -> str:
+    """:func:`workflow_source_diff` for a card, refused when too large to carry whole."""
+    diff = workflow_source_diff(old, new)
     # Counted as the card store counts it: the escaped text.
     if len(json.dumps(diff)) - 2 > WORKFLOW_DIFF_MAX:
         raise catalog.CardCatalogError(
@@ -1481,18 +1518,22 @@ async def _workflow_context(
     from kiro_crew.workflows.validate import validate
 
     result = await asyncio.to_thread(validate, params["source"])
-    if not result.ok:
-        errors = "; ".join(str(e) for e in result.errors)
+    if result.save_errors:  # a compile-stage error still saves, with a warning
+        errors = "; ".join(str(e) for e in result.save_errors)
         raise catalog.CardCatalogError(
             "invalid_workflow", f"the script is not valid: {errors[:400]}"
         )
     if kind != catalog.KIND_WORKFLOW_UPDATE or not before.get("exists"):
         return {}
     definition = await asyncio.to_thread(
-        _workflow_service(state).get_definition, str(before.get("id") or "")
+        _workflow_service(state).get_definition, str(before.get("ref") or before.get("id") or "")
     )
     revision = before.get("revision")
-    if not isinstance(definition, dict) or definition.get("revision") != revision:
+    if (
+        not isinstance(definition, dict)
+        or definition.get("id") != before.get("id")
+        or definition.get("revision") != revision
+    ):
         # The diff must be against the revision Apply pins as ``expected_revision``;
         # a save landing between the two reads would otherwise show a diff against
         # a script the card does not replace.

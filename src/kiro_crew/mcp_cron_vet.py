@@ -24,7 +24,8 @@ from typing import Any
 
 from kiro_crew.cron import CronJob, lookup_cron_folder_id
 from kiro_crew.cron_script import resolve_script_path
-from kiro_crew.mcp_core import _post, _resolve_session_key
+from kiro_crew.mcp_core_parts.gateway import _post
+from kiro_crew.mcp_core_parts.identity import _resolve_session_key
 from kiro_crew.mcp_cron_shell_scan import (
     _BACKSLASH_ESCAPE_RE,
     _CRON_BRACE_EXPANSION_RE,
@@ -247,7 +248,7 @@ def _vet_shell_command(command: str, *, governance_checked: bool = False) -> str
     # purpose: every step below is at least O(n) in space -- the fold on the next line
     # builds a new string, and `_quote_states` builds two lists at a measured 16.0
     # bytes/char -- so by the time any of them could raise, the memory is already
-    # committed. The import path (`portability.py:_sanitize_imported_crons`) hands this
+    # committed. The import path (`portability_vetting.py:_sanitize_imported_crons`) hands this
     # function the raw dict value with no field-length cap, bounded only by the 2 GiB
     # uncompressed-archive ceiling, and an OOM kill there is a SIGKILL its
     # `except Exception` cannot convert into a dropped job. See

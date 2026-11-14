@@ -160,6 +160,7 @@ custom-rules:
       - "src/kiro_crew/cli_server_*.py"
       - "src/kiro_crew/dashboard/routes/**/*.py"
       - "src/kiro_crew/deploy/handlers.py"
+      - "src/kiro_crew/deploy/handlers_*.py"
     rule: |
       Do NOT add work to the gateway boot path. Everything between process
       start and the moment the dashboard socket accepts requests runs once, in
@@ -305,7 +306,7 @@ custom-rules:
         and can run the legacy migration), pins the import-time `~/.kiro`
         bindings via `_isolate_shared_kiro_paths`, scrubs the inherited
         shell-preload and exported-function variables `name_grant` refuses on
-        (`BASH_ENV`/`ENV`/..., `BASH_FUNC_*`), pins the SEL default dir
+        (`BASH_ENV`/`SHELLOPTS`/..., `BASH_FUNC_*`), pins the SEL default dir
         session-wide, redirects `tempfile`'s base with residue reported,
         restores the session CWD in a `tryfirst` teardown hook before fixture
         finalizers run, and fails the run on residue at the repository root.
@@ -580,7 +581,7 @@ custom-rules:
         conditional on an edition, a feature flag, an env var, or a registry
         lookup, or that makes an unusable persisted acp_backend raise instead of
         degrading to kiro with a logged reason. The exceptions are H17 and the
-        enterprise floor (D6), both under Allowed. In the gateway, D6 may refuse
+        LTS floor (D6), both under Allowed. In the gateway, D6 may refuse
         a session whose RESOLVED backend is KAS when the gateway's boot proved KAS
         cannot start on the route it would take (kiro-cli unable to run KAS, or
         no runnable engine bundle), wherever that backend came from
@@ -633,16 +634,16 @@ custom-rules:
         or the fallback reaching a pin this gateway cannot start (that one
         keeps the refusal) or any session that is not that crewmate's DM or
         worker.
-      - D6 (rfc-crew-enterprise-edition.md): in an ENTERPRISE build the floor
-        is KAS, not kiro. The owner chose KAS as the one harness an enterprise
+      - D6 (rfc-crew-lts-edition.md): in an LTS build the floor
+        is KAS, not kiro. The owner chose KAS as the one harness an LTS
         build keeps, so there the kiro harness is selectable only when the
         remote policy allows it, and an unusable persisted acp_backend degrades
         to KAS with a logged reason. The edition is read ONLY from the
-        build-time constant (kiro_crew.edition.is_enterprise()), never from
+        build-time constant (kiro_crew.edition.is_lts()), never from
         config, an env var or the platform context, so the selection gate stays
         free of a context read (H3). A KAS that is proven unable to start on
         the route it would take refuses the gateway start when the main backend
-        runs KAS (enterprise boot, naming the fix) instead of falling back to
+        runs KAS (LTS boot, naming the fix) instead of falling back to
         kiro. When the main backend does not run KAS, the start goes on and the
         boot-recorded verdict refuses each later gateway session whose resolved
         backend is KAS, after the selection gate and before any process exists,
@@ -652,7 +653,7 @@ custom-rules:
         (H13). Still FLAG any of this reaching an oss build, the edition read
         from anything but that constant, the selection gate raising, a refusal
         or change that reaches a session whose resolved backend is kiro, or a
-        silent fall back to kiro in an enterprise build.
+        silent fall back to kiro in an LTS build.
 
   - id: memory-store-seam
     blocking: true
@@ -1136,6 +1137,35 @@ custom-rules:
       FLAG a `create_task` / fire-and-forget durable write whose in-memory effect
       is applied before it lands. FLAG a boolean success returned on a path where
       the write raised or returned falsy.
+
+  - id: no-implicit-state-machines
+    blocking: false
+    file-patterns:
+      - "src/kiro_crew/**/*.py"
+      - "website/src/**/*.ts"
+      - "website/src/**/*.tsx"
+    rule: |
+      When a change adds or changes a value that moves between states (a status
+      string, a phase field, a pair of boolean flags, a progress file), the
+      states and the allowed moves must live in ONE place: an enum plus a
+      transition table, or a single transition function. Not spread across
+      flags and writers.
+
+      A state machine nobody owns reaches states nobody designed: it gets
+      stuck, shows two states at once, reopens finished work, keeps copies
+      that drift, and loses state on restart.
+
+      Real defects this rule exists for, all found on main:
+      - the update popup stuck on "restarting", every exit disabled (#34434);
+      - chat showing Resume and Stop together on one turn (#34409);
+      - a closed work item reopened from a torn record;
+      - channel approvals kept in nine separate stores;
+      - "Resume all" losing paused members across a restart (#33467).
+
+      FLAG only new or changed code in the diff, never code that was already
+      there. Each flag names its fix: one owner for the value, a timeout or an
+      exit for a middle state, or one combined state value in place of two
+      flags.
 
   - id: a-ratchet-may-only-tighten
     blocking: true

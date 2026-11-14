@@ -126,6 +126,13 @@ class FakeSessions:
     async def try_acquire(self, key):
         return self.has_session(key)
 
+    #: True models a session the Kiro account check flagged: ``try_acquire``
+    #: refuses it while it stays registered.
+    retiring = False
+
+    def is_retiring(self, key) -> bool:
+        return self.retiring
+
     def release(self, key):
         pass
 
@@ -1384,6 +1391,7 @@ class _Slot:
         self.key = "slot-1"
         self.running = running
         self.task = None
+        self._deferred_notes: list[dict] = []
         self.appended: list[tuple[str, str]] = []
         self.queued: list[str] = []
 

@@ -20,6 +20,7 @@ from kiro_crew.messaging.driver import APPROVAL_AUTO
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.whatsapp.commands import (
+    COMPACT_ACCOUNT_CHANGED_TEXT,
     COMPACT_AUTO_TEXT,
     COMPACT_BUSY_TEXT,
     COMPACT_FAILED_TEXT,
@@ -133,6 +134,13 @@ class FakeSessions:
     async def try_acquire(self, key: str) -> bool:
         return self._acquirable
 
+    #: True models a session the Kiro account check flagged: ``try_acquire``
+    #: refuses it while it stays registered.
+    retiring = False
+
+    def is_retiring(self, key) -> bool:
+        return self.retiring
+
     def has_session(self, key: str) -> bool:
         return self._session_exists
 
@@ -228,7 +236,7 @@ class FakeTransport:
         self.pending_verdicts: dict[int, GroupVerdict] = {}
         self.group_gate = FakeGroupGate()
         self.pending_message_id: dict[int, str] = {}
-        self.pending_original: dict[int, tuple[str, int]] = {}
+        self.pending_original: dict[int, tuple[str, tuple[str, ...]]] = {}
         self.pending_voice_note: set[int] = set()
         #: Text and voice sends in order, so a test can see which landed first.
         self.outbound: list[str] = []
@@ -350,7 +358,7 @@ def test_update_pause_spools_dm_new_before_generation_side_effects(monkeypatch):
     d, _client, sessions, transport = _make(provider=FakeProvider())
     sessions.reserve_inbound_callback = lambda: None
     inbound = _msg("/new")
-    transport.pending_original[id(inbound)] = ("/new", 0)
+    transport.pending_original[id(inbound)] = ("/new", ())
     spooled: list[tuple[str, Any]] = []
 
     async def capture(*, channel_type, route):
@@ -524,6 +532,46 @@ def test_busy_session_folds_into_current_reply_when_steerable():
     assert any("folded" in t.lower() for _, t in transport.sent)
 
 
+@pytest.mark.parametrize("voice", [False, True], ids=["photo", "voice-note"])
+def test_a_busy_message_whose_text_names_its_media_is_not_steered(tmp_path, voice):
+    """The transport deletes the media once dispatch returns, before the running
+    turn reads a steer, so a steered path names a deleted file. A voice note's
+    text is its transcript and names no file, so it still folds in."""
+    from kiro_crew.messaging.attachments import IngestResult, append_attachment_context
+    from kiro_crew.whatsapp.transport_dispatch import BUSY_NOTE
+
+    class Steering(FakeProvider):
+        supports_steer = True
+
+        def __init__(self):
+            super().__init__()
+            self.steered: list[str] = []
+
+        def has_active_turn(self):
+            return True
+
+        async def steer(self, text):
+            self.steered.append(text)
+            return True
+
+    # Built the way whatsapp/transport.py builds it from the ingest result.
+    if voice:
+        transcript = "[Voice memo transcription]\nuse the other one\n[End of transcription]"
+        result = IngestResult(audio_paths=[str(tmp_path / "note.ogg")], text_blocks=[transcript])
+    else:
+        result = IngestResult(image_paths=[str(tmp_path / "photo.jpg")])
+    text = append_attachment_context("" if voice else "see this", result)
+    inbound = _msg(text)
+    inbound.attachments = list(result.temp_paths)
+    provider = Steering()
+    d, _client, _sessions, transport = _make(provider=provider, busy=True)
+    asyncio.run(d.handle_message(inbound))
+    assert provider.steered == ([text] if voice else [])
+    assert [t for _, t in transport.sent] == (
+        ["Folded into the current reply."] if voice else [BUSY_NOTE]
+    )
+
+
 def test_busy_flips_free_reprocesses_the_message():
     """If the session frees between is_busy checks, the message is re-handled."""
     provider = FakeProvider("late reply")
@@ -644,6 +692,37 @@ def test_unprompted_group_silence_delivers_nothing_and_skips_cooldown():
 
     assert transport.sent == []  # sentinel suppressed
     assert transport.group_gate.recorded == []  # no cooldown started
+
+
+@pytest.mark.parametrize("bucket", ["own", "other"])
+def test_an_unprompted_group_message_during_a_turn_posts_no_busy_receipt(bucket):
+    # Nobody addressed the bot, so a "still working" note answers a question no
+    # one asked; an unprompted turn must stay invisible until it has something.
+    provider = FakeProvider()
+    d, _client, sessions, transport = _make(provider=provider)
+    transport._is_operator = False
+    busy_key = d._session_key(_GROUP, is_operator=bucket != "own")
+    sessions.is_busy = lambda key: key == busy_key  # type: ignore[method-assign]
+    inbound = _msg("anyone know python?", conv=_GROUP, user="447711111111")
+    transport.pending_verdicts[id(inbound)] = GroupVerdict(
+        respond=True, unprompted=True, rules="Help with python questions.", may_steer=False
+    )
+    asyncio.run(d.handle_message(inbound))
+    assert provider.prompts == []
+    assert transport.sent == []
+
+
+def test_the_operators_unprompted_follow_up_during_a_turn_still_reaches_the_busy_path():
+    # The operator may steer: an unaddressed follow-up while their own turn runs
+    # is folded in (or receipted), never silently dropped.
+    provider = FakeProvider()
+    d, _client, _sessions, transport = _make(provider=provider, busy=True)
+    inbound = _msg("also cover Y", conv=_GROUP, user="447700900000")
+    transport.pending_verdicts[id(inbound)] = GroupVerdict(
+        respond=True, unprompted=True, rules="Help with python questions.", may_steer=True
+    )
+    asyncio.run(d.handle_message(inbound))
+    assert len(transport.sent) == 1
 
 
 def test_group_command_from_non_operator_is_ignored():
@@ -782,13 +861,14 @@ def test_dm_route_spools_the_pre_ingestion_original_not_the_prompt(monkeypatch):
     d, _client, _sessions, transport = _make()
     inbound = _msg("look at this\n\n/tmp/kc-att/img-1.jpg")
     inbound.attachments = ["/tmp/kc-att/img-1.jpg"]
-    transport.pending_original[id(inbound)] = ("look at this", 1)
+    transport.pending_original[id(inbound)] = ("look at this", ("image.jpg",))
 
     turn = _captured_turn(monkeypatch, d, inbound)
 
     assert turn is not None and turn.inbound_route is not None
     assert turn.inbound_route.text == "look at this", "the ingested prompt was spooled"
     assert turn.inbound_route.attachments_dropped == 1
+    assert turn.inbound_route.attachment_names == ("image.jpg",)
     assert turn.inbound_route.conversation_id == _DM
 
 
@@ -805,7 +885,7 @@ def test_group_route_is_never_declared(monkeypatch):
     """``may_send_to`` knows nothing of the group roster, so groups are not spooled."""
     d, _client, _sessions, transport = _make()
     inbound = _msg("hi group", conv=_GROUP)
-    transport.pending_original[id(inbound)] = ("hi group", 0)
+    transport.pending_original[id(inbound)] = ("hi group", ())
     transport.pending_verdicts[id(inbound)] = GroupVerdict(respond=True)
 
     turn = _captured_turn(monkeypatch, d, inbound)
@@ -1013,6 +1093,23 @@ def test_compact_command_on_a_busy_session_asks_for_a_retry():
     assert provider.compacts == 0
     assert [t for _, t in transport.sent] == [COMPACT_BUSY_TEXT]
     assert sessions.released == 0, "nothing was acquired, so nothing may be released"
+
+
+def test_compact_command_on_a_flagged_session_says_the_account_changed():
+    """A session the Kiro account check flagged is refused but stays registered.
+
+    No reply holds it, so the busy receipt would leave the operator retrying a
+    compaction that never comes: the next message restarts the conversation.
+    """
+    provider = FakeProvider()
+    d, _client, sessions, transport = _make(
+        provider=provider, acquirable=False, session_exists=True
+    )
+    sessions.retiring = True
+    asyncio.run(d.handle_message(_msg("/compact")))
+    assert provider.compacts == 0
+    assert [t for _, t in transport.sent] == [COMPACT_ACCOUNT_CHANGED_TEXT]
+    assert sessions.released == 0
 
 
 def test_compact_command_without_a_session_says_there_is_nothing_to_compact():

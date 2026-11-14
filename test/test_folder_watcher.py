@@ -6,6 +6,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -15,9 +16,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from kiro_crew.knowledge import folder_watcher
+from kiro_crew.knowledge import folder_watcher, llm_pool
 from kiro_crew.knowledge.connectors.local_folder import LocalFolderConnector
 from kiro_crew.knowledge.folder_watcher import MAX_SCAN_ATTEMPTS, FolderWatcher
+from kiro_crew.knowledge.ingestion import FileTooLargeError
 from kiro_crew.knowledge.readers import FileReader
 from kiro_crew.knowledge.store import KnowledgeStore
 
@@ -388,6 +390,48 @@ class TestFolderWatcherScan:
         assert stats["capped"] == 5
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("props", [
+        {"max_files": "5"},          # a string from a hand-written add-source body
+        {"max_files": 0.5},          # positive, but truncates to a cap of 0
+        {"ignore_patterns": "*.log"},  # a bare string, not a list
+        {"ignore_patterns": [1]},    # a non-string entry
+    ])
+    async def test_a_malformed_scan_property_falls_back_instead_of_breaking_the_scan(
+        self, store, pipeline, tmp_path, props
+    ):
+        """The add-source route stores ``properties`` as sent. A wrong-shaped
+        value is ignored, as the preview already ignores it, so the scan takes
+        every file rather than raising or ignoring them all."""
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        for i in range(3):
+            (vault / f"note{i}.md").write_text(f"Note {i}")
+        fw = FolderWatcher(store, pipeline)
+        source_id = store.add_source("test", "local_folder", str(vault))
+        source = {"id": source_id, "uri": str(vault), "source_type": "local_folder",
+                  "properties": json.dumps(props)}
+
+        stats = await fw.scan_source(source)
+        assert stats["new"] == 3
+        assert stats["capped"] == 0
+
+    @pytest.mark.asyncio
+    async def test_an_int_cap_of_zero_still_caps_every_file(self, store, pipeline, tmp_path):
+        """An int cap is used as stored, so 0 keeps capping every file."""
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        for i in range(3):
+            (vault / f"note{i}.md").write_text(f"Note {i}")
+        fw = FolderWatcher(store, pipeline)
+        source_id = store.add_source("test", "local_folder", str(vault))
+        source = {"id": source_id, "uri": str(vault), "source_type": "local_folder",
+                  "properties": json.dumps({"max_files": 0})}
+
+        stats = await fw.scan_source(source)
+        assert stats["new"] == 0
+        assert stats["capped"] == 3
+
+    @pytest.mark.asyncio
     async def test_changed_file_reingested(self, store, pipeline, vault):
         fw = FolderWatcher(store, pipeline)
         source_id = store.add_source("test", "local_folder", str(vault))
@@ -709,14 +753,21 @@ class TestFolderWatcherFailedFiles:
     """Test that failed ingestion records error and doesn't block scan."""
 
     @pytest.mark.asyncio
-    async def test_failed_ingestion_records_error(self, store, pipeline, vault):
+    @pytest.mark.parametrize("exc, logs_error", [
+        (RuntimeError("parse error"), True),
+        # The pipeline already warned about an oversized file: the scan logs no ERROR.
+        (FileTooLargeError("raise knowledge.max_ingest_file_mb in config to ingest it"), False),
+    ], ids=["read_error", "oversized"])
+    async def test_failed_ingestion_records_error(
+            self, store, pipeline, vault, caplog, exc, logs_error):
         fw = FolderWatcher(store, pipeline)
         source_id = store.add_source("test", "local_folder", str(vault))
         source = {"id": source_id, "uri": str(vault), "source_type": "local_folder", "properties": "{}"}
 
-        pipeline.ingest_file = AsyncMock(side_effect=RuntimeError("parse error"))
+        pipeline.ingest_file = AsyncMock(side_effect=exc)
 
-        stats = await fw.scan_source(source)
+        with caplog.at_level(logging.ERROR, logger=folder_watcher.logger.name):
+            stats = await fw.scan_source(source)
         assert stats["failed"] == 3  # all 3 files fail
 
         rows = store.db.execute(
@@ -724,7 +775,25 @@ class TestFolderWatcherFailedFiles:
             (source_id,)).fetchall()
         for row in rows:
             assert row["status"] == "failed"
-            assert "parse error" in row["error_message"]
+            assert str(exc) in row["error_message"]
+        errors = [r for r in caplog.records if r.name == folder_watcher.logger.name]
+        assert bool(errors) is logs_error
+
+    @pytest.mark.asyncio
+    async def test_a_pool_shut_down_at_exit_leaves_the_file_to_the_next_start(
+            self, store, pipeline, vault):
+        """Gateway exit is not a defect in the file: a terminal 'failed' would keep
+        it out of every later scan until the user retried it by hand."""
+        fw = FolderWatcher(store, pipeline)
+        source_id = store.add_source("test", "local_folder", str(vault))
+        source = {"id": source_id, "uri": str(vault), "source_type": "local_folder", "properties": "{}"}
+        pipeline.ingest_file = AsyncMock(side_effect=llm_pool.LLMPoolClosed())
+
+        with pytest.raises(llm_pool.LLMPoolClosed):
+            await fw.scan_source(source)
+        rows = store.db.execute(
+            "SELECT status FROM folder_file_state WHERE source_id = ?", (source_id,)).fetchall()
+        assert [row["status"] for row in rows] == ["scanning"]
 
 
 class TestHashFileSecurity:

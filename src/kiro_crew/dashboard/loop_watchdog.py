@@ -31,9 +31,9 @@ things turn the silence that follows a wedge into an actionable artifact:
    schedules it on the absolute mach timebase, which does not advance during
    sleep.  So a laptop resume does not fire a deadline armed before the
    sleep; the heartbeat, on the same monotonic clock, missed no beat either.
-   Desktop launches use a 25s exit budget near Electron's independent
-   liveness window; managed services have no Electron probe, use a wider
-   budget, and receive the soft dump first.
+   Desktop launches use a 25s exit budget inside Electron's independent
+   liveness window (about a minute); managed services have no Electron
+   probe, use a wider budget, and receive the soft dump first.
 
    faulthandler's own ``dump_traceback_later`` timer cannot be that decider
    on every platform: it waits on an interpreter lock whose deadline clock is
@@ -92,8 +92,8 @@ re-arms the alarm, for at most :data:`PAGING_GRACE_MAX_SECS` beyond the exit
 budget, and says so once at WARNING.  A thread blocked in a syscall or
 holding the GIL in a C call takes no major faults, so those still exit on
 the normal budget.  A desktop budget (below ``stall_after``) defers
-nothing: the desktop app's own liveness probe ends a silent gateway within
-a minute regardless.
+nothing: the desktop app's own liveness probe ends a silent gateway about
+a minute in regardless.
 
 The class is deliberately split so the decision logic (:meth:`check`) is a
 pure, synchronous step that can be driven from tests with injected clocks
@@ -105,18 +105,29 @@ from __future__ import annotations
 
 import faulthandler
 import logging
+import os
 import signal
 import sys
 import threading
+import time
 import typing
 from collections.abc import Callable
 
+from kiro_crew.dashboard.crash_dump_store import (
+    FAULTHANDLER_MAX_FRAMES,
+    FAULTHANDLER_MAX_THREADS,
+    LOOP_THREAD_HEADER,
+    record_alarm_due,
+)
 from kiro_crew.dashboard.stall_enrichment import collect_stall_enrichment, describe_loop_thread
 from kiro_crew.diag.threads import _parse_stat, _read_text, _task_dir
 from kiro_crew.platform_compat import (
+    MEMORY_PRESSURE_WARN,
     arm_process_alarm,
     awake_now,
     boottime_now,
+    memory_pressure_level,
+    proc_pageins_for_pid,
     process_alarm_available,
 )
 
@@ -133,6 +144,31 @@ SUSPEND_SKEW_MIN_SECS: float = 2.0
 #: paging still ends the process.
 PAGING_GRACE_MAX_SECS: float = 600.0
 
+#: The macOS grace cap, shorter than the Linux one on purpose.  The macOS
+#: page-in signal (:func:`read_loop_pageins_under_pressure`) is process-wide,
+#: not per-thread, so it cannot tell "the loop thread is paging" from "some
+#: other thread in the process is paging".  A shorter cap bounds how long a
+#: genuinely wedged loop can be kept alive by an unrelated thread's paging.
+PAGING_GRACE_MAX_SECS_MACOS: float = 120.0
+
+#: The WARNING a paging deferral logs, once per silence, in two forms selected
+#: by the grace cap -- already how the macOS watchdog is distinguished without a
+#: platform branch (see :data:`PAGING_GRACE_MAX_SECS_MACOS`). The Linux signal
+#: is the loop thread's own major-fault count, so its message names the thread
+#: and rules out a wedge. The macOS signal is the whole process's page-in count,
+#: which cannot attribute paging to the loop thread, so its message makes no
+#: such claim. Each takes three %-args: silence seconds, count delta, budget.
+_PAGING_MESSAGE_LINUX: str = (
+    "event loop silent %.1fs while its thread is paging (%d major faults "
+    "since the last poll): the host is short of memory, not the loop "
+    "wedged, so the stall exit is deferred for up to %.0fs of silence"
+)
+_PAGING_MESSAGE_MACOS: str = (
+    "event loop silent %.1fs while the process is paging (%d page-ins "
+    "under memory pressure since the last poll): the stall exit is "
+    "deferred for up to %.0fs of silence"
+)
+
 
 def read_thread_major_faults(native_thread_id: int | None) -> int | None:
     """Major page faults taken so far by one thread of this process.
@@ -148,6 +184,48 @@ def read_thread_major_faults(native_thread_id: int | None) -> int | None:
         return None
     major_faults = _parse_stat(stat_text).get("major_faults")
     return major_faults if isinstance(major_faults, int) else None
+
+
+def read_loop_pageins_under_pressure(
+    _native_thread_id: int | None,
+    *,
+    pressure_level: "Callable[[], int | None]" = memory_pressure_level,
+    pageins: "Callable[[int], int | None]" = proc_pageins_for_pid,
+    warn_level: int = MEMORY_PRESSURE_WARN,
+) -> int | None:
+    """macOS analogue of :func:`read_thread_major_faults` for the paging deferral.
+
+    Plugs into the same ``loop_major_faults`` hook, so :meth:`LoopStallWatchdog.
+    _defer_exit_while_paging` needs no change.  It returns the process's
+    ``ri_pageins`` count **only while the host is under memory pressure**
+    (``memory_pressure_level`` at or above WARN); otherwise it returns ``None``.
+
+    The ``None``-when-not-pressured choice is deliberate and load-bearing.  The
+    deferral acts on a *rise* between two readings, and ``None`` is already its
+    "no reading -- reset the baseline, defer nothing" path.  Returning a flat
+    ``0`` instead would manufacture a huge false rise on the first pressured poll
+    after an unpressured one (``0`` -> true count) and defer a genuinely wedged
+    loop.  So the pressure gate folds into the reader as: no pressure -> ``None``
+    -> no baseline -> no deferral.
+
+    This is also why a stall the compressor serves (pressure high, disk pageins
+    flat) still exits on the normal budget: the count does not rise, so nothing
+    defers.  The signal only ever *extends* the budget on real disk-pagein
+    progress; it can never keep a flat-pagein stall alive.
+
+    The signal is process-wide, not per-thread -- macOS exposes no public
+    per-thread page-in count -- so ``_native_thread_id`` is accepted to match
+    :func:`read_thread_major_faults`'s signature and ignored.  That coarseness
+    is bounded by the shorter :data:`PAGING_GRACE_MAX_SECS_MACOS`.
+
+    Off macOS, or on any unreadable signal, returns ``None``.  The two readers
+    are injectable so the deferral can be driven deterministically in tests
+    without ever inducing real memory pressure.
+    """
+    level = pressure_level()
+    if level is None or level < warn_level:
+        return None
+    return pageins(os.getpid())
 
 
 #: The mechanism the last :func:`_default_arm_later` armed the dump-then-exit
@@ -365,7 +443,13 @@ class LoopStallWatchdog:
             :func:`kiro_crew.dashboard.stall_enrichment.collect_stall_enrichment`.
         loop_major_faults: Reads the loop thread's major-fault count from its
             native thread id, ``None`` when unknown; injectable for tests.
-            Defaults to :func:`read_thread_major_faults`.
+            Defaults to :func:`read_thread_major_faults`.  macOS passes
+            :func:`read_loop_pageins_under_pressure` instead.
+        paging_grace_max: Longest the exit may be deferred past ``exit_after``
+            while the loop keeps paging.  ``None`` resolves to the module
+            :data:`PAGING_GRACE_MAX_SECS` at construction; macOS passes the
+            shorter :data:`PAGING_GRACE_MAX_SECS_MACOS` because its page-in
+            signal is process-wide rather than per-thread.
         log: Logger, injectable for tests.
     """
 
@@ -393,7 +477,9 @@ class LoopStallWatchdog:
         enrich_after: float = 15.0,
         enrich: "Callable[[float], list[str]] | None" = None,
         loop_major_faults: Callable[[int | None], int | None] = read_thread_major_faults,
+        paging_grace_max: float | None = None,
         log: logging.Logger | None = None,
+        wall: Callable[[], float] = time.time,
     ) -> None:
         self._stall_after = stall_after
         self._exit_after = exit_after
@@ -420,12 +506,33 @@ class LoopStallWatchdog:
         self._lag_episode_max = 0.0
         self.lagging = False
         self.sustained_lag_episodes = 0
-        # ``threading.get_ident()`` of the thread that last beat: the loop
-        # thread the enrichment locates.  None until the first beat.
+        # ``threading.get_ident()`` of the thread that started the watchdog or
+        # last beat: the loop thread the enrichment locates.  None until then.
         self._loop_thread_id: int | None = None
         # The kernel's id for that same thread, which names its procfs row.
         self._loop_native_thread_id: int | None = None
         self._loop_major_faults = loop_major_faults
+        # The grace cap for THIS instance, resolved from the module default at
+        # construction when not given.  Reading the module name here (not as a
+        # default-arg value, which binds once at def time) keeps a
+        # ``monkeypatch.setattr(loop_watchdog, "PAGING_GRACE_MAX_SECS", ...)``
+        # done before construction effective, and lets the macOS watchdog pass
+        # the shorter ``PAGING_GRACE_MAX_SECS_MACOS`` without a platform branch
+        # inside the hot path.
+        self._paging_grace_max = (
+            PAGING_GRACE_MAX_SECS if paging_grace_max is None else paging_grace_max
+        )
+        # The WARNING a paging deferral logs, once per silence. Selected from
+        # the grace cap, the same signal that already distinguishes the macOS
+        # watchdog without a platform branch: the macOS cap pairs with the
+        # process-wide page-in message, every other cap with the Linux
+        # per-thread major-fault message. Takes three %-args: silence seconds,
+        # the count delta, total budget.
+        self._paging_log_message = (
+            _PAGING_MESSAGE_MACOS
+            if self._paging_grace_max == PAGING_GRACE_MAX_SECS_MACOS
+            else _PAGING_MESSAGE_LINUX
+        )
         # Counts beats, so a paging deferral can tell that the loop beat after
         # it sampled and must leave the beat's fresh deadline alone.
         self._beat_generation = 0
@@ -436,7 +543,17 @@ class LoopStallWatchdog:
         # Serialises the cancel-then-arm pair between the loop thread's beat
         # and the daemon thread's paging deferral.
         self._alarm_lock = threading.Lock()
+        # Where the dump file ended before the loop thread's stack was written
+        # into it, so a recovery can truncate it back. None when not written.
+        self._loop_stack_offset: int | None = None
         self._dumped = False
+        # When the armed alarm is due, on the ``now`` clock: set by every arm,
+        # read by the daemon thread, which records it in the dump file's header
+        # on the wall clock (:meth:`_record_alarm_due`). ``_due_written`` is the
+        # value last written there, None for the header's "no alarm".
+        self._wall = wall
+        self._alarm_due_at: float | None = None
+        self._due_written: int | None = None
         # True only between start() and stop() when exit_after is set; gates the
         # alarm so a dashboard-only process (e.g. `kirocrew chat`, where
         # start() is never called) never arms a process-ending timer.
@@ -493,6 +610,7 @@ class LoopStallWatchdog:
                 return False
             try:
                 self._arm_later(seconds)
+                self._alarm_due_at = self._now() + seconds
             except Exception:  # pragma: no cover - never let petting crash the loop
                 # Cancellation succeeded but no replacement alarm exists, and
                 # with the flag cleared no later beat arms one: the exit is off
@@ -566,16 +684,18 @@ class LoopStallWatchdog:
         the silence measured here is monotonic, and the alarm pauses during a
         suspend, so a suspend never counts as a stall on either layer.
 
-        Enrichment deliberately never touches ``dump_file``: that file is the
-        boot-time crash sentinel (``crash_dump_store._is_header_only`` counts
-        lines), so a watchdog-side append would make a *recovered* 15–25s
-        stall read as a fatal crash on the next startup.  Only faulthandler
-        writes stacks into it.  The journal WARNING survives both outcomes —
-        the process lives to keep logging on recovery, and journald has
-        already persisted the line when the alarm ends a fatal stall.
+        The enrichment lines go to the logger only.  The one thing the
+        watchdog writes into ``dump_file`` is the loop thread's stack
+        (:meth:`_write_loop_stack`), and it truncates that away again when the
+        loop recovers: the file is the boot-time crash sentinel
+        (``crash_dump_store._is_header_only`` counts lines), so a recovered
+        stall must leave it header-only.  The journal WARNING survives both
+        outcomes — the process lives to keep logging on recovery, and journald
+        has already persisted the line when the alarm ends a fatal stall.
         """
         mono = self._now()
         self._note_resume(mono)
+        self._record_alarm_due(mono)
         silence = mono - self._last_beat
         self._note_sustained_lag()
         self._defer_exit_while_paging(silence)
@@ -592,6 +712,7 @@ class LoopStallWatchdog:
                 silence,
                 "\n".join(lines),
             )
+            self._write_loop_stack(silence)
         if silence >= self._stall_after:
             if not self._dumped:
                 self._dumped = True
@@ -629,9 +750,112 @@ class LoopStallWatchdog:
                 "event loop recovered after stall enrichment (last beat %.1fs ago)",
                 silence,
             )
+        self._drop_loop_stack()
         self._dumped = False
         self._enriched = False
         return False
+
+    def _record_alarm_due(self, mono: float) -> None:
+        """Keep the dump header's ``alarm-due=`` value at the armed alarm's deadline.
+
+        Written from this thread, so the loop thread does no file I/O for it.
+        The kernel holds an expired alarm until the process runs again, so a
+        dump that fired well after the recorded deadline belongs to a process
+        the host stopped running, not to a wedged loop
+        (:func:`kiro_crew.dashboard.crash_dump_store.dump_host_pause_secs`).
+        "No alarm" is written once the alarm is off, before this poll can
+        write a soft dump into the file, so a late soft dump never reads as a
+        late alarm.
+
+        shortcut: the value is moved to the wall clock once per poll, so a
+        host suspend that ends less than one poll before the alarm fires
+        leaves a deadline that reads the suspend as lateness; upgrade if such
+        dumps turn up.
+        """
+        due = self._alarm_due_at if self._later_active else None
+        value = None if due is None else int(self._wall() + (due - mono))
+        if value == self._due_written:
+            return
+        record_alarm_due(self._dump_file, value)
+        self._due_written = value
+
+    def _write_loop_stack(self, silence: float) -> None:
+        """Write the loop thread's stack into the dump file, ahead of the fatal dump.
+
+        faulthandler lists at most :data:`FAULTHANDLER_MAX_THREADS` threads,
+        newest first, so in a gateway with more threads the loop thread (the
+        oldest) is the one it leaves out.  This block is written from the
+        daemon thread while the alarm is still pending, so the alarm's
+        all-thread dump lands after it and the readers in
+        :mod:`kiro_crew.dashboard.crash_dump_store` take it as the wedged
+        thread.  Only while the alarm is armed: that is the only case where
+        the file is not otherwise written, and :meth:`_drop_loop_stack`
+        removes the block if the loop recovers.  Nothing here runs in a
+        signal handler.  A daemon thread that cannot get the GIL in time (the
+        loop thread holds it inside a C call, or the whole host is frozen)
+        writes nothing, and the readers then say the loop thread is missing.
+        """
+        target, thread_id = self._dump_file, self._loop_thread_id
+        if target is None or thread_id is None or not self._later_active:
+            return
+        generation = self._beat_generation
+        try:
+            frames = sys._current_frames()
+            frame = frames.get(thread_id)
+            if frame is None:
+                return
+            cut = (
+                f"; only the newest {FAULTHANDLER_MAX_THREADS} are listed after this block"
+                if len(frames) > FAULTHANDLER_MAX_THREADS
+                else ""
+            )
+            lines = [
+                f"# Event-loop thread after {silence:.0f}s of silence, written by the loop "
+                f"watchdog: {len(frames)} threads were alive{cut}.\n",
+                f"{LOOP_THREAD_HEADER} 0x{thread_id:016x} (most recent call first):\n",
+            ]
+            for _depth in range(FAULTHANDLER_MAX_FRAMES):
+                if frame is None:
+                    break
+                code = frame.f_code
+                lines.append(
+                    f'  File "{code.co_filename}", line {frame.f_lineno} in {code.co_name}\n'
+                )
+                frame = frame.f_back
+            lines.append("\n")
+            fd = target.fileno()
+            offset = os.lseek(fd, 0, os.SEEK_CUR)
+            os.write(fd, "".join(lines).encode("utf-8", "replace"))
+            self._loop_stack_offset = offset
+        except Exception:  # noqa: BLE001 - a capture must never stop the watchdog
+            self._log.debug("loop watchdog could not write the loop thread's stack", exc_info=True)
+            return
+        # A beat or a stop() that landed while the block was being written makes
+        # it stale, and stop() saw no offset to drop, so the writer drops it.
+        # Nothing on the loop thread touches the file: a beat leaves a stale
+        # block to the next poll's recovery branch.
+        # shortcut: a block from a recovered stall stays until that poll, so if
+        # the loop holds the GIL in a C call within one poll of recovering and
+        # the gateway has over 100 threads, the readers show the old stack;
+        # upgrade if such dumps turn up.
+        if self._stop.is_set() or self._beat_generation != generation:
+            self._drop_loop_stack()
+
+    def _drop_loop_stack(self) -> None:
+        """Truncate the dump file back to before :meth:`_write_loop_stack`'s block."""
+        offset, self._loop_stack_offset = self._loop_stack_offset, None
+        if offset is None or self._dump_file is None:
+            return
+        try:
+            fd = self._dump_file.fileno()
+            os.ftruncate(fd, offset)
+            os.lseek(fd, offset, os.SEEK_SET)
+        except OSError:
+            self._log.warning(
+                "loop watchdog could not remove the loop thread's stack from the dump file; "
+                "the next start may report this recovered stall as a crash",
+                exc_info=True,
+            )
 
     def _defer_exit_while_paging(self, silence: float) -> None:
         """Re-arm the alarm while the silent loop thread keeps paging.
@@ -646,7 +870,7 @@ class LoopStallWatchdog:
 
         Nothing is deferred when ``exit_after`` is below ``stall_after``: that
         is the desktop budget, where the desktop app's own liveness probe
-        ends a silent gateway within a minute anyway, so a deferral would
+        ends a silent gateway about a minute in anyway, so a deferral would
         only trade the alarm's stack dump for that kill.
         """
         exit_after = self._exit_after
@@ -665,7 +889,7 @@ class LoopStallWatchdog:
             return
         if major_faults <= baseline[1]:
             return
-        remaining_budget = exit_after + PAGING_GRACE_MAX_SECS - silence
+        remaining_budget = exit_after + self._paging_grace_max - silence
         if remaining_budget <= 0:
             return
         if not self._rearm_alarm(min(exit_after, remaining_budget), unless_beat_since=generation):
@@ -673,12 +897,10 @@ class LoopStallWatchdog:
         if self._paging_logged_generation != generation:
             self._paging_logged_generation = generation
             self._log.warning(
-                "event loop silent %.1fs while its thread is paging (%d major faults "
-                "since the last poll): the host is short of memory, not the loop "
-                "wedged, so the stall exit is deferred for up to %.0fs of silence",
+                self._paging_log_message,
                 silence,
                 major_faults - baseline[1],
-                exit_after + PAGING_GRACE_MAX_SECS,
+                exit_after + self._paging_grace_max,
             )
 
     def claim_lag_enrichment(self, lag: float) -> bool:
@@ -764,13 +986,23 @@ class LoopStallWatchdog:
                 self.check()
             except Exception:  # pragma: no cover - watchdog must outlive any error
                 self._log.exception("loop watchdog check raised")
+        # Stopped: no alarm can follow, so an orderly stop must not leave the
+        # block behind to read as a crash at the next start.  Dropped here,
+        # on this thread, so all dump-file I/O stays off the loop thread.
+        self._drop_loop_stack()
 
     def start(self) -> None:
-        """Arm the dump-then-exit alarm and spawn the daemon thread (idempotent)."""
+        """Arm the dump-then-exit alarm and spawn the daemon thread (idempotent).
+
+        Called on the loop thread, which it records, so a stall before the
+        first beat can still read that thread's fault count.
+        """
         if self._thread is not None:
             return
         self._stop.clear()
         self._last_beat = self._now()
+        self._loop_thread_id = threading.get_ident()
+        self._loop_native_thread_id = threading.get_native_id()
         self._last_poll_mono = None
         self._last_poll_suspend = None
         # Prime the authoritative dump-then-exit before the first beat.
@@ -778,6 +1010,7 @@ class LoopStallWatchdog:
             try:
                 self._cancel_later()
                 self._arm_later(self._exit_after)
+                self._alarm_due_at = self._now() + self._exit_after
                 self._later_active = True
             except Exception:  # pragma: no cover - degrade to soft dump only
                 self._log.exception("loop watchdog failed to arm the stall alarm")
@@ -818,6 +1051,8 @@ class LoopStallWatchdog:
                     self._cancel_later()
                 except Exception:  # pragma: no cover - cancel must never crash shutdown
                     self._log.exception("loop watchdog failed to cancel the stall alarm")
+        # The daemon thread drops a loop-thread block on its way out (_run), so
+        # this method, which runs on the loop thread, does no file I/O.
         thread, self._thread = self._thread, None
         if thread is not None and thread.is_alive():
             thread.join(timeout)

@@ -1,6 +1,6 @@
 """Reading installed apps: the app list, one app's row, enablement, and agent ownership.
 
-``list_apps``, ``get_app``, ``app_enabled_state`` / ``is_app_enabled`` / ``app_disabled``,
+``list_apps``, ``get_app``, ``app_enabled_state`` / ``is_app_enabled``,
 the source and provenance setters, and which installed app owns an agent and whether a
 session bound to it may run (``owning_app_for_agent``, ``app_command_agent_refusal``).
 
@@ -17,7 +17,7 @@ import logging
 import stat
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from kiro_crew.apps.composer_action_grants import composer_action_grant_row
 from kiro_crew.apps.execution import shipped_builtin_app_root
@@ -28,6 +28,7 @@ from kiro_crew.apps.manager_records import (
     APP_MANIFEST_FILENAME,
     INSTALLED_META_FILENAME,
     InstalledApp,
+    InstalledRecordShapeError,
     _approved_grants_row,
     _is_sidecar_entry,
     _read_installed,
@@ -39,7 +40,10 @@ from kiro_crew.apps.manager_records import (
 )
 from kiro_crew.apps.manifest import AppManifest, contain_command_agents
 from kiro_crew.apps.message_action_grants import message_action_grant_row
+from kiro_crew.apps.protected_app_state import owner_disabled
 from kiro_crew.apps.selection_action_grants import selection_action_grant_row
+from kiro_crew.apps.user_session_reach import user_session_reach_grant_row
+from kiro_crew.apps.worker_auto_approve import worker_auto_approve_grant_row
 from kiro_crew.platform_compat import is_link_or_junction
 
 logger = logging.getLogger("kiro_crew.apps.manager")
@@ -231,7 +235,9 @@ class AgentOwner:
     enabled: bool
 
 
-def _owner_json(path: Path) -> dict[str, Any] | None:
+def _owner_json(
+    path: Path, *, admit_hardlinked: Callable[[str, bytes], bool] | None = None
+) -> dict[str, Any] | None:
     """*path* parsed as a JSON object for the owner lookup, or None when refused.
 
     Every file the lookup reads -- an app's ``installed.json``, its ``app.json``
@@ -239,17 +245,29 @@ def _owner_json(path: Path) -> dict[str, Any] | None:
     before anything follows a link (:func:`_screened_spec_path`) and read through
     the hardened, audited agent-spec reader. A link into a protected location, an
     oversized file and a document that is not an object all read as None.
+
+    *admit_hardlinked* is given only for a file under a shipped builtin's package
+    root. An installer that hardlinks package files leaves those with a second
+    link, so such a file is admitted when it is the app's ``app.json`` or a
+    declared agent spec and its bytes match the installed RECORD digest
+    (:func:`kiro_crew.skills_discovery._builtin_app_file_admission`). A
+    hardlinked file anywhere else stays refused.
     """
     from kiro_crew.agent_discovery import _read_agent_spec
 
     screened = _screened_spec_path(path)
     if screened is None:
         return None
-    data = _read_agent_spec(screened, operation="app_agent_owner", source="unknown")
+    extra: dict[str, Any] = {}
+    if admit_hardlinked is not None:
+        extra["admit_hardlinked"] = admit_hardlinked
+    data = _read_agent_spec(screened, operation="app_agent_owner", source="unknown", **extra)
     return data if isinstance(data, dict) else None
 
 
-def _app_agent_names(app_name: str, manifest: AppManifest, app_root: Path) -> set[str]:
+def _app_agent_names(
+    app_name: str, manifest: AppManifest, app_root: Path, *, shipped: bool = False
+) -> set[str]:
     """Every name *app_name*'s own agents are selected by, for attributing a binding.
 
     Each agent's declared ``name`` (its file stem when it declares none), plus the
@@ -257,18 +275,27 @@ def _app_agent_names(app_name: str, manifest: AppManifest, app_root: Path) -> se
     names either is recognised. Attribution only, never an authorization: a
     templated spec still names its agent here, unlike the command-agent check in
     :mod:`kiro_crew.apps.manifest`. A path escaping the app root, and a spec the
-    screened read refuses (:func:`_owner_json`), contribute nothing.
+    screened read refuses (:func:`_owner_json`), contribute nothing. *shipped*
+    marks a shipped builtin's package root: its hardlinked ``app.json`` and the
+    specs that pass the path screen are admitted by their RECORD digest.
     """
     from kiro_crew.apps import bridges  # bridges imports this module
     from kiro_crew.apps.manifest import _app_path_refusal, screen_app_path
 
     names: set[str] = set()
     screened_root = screen_app_path(app_root) if manifest.agents else None
-    for rel in manifest.agents:
-        rel = str(rel)
-        if not rel or _app_path_refusal(rel, app_root, screened_root):
-            continue
-        data = _owner_json(app_root / rel)
+    accepted = [
+        rel
+        for rel in map(str, manifest.agents)
+        if rel and not _app_path_refusal(rel, app_root, screened_root)
+    ]
+    admit = None
+    if shipped:
+        from kiro_crew.skills_discovery import _builtin_app_file_admission
+
+        admit = _builtin_app_file_admission(app_root, [APP_MANIFEST_FILENAME, *accepted])
+    for rel in accepted:
+        data = _owner_json(app_root / rel, admit_hardlinked=admit)
         if data is None:
             continue
         name = data.get("name", Path(rel.replace("\\", "/")).stem)
@@ -308,12 +335,21 @@ def owning_app_for_agent(agent: str) -> AgentOwner | None:
             raw_meta = _owner_json(entry / INSTALLED_META_FILENAME)
             if raw_meta is None:
                 continue
-            root = shipped_builtin_app_root(entry.name) or entry
-            raw_manifest = _owner_json(root / APP_MANIFEST_FILENAME)
+            shipped_root = shipped_builtin_app_root(entry.name)
+            root = shipped_root or entry
+            shipped = shipped_root is not None
+            admit = None
+            if shipped:
+                from kiro_crew.skills_discovery import _builtin_app_file_admission
+
+                admit = _builtin_app_file_admission(root, [APP_MANIFEST_FILENAME])
+            raw_manifest = _owner_json(root / APP_MANIFEST_FILENAME, admit_hardlinked=admit)
             if raw_manifest is None:
                 continue
             manifest = AppManifest.from_dict(raw_manifest)
-            if not manifest.agents or agent not in _app_agent_names(entry.name, manifest, root):
+            if not manifest.agents or agent not in _app_agent_names(
+                entry.name, manifest, root, shipped=shipped
+            ):
                 continue
             label = manifest.displayName.strip() or entry.name
             enabled = bool(InstalledApp.from_dict(raw_meta).enabled)
@@ -327,8 +363,10 @@ def missing_agent_reason(agent: str, *, member: str = "") -> str:
     """Why a session cannot start on *agent*, whose definition is gone, and the fix.
 
     *member* is the Crew Member the session belongs to, when there is one; the
-    reason then names the member rather than the agent. Blocking file I/O through
-    :func:`owning_app_for_agent`; call it off the event loop.
+    reason then names the member rather than the agent. An agent no app declares
+    that is the configured ``agent.default_agent`` also gets the setting as the
+    fix. Blocking file I/O through :func:`owning_app_for_agent` and a config load;
+    call it off the event loop.
     """
     owner = owning_app_for_agent(agent)
     subject = f'Bot "{member}"' if member else f'The agent "{agent}"'
@@ -339,7 +377,23 @@ def missing_agent_reason(agent: str, *, member: str = "") -> str:
                 f'{subject} can\'t start: its agent template "{agent}" is missing. '
                 "Pick another template on its Agent Template tab."
             )
-        return f"{subject} can't start: its agent definition is missing."
+        reason = f"{subject} can't start: its agent definition is missing."
+        # A session that names no agent starts from agent.default_agent, so a
+        # default with no spec refuses every one of them until the setting changes.
+        from kiro_crew.dashboard.side_readonly_spec import missing_default_agent_explanation
+
+        default = missing_default_agent_explanation(agent)
+        if default is not None:
+            reason += f" It is agent.default_agent, which setup does not write. {default[1]}"
+        # A linked-worktree gateway is refused the shared agent home, so on a home
+        # with no specs the definition was never written: say so, and what to do.
+        try:
+            from kiro_crew.agent import _worktree_declined_spec_hint
+
+            reason += _worktree_declined_spec_hint()
+        except Exception:  # noqa: BLE001 - the hint is a label, never a gate
+            logger.debug("no worktree hint for a missing agent %r", agent, exc_info=True)
+        return reason
     if not owner.enabled:
         return (
             f"{subject} comes from the {owner.label} app, which is disabled. "
@@ -363,7 +417,13 @@ def list_apps() -> list[dict[str, Any]]:
     for entry in sorted(root.iterdir()):
         if _is_sidecar_entry(entry.name) or not entry.is_dir():
             continue
-        meta = _read_installed(entry.name)
+        try:
+            meta = _read_installed(entry.name)
+        except InstalledRecordShapeError as exc:
+            # One damaged record must not take the whole listing down; it is left
+            # on disk untouched and named in the log.
+            logger.warning("Skipping app %s in the listing: %s", entry.name, exc)
+            continue
         if not meta:
             continue
         # Also load manifest for full info
@@ -401,13 +461,15 @@ def list_apps() -> list[dict[str, Any]]:
             except Exception:
                 pass
         app_info: dict[str, Any] = {
-            **meta.to_dict(),
+            **meta.to_row_dict(),
             **_approved_grants_row(entry.name),
             **link_preview_grant_row(entry.name, manifest_data),
             **message_action_grant_row(entry.name, manifest_data),
             **link_open_grant_row(entry.name, manifest_data),
             **composer_action_grant_row(entry.name, manifest_data),
             **selection_action_grant_row(entry.name, manifest_data),
+            **worker_auto_approve_grant_row(entry.name, manifest_data),
+            **user_session_reach_grant_row(entry.name, manifest_data),
             "manifest": manifest_data,
         }
         # Include migratedTo if non-empty
@@ -443,13 +505,15 @@ def get_app(name: str) -> dict[str, Any] | None:
         except Exception:
             pass
     row = {
-        **meta.to_dict(),
+        **meta.to_row_dict(),
         **_approved_grants_row(name),
         **link_preview_grant_row(name, manifest_data),
         **message_action_grant_row(name, manifest_data),
         **link_open_grant_row(name, manifest_data),
         **composer_action_grant_row(name, manifest_data),
         **selection_action_grant_row(name, manifest_data),
+        **worker_auto_approve_grant_row(name, manifest_data),
+        **user_session_reach_grant_row(name, manifest_data),
         "manifest": manifest_data,
     }
     adoption_markers = _adoption_rows_context()
@@ -599,7 +663,8 @@ def app_enabled_state(name: str) -> bool | None:
             logger.warning("Metadata path %s is not a regular file", meta_path)
             return None
         data = json.loads(meta_path.read_text(encoding="utf-8"))
-        return bool(InstalledApp.from_dict(data).enabled)
+        # The owner's disable, kept outside the app's tree, outranks this file.
+        return bool(InstalledApp.from_dict(data).enabled) and not owner_disabled(name)
     # No `json.JSONDecodeError` member: it subclasses ValueError, so pairing the two is
     # redundant and the repo ratchets against it.
     except (OSError, ValueError, TypeError, KeyError) as exc:
@@ -616,25 +681,6 @@ def is_app_enabled(name: str) -> bool:
     """
     meta = _read_installed(name)
     return bool(meta and meta.enabled)
-
-
-# The builtin that owns the Task Runner page. Its routes are host-owned, so the
-# start paths read this app's switch themselves (see ``app_disabled``).
-TASK_RUNNER_APP = "projects"
-
-TASK_RUNNER_DISABLED_MESSAGE = "Task Runner is disabled. Enable it in Library to start tasks."
-
-
-def app_disabled(name: str) -> bool:
-    """True only when the app is installed and switched off.
-
-    Not ``not is_app_enabled(name)``: that is also True when no record exists,
-    and a host-owned surface (Task Runner on a headless host or in tests) runs
-    without one. Only an explicit ``enabled: false`` reads as disabled here.
-    Read-only, like :func:`is_app_enabled`.
-    """
-    meta = _read_installed(name)
-    return meta is not None and not meta.enabled
 
 
 @holds_app_record_locks

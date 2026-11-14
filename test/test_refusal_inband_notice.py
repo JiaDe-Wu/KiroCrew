@@ -19,6 +19,7 @@ import pathlib
 import re
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from kiro_crew.dashboard.chat_runner import (
     _refined_tool_row_content,
@@ -40,6 +41,8 @@ from kiro_crew.dashboard.state import (
     build_refusal_steer_notice,
     should_queue_refusal_recovery,
 )
+
+_CREDENTIAL = github_classic(seed=13)
 
 
 class _SteerClient:
@@ -88,6 +91,7 @@ class _Slot:
 
 class _Event:
     request_id = 7
+    tool_call_id = ""
     title = "bash"
     tool_kind = "execute"
 
@@ -626,11 +630,11 @@ class TestHookErrorExplainsItself:
             _Slot(),
             _Event(),
             session_key="s",
-            error="hook saw AKIAIOSFODNN7EXAMPLE",
+            error=f"hook saw {_CREDENTIAL}",
             refusal_notices=notices,
             refusal_reasons=[],
         )
-        assert "AKIAIOSFODNN7EXAMPLE" not in client.steered[0]
+        assert _CREDENTIAL not in client.steered[0]
 
     @pytest.mark.asyncio
     async def test_hook_error_records_a_fallback_entry(self):
@@ -643,12 +647,12 @@ class TestHookErrorExplainsItself:
             _Slot(),
             _Event(),
             session_key="s",
-            error="hook saw AKIAIOSFODNN7EXAMPLE",
+            error=f"hook saw {_CREDENTIAL}",
             refusal_reasons=reasons,
             refusal_notices=None,
         )
         assert reasons
-        assert "AKIAIOSFODNN7EXAMPLE" not in reasons[0][1]
+        assert _CREDENTIAL not in reasons[0][1]
 
 
 class TestEveryHostDenyCallSiteIsWired:
@@ -1131,3 +1135,43 @@ class TestEveryHostDenyCallSiteIsWired:
             "the reason alongside the notice, or use a local throwaway list when "
             "this deny is answered without a recovery entry"
         )
+
+
+class _MetaSlot(_Slot):
+    """Records each row's meta, the join key the dashboard marks a tool line by."""
+
+    def __init__(self):
+        super().__init__()
+        self.metas: list[object] = []
+
+    def append(self, role, content, cls, **kw):
+        super().append(role, content, cls, **kw)
+        self.metas.append(kw.get("meta"))
+
+
+class _CallEvent(_Event):
+    tool_call_id = "call-9"
+    tool_purpose = ""
+    tool_input = ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deny", ["hook_blocked", "invalid", "hook_error"])
+async def test_every_deny_row_names_its_tool_call(deny):
+    """Without the tool_call_id the blocked row cannot reach the tool's own line,
+    which keeps a green check while the cards below say it was blocked."""
+    slot = _MetaSlot()
+    common = dict(session_key="s", refusal_reasons=[], refusal_notices=None)
+    if deny == "hook_blocked":
+        await _reject_hook_blocked(
+            _SteerClient(), slot, _CallEvent(), pre_hook_results=["BLOCKED: no"], **common
+        )
+    elif deny == "invalid":
+        await _reject_invalid_tool(
+            _SteerClient(), slot, _CallEvent(), error=ValueError("bad name"), **common
+        )
+    else:
+        await _reject_hook_error(_SteerClient(), slot, _CallEvent(), error="boom", **common)
+    assert [m.get("tool_call_id") if isinstance(m, dict) else None for m in slot.metas] == [
+        "call-9"
+    ]

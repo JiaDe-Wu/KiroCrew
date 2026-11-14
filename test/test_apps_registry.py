@@ -58,6 +58,17 @@ class TestMinimalEnvHonorsWindowsCaseInsensitivity:
         assert env["USERPROFILE"] == r"C:\Users\me"
         assert env["TEMP"] == r"C:\Temp"
 
+    def test_programdata_reaches_both_registry_git_envs(self, monkeypatch) -> None:
+        """Win32-OpenSSH exits 255 with no output when `ProgramData` is unset.
+
+        Every ssh:// registry clone on Windows starts from one of these two envs,
+        so without it no ssh:// registry or app repository can be cloned there.
+        """
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(registry.os, "environ", {"PROGRAMDATA": r"C:\ProgramData"})
+        assert registry.minimal_env().get("PROGRAMDATA") == r"C:\ProgramData"
+        assert registry.anonymous_git_env().get("PROGRAMDATA") == r"C:\ProgramData"
+
     def test_folding_did_not_admit_secrets(self, monkeypatch) -> None:
         """The fold widens CASE, never the key set."""
         monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
@@ -1376,3 +1387,40 @@ class TestCatalogFailureNeverBreaksTheStore:
             await self._rows(monkeypatch)
         assert any("catalog" in r.message for r in caplog.records)
         assert any(r.exc_info for r in caplog.records), "expected a traceback"
+
+    CAUSE = "a recent catalog fetch failed; not retrying yet"
+
+    def _unreachable(self, monkeypatch):
+        def unreachable():
+            raise registry.official_catalog.CatalogUnavailable(self.CAUSE)
+
+        monkeypatch.setattr(registry.official_catalog, "fetch_inventory_entries", unreachable)
+
+    def _assert_one_line_with_the_cause(self, caplog, what):
+        warnings = [r for r in caplog.records if r.levelname == "WARNING" and what in r.message]
+        assert len(warnings) == 1
+        assert self.CAUSE in warnings[0].getMessage()
+        assert not warnings[0].exc_info, "an expected miss must not log a traceback"
+        assert any(
+            r.levelname == "DEBUG" and r.exc_info for r in caplog.records
+        ), "the stack must stay available at DEBUG"
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_catalog_logs_one_line_with_the_cause(self, monkeypatch, caplog):
+        """Offline, every store listing hits this branch, so a traceback per
+        listing buries the log. The expected miss is one line naming the cause;
+        the stack is still there at DEBUG for whoever turns it on.
+        """
+        self._unreachable(monkeypatch)
+        with caplog.at_level("DEBUG", logger=registry.logger.name):
+            rows = await self._rows(monkeypatch)
+        assert "seed-app" in rows
+        self._assert_one_line_with_the_cause(caplog, "no official catalog inventory")
+
+    def test_an_unreachable_catalog_install_lookup_logs_one_line(self, monkeypatch, caplog):
+        """The catalog-first listing asks the same fetch whether a catalog-only row
+        is installable, so it answers an outage the same way."""
+        self._unreachable(monkeypatch)
+        with caplog.at_level("DEBUG", logger=registry.logger.name):
+            assert registry._catalog_installable_rows() == {}
+        self._assert_one_line_with_the_cause(caplog, "install coordinates")

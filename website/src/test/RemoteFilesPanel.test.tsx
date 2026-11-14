@@ -285,7 +285,7 @@ describe('RemoteFilesPanel', () => {
     // Said on its own line, not appended to the path (which truncates).
     const notice = await screen.findByRole('status')
     expect(notice).toHaveTextContent("This file is larger than 256 KB, so only the first 256 KB is shown and it can't be edited here.")
-    for (const el of screen.getAllByTitle('big.log')) expect(el).not.toHaveTextContent(/256 KB/)
+    for (const el of screen.getAllByText(/big\.log/)) expect(el).not.toHaveTextContent(/256 KB/)
     expect(screen.queryByRole('button', { name: 'Save' })).toBeNull()
   })
 
@@ -536,6 +536,24 @@ describe('RemoteGitPanel', () => {
     await u.click(await screen.findByRole('button', { name: 'Modified run.sh' }))
     expect((await screen.findByTestId('patch', {}, { timeout: 5000 })).textContent).toBe(patch)
     expect(screen.queryByText(/no difference from the last commit/i)).not.toBeInTheDocument()
+  })
+
+  it('shows a cut-off commit subject in the bubble on keyboard focus, not in a native title', async () => {
+    const subject = 'fix: keep the end of a very long commit subject readable in the history list'
+    vi.spyOn(api, 'chatSlotEnvironmentGit').mockImplementation(async (_slot, op) => {
+      if (op === 'git_status') return { root: '/w', git: true, output: '## main\0' }
+      if (op === 'git_log') return { root: '/w', git: true, output: `abc1234\tme\t1700000000\t${subject}\n` }
+      return { root: '/w', git: true, output: '' }
+    })
+    wrap(<RemoteGitPanel slot="chat-1" name="Remote" />)
+    // The history read waits on the status read's success, so the subject lands
+    // after two chained query answers: bound that chain explicitly.
+    const CHAINED_READS_MS = 5000
+    const line = await screen.findByText(subject, {}, { timeout: CHAINED_READS_MS })
+    expect(line).not.toHaveAttribute('title')
+    expect(line).toHaveAttribute('tabindex', '0')
+    fireEvent.focus(line)
+    expect(screen.getByRole('tooltip')).toHaveTextContent(subject)
   })
 
   it('re-reads a file diff when it is reopened, under the app query defaults', async () => {

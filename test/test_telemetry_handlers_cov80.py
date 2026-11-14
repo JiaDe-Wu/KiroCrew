@@ -41,10 +41,13 @@ from unittest.mock import MagicMock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
+from redaction_structured_cases import github_classic
 
 from kiro_crew.config import loader as config_loader
 from kiro_crew.dashboard.handlers import telemetry as h
 from kiro_crew.dashboard.state import NEW_SESSION_TITLE
+
+_KEY = github_classic(seed=15)  # a token the credential plan redacts
 
 _BOUNDS: list[float] = [10.0, 20.0, 30.0, 40.0, 50.0]
 
@@ -501,7 +504,7 @@ async def test_context_trace_returns_the_per_turn_trace(
 def test_persisted_titles_reads_each_transcript_once() -> None:
     log = MagicMock()
     log.get_metadata = MagicMock(return_value={"title": "zzq persisted"})
-    out = h._persisted_titles(log, ["chat-1-9", "chat-1-9", "chat-2-4"])
+    out = h._persisted_titles(log, ["chat-1-9", "chat-1-9", "chat-2-4"], {})
     assert out == {"chat-1-9": "zzq persisted", "chat-2-4": "zzq persisted"}
     # Deduplicated by TRANSCRIPT key, so the repeated slot costs no second read.
     assert log.get_metadata.call_count == 2
@@ -510,13 +513,13 @@ def test_persisted_titles_reads_each_transcript_once() -> None:
 def test_persisted_titles_drops_the_placeholder_and_the_unnamed() -> None:
     log = MagicMock()
     log.get_metadata = MagicMock(side_effect=[{"title": NEW_SESSION_TITLE}, {}])
-    assert h._persisted_titles(log, ["chat-1-9", "chat-2-4"]) == {}
+    assert h._persisted_titles(log, ["chat-1-9", "chat-2-4"], {}) == {}
 
 
 def test_persisted_titles_survives_an_unreadable_metadata_line() -> None:
     log = MagicMock()
     log.get_metadata = MagicMock(side_effect=OSError("truncated"))
-    assert h._persisted_titles(log, ["chat-1-9"]) == {}
+    assert h._persisted_titles(log, ["chat-1-9"], {}) == {}
 
 
 # --- _with_conversation_titles ----------------------------------------------
@@ -539,7 +542,7 @@ async def test_with_titles_is_a_noop_when_state_exposes_no_slot_accessor() -> No
 @pytest.mark.asyncio
 async def test_with_titles_prefers_the_live_slot_and_redacts_it() -> None:
     """This is a second serialization boundary for an LLM-authored field."""
-    slot = SimpleNamespace(display_title="key AKIAIOSFODNN7EXAMPLE leaked")
+    slot = SimpleNamespace(display_title=f"key {_KEY} leaked")
     state = SimpleNamespace(get_slot=lambda key: slot, conversation_log=None)
     cost: dict[str, Any] = {
         "turns": [1],
@@ -547,7 +550,7 @@ async def test_with_titles_prefers_the_live_slot_and_redacts_it() -> None:
     }
     out = await h._with_conversation_titles(_mk(state=state), cost)
     title = out["conversations"][0]["title"]
-    assert "AKIAIOSFODNN7EXAMPLE" not in title
+    assert _KEY not in title
     assert "REDACTED" in title
     # The memoised cost object must not gain the title by reference.
     assert "title" not in cost["conversations"][0]
@@ -623,6 +626,7 @@ def _beacon_stub(monkeypatch: pytest.MonkeyPatch, info: dict, *, env_opted_out: 
     stub.status = MagicMock(return_value=info)
     stub.is_env_opted_out = MagicMock(return_value=env_opted_out)
     stub.DISABLE_ENV = "KIROCREW_TELEMETRY_DISABLED"
+    stub.opt_out_env_var = MagicMock(return_value="KIROCREW_TELEMETRY_DISABLED")
     monkeypatch.setattr(h, "beacon", stub)
     return stub
 
@@ -702,6 +706,7 @@ async def test_collection_status_reports_the_effective_switch_state(
         "env_var": h.TELEMETRY_ENV_VAR,
         "overlay_override": False,
         "otlp_configured": True,
+        "export_permitted": True,
         "otlp_destinations": [{"name": "ops", "source": "otlp_endpoints", "locked": False}],
         "metrics_dir": str(tmp_path / "m"),
     }

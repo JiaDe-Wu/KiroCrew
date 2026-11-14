@@ -104,16 +104,40 @@ case "$url" in
     # spec list, derived by the Runner from the workflow text.
     # codeql_pr_runs.json is the checked-in CodeQL workflow's own runs
     # (advanced setup), passed through with the path they carry.
-    jq -cs --arg names "$LANE_FILES" '
-      {workflow_runs:
-        ([.[0].workflow_runs[] | .path = ".github/workflows/ci.yml"]
+    # code_review_runs.json, when a test writes one, answers for
+    # code-review.yml in place of green_runs.json. A Code Review run with no
+    # display_title records the PR's current base, as code-review.yml does.
+    cr="$FIXTURES/code_review_runs.json"
+    [ -f "$cr" ] || cr=/dev/null
+    # The object value stays in parentheses: CI's jq 1.7 rejects a bare `a + b` there.
+    jq -cs --arg names "$LANE_FILES" --arg base "${BASE_REF:-}" '
+      .[3] as $cr
+      | {workflow_runs:
+        (([.[0].workflow_runs[] | .path = ".github/workflows/ci.yml"]
          + [.[1].workflow_runs[] as $r
-            | ($names | split(" ")[] | select(. != "")) as $n
+            | ($names | split(" ")[] | select(. != "")
+               | select($cr == null or . != "code-review.yml")) as $n
             | $r | .path = ".github/workflows/" + $n]
+         + [($cr // {workflow_runs: []}).workflow_runs[]
+            | .path = ".github/workflows/code-review.yml"]
+         | map(if .path == ".github/workflows/code-review.yml"
+               then .display_title //= "[base \($base)]" else . end))
          + .[2].workflow_runs)}
-    ' "$FIXTURES/ci_runs.json" "$FIXTURES/green_runs.json" "$FIXTURES/codeql_pr_runs.json"
+    ' "$FIXTURES/ci_runs.json" "$FIXTURES/green_runs.json" "$FIXTURES/codeql_pr_runs.json" "$cr"
     exit 0 ;;
   *"/actions/runs?event=dynamic"*)         cat "$FIXTURES/codeql_runs.json"; exit 0 ;;
+  *"/actions/runs/"[0-9]*)
+    # One run by id, read when the head_sha listing came back empty and the
+    # head's check-runs name the run. run_<id>.json is the run object; no
+    # fixture answers like a deleted run.
+    rid="${url##*/actions/runs/}"
+    rid="${rid%%[/?]*}"
+    if [ -f "$FIXTURES/run_$rid.json" ]; then
+      cat "$FIXTURES/run_$rid.json"
+      exit 0
+    fi
+    echo 'gh: Not Found (HTTP 404)' >&2
+    exit 1 ;;
   *"/collaborators/"*"/permission"*)
     # A reviewer's repository permission, after gh's own --jq. The fixture
     # maps login -> permission; a login it does not name has write access.
@@ -734,9 +758,11 @@ class TestAnEditWaitsForTheLanesItRestarts:
         assert proc.returncode == 0, proc.stderr
         assert outputs["status_state"] == state
         log = _lane_log(proc)
-        assert ("Code Review (edit re-run not started)" in log) == (state == "pending")
-        # Build re-runs on no edit, so its pre-edit run is still its verdict.
+        assert ("PR Hygiene (edit re-run not started)" in log) == (state == "pending")
+        # Build and Code Review re-run on no edit, so each pre-edit run is
+        # still its verdict.
         assert "Build (edit re-run not started)" not in log
+        assert "Code Review (edit re-run not started)" not in log
 
     def test_the_lane_list_matches_the_edited_triggers(self):
         listed = re.search(r'edited_lanes=" ([^"]+) "', _evaluate_script())
@@ -1174,7 +1200,37 @@ class TestSameSecondRunCollapse:
                 )
 
 
-class TestForkScanVerdictIsBoundToItsPullRequest:
+class _AnotherPullRequestOrAttemptStaysPending:
+    """The two stale-row checks every attempt-bound fork lane runs, written once.
+
+    The scan class and ``_ForkLaneVerdictBinding`` take this as a base and keep their
+    own ``_only_check_run``, ``_trigger_attempt`` and ``_id_for``, so every node id
+    stays ``<Class>::<test>``.
+    """
+
+    def test_a_siblings_clean_check_run_does_not_pass_this_pr(self, runner: Runner):
+        # Same name, same head SHA, same attempt -- DIFFERENT pull request.
+        self._only_check_run(runner, self._id_for(runner, pr="9999", attempt=1))
+
+        proc, outputs = runner.evaluate(fork=True)
+
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "pending"
+
+    def test_a_previous_attempts_clean_check_run_does_not_pass_a_rerun(self, runner: Runner):
+        # The trigger has been re-run: attempt 2 is current, and the only row on
+        # the commit is attempt 1's clean verdict -- computed for the previous
+        # attempt. It must not answer for this one.
+        self._trigger_attempt(runner, 2)
+        self._only_check_run(runner, self._id_for(runner, pr=runner.env["PR"], attempt=1))
+
+        proc, outputs = runner.evaluate(fork=True)
+
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "pending"
+
+
+class TestForkScanVerdictIsBoundToItsPullRequest(_AnotherPullRequestOrAttemptStaysPending):
     """A fork scan verdict must belong to THIS pull request and THIS attempt.
 
     Two open PRs can share a head SHA -- the same fork branch opened against two
@@ -1227,27 +1283,6 @@ class TestForkScanVerdictIsBoundToItsPullRequest:
 
     def _id_for(self, runner: Runner, *, pr: str, attempt: int) -> str:
         return f"{self.PREFIX}{pr}-{RUN_ID}-{attempt}"
-
-    def test_a_siblings_clean_check_run_does_not_pass_this_pr(self, runner: Runner):
-        # Same name, same head SHA, same attempt -- DIFFERENT pull request.
-        self._only_check_run(runner, self._id_for(runner, pr="9999", attempt=1))
-
-        proc, outputs = runner.evaluate(fork=True)
-
-        assert proc.returncode == 0, proc.stderr
-        assert outputs["status_state"] == "pending"
-
-    def test_a_previous_attempts_clean_check_run_does_not_pass_a_rerun(self, runner: Runner):
-        # The trigger has been re-run: attempt 2 is current, and the only row on
-        # the commit is attempt 1's clean verdict -- computed against whatever the
-        # ruleset said last time. It must not answer for this attempt.
-        self._trigger_attempt(runner, 2)
-        self._only_check_run(runner, self._id_for(runner, pr=runner.env["PR"], attempt=1))
-
-        proc, outputs = runner.evaluate(fork=True)
-
-        assert proc.returncode == 0, proc.stderr
-        assert outputs["status_state"] == "pending"
 
     def test_a_siblings_trigger_run_is_not_mistaken_for_this_prs(self, runner: Runner):
         # The expected external_id names the newest run of the lane's TRIGGERING
@@ -1330,7 +1365,7 @@ class TestForkScanVerdictIsBoundToItsPullRequest:
         assert "Internal Content Scan" in _bucket(_lane_log(proc), "passed")
 
 
-class _ForkLaneVerdictBinding:
+class _ForkLaneVerdictBinding(_AnotherPullRequestOrAttemptStaysPending):
     """A fork lane verdict must belong to THIS pull request and THIS attempt.
 
     Two open PRs can share a head SHA -- the same fork branch opened against two
@@ -1393,27 +1428,6 @@ class _ForkLaneVerdictBinding:
 
     def _id_for(self, runner: Runner, *, pr: str, attempt: int) -> str:
         return f"{self.PREFIX}{pr}-{RUN_ID}-{attempt}"
-
-    def test_a_siblings_clean_check_run_does_not_pass_this_pr(self, runner: Runner):
-        # Same name, same head SHA, same attempt -- DIFFERENT pull request.
-        self._only_check_run(runner, self._id_for(runner, pr="9999", attempt=1))
-
-        proc, outputs = runner.evaluate(fork=True)
-
-        assert proc.returncode == 0, proc.stderr
-        assert outputs["status_state"] == "pending"
-
-    def test_a_previous_attempts_clean_check_run_does_not_pass_a_rerun(self, runner: Runner):
-        # The trigger has been re-run: attempt 2 is current, and the only row on
-        # the commit is attempt 1's clean verdict -- computed on the previous
-        # roll. It must not answer for this attempt.
-        self._trigger_attempt(runner, 2)
-        self._only_check_run(runner, self._id_for(runner, pr=runner.env["PR"], attempt=1))
-
-        proc, outputs = runner.evaluate(fork=True)
-
-        assert proc.returncode == 0, proc.stderr
-        assert outputs["status_state"] == "pending"
 
     def test_a_siblings_trigger_run_is_not_mistaken_for_this_prs(self, runner: Runner):
         # The expected external_id names the newest run of the lane's TRIGGERING
@@ -1555,13 +1569,12 @@ class TestAwaitingApprovalIsAttributedToTheMaintainer:
         assert outputs["state"] == "action_required"
         assert outputs["status_state"] == "failure"
         assert outputs["label"] == "readiness: action required"
-        # Five: Fast Gate joined CI, Build and Code Review as a monitored lane
-        # when the cheap blocking gates were split out of ci.yml, and Issue Gate
-        # joined when every PR had to declare a triaged issue. The stub routes
-        # every non-ci.yml workflow to green_runs.json, so each is covered by
-        # the same `action_required` fixture as the others.
+        # Six: CI, Fast Gate, Build, Code Review, PR Hygiene and Issue Gate are
+        # the monitored workflow lanes. The stub routes every non-ci.yml
+        # workflow to green_runs.json, so each is covered by the same
+        # `action_required` fixture as the others.
         assert outputs["description"] == (
-            "5 workflow(s) awaiting maintainer approval; none has run yet"
+            "6 workflow(s) awaiting maintainer approval; none has run yet"
         )
         assert len(outputs["description"]) <= 140
         summary = (runner.temp / "pr-readiness-summary.md").read_text()
@@ -1570,9 +1583,12 @@ class TestAwaitingApprovalIsAttributedToTheMaintainer:
         assert "**Waiting**" in summary
         log_line = self._lane_state(proc)
         assert "failed=[]" in log_line
-        # Fast Gate sits between CI and Build and Issue Gate follows Code Review
-        # in the spec order, matching the order pr-readiness.yml appends the lanes.
-        assert "awaiting_approval=[CI Fast Gate Build Code Review Issue Gate]" in log_line
+        # Fast Gate sits between CI and Build, and PR Hygiene then Issue Gate
+        # follow Code Review in the spec order, matching the order
+        # pr-readiness.yml appends the lanes.
+        assert (
+            "awaiting_approval=[CI Fast Gate Build Code Review PR Hygiene Issue Gate]" in log_line
+        )
 
     def test_real_failure_and_approval_wait_are_reported_separately(self, runner: Runner):
         (runner.fixtures / "ci_runs.json").write_text(
@@ -1586,10 +1602,10 @@ class TestAwaitingApprovalIsAttributedToTheMaintainer:
 
         assert proc.returncode == 0, proc.stderr
         assert outputs["status_state"] == "failure"
-        # Four awaiting: ci.yml is the one blocking item here, and Build, Code
-        # Review, Fast Gate and Issue Gate are the lanes left waiting.
+        # Five awaiting: ci.yml is the one blocking item here, and Build, Code
+        # Review, PR Hygiene, Fast Gate and Issue Gate are the lanes left waiting.
         assert outputs["description"] == (
-            "1 blocking readiness item(s); 4 awaiting maintainer approval"
+            "1 blocking readiness item(s); 5 awaiting maintainer approval"
         )
         summary = (runner.temp / "pr-readiness-summary.md").read_text()
         assert "**Blocking**" in summary

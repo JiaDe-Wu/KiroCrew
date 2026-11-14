@@ -8,6 +8,7 @@ archive is served from memory, and every clock is injected.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -21,12 +22,15 @@ from builtin_adoption_helpers import (
     seed_agent,
     write_builtin_record,
 )
+from config_pending_helpers import make_config_json_pending
 
 from kiro_crew.apps import builtin_adoption as adoption
 from kiro_crew.apps import builtin_adoption_apply as apply_mod
 from kiro_crew.apps import manager
 from kiro_crew.apps.builtin_adoption_state import read_adoption_markers, read_ledger
+from kiro_crew.config import loosening_provenance as lp
 from kiro_crew.config.loader import _invalidate_config_cache, config_local_path
+from kiro_crew.sandbox import SandboxUnavailableError
 from kiro_crew.testing.ids import UNALLOCATABLE_PID
 
 pytestmark = [requires_git, pytest.mark.asyncio]
@@ -125,10 +129,14 @@ async def test_apply_records_the_legacy_nav_beside_the_marker(world, tmp_path, m
 
 
 def _drop_recorded_nav(home) -> None:
+    # Through the gateway's own writer: where the sandbox seals config.json, a plain
+    # write is a hand edit held for review, and the base read would not see it.
+    from kiro_crew.config.loader import write_config_atomically
+
     path = home / "config.json"
     raw = json.loads(path.read_text(encoding="utf-8"))
     raw["agent"].pop("apps_builtin_adoption_nav")
-    path.write_text(json.dumps(raw), encoding="utf-8")
+    write_config_atomically(path, raw)
     _invalidate_config_cache()
 
 
@@ -215,6 +223,13 @@ async def test_an_approved_set_narrower_than_the_pin_is_widening(world):
                 "api": [f"/api/apps/{NAME}", f"/api/apps/{NAME}/*"],
                 "storage": True,
                 "sessionApproval": True,
+            }
+        },
+        {
+            "permissions": {
+                "api": [f"/api/apps/{NAME}", f"/api/apps/{NAME}/*"],
+                "storage": True,
+                "chatSlots": True,
             }
         },
     ],
@@ -420,6 +435,57 @@ async def test_a_transient_config_failure_at_apply_is_retried_at_the_next_boot(w
     assert await _stage() == {NAME: "staged"}
     assert await _boot() == {NAME: "applied"}
     assert len(calls) == 2
+
+
+def _discard_pending_config(path) -> None:
+    """What Discard leaves: the endorsed bytes back on disk, nothing pending."""
+    path.write_bytes(lp.endorsed_bytes(lp.LEAF_CONFIG))
+    assert not lp.leaf_pending(lp.LEAF_CONFIG)
+    _invalidate_config_cache()
+
+
+async def test_a_pending_outside_edit_logs_one_warning_and_adopts_once_resolved(
+    world, monkeypatch, caplog
+):
+    """The trust write is refused while config.json waits for review: an expected
+    state, so one warning naming the file with no trace, the built-in untouched and
+    the ledger still staged for the next boot."""
+    await _stage()
+    seed_agent(world.home, {"bot_name": "Crew"})
+    path = make_config_json_pending(monkeypatch)
+    with caplog.at_level(logging.DEBUG, logger=apply_mod.logger.name):
+        assert await _boot() == {NAME: "waiting_for_review"}
+
+    ours = [r for r in caplog.records if r.name == apply_mod.logger.name]
+    [warning] = [r for r in ours if r.levelno >= logging.WARNING]
+    assert warning.levelno == logging.WARNING
+    assert warning.exc_info is None
+    assert NAME in warning.getMessage() and lp.LEAF_CONFIG in warning.getMessage()
+    assert any(r.levelno == logging.DEBUG and r.exc_info for r in ours)
+    ledger = read_ledger(NAME)
+    assert (ledger.state, ledger.attempts) == ("staged", 0)
+    assert manager.builtin_owns_installed(NAME)
+    assert NAME not in read_adoption_markers()
+
+    _discard_pending_config(path)
+    assert await _boot() == {NAME: "applied"}
+
+
+async def test_a_pending_outside_edit_records_no_nav_and_logs_no_warning(
+    world, monkeypatch, caplog
+):
+    await _stage()
+    assert await _boot() == {NAME: "applied"}
+    recorded = agent_section(world.home)["apps_builtin_adoption_nav"]
+    _drop_recorded_nav(world.home)
+    path = make_config_json_pending(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger=apply_mod.logger.name):
+        assert await _boot() == {}
+    assert not [r for r in caplog.records if r.name == apply_mod.logger.name]
+
+    _discard_pending_config(path)
+    assert await _boot() == {}
+    assert agent_section(world.home)["apps_builtin_adoption_nav"] == recorded
 
 
 async def test_an_overlay_owned_trust_key_blocks_then_adopts_once_removed(world):
@@ -811,7 +877,7 @@ async def test_an_ambiguous_mid_swap_state_is_left_untouched_and_nothing_registe
     assert not adoption.builtin_released(NAME)
     assert manager._update_marker_dir(NAME).exists()
     # The boot goes on to register built-ins: a fresh record here would be a reset
-    # app, and the next adoption's stale-copy cleanup would delete the moved data.
+    # app, with its data then in two places.
     monkeypatch.setattr(manager, "discover_builtin_apps", lambda: [_shipped_definition(world)])
     manager.register_builtin_apps()
     assert not (dest / "installed.json").exists(), "nothing registers over the files set aside"
@@ -822,7 +888,7 @@ async def test_an_ambiguous_mid_swap_state_is_left_untouched_and_nothing_registe
 
 
 async def test_data_in_two_places_is_never_adopted(world):
-    """The swap's stale-copy cleanup would delete ``.<name>-data-tmp``: refuse instead."""
+    """``update_app`` refuses data in two places: the adoption skips it before staging."""
     await _stage()
     dest = manager.app_dir(NAME)
     tmp_data = dest.parent / f".{NAME}-data-tmp"
@@ -1008,3 +1074,24 @@ async def test_a_first_pass_that_raises_with_no_ledger_still_retries(world, monk
     await adoption.stage_builtin_adoptions(now=lambda: clock[0], sleep=fake_sleep)
     assert sleeps == [300.0]
     assert read_ledger(NAME).state == "staged"
+
+
+async def test_a_host_with_no_sandbox_logs_one_warning_line_not_a_traceback(
+    world, monkeypatch, caplog
+):
+    """The fetch runs in the sandbox, so a host with no backend (stock Ubuntu's AppArmor
+    userns restriction) refuses it on every pass: one warning carrying the refusal's own
+    remedy, with no stack trace under it."""
+    refusal = "Sandbox backend unavailable. Run `kirocrew service install` to install the profile."
+
+    async def no_sandbox(*args, **kwargs):
+        raise SandboxUnavailableError(refusal, kind="no_backend", detail="errno 1 (EPERM)")
+
+    monkeypatch.setattr(apply_mod, "stage_pin", no_sandbox)
+    with caplog.at_level(logging.WARNING, logger=apply_mod.logger.name):
+        assert await _stage() == {NAME: "error"}
+
+    [record] = [r for r in caplog.records if r.name == apply_mod.logger.name]
+    assert record.levelno == logging.WARNING
+    assert record.exc_info is None
+    assert record.getMessage() == f"Adoption staging of {NAME} failed: {refusal}"

@@ -19,9 +19,12 @@ import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from kiro_crew import history as H
 from kiro_crew.history import HistoryConsolidator
+
+_KEY = github_classic(seed=25)  # a token the credential plan redacts
 
 _LIVE_BODY = "## When to use\nold\n## Steps\n1. old\n## Gotchas\nnone\n"
 
@@ -96,13 +99,13 @@ class FakeLoader:
         return None
 
 
-def _mk(loader, **kw):
+def _mk(loader, approval_required=True, **kw):
     return HistoryConsolidator(
         log=MagicMock(),
         memory=MagicMock(),
         skills_loader=loader,
         auto_skills_enabled=True,
-        approval_required=True,
+        approval_required=approval_required,
         **kw,
     )
 
@@ -311,9 +314,12 @@ def test_stage_update_no_loop_skips_merge():
 # ── _process_auto_skills routing ──
 
 
-def test_process_routes_update(monkeypatch):
+# An update to a live skill stages even with approval off: the toggle governs
+# new candidates only, as its help text and the Skills doc say.
+@pytest.mark.parametrize("approval_required", [True, False])
+def test_process_routes_update(monkeypatch, approval_required):
     loader = FakeLoader()
-    c = _mk(loader)
+    c = _mk(loader, approval_required=approval_required)
     monkeypatch.setattr(
         c, "_dedupe_candidate", lambda s, d, t: (H.VERDICT_UPDATE, "auto/deploy-helper")
     )
@@ -783,7 +789,7 @@ async def test_merge_prompt_never_receives_live_body_credentials():
     loader = FakeLoader(
         live_body=(
             "## When to use\nrun the deploy\n"
-            "## Steps\n1. export AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE\n"
+            f"## Steps\n1. export AWS_SECRET_ACCESS_KEY={_KEY}\n"
             "2. aws s3 sync ./out s3://bucket\n"
         )
     )
@@ -810,7 +816,7 @@ async def test_merge_prompt_never_receives_live_body_credentials():
         ctx.stop()
 
     # The credential-shaped token must not appear in what the model received.
-    assert "AKIAIOSFODNN7EXAMPLE" not in seen["live"]
+    assert _KEY not in seen["live"]
     # The surrounding prose is still intact, so the merge stays useful.
     assert "run the deploy" in seen["live"]
     assert "aws s3 sync" in seen["live"]

@@ -57,6 +57,10 @@ from kiro_crew.config.sections import (
     JUDGE_PROVIDERS,
     LIVE_MAX_FPS_CHOICES,
     LIVE_QUALITIES,
+    MAX_PER_CREATOR_MAX,
+    MAX_PER_CREATOR_MIN,
+    REMOTE_EDITOR_HOST_PATTERN,
+    REMOTE_EDITOR_IDS,
     SESSION_SORT_MODES,
     SHARED_CREW_BOUNDS,
     STRANDS_PROVIDER_CHOICES,
@@ -68,6 +72,7 @@ from kiro_crew.context_management import RESULT_FILE_MAX_BYTES
 from kiro_crew.dashboard.handlers.core_config_models import _validate_role_model
 from kiro_crew.effort import EFFORT_LEVELS
 from kiro_crew.instances.crew_ref import MAX_CREW_REF_LEN
+from kiro_crew.update_deferral import MAX_SKIPPED_VERSIONS
 from kiro_crew.validation import QUALIFIED_MODEL_PATTERN
 
 
@@ -148,6 +153,8 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # The remote-dispatch preview switch (Settings → Developer → Feature previews,
     # rfc-conductor-remote-dispatch.md). Read on every call, so no restart.
     "work_ledger.remote_dispatch": {"type": "bool"},
+    # Task Runner's switch (Settings > Display > View). Every start reads it, so no restart.
+    "taskrunner.enabled": {"type": "bool"},
     # Default model for new sessions. Membership can NOT be validated against a
     # fixed list: the real vocabulary is whatever the live kiro-cli advertises
     # (/api/models spawns it to find out), and it spans both canonical registry
@@ -256,6 +263,14 @@ _EDITABLE_CONFIG: dict[str, dict] = {
         "clamp_fn": lambda v: _clamp_compact_wait_secs(v, 0.0),
     },
     "session.pool_size": {"type": "int", "min": 0, "max": 10},
+    # How many live sessions one creator may hold (Settings → Chat → Sessions).
+    # Same bounds as the load-time clamp. Read at each session create, so a save
+    # applies to the next create with no restart.
+    "session.max_per_creator": {
+        "type": "int",
+        "min": MAX_PER_CREATOR_MIN,
+        "max": MAX_PER_CREATOR_MAX,
+    },
     "session.pool_agent": {"type": "str", "values_fn": _agent_values},
     "session.pool_ttl_secs": {"type": "int", "min": POOL_TTL_SECS_MIN, "max": POOL_TTL_SECS_MAX},
     # Intent-level session summaries in the chat right panel. Only the boolean
@@ -299,19 +314,33 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # The sidebar's session sort key, written by the sort menu; the enum is the
     # loader's own list, spelled once.
     "dashboard.session_sort": {"type": "enum", "values": list(SESSION_SORT_MODES)},
+    # Whether the sidebar draws unfiled sessions above the folder list. A view
+    # preference the sort-and-filter menu writes. Nothing outside the dashboard
+    # reads it.
+    "dashboard.unfiled_sessions_above_folders": {"type": "bool"},
     # Per-version snooze/skip verdict for the proactive update popup, written
     # as ONE atomic record: the three fields only mean anything together, so
     # per-field writes would open both a crash window (old verdict paired
     # with a new version) and a two-client interleave that reassembles a
     # verdict nobody expressed. Persisted in gateway config (not browser
     # storage) so the decision holds across browsers and the desktop app's
-    # embedded dashboard.
+    # embedded dashboard. The route stores a fourth, ``stored_at``, from this
+    # host's clock, in place of any a client sends.
     "dashboard.update_nudge": {
         "type": "dict",
         "keys": {
             "version": {"type": "str", "max_len": 128},
             "snoozed_until": {"type": "float", "min": 0.0, "max": 4102444800.0},
             "skipped": {"type": "bool"},
+            # Every skip. Optional: the popup's verdict omits it and the route
+            # merges the verdict into the saved list; a whole record (a change
+            # card or its Undo) sends it and is stored as sent.
+            "skipped_versions": {
+                "type": "str_list",
+                "max_items": MAX_SKIPPED_VERSIONS,
+                "max_item_len": 128,
+                "optional": True,
+            },
         },
     },
     # Default shell for the built-in terminal panel (Settings → Display →
@@ -340,6 +369,10 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # The per-row unread dot on sidebar session cards (Settings → Display →
     # Sidebar). Default on; only a literal `false` hides it.
     "dashboard.show_unread_dot": {"type": "bool"},
+    # The quick-search shortcut opens the Command Bar launcher (Settings ->
+    # Display -> View). Default on; only a literal `false` opens the search
+    # palette instead.
+    "dashboard.command_bar_enabled": {"type": "bool"},
     # The terminal app "Open in external terminal" starts (Settings → Display →
     # Terminal). "" = unset, the default, which withholds the action. Limited
     # to the desktop shell's launch allowlist; the launch gate in
@@ -348,6 +381,15 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "dashboard.terminal.external_app": {
         "type": "enum",
         "values": ["", *EXTERNAL_TERMINAL_APPS],
+    },
+    # The side panel ⋯ menu's "Open in <editor>" link (Settings → Display → Remote
+    # editor). "" = off. The editor is an enum because its value becomes the
+    # link's URL scheme; the host pattern keeps URL structure out of the link.
+    "dashboard.remote_editor.editor": {"type": "enum", "values": ["", *REMOTE_EDITOR_IDS]},
+    "dashboard.remote_editor.host": {
+        "type": "str",
+        "max_len": 253,
+        "pattern": REMOTE_EDITOR_HOST_PATTERN,
     },
     # Keep the host awake while the agent is running a task. Gateway-host
     # behavior (not a display pref), read by the prevent-sleep poll in
@@ -474,6 +516,9 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # path expansion, sensitive-path exclusion and existence, so a path it declines is
     # skipped there rather than refused here.
     "skills.extra_paths": {"type": "str_list", "max_items": 64, "max_item_len": 4096},
+    # Memory → Repeated failures: the opt-in weekly bell note
+    # (dashboard/repeated_failures_notice.py). Default OFF in MemoryConfig.
+    "memory.repeated_failures_notice": {"type": "bool"},
     # Knowledge Library ingestion. Chunk budget max mirrors the point past which
     # a single sweep stops being a trickle; dedup cadence max is ~a day of sweeps.
     "knowledge.auto_add_documents": {"type": "bool"},

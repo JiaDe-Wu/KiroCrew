@@ -14,6 +14,7 @@ from aiohttp import web
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.server import (
+        PAGING_GRACE_MAX_SECS_MACOS,
         DashboardState,
         LoopStallWatchdog,
         attribute_dump,
@@ -21,13 +22,16 @@ if TYPE_CHECKING:
         data_home,
         describe,
         dump_age_seconds,
+        dump_fired_at,
         dump_replay_lines,
         load_loop_stall_exit_after,
         logger,
         newest_dump_with_stacks,
         open_dump_file,
         platform_compat,
+        read_loop_pageins_under_pressure,
         record_healthy_boot,
+        register_pre_exec_stop,
         resolve_loop_stall_exit_after,
         rotate_dumps,
         sweep_stale_dumps,
@@ -59,9 +63,9 @@ async def _open_loop_watchdog(_launch_environment: dict[str, str]) -> LoopStallW
     ~/.kiro/crew/logs/crash-dumps/ so they are findable via `kirocrew doctor`
     and startup warnings, rather than buried in interleaved stderr/journal.
     Crash-dump hygiene: sweep header-only dumps left by prior sessions that
-    exited without ever wedging (every startup pre-creates one for
-    faulthandler's fd), THEN rotate. Sweeping first keeps empty startup files
-    from aging real stall dumps out of the rotation window.
+    exited cleanly (every startup pre-creates one for faulthandler's fd), THEN
+    rotate. Sweeping first keeps empty startup files from aging real stall
+    dumps out of the rotation window.
     """
     await asyncio.to_thread(sweep_stale_dumps)
     await asyncio.to_thread(rotate_dumps)
@@ -78,7 +82,28 @@ async def _open_loop_watchdog(_launch_environment: dict[str, str]) -> LoopStallW
         # Config failure must not erase the managed-service grace that protects
         # the process while its config filesystem is itself under pressure.
         _exit_after = float(resolve_loop_stall_exit_after(environ=_launch_environment))
-    return LoopStallWatchdog(dump_file=_dump_file, exit_after=_exit_after)
+    # On macOS the Linux per-thread major-fault reader returns None, so the
+    # paging deferral never fires. Swap in the process-wide page-in reader
+    # (gated on memory pressure) with a shorter grace cap, since that signal
+    # cannot attribute paging to the loop thread specifically.
+    if platform_compat.IS_MACOS:
+        watchdog = LoopStallWatchdog(
+            dump_file=_dump_file,
+            exit_after=_exit_after,
+            loop_major_faults=read_loop_pageins_under_pressure,
+            paging_grace_max=PAGING_GRACE_MAX_SECS_MACOS,
+        )
+    else:
+        watchdog = LoopStallWatchdog(dump_file=_dump_file, exit_after=_exit_after)
+
+    async def _stop_before_exec() -> None:
+        # An in-place restart can exec right after a recovered stall, before
+        # the daemon thread's next poll drops the loop-thread block; stopping
+        # the watchdog drops it so the successor does not read a crash.
+        await asyncio.to_thread(watchdog.stop)
+
+    register_pre_exec_stop("Loop stall watchdog", _stop_before_exec)
+    return watchdog
 
 
 def _start_loop_heartbeat(
@@ -115,6 +140,8 @@ def _start_loop_heartbeat(
         # ``platform_compat.awake_now``, which a sleep does not advance on any
         # platform (Windows' ``time.monotonic`` counts one), so a laptop resume
         # is neither silence to the watchdog nor lag here.
+        from kiro_crew.dashboard.handlers import config_pending
+
         interval = 5.0
         while True:
             t0 = platform_compat.awake_now()
@@ -130,6 +157,12 @@ def _start_loop_heartbeat(
             # block the loop this heartbeat exists to watch. After the lag
             # read so the await can't register as loop lag.
             await state.resource_pressure_notifier.maybe_sample()
+            # A hand-edited sealed keystone file going pending raises one bell
+            # note; same contract as above (self-gated, bounded, never raises).
+            await config_pending.sync_pending_notes(state, t0)
+            # The opt-in weekly repeated-failures note: one clock read here,
+            # the check itself runs in a task and a worker thread of its own.
+            state.repeated_failures_notifier.maybe_check(state)
             released = await _heap_trim_maintainer.maybe_trim()
             if released >= platform_compat.HEAP_TRIM_LOG_THRESHOLD_BYTES:
                 logger.info(
@@ -187,11 +220,33 @@ async def _report_prior_crash_dump(state: DashboardState) -> None:
         # been reported; the dump stays on disk for `kirocrew doctor` to show on
         # demand.
         if _age_h < 168 and await asyncio.to_thread(claim_dump_notification, _prior_dump):
+            # Attributed first: whether the host stopped running the gateway
+            # decides how both the log line and the notification describe it.
+            try:
+                _attribution = await asyncio.to_thread(attribute_dump, _prior_dump, data_home())
+                _attr_lines = describe(_attribution)
+                _host_pause = _attribution.host_pause_secs
+            except Exception:
+                logger.debug("stall attribution for notification failed", exc_info=True)
+                _attr_lines, _host_pause = [], None
+            # The file is named for when that gateway started; when it fired
+            # is its last write.
+            try:
+                _fired = await asyncio.to_thread(dump_fired_at, _prior_dump)
+            except OSError:
+                _fired = "unknown"
             logger.warning(
-                "⚠️  Prior loop-stall crash dump found: %s (%.1f hours ago). "
+                "⚠️  Prior loop-stall crash dump found: %s (fired %s, %.1f hours ago%s). "
                 "Run `kirocrew doctor` for details.",
                 _prior_dump,
+                _fired,
                 _age_h,
+                (
+                    f"; its alarm fired {_host_pause:.0f}s late, so the host had stopped "
+                    "running the gateway: a host-wide pause, not a gateway stall"
+                    if _host_pause is not None
+                    else ""
+                ),
             )
             # Replay stack content to journal so container/journal-only operators
             # can see it without accessing the file system.
@@ -209,19 +264,21 @@ async def _report_prior_crash_dump(state: DashboardState) -> None:
             # Say who the loop was working for, from the same evidence the
             # doctor reads, so the person restarting knows which job to look
             # at without opening the dump.
-            try:
-                _attr_lines = describe(
-                    await asyncio.to_thread(attribute_dump, _prior_dump, data_home())
-                )
-            except Exception:
-                logger.debug("stall attribution for notification failed", exc_info=True)
-                _attr_lines = []
+            _what = (
+                "The host stopped running the previous gateway, and its stall alarm ended it"
+                if _host_pause is not None
+                else "The previous gateway stopped responding and exited"
+            )
             try:
                 state.notify(
                     "heartbeat",
-                    "⚠️ Gateway restarted after an event-loop stall",
                     (
-                        f"The previous gateway stopped responding and exited "
+                        "⚠️ Gateway restarted after a host-wide pause"
+                        if _host_pause is not None
+                        else "⚠️ Gateway restarted after an event-loop stall"
+                    ),
+                    (
+                        f"{_what} "
                         f"{_age_h:.1f}h ago, then restarted. Work in flight at "
                         f"that moment was interrupted and not saved. "
                         + ("".join(f"{ln}. " for ln in _attr_lines))

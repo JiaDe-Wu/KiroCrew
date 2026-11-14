@@ -24,6 +24,7 @@ from kiro_crew.config.sections_agent_fields import (
     DEFAULT_CWD_ALLOWED_ROOTS,
     JAIL_MODE_AUTO,
     KAS_BUNDLE_DEFAULT_URL,
+    KAS_FAIL_CLOSED_WEB_FETCH_BLOCKED_HELP,
     KAS_REFUSE_PLAIN_HTTP_MCP_HEADERS_HELP,
     YOLO_UNTIL_SHUTDOWN,
     coerce_model_context_tokens,
@@ -42,6 +43,7 @@ from kiro_crew.constants import (
 from kiro_crew.constants import SUBAGENT_TIMEOUT_MAX as _SUBAGENT_TIMEOUT_MAX
 from kiro_crew.constants import SUBAGENT_TIMEOUT_MIN as _SUBAGENT_TIMEOUT_MIN
 from kiro_crew.constants import SUBAGENT_TIMEOUT_SECS as _SUBAGENT_TIMEOUT_SECS
+from kiro_crew.crewmate_worktree import BRANCH_PREFIX as _BRANCH_PREFIX
 from kiro_crew.effort import EFFORT_LEVELS
 
 logger = logging.getLogger("kiro_crew.config.loader")
@@ -257,9 +259,11 @@ class AgentConfig:
         default="kas",
         metadata=_meta(
             "Bot ACP backend",
-            "Backend for crew-member DM sessions: 'kas' (default when omitted or '') "
-            "or another dispatch-capable backend (claude, codex, opencode, goose). "
-            "Bots run on KAS as their Kiro backend, so 'kiro' here also "
+            "Legacy backend for bot DM sessions and their workers. Omitted or '': "
+            "Bots follow agent.acp_backend, or run on 'kas' when that is a harness "
+            "bots cannot run on. A stored value (claude, codex, kas, ...) still wins "
+            "over agent.acp_backend; a bot's own agents.<name>.acp_backend wins over "
+            "both. Bots run on KAS as their Kiro backend, so 'kiro' here also "
             "selects KAS. Members dispatch work into worker sessions through "
             "session-control tools mounted per session over the wire.",
             # Same no-enum reasoning as acp_backend above: the live selectable
@@ -301,7 +305,13 @@ class AgentConfig:
             "(the dashboard's Sign in), never from kiro-cli's store. With nothing "
             "installed the gateway installs the pinned engine at the first spawn. "
             "With false, KAS still takes this route when kiro-cli's relay cannot "
-            "run on the host (no kiro-cli, or one that is not signed in).",
+            "run on the host (no kiro-cli, or one that is not signed in). "
+            "When unset, a Nightly build turns it on and every other build leaves "
+            "it off (config.loader_document.kas_bundle_build_default(), read from "
+            "the build's own stamp, not the update channel). A saved value always "
+            "wins, and save() leaves the key off disk until it is set. This "
+            "dataclass default stays false so the committed config-schema snapshot "
+            "is the same for every build.",
             # The running KAS runtime keeps its process across the switch, so
             # sessions move routes only once that process is replaced.
             restart=True,
@@ -326,10 +336,32 @@ class AgentConfig:
             restart=True,
         ),
     )
+    kas_repair_kiro_cli_extract: bool = field(
+        default=True,
+        metadata=_meta(
+            "KAS: repair kiro-cli's broken engine copy",
+            "When true (the default) and a KAS start through kiro-cli's relay exits with "
+            "'failed to canonicalize KAS server path', Kiro Crew moves kiro-cli's "
+            "incomplete unpacked engine (kas/<version> under kiro-cli's data directory, "
+            "never anything else) out of kas/ to '<version>.kas-broken-<UTC time>' beside "
+            "it, and starts once more, "
+            "so kiro-cli unpacks a fresh copy. Nothing is deleted. When false, or when "
+            "the second start fails the same way, the start fails with one message "
+            "naming the directory and the mv command, and the warm pool stops "
+            "respawning until the directory is moved.",
+        ),
+    )
     kas_refuse_plain_http_mcp_headers: bool = field(
         default=False,
         metadata=_meta(
             "KAS: refuse MCP headers over plain http", KAS_REFUSE_PLAIN_HTTP_MCP_HEADERS_HELP
+        ),
+    )
+    kas_fail_closed_web_fetch_blocked: bool = field(
+        default=False,
+        metadata=_meta(
+            "KAS: refuse all fetches on an unapplied blocked entry",
+            KAS_FAIL_CLOSED_WEB_FETCH_BLOCKED_HELP,
         ),
     )
     kas_bundle_url: str = field(
@@ -367,8 +399,8 @@ class AgentConfig:
     crew_mode_agent: str = field(
         default=_CREW_MODE_AGENT_DEFAULT,
         metadata=_meta(
-            "Ultra Mode agent",
-            "The agent template a chat runs when Ultra Mode is turned on. "
+            "Conductor mode agent",
+            "The agent template a chat runs when conductor mode is turned on. "
             "Empty falls back to the default. Takes effect live for new chats; "
             "no gateway restart.",
         ),
@@ -553,6 +585,38 @@ class AgentConfig:
             "operator answers yes.",
         ),
     )
+    sandbox_readonly_paths: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Sandbox Read-Only Paths",
+            "Absolute directories (a leading ~ is expanded) the sandboxed agent may "
+            "read but never write, enforced by the OS sandbox: a read-only bind mount "
+            "in the Linux namespace (WSL2 included), a write deny in the macOS "
+            "Seatbelt profile. Filesystems mounted below an entry are made read-only "
+            "too. Empty (the default) changes nothing. Kiro Crew's own masks and "
+            "seals are applied on top and always win, so an entry can never expose a "
+            "hidden or sealed Kiro Crew path. An entry that does not exist, is "
+            "relative, is /, or holds /run/user/<uid> or /dev/shm (where the "
+            "Linux sandbox builds its masks) is skipped with a SECURITY warning. "
+            "Making the project directory, the Kiro Crew data home or the agent's own "
+            "state directories read-only breaks the agent there. Not enforced where "
+            "Kiro Crew applies no sandbox of its own: agent.sandbox 'off', a macOS "
+            "spawn delegated to kiro-cli's internal sandbox, and Windows, which logs "
+            "a SECURITY warning. A change applies to sessions started after it.",
+        ),
+    )
+    sandbox_readonly_exceptions: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Sandbox Read-Only Exceptions",
+            "Absolute directories inside a sandbox_readonly_paths entry that stay "
+            "writable, e.g. /mnt/c read-only with /mnt/c/Users/<you>/Documents "
+            "writable. Each must lie strictly inside an entry; one that does not, "
+            "that does not exist, or that would re-open a Kiro Crew mask or seal is "
+            "skipped with a SECURITY warning. A filesystem mounted below an exception "
+            "stays read-only.",
+        ),
+    )
     apps_allow_third_party: bool = field(
         default=False,
         metadata=_meta(
@@ -707,8 +771,13 @@ class AgentConfig:
             "Deferral only starts once the specs cross tool_search_min_pct or "
             "tool_search_min_tokens; disabling reverts to sending full tool "
             "specs. Crew's servers defer only when the spawn runs the pinned "
-            "kiro-cli install or its kiro-cli-chat, and both are >= 2.27.0; any "
-            "other executable, an older or unknown version keeps them resident. "
+            "kiro-cli install or its kiro-cli-chat, and both are >= 2.27.0, or "
+            "runs a KIROCREW_KIRO_BIN override or a kiro-cli found only on PATH "
+            "that is itself >= 2.27.0 (and, when named kiro-cli on macOS or "
+            "Linux, >= 3.0.0); a PATH install is checked inside the sandbox, "
+            "which Windows lacks. Any other executable, an older or unknown "
+            "version keeps them resident, and so does every spawn after a "
+            "request is refused for a changed tool list, until restart. "
             "On Kiro Crew's own KAS engine bundle they always defer: that engine "
             "keeps its tools array fixed when a tool loads. To override the "
             "never-defer list, set "
@@ -748,6 +817,18 @@ class AgentConfig:
             "eligible backends (kiro-cli and codex); every other ACP backend "
             "ignores it and runs a dedicated process per subagent. Set false to "
             "opt an eligible backend back onto per-subagent processes.",
+        ),
+    )
+    chat_runtime_sharing_max_sessions: int = field(
+        default=10,
+        metadata=_meta(
+            "Chat Runtime Sharing: max sessions per process",
+            "How many dashboard chat sessions one shared agent process may serve "
+            "before the next session starts another, while the chat_runtime_sharing "
+            "feature preview is on. This is the blast radius of one process dying: a "
+            "larger value pools more sessions onto one process and loses more of them "
+            "at once. Has no effect while the preview is off, which keeps one process "
+            "per session. Clamped to 1..64.",
         ),
     )
     agent_started_turns: bool = field(
@@ -973,13 +1054,15 @@ class AgentConfig:
             "time is not charged to the start budget "
             "or the startup deadline, but a subagent start that stays queued past "
             "the start-queue cap ends as never started, unless its subagent "
-            "timeout ends it first. A fixed bound, not adaptive: the adaptive loop is the MCP gateway spawn "
+            "timeout ends it first. Not adaptive: the adaptive loop is the MCP gateway spawn "
             'gate and the execution-cap controller. "auto" (the default) sizes it '
-            "once at gateway start as min(cpus // 4, available GB // 3) clamped to "
-            "2..16, with cpus the affinity count capped by a cgroup cpu.max quota; "
-            "the gateway logs the value in force at boot, and kirocrew doctor "
+            "at gateway start as min(cpus // 4, available GB // 3) clamped to "
+            "2..16, with cpus the affinity count capped by a cgroup cpu.max quota, "
+            "and widens it when a later reading finds more memory available; it "
+            "never narrows and never passes what the cores give. "
+            "The gateway logs the value in force at boot and each time it widens, and kirocrew doctor "
             "shows what auto picks for the host now. An integer sets it "
-            "explicitly, clamped to 1..64.",
+            "explicitly, clamped to 1..64, and is fixed until a restart.",
             restart=True,
         ),
     )
@@ -1274,6 +1357,18 @@ class AgentConfig:
             "and additionally to 60s below the turn ceiling at load time.",
         ),
     )
+    deny_override: bool = field(
+        default=True,
+        metadata=_meta(
+            "Deny Rule Override Card",
+            "When a deny rule refuses the agent's shell command in a dashboard "
+            "session you drive, show a card that lets you allow it once or for the "
+            "session. Turn this off to refuse every such command at once, with no "
+            "card and no wait for an answer; session overrides granted earlier "
+            "stop applying while it is off and apply again if it is turned back on, "
+            "until that session ends. Read on each request, so no restart is needed.",
+        ),
+    )
     session_control: bool = field(
         default=True,
         metadata=_meta(
@@ -1336,6 +1431,32 @@ class AgentConfig:
             "disabling them. When on, their reach is still bounded to sessions "
             "they created themselves (creator ownership), the same fence that "
             "binds a member when Session Control is on.",
+        ),
+    )
+    member_branch_prefix: str = field(
+        default=_BRANCH_PREFIX,
+        metadata=_meta(
+            "Bot branch prefix",
+            "The start of the git branch a bot's new worktree is cut on, before "
+            "<bot>/<repo>: 'alice/' gives alice/reviewer/myservice. Each part "
+            "between slashes may use only letters, digits, '.', '_' and '-', may "
+            "not start or end with '.' or '-', has no '..' and no '.lock' ending, and "
+            "is at most 40 characters; an empty or rejected value uses crew/. The "
+            "first part must not be the name "
+            "of a branch the repository has, such as main. Takes effect live for the "
+            "next new worktree; one that exists keeps its branch, and one made again "
+            "after its folder was deleted takes the current prefix.",
+        ),
+    )
+    conductor_own_child_verbs: bool = field(
+        default=True,
+        metadata=_meta(
+            "Conductor Own-Child Sends",
+            "Let the Conductor and the conductor mode team lead send to and close a "
+            "session they created themselves without an approval prompt, the way a "
+            "Bot already does. A send or close aimed at any other session still "
+            "prompts, and the child keeps its own approval mode. Turn this off to "
+            "read every send before it runs.",
         ),
     )
     crew_panel: bool = field(
@@ -1413,6 +1534,24 @@ class AgentConfig:
             "controller cuts the cap when admitted work fails (timeouts, slow "
             "starts, fd or process exhaustion), so this is a smoothing "
             "interval rather than the memory guard.",
+        ),
+    )
+    windows_background_qos: bool = field(
+        default=False,
+        metadata=_meta(
+            "Windows Background QoS",
+            "Windows only. Mark the separate processes that run a chat's task "
+            "runs, and its sub-agents when the chat cannot host them itself, as "
+            "background work when they start: below-normal priority (inherited by "
+            "the git, build and test processes they run), a lower Job object CPU "
+            "weight, and EcoQoS. Priority and weight only matter when the CPU is "
+            "busy; EcoQoS can slow that work even on an idle machine. Sub-agents "
+            "that share the chat's own process (the default while Session Sharing "
+            "is on) are not marked, because the chat runs in that process too. A "
+            "task run a person opened is not marked when it starts the process, "
+            "but one that reuses a process background work started runs marked. "
+            "Applies to processes started "
+            "after the change. Off by default; no effect on macOS or Linux.",
         ),
     )
     subagent_max_turns: int = field(

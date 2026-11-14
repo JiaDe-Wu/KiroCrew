@@ -1,6 +1,6 @@
 import { batchCloseConfirm } from '../../components/TabCloseMenu'
 import { useConfirm } from '../../components/ConfirmDialog'
-import { useState, useRef, useEffect, useCallback, useMemo, Fragment, Suspense, lazy, type ReactNode } from 'react'
+import { useState, useRef, useEffect, useCallback, useMemo, Fragment, type ReactNode } from 'react'
 import { useScrollEdges } from '../../hooks/useScrollEdges'
 import { AllTabsMenu } from '../../components/AllTabsMenu'
 import { useSidePanelTabNav } from './SidePanelTabNav'
@@ -10,10 +10,26 @@ import { Plus, MoreHorizontal, Globe, PanelRight, PanelBottom } from 'lucide-rea
 import { SidePanelDockHost, SidePanelGlyph } from '../../components/SidePanelGlyph'
 import ActivityViewer from './ActivityViewer'
 // Loaded with its tab, not the shell: the panel (attention cards, tile lists,
-// the session card frame) is only mounted once a Dashboard tab exists.
-const CommandCenterPanel = lazy(() => import('./command-center/CommandCenterPanel'))
-// Remote-environment sessions only.
-const RemoteFilesPanel = lazy(() => import('./RemoteFilesPanel'))
+// the session card frame) is only mounted once a Dashboard tab exists. A chunk
+// that fails to load shows its notice in the tab, with Try Again, never the
+// route's card over the whole chat page.
+// No hand-off: the adjacent chat composer holds unsent text and the panel's own
+// answer drafts live in this tab.
+const CommandCenterPanel = lazyRetry(() => import('./command-center/CommandCenterPanel'), {
+  layout: 'block',
+  title: () => i18nT('commandCenter.panel_load_failed'),
+  scope: 'command-center',
+  askAgent: false,
+})
+// Remote-environment sessions only. A chunk that fails to load shows its notice
+// in the Files tab, with Try Again.
+// No hand-off: the chat composer and open files may hold unsaved drafts.
+const RemoteFilesPanel = lazyRetry(() => import('./RemoteFilesPanel'), {
+  layout: 'page',
+  title: () => i18nT('sessionEnvironments.remoteFiles.panelLoadFailed'),
+  scope: 'remote-files',
+  askAgent: false,
+})
 import { CrewWorkersTab } from './command-center/CrewWorkerList'
 import FilesHomePanel from './FilesHomePanel'
 import { slotEnvironmentQueryKey, useSlotEnvironmentPlacement } from '../../components/sessionEnvironmentHooks'
@@ -37,6 +53,7 @@ import { SettingsLink } from '../../components/SettingsLink'
 import type { ExternalTerminalFallbackNote } from '../../lib/externalTerminal'
 import { TOGGLE_SIDE_TERMINAL_EVENT } from '../../lib/panelToggleShortcuts'
 import ErrorBoundary from '../../components/ErrorBoundary'
+import { lazyRetry } from '../../components/lazyRetry'
 import { fetchFileRead } from '../../utils/fileReadQuery'
 import { useAppSelector } from '../../store'
 import { selectSlotSubagents, selectSlotToolLog } from '../../store/chatSlice'
@@ -63,6 +80,7 @@ import { pathBasename, stripTrailingSeparators } from '../../utils/pathBasename'
 // `useSidePanelSize.ts` (the panel's size). Callers keep importing every name
 // exported below from this module.
 export { NEW_MENU_DESC_KEY, NEW_MENU_LABEL_KEY, newMenuSections, TabChip }
+export { HydratingFileTab } from './SidePanelTabBodies'
 export type { SidePanelWithholdable }
 export { CHAT_PANE_MIN_W, SIDE_PANEL_MIN_W, SIDE_PANEL_RESERVED_W, sidePanelEffectiveWidth, sidePanelFillWidth } from './useSidePanelSize'
 
@@ -179,6 +197,7 @@ interface SidePanelProps {
   pins?: ChatPin[]
   pinsLoading?: boolean
   onJumpToPin?: (messageTs: string, mid?: string) => void
+  onPutPinInComposer?: (messageTs: string, mid?: string) => void
   onUnpin?: (id: string) => void
   /** Only shape the copyable deep link a pin row offers. */
   slotTitle?: string
@@ -270,7 +289,7 @@ export default function SidePanel({
   projectDir, navLinks, navResolving, sources, selectedSourceUrl, onSelectSource, onReconcileSource, onDismissSource,
   issues, selectedIssueUrl, onSelectIssue, onReconcileIssue,
   onAddSourceToChat, onSubmitComments, connected = true, onFileSave, onClose, panelHidden,
-  pins, pinsLoading, onJumpToPin, onUnpin,
+  pins, pinsLoading, onJumpToPin, onPutPinInComposer, onUnpin,
   slotTitle, chatMode,
   expanded, fillWidth, canDockBottom = true,
   leadingTabs, segments, extraReserveW = 0, defaultWidth = 460, hiddenViews: hostHiddenViews, onActiveTabChange, pinSummary = false,
@@ -349,7 +368,7 @@ export default function SidePanel({
     const row = slot ? st.dashboard.slots.find(r => r.key === slot) : undefined
     return crewModeRoot(row) || !!crewRootOf(row)
   })
-  // while a new chat's Ultra Mode switch lands (no root stamp yet),
+  // while a new chat's conductor mode switch lands (no root stamp yet),
   // a Crew tab already on its strip is pinned first too.
   const freshChat = useAppSelector(st => {
     const row = slot ? st.dashboard.slots.find(r => r.key === slot) : undefined
@@ -508,6 +527,9 @@ export default function SidePanel({
       setWorkspaceTerminalCapped(!openTerminal({ remoteSlot: slot, title: placement.name }))
     } else if (placement === null) openTerminal({ cwd: projectDir })
   }, [openTerminal, projectDir, slot])
+  // A folder a Side Chat reply names opens as a folder tab here, for this chat.
+  // Stable, so the side transcript's row renderers are not rebuilt every render.
+  const openSideChatFolder = useCallback((p: string) => openFolder(p, slot || null), [openFolder, slot])
   // The note an "Open in <app>" fallback leaves (see the banner below the tab
   // bodies). Held here rather than in the Files tab, which that fallback takes
   // out of view.
@@ -1089,16 +1111,7 @@ export default function SidePanel({
           // Keep the authored document and per-question drafts alive on tab switches.
           if (t.kind === 'command-center') return (
             <div key={`${t.id}:${slot}`} className="absolute inset-0" hidden={!isActive}>
-              {/* Local boundary: the panel is a lazy chunk, and a chunk that fails
-                  to load after main.tsx's preload-reload heal declined would
-                  otherwise reject up to the ROUTE boundary and replace the whole
-                  chat page with an error card. The fallback is the shared error
-                  surface, not nothing, so the tab says why it is empty. */}
-              {/* No hand-off: the adjacent chat composer holds unsent text and the
-                  panel's own answer drafts live in this tab. */}
-              <ErrorBoundary scope="command-center" fallback={<ErrorNotice className="m-3" message={i18nT('commandCenter.panel_load_failed')} />}>
-                <Suspense fallback={null}><CommandCenterPanel slot={slot ?? null} active={isActive && !panelHidden} onAct={onComposerInsert} /></Suspense>
-              </ErrorBoundary>
+              <CommandCenterPanel slot={slot ?? null} active={isActive && !panelHidden} onAct={onComposerInsert} />
             </div>
           )
           if (remoteEnvironment === undefined && (
@@ -1166,14 +1179,12 @@ export default function SidePanel({
               if (!isActive) return null
               return (
                 <div key={t.id} className="absolute inset-0">
-                  <Suspense fallback={null}>
-                    <RemoteFilesPanel
-                      slot={slot}
-                      name={remoteEnvironment.name}
-                      workdir={remoteEnvironment.workdir}
-                      onOpenTerminal={terminalEnabled && !isWithheld('terminal') ? openProjectTerminal : undefined}
-                    />
-                  </Suspense>
+                  <RemoteFilesPanel
+                    slot={slot}
+                    name={remoteEnvironment.name}
+                    workdir={remoteEnvironment.workdir}
+                    onOpenTerminal={terminalEnabled && !isWithheld('terminal') ? openProjectTerminal : undefined}
+                  />
                 </div>
               )
             }
@@ -1240,8 +1251,9 @@ export default function SidePanel({
                   // opens document rows as file tabs via onFileOpen and artifact
                   // rows as artifact tabs via onArtifactOpen.
                   onFileOpen={onFileOpen}
+                  onFolderOpen={openSideChatFolder}
                   onArtifactOpen={onArtifactOpen}
-                  pins={pins} pinsLoading={pinsLoading} onJumpToPin={onJumpToPin} onUnpin={onUnpin}
+                  pins={pins} pinsLoading={pinsLoading} onJumpToPin={onJumpToPin} onPutPinInComposer={onPutPinInComposer} onUnpin={onUnpin}
                   slotTitle={slotTitle} chatMode={chatMode}
                   remoteEnvironmentName={remoteEnvironment?.name}
                   navLinks={navLinks} navResolving={navResolving}

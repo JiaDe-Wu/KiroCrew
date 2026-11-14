@@ -6,6 +6,7 @@ it relaunches the session.
 from __future__ import annotations
 
 import contextlib
+import json
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
@@ -94,7 +95,7 @@ def _model_rejected_reason(
         backends: list[str] = [backend]
     else:
         from kiro_crew.crewmate_harness import CrewmateHarnessUnavailable, crewmate_backend_pin
-        from kiro_crew.members import select_provider_backend
+        from kiro_crew.members import select_provider_backend, session_backend_pick
 
         cfg = None
         try:
@@ -104,20 +105,22 @@ def _model_rejected_reason(
         except Exception:  # pragma: no cover - config load is resilient
             default_backend, member_backend = "", ""
         keys = list(session_keys or ())
-        try:
-            backends = (
-                [
-                    select_provider_backend(
-                        k,
-                        member_backend,
-                        default_backend,
-                        crew_backend=crewmate_backend_pin(cfg, k) if cfg is not None else None,
-                    )
-                    for k in keys
-                ]
-                if keys
-                else [default_backend]
+
+        def _backend_of(k: str | None) -> str:
+            if cfg is None:  # pragma: no cover - config load is resilient
+                return default_backend
+            # A session created on a harness is judged on that harness.
+            pick = session_backend_pick(k)
+            return select_provider_backend(
+                k,
+                member_backend,
+                default_backend,
+                backend_override=pick,
+                crew_backend=crewmate_backend_pin(cfg, k) if pick is None else None,
             )
+
+        try:
+            backends = [_backend_of(k) for k in keys] if keys else [default_backend]
         except CrewmateHarnessUnavailable as exc:
             # A crewmate whose pinned harness cannot start takes no model at all.
             return str(exc)
@@ -202,6 +205,13 @@ async def _reapply_effort_after_live_switch(
         # Through the class: the shared body the provider's own set_model runs.
         return await AcpProvider.reapply_live_effort(provider, slot.reasoning_effort)
     except Exception as exc:
+        if getattr(exc, "command_refused", False) is True:
+            # kiro-cli refused the level for this model and nothing changed; a
+            # reset would cold-start on the same level and lose the live session.
+            logger.warning(
+                "Effort re-apply after live model switch refused for slot %s: %s", name, exc
+            )
+            return True
         logger.warning(
             "Effort re-apply after live model switch failed for slot %s: %s: %s"
             " — falling back to reset",
@@ -360,6 +370,37 @@ def _broadcast_context_reset(state: "DashboardState", slot_key: str, provider: A
         logger.exception("Failed to broadcast context_usage reset for slot %s", slot_key)
 
 
+def _read_model_field(body: dict) -> tuple[str, str, web.Response | None]:
+    """The body's ``model`` as text, a warning to return, or the 400 refusing it.
+
+    ``null`` is read as the default (``""``), with a warning. Any other non-string
+    is refused: saved to the slot, it breaks every later read of ``slot.model``.
+    """
+    raw = body.get("model", "")
+    if raw is None:
+        return "", "model was null; read as the default model", None
+    if not isinstance(raw, str):
+        return (
+            "",
+            "",
+            web.json_response(
+                {"error": "model must be a string", "code": "invalid_model"}, status=400
+            ),
+        )
+    return raw, "", None
+
+
+def _with_warning(resp: web.Response, warning: str) -> web.Response:
+    """*resp* with *warning* added to its JSON body, when it is a success."""
+    if not warning or not 200 <= resp.status < 300 or resp.body is None:
+        return resp
+    payload = json.loads(resp.body)  # type: ignore[arg-type]
+    prior = payload.get("warning")
+    payload["warning"] = f"{prior} {warning}" if prior else warning
+    resp.text = json.dumps(payload)
+    return resp
+
+
 async def api_chat_slot_model(request: web.Request) -> web.Response:
     """POST /api/chat/slots/{slot}/model — set model for a chat slot.
 
@@ -382,9 +423,13 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
     if body_err is not None:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success
-    return await switch_slot_model(
-        state, slot, name, body.get("model", ""), SlotAgentSwitchCaller.for_request(request)
+    raw_model, warning, refusal = _read_model_field(body)
+    if refusal is not None:
+        return refusal
+    resp = await switch_slot_model(
+        state, slot, name, raw_model, SlotAgentSwitchCaller.for_request(request)
     )
+    return _with_warning(resp, warning)
 
 
 async def switch_slot_model(
@@ -951,7 +996,10 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
     if body_err is not None:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success
-    model_name = _normalize_model(body.get("model", ""))
+    raw_model, warning, refusal = _read_model_field(body)
+    if refusal is not None:
+        return refusal
+    model_name = _normalize_model(raw_model)
     # One pick lands on every slot, so it must pass on every slot's harness.
     reason = _model_rejected_reason(
         model_name, session_keys=[effective_session_key(s) for s in list(state._slots.values())]
@@ -1183,5 +1231,6 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
             "skipped_running": skipped_running,
             "unchanged": unchanged,
             "failed": failed,
+            **({"warning": warning} if warning else {}),
         }
     )

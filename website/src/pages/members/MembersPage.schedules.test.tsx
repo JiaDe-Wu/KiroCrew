@@ -320,10 +320,37 @@ describe('MembersPage Profile card Schedules tab', () => {
     vi.mocked(api.crons).mockResolvedValue({ jobs: [] } as never)
     await openCrewmate()
     const list = await openSchedulesTab()
-    expect(await within(list).findByTestId('crew-schedule-empty')).toHaveTextContent(/Nothing wakes this Bot on its own yet/i)
+    expect(await within(list).findByTestId('crew-schedule-empty')).toHaveTextContent(/Nothing wakes this bot on its own yet/i)
     // No `0` anywhere — not on the rail, not in the list.
     expect(screen.queryByTestId('member-schedules-count')).toBeNull()
     expect(within(screen.getByTestId('crew-profile-tabs')).queryByText('0')).toBeNull()
+  })
+
+  it.each([
+    ['a daily goal check-in', { daily: true }, 'Goals tab', true],
+    ['a weekly goal check-in', { weekly: true }, 'Goals tab', true],
+    ['a monthly goal check-in', { monthly: true }, 'Goals tab', true],
+    // Starts with the same words as the check-ins line: only the Goals tab mention tells them apart.
+    ['the Heartbeat', { heartbeat: true }, 'No schedules yet.', false],
+  ])('neither the tab nor the New schedule page says nothing wakes the mate while %s is on', async (_label, on, line, mentionsGoals) => {
+    // The check-ins and the Heartbeat wake the mate without being a row here.
+    vi.mocked(api.crons).mockResolvedValue({ jobs: [] } as never)
+    vi.mocked(api.memberGoals.get).mockResolvedValue({
+      slug: 'oncall', member: 'oncall', goals: [], key_results: [], reports: [], removed_goal: null, removed_key_result: null,
+      schedules: { time: '09:00', timezone: '', daily: false, weekly: false, weekday: 1, monthly: false, month_day: 1, heartbeat: false, interval: 60, ...on },
+      limits: { goal_text_max_chars: 2000, key_result_text_max_chars: 200, key_result_value_max_chars: 40, key_result_reading_max_chars: 120 },
+    } as never)
+    onTestFinished(() => { vi.mocked(api.memberGoals.get).mockReset() })
+    await openCrewmate()
+    const list = await openSchedulesTab()
+    await waitFor(() => expect(within(list).getByTestId('crew-schedule-empty')).toHaveTextContent(line))
+    expect(list).not.toHaveTextContent(/Nothing wakes/)
+    expect(within(list).getByTestId('crew-schedule-empty').textContent).toSatisfy((text: string) => text.includes('Goals tab') === mentionsGoals)
+    fireEvent.click(screen.getByTestId('crew-schedule-create'))
+    const page = await screen.findByTestId('crew-profile-page-new-schedule')
+    await waitFor(() => expect(within(page).getByTestId('member-schedules')).toHaveTextContent(line))
+    expect(page).not.toHaveTextContent(/Nothing wakes/)
+    expect(within(page).getByTestId('member-schedules').textContent).toSatisfy((text: string) => text.includes('Goals tab') === mentionsGoals)
   })
 
   it('reads the list without asking which crew is the default', async () => {
@@ -346,7 +373,7 @@ describe('MembersPage Profile card Schedules tab', () => {
     // The failed read is handled once the list draws its error line; the empty line is withheld with it.
     await screen.findByTestId('crew-schedule-error')
     expect(within(list).queryByTestId('crew-schedule-empty')).toBeNull()
-    expect(list).not.toHaveTextContent(/Nothing wakes this Bot/i)
+    expect(list).not.toHaveTextContent(/Nothing wakes this bot/i)
   })
 
   it('a row opens that job on the Schedule page; the footer opens the page itself', async () => {
@@ -402,11 +429,11 @@ describe('MembersPage Profile card — New schedule', () => {
     // second "What wakes this crewmate" and no second close control under the bar.
     expect(section).toHaveAttribute('data-chromeless', 'true')
     expect(within(section).queryByTestId('crew-wake-add')).toBeNull()
-    expect(within(page).queryByText('What wakes this Bot')).toBeNull()
+    expect(within(page).queryByText('What wakes this bot')).toBeNull()
     expect(within(page).queryAllByRole('button', { name: /cancel new schedule/i })).toHaveLength(0)
     // The form's pinned-crew hint speaks this page's noun: the reader is on the
     // crewmate's Profile, not in the crew editor the editor's sentence names.
-    expect(within(section).getByText("Created from this Bot's profile, so the job runs as this Bot.")).toBeInTheDocument()
+    expect(within(section).getByText("Created from this bot's profile, so the job runs as this bot.")).toBeInTheDocument()
     expect(within(section).queryByText(/this crew's editor/)).toBeNull()
     // A clean form: back pops to the list with no question asked.
     fireEvent.click(screen.getByTestId('crew-profile-back'))
@@ -1092,11 +1119,17 @@ describe('MembersPage Profile card — Goals retention and delivery', () => {
       expect(holdsDocument()).toBe(false)
     } else {
       const notice = await screen.findByTestId(status === 'refused' ? 'crew-goals-new-goal-error' : 'crew-goals-new-goal-unconfirmed')
-      if (status !== 'refused') expect(notice).toHaveTextContent('check the conversation above before sending it again')
-      // The modal stays open over the card, for another try.
+      if (status !== 'refused') expect(notice).toHaveTextContent('open the chat and check the conversation before sending it again')
+      // The modal stays open over the card: a refusal for another try, an
+      // unconfirmed delivery with Open chat in place of Send.
       expect(screen.getByRole('dialog', { name: 'New goal' })).toContainElement(notice)
       expect(screen.getByTestId('crew-profile-modal')).toBeInTheDocument()
-      expect(screen.getByTestId('crew-goals-new-goal-send')).toBeEnabled()
+      expect(screen.getByTestId(status === 'refused' ? 'crew-goals-new-goal-send' : 'crew-goals-new-goal-open-chat')).toBeEnabled()
+      if (status !== 'refused') {
+        // Open chat sends nothing and, floating over the thread, closes the card.
+        fireEvent.click(screen.getByTestId('crew-goals-new-goal-open-chat'))
+        await waitFor(() => expect(screen.queryByTestId('crew-profile-panel')).toBeNull())
+      }
     }
     expect(api.sendChat).toHaveBeenCalledTimes(1)
     const [message, slot] = vi.mocked(api.sendChat).mock.calls[0]

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,7 @@ from publish_sync_helpers import (  # noqa: F401 -- fixtures are requested by na
     store_fixture,
     wire,
 )
+from redaction_structured_cases import synth
 
 from kiro_crew import publish_sync
 from kiro_crew.artifacts import (
@@ -35,6 +37,10 @@ from kiro_crew.artifacts import (
 )
 
 # ── publish ──────────────────────────────────────────────────────────────────
+
+
+# A synthetic 40-character secret the redactor removes; an AWS key ID stays visible.
+_SECRET = synth(40, seed=203)
 
 
 @pytest.mark.asyncio
@@ -176,6 +182,27 @@ async def test_later_successful_visibility_change_clears_a_stale_notice(store, f
 
     pub = store.get("d").publication
     assert pub.notice == ""
+    assert pub.last_error == ""
+
+
+@pytest.mark.asyncio
+async def test_visibility_change_records_a_new_provider_notice(store, fake_client):
+    """A completed sharing change keeps a warning returned by its provider."""
+    store.create(name="Doc", content="v1", kind="text", slug="d")
+    await publish_sync.publish("d", visibility="PRIVATE")
+    fake_client.update_sharing_response = {
+        "artifactId": "uuid-123",
+        "notice": "The link may show content from another bucket.",
+        "notice_code": "unknown",
+    }
+
+    summary = await publish_sync.update_sharing("d", visibility="PUBLIC")
+
+    pub = store.get("d").publication
+    assert pub.notice == "The link may show content from another bucket."
+    assert pub.notice_code == "unknown"
+    assert summary["notice"] == pub.notice
+    assert summary["notice_code"] == pub.notice_code
     assert pub.last_error == ""
 
 
@@ -1103,10 +1130,10 @@ def test_redact_untrusted_scans_every_source():
     # later updates the content, so a `manual`-labelled artifact can carry
     # LLM/agent bytes by publish time — it MUST still be scanned. An AKIA-shaped
     # credential is redacted regardless of source.
-    secret = "leak AKIAIOSFODNN7EXAMPLE now"
+    secret = f"leak {_SECRET} now"
     for source in ("manual", "chat", "cron", "subagent", "import"):
         out = publish_sync._redact_untrusted(secret, source)
-        assert "AKIAIOSFODNN7EXAMPLE" not in out, source
+        assert _SECRET not in out, source
     # Empty text short-circuits unchanged.
     assert publish_sync._redact_untrusted("", "manual") == ""
 
@@ -1241,6 +1268,29 @@ async def test_unpublish_asks_whether_this_publications_account_is_reachable(
 
 
 @pytest.mark.asyncio
+async def test_the_reachability_probe_runs_off_the_event_loop(store, fake_client, monkeypatch):
+    # Personal Drive answers `reachable_for` with a blocking STS subprocess, so both
+    # withdrawal paths must ask it from a worker thread: on the loop thread it stalls
+    # every other request for as long as the probe takes.
+    loop_thread = threading.get_ident()
+    probed_on: list[int] = []
+
+    def reachable_for(self, *, external_id):
+        probed_on.append(threading.get_ident())
+        return False
+
+    monkeypatch.setattr(type(fake_client), "reachable_for", reachable_for)
+    store.create(name="Doc", content="x", kind="text", slug="r-off-loop")
+    await publish_sync.publish("r-off-loop")
+    with pytest.raises(publish_sync.PublishUnavailableError):
+        await publish_sync.unpublish("r-off-loop")
+    result = await publish_sync.delete_for_artifact(store.get("r-off-loop"))
+    assert result is publish_sync.DeleteWithdrawal.UNREACHABLE
+    assert len(probed_on) == 2
+    assert loop_thread not in probed_on
+
+
+@pytest.mark.asyncio
 async def test_reachable_for_defaults_to_the_destination_wide_answer(fake_client):
     """Providers that bind nothing per publication must not have to implement it."""
     fake_client.ready = False
@@ -1312,7 +1362,7 @@ async def test_publish_redacts_the_providers_notice_before_persisting_it(store, 
     fake_client.upload_response = dict(
         fake_client.upload_response,
         # AWS's own documentation example key -- not a live credential.
-        notice="rolling out; debug key AKIAIOSFODNN7EXAMPLE",
+        notice=f"rolling out; debug key {_SECRET}",
         notice_code="rolling_out",
     )
     store.create(name="Doc", content="x", kind="text", slug="red1")
@@ -1320,7 +1370,7 @@ async def test_publish_redacts_the_providers_notice_before_persisting_it(store, 
     stored = store.get("red1").publication
     assert stored is not None
     # The key must not survive into the record the dashboard reads.
-    assert "AKIAIOSFODNN7EXAMPLE" not in stored.notice
+    assert _SECRET not in stored.notice
     assert "REDACTED" in stored.notice
     # The discriminator is a constrained enum, so it passes through untouched.
     assert stored.notice_code == "rolling_out"

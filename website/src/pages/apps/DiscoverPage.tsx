@@ -29,9 +29,11 @@ import CategoryRail from '../../components/appstore/CategoryRail'
 import AppListRow from '../../components/appstore/AppListRow'
 import TrustAppModal, { isTrustDeniedError } from '../../components/appstore/TrustAppModal'
 import SourcesPopover from '../../components/appstore/SourcesPopover'
-import { categoryCounts, categoryFor, type Category } from '../../components/appstore/categories'
+import { categoryCounts, categoryFor, categoryLabel, type Category } from '../../components/appstore/categories'
 import { sourceKey, sourceRowKey, type RegistryApp } from '../../components/appstore/types'
 import { api } from '../../api/client'
+import { useConnected } from '../../hooks/useConnected'
+import { offlineProps } from '../../utils/offline'
 import { i18nT } from '../../i18n/t'
 import { compareText } from '../../i18n/format'
 import ErrorNotice from '../../components/ErrorNotice'
@@ -41,7 +43,9 @@ import { useAppActions } from './useAppActions'
 import { useAppUpdates } from './useAppUpdates'
 import UpdatesList from './UpdatesList'
 import { cardDataKey } from './cardDataKey'
-import { registryRefreshFailureMessage } from '../../components/appstore/registryRefreshMessage'
+import {
+  registryListingFailureMessage, registryRefreshFailureMessage,
+} from '../../components/appstore/registryRefreshMessage'
 
 /**
  * Which app in a featured card has an action in flight, or null.
@@ -139,6 +143,10 @@ function DiscoverPageBody() {
      resolves HERE, so it links nowhere and auto-dismisses instead. */
   const [successLink, setSuccessLink] = useState(false)
   const [actionLoading, setActionLoading] = useState<string | null>(null)
+  // The store refresh, Enable and the Updates tab write to the gateway, so each
+  // is refused while it is offline (offlineProps names why), as on the Library.
+  const connected = useConnected()
+  const offlineVerb = i18nT('utils.offline.manage_apps')
 
   /* Sub-tab state (V1 mockup: Featured | Updates). Component-internal state
      initialized SYNCHRONOUSLY from the URL so a `/apps/-/updates` deep-link or
@@ -158,7 +166,7 @@ function DiscoverPageBody() {
   const {
     apps, appsError, registryError, loading,
     browseApps, featuredSections, categories, sources, updatables,
-    announceAppsChanged, registriesUnknown,
+    announceAppsChanged, registriesUnknown, catalogUnavailable, registryFetchFailures,
   } = useAppsData()
 
   useEffect(() => {
@@ -212,16 +220,15 @@ function DiscoverPageBody() {
   // The settled results are READ, not discarded: a failed refresh keeps
   // serving the prior (stale or seed) listing, which looks identical to a
   // successful one, so the outcome must reach the error banner or the user
-  // cannot tell them apart. TWO outcomes are observable here and the code
-  // claims only those: a REJECTED POST reports its own message, and a
-  // fulfilled registries response reporting per-source failures names them
-  // (the same branch RegistryManager runs on this response shape).
+  // cannot tell them apart. THREE outcomes are observable here and the code
+  // claims only those: a REJECTED POST reports its own message, a fulfilled
+  // registries response reporting per-source failures names them (the same
+  // branch RegistryManager runs on this response shape), and a refetched
+  // listing that says it is the offline fallback (`catalogUnavailable`).
   //
-  // A degraded OFFICIAL catalog is deliberately NOT claimed: the store POST
-  // only drops caches and never fetches (see handle_registry_refresh), so it
-  // resolves ok whatever the catalog's health, and the fetch it defers to
-  // serves the seed listing with a 200. Reporting that needs a signal on the
-  // follow-up GET, which is a server change and not this one.
+  // The official catalog is judged by that refetched listing, not by the store
+  // POST: the POST only drops caches and never fetches (see
+  // handle_registry_refresh), so it resolves ok whatever the catalog's health.
   //
   // Reporting never skips the invalidations below -- the healthy source still
   // gets its refetch.
@@ -241,8 +248,22 @@ function DiscoverPageBody() {
     // Clear only while the banner still shows what this handler put there.
     else setError(prev => (prev === previous ? '' : prev))
   }
+
+  // The sources the listing reports it could not read: the official catalog,
+  // when the shelf is the offline fallback, then the registries whose index
+  // fetch failed, whose apps are missing from the shelf or shown as last synced.
+  // Nothing else on the page says so. Shown whatever the banner above holds,
+  // because the banner speaks for one refresh and this notice for the listing on
+  // screen. A dismissal holds until the text changes, so a new failure or cause
+  // shows again.
+  const [dismissedFetchNotice, setDismissedFetchNotice] = useState('')
+  const fetchNotice = [
+    catalogUnavailable ? i18nT('pages.appsPage.store_catalog_unreachable') : '',
+    registryListingFailureMessage(registryFetchFailures ?? []),
+  ].filter(Boolean).join('\n')
+  const showFetchNotice = fetchNotice !== '' && fetchNotice !== dismissedFetchNotice
   const handleRefresh = async () => {
-    if (refreshing) return
+    if (refreshing || !connected) return
     setRefreshing(true)
     try {
       const [storeResult, registriesResult] = await Promise.allSettled([
@@ -252,19 +273,21 @@ function DiscoverPageBody() {
       const rejection = [storeResult, registriesResult].find(
         (r): r is PromiseRejectedResult => r.status === 'rejected',
       )
-      if (rejection) {
-        reportRefreshOutcome(rejection.reason instanceof Error && rejection.reason.message
-          ? rejection.reason.message
-          : i18nT('components.registryManager.failed_to_refresh_registries'))
-      } else {
-        reportRefreshOutcome(registriesResult.status === 'fulfilled'
-          ? registryRefreshFailureMessage(registriesResult.value)
-          : '')
-      }
+      const outcome = rejection
+        ? (rejection.reason instanceof Error && rejection.reason.message
+            ? rejection.reason.message
+            : i18nT('components.registryManager.failed_to_refresh_registries'))
+        : (registriesResult.status === 'fulfilled'
+            ? registryRefreshFailureMessage(registriesResult.value)
+            : '')
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['registry'] }),
         queryClient.invalidateQueries({ queryKey: ['apps'] }),
       ])
+      const offline = storeResult.status === 'fulfilled'
+        && queryClient.getQueryData<{ catalogUnavailable?: boolean }>(['registry'])?.catalogUnavailable
+      reportRefreshOutcome([outcome, offline ? i18nT('pages.appsPage.store_catalog_unreachable') : '']
+        .filter(Boolean).join(' '))
     } finally {
       setRefreshing(false)
     }
@@ -330,6 +353,7 @@ function DiscoverPageBody() {
   // `handleInstall` owns the consent modal.
 
   const enableApp = async (name: string) => {
+    if (!connected) return
     setActionLoading(`${name}:enable`)
     setError('')
     try {
@@ -377,8 +401,9 @@ function DiscoverPageBody() {
             // drops a keyboard user's focus to the page for the whole refresh.
             aria-label={refreshing ? i18nT('pages.appsPage.refreshing_store') : i18nT('pages.appsPage.refresh_store')}
             title={refreshing ? i18nT('pages.appsPage.refreshing_store') : i18nT('pages.appsPage.refresh_store')}
+            {...offlineProps(connected, offlineVerb, i18nT('pages.appsPage.refresh_store'))}
             onClick={handleRefresh}
-            aria-disabled={refreshing || undefined}
+            aria-disabled={refreshing || !connected || undefined}
             className="aria-disabled:opacity-30 aria-disabled:cursor-default"
           >
             <RefreshCw size={15} className={refreshing ? 'animate-spin' : undefined} />
@@ -445,6 +470,17 @@ function DiscoverPageBody() {
             message={displayError}
             onDismiss={dismissError}
             className="mb-4 animate-rise"
+          />
+        )}
+        {/* No hand-off: the SourcesPopover's install-path input shares this
+            page, and navigating away would discard what the user typed. */}
+        {showFetchNotice && (
+          <ErrorNotice
+            message={fetchNotice}
+            messageClassName="whitespace-pre-line"
+            onDismiss={() => setDismissedFetchNotice(fetchNotice)}
+            className="mb-4 animate-rise"
+            testId="registry-fetch-notice"
           />
         )}
         {successMsg && (
@@ -524,6 +560,7 @@ function DiscoverPageBody() {
               rows={updatables}
               updatingAll={updatingAll}
               updatePending={updatePending}
+              connected={connected}
               onUpdate={runUpdate}
               onUpdateAll={updateAll}
             />
@@ -611,6 +648,7 @@ function DiscoverPageBody() {
                     busyName={
                       featuredBusyName(actionLoading, section.apps)
                     }
+                    connected={connected}
                     onGet={name => getApp(name)}
                     onEnable={name => enableApp(name)}
                     onOpenApp={(name, e) => openDetail(name, e)}
@@ -624,7 +662,7 @@ function DiscoverPageBody() {
 
             <div className="flex items-baseline justify-between mt-2 mb-3">
               <h3 className="text-[17px] font-semibold text-text-strong">
-                {category === 'all' ? i18nT('pages.appsPage.all_apps') : category}
+                {category === 'all' ? i18nT('pages.appsPage.all_apps') : categoryLabel(category)}
               </h3>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-[224px_minmax(0,1fr)] gap-6 items-start">
@@ -694,6 +732,7 @@ function DiscoverPageBody() {
                         /* Update All lives on the Library page, so the old
                            `|| !!updatingAll` freeze no longer applies here. */
                         busy={actionLoading === `${app.name}:enable`}
+                        connected={connected}
                         onOpen={e => openDetail(app.name, e)}
                         onGet={() => getApp(app.name)}
                         onUpdate={() => updateApp(app.name)}

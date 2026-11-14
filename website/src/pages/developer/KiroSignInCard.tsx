@@ -1,10 +1,15 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertTriangle, CheckCircle2, KeyRound, Loader2, LogOut, RefreshCw } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, Eye, EyeOff, KeyRound, Loader2, LogOut, RefreshCw } from 'lucide-react'
 import { api, type KasLoginStatus } from '../../api/client'
+import { isAccountOnly, parseKiroUsagePayload } from '../../api/kiroUsage'
 import { KasLoginEmbedded } from '../../components/KasLoginGate'
 import { providerLabelFromWire } from '../../components/kasProviderLabel'
+import { KIRO_ACCOUNT_EMAIL_HIDDEN_KEY } from '../../components/KiroAccountModal'
+import { usePersistedBool } from '../../hooks/usePersistedBool'
+import { configuredAcpBackend, type AcpBackendConfig } from '../../api/acpBackend'
 import { clearCachedModels } from '../../providers/adapters/acp'
+import { KIRO_SIGN_IN_BACKEND } from './kiroSignInLink'
 import ErrorNotice from '../../components/ErrorNotice'
 import { Btn, Card, CardTitle } from '../../components/ui'
 import { KIRO_SIGN_IN_HIGHLIGHT_ANCHOR } from '../../hooks/useSettingHighlight'
@@ -15,6 +20,83 @@ import { signInLapsed } from './kiroSignInState'
 // Same cache key the embedded flow reads status under (KasLoginGate.QUERY_KEY):
 // a sign-out here must invalidate the flow's query, not a private copy of it.
 const STATUS_QUERY_KEY = ['kas-login'] as const
+
+/**
+ * Who the stored sign-in belongs to (email, else account name), read from the
+ * top bar's `['kiro-usage']` reading -- the vault stores no e-mail, so that
+ * whoami-backed reading is the only place a name exists. That reading names the
+ * vault account only while the saved main harness is KAS (the gateway's
+ * `_vault_owns_usage_sync`); on any other harness it names kiro-cli's login,
+ * which this card's Sign out does not touch, so no name is shown then, nor
+ * before the config has loaded. `enabled: false`: the top bar owns both reads,
+ * this only observes them. `hidden`: an e-mail follows the account popup's hide
+ * toggle (hidden by default), so a shared screen does not show it here either;
+ * an account name is never hidden.
+ */
+function useSignedInAccount(): { name: string; hidden: boolean; isEmail: boolean } {
+  const { data } = useQuery({
+    queryKey: ['kiro-usage'],
+    queryFn: () => api.sessionsUsage().then(parseKiroUsagePayload),
+    enabled: false,
+  })
+  const { data: cfg } = useQuery<AcpBackendConfig>({
+    queryKey: ['kirocrewConfig'],
+    queryFn: () => api.kirocrewConfig(),
+    enabled: false,
+  })
+  const [emailHidden] = usePersistedBool(KIRO_ACCOUNT_EMAIL_HIDDEN_KEY, true)
+  const none = { name: '', hidden: false, isEmail: false }
+  if (cfg === undefined || configuredAcpBackend(cfg) !== KIRO_SIGN_IN_BACKEND) return none
+  if (typeof data !== 'object' || data === null || isAccountOnly(data)) return none
+  if (data.email) return { name: data.email, hidden: emailHidden, isEmail: true }
+  return { ...none, name: data.account || '' }
+}
+
+/**
+ * The account after the provider, as ` · <name>`. A hidden e-mail is blurred like
+ * the popup's and, as there, sits beside the Show/Hide e-mail toggle, so the card
+ * itself can reveal it. The folded heading passes no toggle and shows only a
+ * visible name: a blur with nothing to press would not say which account it is.
+ */
+function AccountName({
+  name,
+  hidden,
+  isEmail,
+  withToggle = false,
+  testId,
+}: {
+  name: string
+  hidden: boolean
+  isEmail: boolean
+  withToggle?: boolean
+  testId?: string
+}) {
+  const [, setEmailHidden] = usePersistedBool(KIRO_ACCOUNT_EMAIL_HIDDEN_KEY, true)
+  if (!name) return null
+  const toggleLabel = i18nT(hidden ? 'components.kiroAccountModal.show_email' : 'components.kiroAccountModal.hide_email')
+  return (
+    <span data-testid={testId} className="ml-1.5 inline-flex items-center gap-1.5 font-normal text-muted">
+      {'· '}
+      <span
+        data-account-hidden={hidden ? 'true' : undefined}
+        className={hidden ? 'select-none blur-[5px] opacity-60' : undefined}
+      >
+        {name}
+      </span>
+      {withToggle && isEmail ? (
+        <button
+          type="button"
+          onClick={() => setEmailHidden(!hidden)}
+          className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-border text-muted transition-colors hover:border-accent/35 hover:bg-accent/10 hover:text-accent focus-ring-accent"
+          aria-label={toggleLabel}
+          title={toggleLabel}
+        >
+          {hidden ? <Eye className="lucide-inline" aria-hidden="true" /> : <EyeOff className="lucide-inline" aria-hidden="true" />}
+        </button>
+      ) : null}
+    </span>
+  )
+}
 
 function SignedInSummary({
   status,
@@ -38,10 +120,13 @@ function SignedInSummary({
       // fresh (global `staleTime: Infinity`) until a session spawns.
       clearCachedModels()
       void queryClient.resetQueries({ queryKey: ['available-models'] })
+      // So does its usage reading, which names it: no stale name on the next sign-in.
+      void queryClient.resetQueries({ queryKey: ['kiro-usage'] })
     },
   })
   const lapsed = signInLapsed(status)
   const provider = providerLabelFromWire(status.provider)
+  const account = useSignedInAccount()
   // What renews the session, in words the user can act on: an access token the
   // engine refreshes itself, one that has already lapsed, or one the issuer
   // refused to renew. Never the token, never its length.
@@ -73,6 +158,7 @@ function SignedInSummary({
             {lapsed
               ? i18nT('pages.developer.kiroSignInCard.sign_in_expired')
               : i18nT('pages.developer.kiroSignInCard.signed_in_with', { provider })}
+            {!lapsed ? <AccountName {...account} withToggle testId="kiro-sign-in-account" /> : null}
           </p>
           <p className="mt-0.5 text-[13px] leading-relaxed text-muted">
             {lapsed
@@ -153,13 +239,26 @@ function SignedInSummary({
  * and the search entry (`KIRO_SIGN_IN_SETTING_ID`), which waits on the
  * `data-setting-id` this card carries.
  *
- * `compact` is that in-detail form: a section with a small heading rather than
+ * `compact` is that in-detail form: a fold with a small heading rather than
  * a `Card` with a `CardTitle`, because the detail it sits in is already the
  * bordered panel and a card inside it would be a box inside a box. The anchor
  * (`data-setting-key`) and the test id are the same in both forms, so the
  * chat's deep link rings whichever one is on screen.
+ *
+ * The compact form FOLDS: a `<details>` that is open while the person still has
+ * to sign in (signed out, lapsed, or the status read failed) and closed to its
+ * heading plus "Signed in with …" once a usable sign-in is stored, so a done step
+ * stops taking the page. Closed while the first answer is in flight, so a signed-in
+ * page never flashes the chooser open. A sign-in that lapses later re-opens it. A
+ * toggle by the person wins over that default; `openRequest` (bumped by the chat's
+ * sign-in deep link) opens it whatever they last chose, once: the card reports it
+ * handled so a later remount does not force it open again.
  */
-export function KiroSignInCard({ compact = false }: { compact?: boolean } = {}) {
+export function KiroSignInCard({
+  compact = false,
+  openRequest = 0,
+  onOpenRequestHandled,
+}: { compact?: boolean; openRequest?: number; onOpenRequestHandled?: () => void } = {}) {
   const title = i18nT('pages.developer.kiroSignInCard.title')
   // Set after a successful sign-out, so the "applies to agent processes started
   // from now on" note shows at the moment the change was made. Held HERE, above
@@ -169,15 +268,45 @@ export function KiroSignInCard({ compact = false }: { compact?: boolean } = {}) 
   const [signedOutNote, setSignedOutNote] = useState(false)
   // Observe the flow's status (same cache key, no extra fetch: the flow owns the
   // polling) so the note clears when a credential is stored again.
-  const { data: observed } = useQuery({
+  const { data: observed, isError: statusFailed } = useQuery({
     queryKey: STATUS_QUERY_KEY,
     queryFn: api.kasLoginStatus,
     enabled: false,
   })
   const authenticated = observed?.authenticated === true
+  const account = useSignedInAccount()
   useEffect(() => {
     if (authenticated) setSignedOutNote(false)
   }, [authenticated])
+  // The compact fold: `null` follows the sign-in state, a boolean is the person's toggle.
+  const signedIn = authenticated && observed !== undefined && !signInLapsed(observed)
+  const [userOpen, setUserOpen] = useState<boolean | null>(null)
+  // Set at the FIRST answer and only ever re-opened after that: signing in from the
+  // open fold must not snap it shut under the person's pointer, but a sign-in that
+  // lapses or is signed out elsewhere must not hide behind a closed heading.
+  const [autoOpen, setAutoOpen] = useState<boolean | null>(null)
+  const wasSignedIn = useRef(false)
+  useEffect(() => {
+    // A failed first read opens it and keeps it open once a retry answers.
+    if (observed === undefined && statusFailed && autoOpen === null) setAutoOpen(true)
+    else if (observed !== undefined && autoOpen === null) setAutoOpen(!signedIn)
+    // Every signed-in -> not-signed-in change re-opens it, whatever the person last chose.
+    if (wasSignedIn.current && !signedIn && observed !== undefined) {
+      setAutoOpen(true)
+      setUserOpen(null)
+    }
+    wasSignedIn.current = signedIn
+  }, [observed, autoOpen, signedIn, statusFailed])
+  const handled = useRef(onOpenRequestHandled)
+  handled.current = onOpenRequestHandled
+  useEffect(() => {
+    if (openRequest > 0) {
+      setUserOpen(true)
+      handled.current?.()
+    }
+  }, [openRequest])
+  // A failed status read is not an answer to fold on: its error and retry are inside.
+  const open = userOpen ?? autoOpen ?? statusFailed
   const body = (
     <>
       {signedOutNote ? (
@@ -211,20 +340,42 @@ export function KiroSignInCard({ compact = false }: { compact?: boolean } = {}) 
   )
   if (compact) {
     return (
-      <section
+      <details
+        open={open}
         aria-label={title}
+        // `onToggle` also fires for the `open` prop's own changes; recording only a
+        // value that differs keeps the default in charge until the person clicks.
+        onToggle={e => {
+          const next = e.currentTarget.open
+          if (next !== open) setUserOpen(next)
+        }}
         className="border-t border-border pt-3"
         data-setting-key={KIRO_SIGN_IN_HIGHLIGHT_ANCHOR}
         data-setting-id={KIRO_SIGN_IN_HIGHLIGHT_ANCHOR}
         data-setting-label={i18nT('pages.developer.kiroSignInCard.search_label')}
         data-testid="kiro-sign-in-card"
       >
-        <h3 className="mb-2 flex items-center gap-1.5 text-[13px] font-semibold text-text-strong">
-          <KeyRound className="lucide-inline" aria-hidden="true" />
-          {title}
-        </h3>
-        {body}
-      </section>
+        {/* Block, not flex: a flex summary loses the native disclosure triangle,
+            the one cue that the heading toggles. The heading inside keeps the
+            heading-navigation stop the section form had. */}
+        <summary className="cursor-pointer text-[13px] text-text-strong focus-ring">
+          <h3 className="m-0 inline text-[13px] font-semibold">
+            <KeyRound className="lucide-inline mr-1.5" aria-hidden="true" />
+            {title}
+          </h3>
+          {/* Closed only: the open body states the same sign-in itself. */}
+          {!open && signedIn && observed && (
+            <span data-testid="kiro-sign-in-fold-state" className="ml-1.5 font-normal text-muted">
+              {'· '}
+              {i18nT('pages.developer.kiroSignInCard.signed_in_with', {
+                provider: providerLabelFromWire(observed.provider),
+              })}
+              {account.hidden ? null : <AccountName {...account} />}
+            </span>
+          )}
+        </summary>
+        <div className="mt-2">{body}</div>
+      </details>
     )
   }
   return (

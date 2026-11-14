@@ -56,7 +56,16 @@ from kiro_crew.dashboard.handlers.usage import (
 from kiro_crew.dashboard.state import NEW_SESSION_TITLE
 from kiro_crew.hooks import validate_file_path
 from kiro_crew.jsonl_util import bounded_records
-from kiro_crew.metrics.provider import TELEMETRY_ENV_VAR, env_pin, otlp_egress_listing
+from kiro_crew.metrics.provider import (
+    TELEMETRY_ENV_VAR,
+    _held_consent,
+    env_pin,
+    env_pin_is_soft,
+    live_recorder_state,
+    otlp_egress_listing,
+    outbound_consented,
+    pin_env_var,
+)
 from kiro_crew.metrics.schema import RESOURCE_ATTR_PROCESS_START_TIME
 from kiro_crew.metrics.turns import TURN_COST_METRIC, TURN_CREDITS_METRIC, TURN_METRIC
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -228,6 +237,10 @@ class _TelemetryState(NamedTuple):
     # and also when posture could not be resolved (``otlp_configured`` is then
     # True: a disclosure that cannot name its destinations still says they exist).
     otlp_destinations: "tuple[dict, ...]" = ()
+    # ``outbound_consented``: a destination alone does not export, recording must
+    # also have been turned on explicitly. True when unresolvable, the disclosure
+    # direction.
+    export_permitted: bool = True
 
 
 def _telemetry_cfg() -> _TelemetryState:
@@ -249,10 +262,16 @@ def _telemetry_cfg() -> _TelemetryState:
     otlp_configured = False
     destinations: "tuple[dict, ...]" = ()
     retention_days = 0
+    export_permitted = True
     directory = config_dir() / "metrics"
     try:
-        cfg = KiroCrewConfig.load().telemetry
-        enabled = bool(cfg.enabled)
+        full_cfg = KiroCrewConfig.load()
+        cfg = full_cfg.telemetry
+        # An unparseable config file holds consent as unknown: no recorder is
+        # built, but a live one keeps running. Report what this process records.
+        held = _held_consent(full_cfg, bool(cfg.enabled))
+        live_recording, live_exporting = live_recorder_state()
+        enabled = live_recording if held is None else bool(held)
         retention_days = max(0, int(getattr(cfg, "retention_days", 0) or 0))
         if getattr(cfg, "local_dir", None):
             directory = Path(cfg.local_dir).expanduser()
@@ -272,6 +291,14 @@ def _telemetry_cfg() -> _TelemetryState:
                 for row in otlp_egress_listing(cfg)
             )
             otlp_configured = bool(destinations)
+            if otlp_configured:
+                # Unknown consent keeps the live recorder, so disclose what IT exports.
+                export_permitted = live_exporting if held is None else outbound_consented(full_cfg)
+            if held is None and live_exporting:
+                # The fallback load may list no destination (an unparseable file
+                # reads as defaults) while the kept reader still sends.
+                otlp_configured = True
+                export_permitted = True
         except Exception:
             # Posture unresolvable (a provider that raised, an uncomposable
             # context). Report egress rather than promising local-only: this
@@ -283,16 +310,29 @@ def _telemetry_cfg() -> _TelemetryState:
     except Exception:
         logger.debug("telemetry config load failed; assuming disabled", exc_info=True)
     env_var = TELEMETRY_ENV_VAR
+    soft = False
     try:
+        env_var = pin_env_var()
         pin = env_pin()
+        soft = pin is not None and env_pin_is_soft()
     except Exception:
         logger.debug("telemetry env pin resolution failed", exc_info=True)
         pin = None
     if pin is not None:
         enabled = pin
-        env_pinned = True
+        # A soft pin (``KIROCREW_TELEMETRY_DISABLED`` holding the default off)
+        # gives way to a written ``telemetry.enabled``, so the switch stays
+        # usable: writing it is exactly how the user lifts that pin.
+        env_pinned = not soft
     return _TelemetryState(
-        enabled, directory, env_pinned, env_var, otlp_configured, retention_days, destinations
+        enabled,
+        directory,
+        env_pinned,
+        env_var,
+        otlp_configured,
+        retention_days,
+        destinations,
+        export_permitted,
     )
 
 
@@ -318,9 +358,9 @@ def _shards_in_window(directory: Path, days: float, until: float | None = None) 
     last = end.date()
     out: list[Path] = []
     for p in directory.glob("metrics-*.jsonl"):
-        # Defensive: skip any shard that resolves to a sensitive path (symlink).
-        if validate_file_path(str(p)) is None:
-            continue
+        # Parse the filename date first (cheap string work) and skip shards
+        # outside the window before the path gate, so an unpruned directory does
+        # not pay the full validate_file_path resolve for shards it never reads.
         # filename: metrics-YYYY-MM-DD-<pid>.jsonl
         stem = p.stem  # metrics-YYYY-MM-DD-<pid>
         parts = stem.split("-")
@@ -330,8 +370,13 @@ def _shards_in_window(directory: Path, days: float, until: float | None = None) 
             d = datetime.strptime("-".join(parts[1:4]), "%Y-%m-%d").date()
         except ValueError:
             continue
-        if cutoff <= d and (until is None or d <= last):
-            out.append(p)
+        if not (cutoff <= d and (until is None or d <= last)):
+            continue
+        # Defensive: an in-window shard that resolves to a sensitive path
+        # (symlink) is still skipped before it is read.
+        if validate_file_path(str(p)) is None:
+            continue
+        out.append(p)
     return out
 
 
@@ -1487,6 +1532,8 @@ async def api_telemetry_startup(request: web.Request) -> web.Response:
     cost = await asyncio.to_thread(_cost_block, cost_window)
     if cost:
         cost = await _with_conversation_titles(request, cost)
+        if isinstance(cost.get("usd"), dict):
+            cost = {**cost, "usd": await _with_conversation_titles(request, cost["usd"])}
     return web.json_response(
         {
             "enabled": state.enabled,
@@ -1656,8 +1703,14 @@ def _app_is_enabled(app_name: str) -> bool:
         return False
 
 
-def _persisted_titles(conversation_log: Any, slot_keys: list[str]) -> dict[str, str]:
+def _persisted_titles(
+    conversation_log: Any, slot_keys: list[str], transcripts: dict[str, str]
+) -> dict[str, str]:
     """Read the persisted title for each of *slot_keys*. Blocking; call off-loop.
+
+    A slot resolves through the transcript its usage rows recorded (*transcripts*)
+    before its name: a closed tab linked to another session (a task review, a
+    workflow, a cron run) is found no other way.
 
     ``get_metadata`` rather than ``list_sessions``: the latter falls back to the
     first user message and then to the session key when the metadata line names
@@ -1666,8 +1719,7 @@ def _persisted_titles(conversation_log: Any, slot_keys: list[str]) -> dict[str, 
     ``metadata["title"]`` counts here, which is the same thing the live slot
     carries.
 
-    Keyed by SLOT key on the way out, so the caller never has to know how a slot
-    maps onto a transcript. Distinct slots can share one transcript (a
+    Keyed by SLOT key on the way out. Distinct slots can share one transcript (a
     channel-born slot's conversation IS the channel's), so the read is
     deduplicated by transcript key rather than by slot.
     """
@@ -1675,7 +1727,7 @@ def _persisted_titles(conversation_log: Any, slot_keys: list[str]) -> dict[str, 
     out: dict[str, str] = {}
     for slot_key in slot_keys:
         try:
-            transcript_key = slot_transcript_key(slot_key)
+            transcript_key = transcripts.get(slot_key) or slot_transcript_key(slot_key)
         except Exception:  # pragma: no cover — a key shape no rule recognises
             continue
         if transcript_key not in by_transcript:
@@ -1721,6 +1773,10 @@ async def _with_conversation_titles(request: web.Request, cost: dict[str, Any]) 
     title in module-global cache and keep serving it for the rest of the TTL
     after the conversation was renamed or closed.
     """
+    # Server-side only: off the payload before any return below.
+    transcripts = cost.get("transcripts") or {}
+    if "transcripts" in cost:
+        cost = {k: v for k, v in cost.items() if k != "transcripts"}
     try:
         state = request.app["state"]
     except KeyError:
@@ -1748,7 +1804,9 @@ async def _with_conversation_titles(request: web.Request, cost: dict[str, Any]) 
 
     conversation_log = getattr(state, "conversation_log", None)
     if unresolved and conversation_log is not None:
-        titles.update(await asyncio.to_thread(_persisted_titles, conversation_log, unresolved))
+        titles.update(
+            await asyncio.to_thread(_persisted_titles, conversation_log, unresolved, transcripts)
+        )
 
     rows = []
     for row in conversations:
@@ -1836,7 +1894,9 @@ async def api_beacon_status(request: web.Request) -> web.Response:
             "reason_code": str(info.get("reason_code", "")),
             "endpoint_configured": bool(info.get("endpoint_configured", False)),
             "env_override": beacon.is_env_opted_out(),
-            "env_var": beacon.DISABLE_ENV,
+            # DO_NOT_TRACK when that is what pins it, so the note names the
+            # variable that actually has to be unset.
+            "env_var": beacon.opt_out_env_var(),
             "overlay_override": overlay_override,
             # Resolved inside beacon.status (already on a worker thread) rather
             # than re-evaluated here, so this reports the same verdict that
@@ -1893,6 +1953,8 @@ async def api_collection_status(request: web.Request) -> web.Response:
             "env_var": state.env_var,
             "overlay_override": overlay_override,
             "otlp_configured": state.otlp_configured,
+            # Whether a configured destination is actually sent to now.
+            "export_permitted": state.export_permitted,
             "otlp_destinations": [dict(row) for row in state.otlp_destinations],
             "metrics_dir": str(state.directory),
         }

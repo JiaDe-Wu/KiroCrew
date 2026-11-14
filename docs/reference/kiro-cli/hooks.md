@@ -4,9 +4,9 @@ Source: https://kiro.dev/docs/hooks/, plus its `types` and `actions` subpages
 (fetched 2026-09-06; the former `/docs/cli/hooks/` redirects there — hooks are
 documented as one page across every surface).
 
-> **Carries local additions.** Kiro Crew's fail-closed `PreToolUse` exit contract
-> and its command-length limit have no upstream counterpart. A re-fetch must
-> preserve them.
+> **Carries local additions.** Kiro Crew's fail-closed `PreToolUse` exit contract,
+> its command-length limit and its notes on output size and caching have no
+> upstream counterpart. A re-fetch must preserve them.
 
 Execute custom commands, or inject an agent prompt, at specific points during
 agent lifecycle and tool execution.
@@ -62,10 +62,15 @@ An MCP tool arrives under its namespaced name, such as `@postgres/query`.
   as injected context text rather than denying anything.
 - **Any other exit** — including a timeout, a crash, or an unexecutable
   command:
-  - **PreToolUse**: the tool call is **blocked** (fail closed). A gating hook
-    that cannot deliver a verdict resolves to deny, so breaking, slowing, or
-    deleting a deny hook cannot silently disable the policy it enforces. The
-    block detail prefers `result.error`, then STDERR, then `exited with code N`.
+  - **PreToolUse**, for a hook on Kiro Crew's own Hooks page: the tool call is
+    **blocked** (fail closed). A gating hook that cannot deliver a verdict
+    resolves to deny, so breaking, slowing, or deleting a deny hook cannot
+    silently disable the policy it enforces. The block detail prefers
+    `result.error`, then STDERR, then `exited with code N`.
+  - **PreToolUse**, for an agent-spec hook that Kiro Crew runs itself (see
+    below): kiro-cli's contract holds, so a crash, kill or timeout is a warning
+    and the tool goes ahead. A spec hook that a policy (governance or the shell
+    deny list) refused to run blocks the call, with the refusal as the reason.
   - **All other events**: warn-only — STDERR is shown as a warning and
     execution continues.
 
@@ -97,9 +102,10 @@ Runs when user submits prompt. Receives `prompt` field. Exit 0 → STDOUT added 
 
 ### PreToolUse
 Runs before tool execution and gates the tool call: exit 0 allows, exit 2
-denies, and **any other exit** (timeout, crash, unexecutable command) also
-blocks the tool — a hook that cannot deliver a verdict fails closed. Receives
-`tool_name`, `tool_input`.
+denies. On a Kiro Crew Hooks-page hook, **any other exit** (timeout, crash,
+unexecutable command) also blocks the tool — a hook that cannot deliver a
+verdict fails closed; an agent-spec hook keeps kiro-cli's warn-and-continue
+contract (see Hook output). Receives `tool_name`, `tool_input`.
 
 ### PostToolUse
 Runs after tool execution. Receives `tool_name`, `tool_input`, `tool_response`.
@@ -131,6 +137,17 @@ matcher, the command's length and its limit.
 To run longer logic, put it in a script file and call that script from the
 hook, for example `"command": "~/.kiro/hooks/check.sh"`.
 
+## Output size (Kiro Crew)
+
+Where Kiro Crew runs an agent's spec hooks itself (KAS, goose, opencode and
+strands, and claude and codex for every event but `preToolUse`), an object-form hook's
+`max_output_size` cuts its STDOUT at that many UTF-8 bytes, after redaction,
+and appends a truncation marker. Every hook's stream is capped at 64 KiB as
+well, so a larger value, or none, leaves that cap.
+
 ## Caching
 
 `cache_ttl_seconds`: 0 = no caching (default), >0 = cache successful results. AgentSpawn hooks never cached.
+
+Where Kiro Crew runs an agent's spec hooks itself, `cache_ttl_seconds` is not
+honoured: the hook runs on every event, and the log names it once.

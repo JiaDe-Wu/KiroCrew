@@ -94,6 +94,7 @@ def _expand_header_placeholders(
         _ENV_VAR_PLACEHOLDER,
         _expand_env_placeholders,
         _placeholder_source_env,
+        _placeholder_value,
     )
 
     source = _placeholder_source_env()
@@ -105,7 +106,7 @@ def _expand_header_placeholders(
                 # The same lookup _expand_env_placeholders performs against the
                 # same source view; a miss stays literal and contributes no
                 # scrub entry (the literal is not a secret).
-                hit = source.get(match.group(1))
+                hit = _placeholder_value(source, match.group(1))
                 if hit is not None:
                     resolved.append(hit)
             expanded[name] = _expand_env_placeholders(value, source=source)
@@ -303,6 +304,21 @@ async def _runtime_grant_present(
     return None
 
 
+async def _record_grant_presence(server: McpServerInfo) -> None:
+    """Set ``auth_grant_present``: Crew's vault when Crew holds the sign-in, else the runtimes'."""
+    from kiro_crew.connections import crew_oauth
+
+    if await asyncio.to_thread(crew_oauth.owns, server.name):
+        # Crew serves this server to KAS chats through its proxy, so kiro-cli's
+        # cache and the KAS vault are not where its grant lives.
+        server.auth_crew_held = True
+        server.auth_grant_present = await asyncio.to_thread(crew_oauth.holds_grant, server.name)
+        return
+    server.auth_grant_present = await _runtime_grant_present(
+        server.url, server.name, has_headers=bool(server.headers)
+    )
+
+
 async def _probe_remote(
     server: McpServerInfo, *, protocol_version: str = MCP_CLIENT_PROTOCOL_VERSION
 ) -> McpServerInfo:
@@ -317,6 +333,7 @@ async def _probe_remote(
     # required" for a server that never asked for one.
     server.auth_challenge = False
     server.auth_grant_present = None
+    server.auth_crew_held = False
     refusal = remote_header_secret_ref_error(server.headers)
     if refusal:
         # Not contacted: the header would reach the server as the literal
@@ -422,9 +439,7 @@ async def _probe_remote(
                         # own rule that the access owing a trail is the one a
                         # caller ACTS on.
                         if server.auth_challenge:
-                            server.auth_grant_present = await _runtime_grant_present(
-                                server.url, server.name, has_headers=bool(server.headers)
-                            )
+                            await _record_grant_presence(server)
                     else:
                         server.status = "error"
                         server.error = _redirect_error(resp.status, resp.headers, server.url)

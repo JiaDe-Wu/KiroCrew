@@ -6,7 +6,7 @@ const path = require("path");
 const { createTokenRetryHandler, dashboardRetryPath, loadDashboardWithToken } = require("./token-retry");
 const { createRendererRecovery, withSafeReload, hasSafeReload } = require("./renderer-recovery");
 const { createRendererExhaustedNotice } = require("./renderer-exhausted-notice");
-const { createHangRecovery } = require("./hang-recovery");
+const { createHangRecovery, endHungRenderer } = require("./hang-recovery");
 const { armSplashHistoryClear, fileShellPageBasename } = require("./splash-history");
 const { armSwipeHistory, browserPanelUnderCursor } = require("./swipe-history");
 const { armScrollTouch } = require("./scroll-touch");
@@ -33,6 +33,7 @@ const { attachContextMenu } = require("./context-menu");
 const {
   TUNNEL_OPTION_LABEL,
   parseRemoteCrewFields,
+  remoteCrewDraft,
   saveRemoteCrewConfig,
   tunnelOptionHint,
 } = require("./remote-crew-setup");
@@ -302,6 +303,8 @@ function createWindowLifecycle(options) {
   function setupWindowContents(win, windowBackendUrl) {
     const windowPort = defaultedPort(windowBackendUrl);
     let customName = null;
+    // isGatewayLocalForWindow reads this.
+    win._mcBackendUrl = windowBackendUrl;
 
     const view = new WebContentsView({
       webPreferences: {
@@ -312,6 +315,19 @@ function createWindowLifecycle(options) {
         // The preload reads this argument to reserve caption-control space.
         additionalArguments: LINUX_FRAMELESS ? ["--kc-linux-frameless"] : [],
       },
+    });
+    // The preload asks this on every load, so a crew configured or cleared for
+    // the port applies from the next load. The ask is synchronous: the listener
+    // is on this view's own WebContents before anything loads, and every path
+    // answers, so the renderer never waits on a reply that does not come.
+    view.webContents.ipc.on("dashboard:is-remote-gateway", (event) => {
+      let remote = true;
+      try {
+        remote = !isGatewayLocalForWindow(win);
+      } catch (err) {
+        glog(`dashboard:is-remote-gateway: ${err && err.message}`);
+      }
+      event.returnValue = remote;
     });
     view.setBackgroundColor("#00000000");
     win.contentView.addChildView(view);
@@ -398,9 +414,9 @@ function createWindowLifecycle(options) {
       scheduleFullscreenSettle();
     });
 
-    // DOM fullscreen is separate from native window fullscreen. Bridge it so a
-    // video can grow the BaseWindow, and retain provenance so persistence never
-    // mistakes a video-raised transition for the user's launch preference.
+    // Electron raises the BaseWindow when a page element goes DOM-fullscreen.
+    // Retain who raised it, so persistence never mistakes a video-raised
+    // transition for the user's launch preference.
     win._mcHtmlFullScreen = attachHtmlFullScreen({
       win,
       webContents: view.webContents,
@@ -472,7 +488,6 @@ function createWindowLifecycle(options) {
       applyTitle();
     };
     win._mcGetCustomName = () => customName;
-    win._mcBackendUrl = windowBackendUrl;
     // The dashboard SPA is a capture surface (the chat composer's snip and the
     // web-preview crop). Registered against the gateway origin THIS window was
     // opened on, so a secondary window pointed at a remote gateway is bound to
@@ -731,7 +746,11 @@ function createWindowLifecycle(options) {
     };
     mainWindow.on("resize", persistDebounced);
     mainWindow.on("move", persistDebounced);
-    mainWindow.on("enter-full-screen", persist);
+    // Entering fullscreen is persisted after the debounce, not inside the emit:
+    // whether a page or the user raised the window is only known once both of
+    // Electron's events for the raise have landed, and their order differs by
+    // platform.
+    mainWindow.on("enter-full-screen", persistDebounced);
     mainWindow.on("leave-full-screen", persist);
 
     // Journal the terminal events so a stalled transition is legible in
@@ -914,7 +933,10 @@ function createWindowLifecycle(options) {
       log: glog,
       forceCrash: () => {
         if (mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return;
-        mainWindow.webContents.forcefullyCrashRenderer();
+        const outcome = endHungRenderer(mainWindow.webContents, {
+          underTranslation: process.platform === "darwin" && app.runningUnderARM64Translation === true,
+        });
+        if (outcome !== "force-crashed") glog(`hung renderer under Rosetta: ${outcome} by pid`);
       },
     });
     mainWindow.webContents.on("unresponsive", () => hangRecovery.handleUnresponsive());
@@ -1110,12 +1132,12 @@ function createWindowLifecycle(options) {
     const currentBin = config?.binPath || DEFAULT_REMOTE_BIN;
     const currentRemotePort = config?.remotePort || "";
     const currentRemotePath = config?.remotePath || "";
-    const currentManageTunnel = config?.manageTunnel === true;
     // The app keeps a tunnel only for the port it launched on, so this form
     // offers the option there alone; for any other tab it carries the stored
     // choice over unchanged.
     const isLaunchPort = String(focusedPort) === String(port);
     const offerTunnel = isLaunchPort && !IS_WINDOWS;
+    const currentManageTunnel = remoteCrewDraft(config || {}, { tunnelByDefault: offerTunnel }).manageTunnel;
 
     const css = await getModalCSS();
     const esc = (value) => value
@@ -1163,7 +1185,8 @@ function createWindowLifecycle(options) {
           window.close();
         }
         document.addEventListener('keydown', event => {
-          if (event.key === 'Enter') save();
+          // Enter on a focused button is that button's own press: Cancel must not save.
+          if (event.key === 'Enter' && !(event.target instanceof HTMLButtonElement)) save();
           if (event.key === 'Escape') window.close();
         });
       </script>
@@ -1516,28 +1539,46 @@ function createWindowLifecycle(options) {
     return appMenu;
   }
 
-  function menuItems(sender, id) {
+  // senderIsLocal is threaded down from the ipc-registrar boundary the same
+  // way it reaches `executeMenu` — computed once via `assertLocalDashboard`
+  // and cached per WebContents, then handed here. `serializeMenuItems`
+  // marks LOCAL_ONLY leaves `enabled: false` for a remote sender so a
+  // connection window paints a greyed row rather than an enabled one that
+  // silently no-ops when clicked. Strict `=== true` matches the fail-closed
+  // rule executeMenuItem uses.
+  function menuItems(sender, id, senderIsLocal) {
     if (!IS_WINDOWS || !WINDOWS_TITLEBAR_MENU_IDS.has(id)) return [];
     const menu = appMenu || Menu.getApplicationMenu();
     const item = menu && menu.getMenuItemById(id);
     const win = windowForWebContents(sender);
     if (!item || !item.submenu || !win || win.isDestroyed()) return [];
-    return serializeMenuItems(item.submenu);
+    return serializeMenuItems(item, senderIsLocal === true);
   }
 
-  function executeMenu(sender, id, index) {
+  // Returns whether the click DISPATCHED. `app-menu:execute` answers the
+  // renderer with it, and the renderer refetches its rows on a `false` — so a
+  // bare `return` here (reporting `undefined` for a guard refusal) would
+  // silently become "dispatched" at the strict check on the IPC boundary. Every
+  // exit says so explicitly.
+  function executeMenu(sender, id, index, senderIsLocal) {
     if (
       !IS_WINDOWS
       || !WINDOWS_TITLEBAR_MENU_IDS.has(id)
       || !Number.isInteger(index)
-    ) return;
+    ) return false;
     const menu = appMenu || Menu.getApplicationMenu();
     const topLevelItem = menu && menu.getMenuItemById(id);
     const win = windowForWebContents(sender);
-    if (!win || win.isDestroyed()) return;
+    if (!win || win.isDestroyed()) return false;
     // sender is the focused dashboard WebContents: titlebar menu interaction
     // itself gives it focus, which is what Electron role items expect.
-    executeMenuItem(topLevelItem, index, win, sender);
+    //
+    // `senderIsLocal` is computed once at the IPC boundary in
+    // ipc-registrar.js via `assertLocalDashboard` (origin + local-gateway +
+    // primary-port-owner). Forwarded here with strict `=== true` so any
+    // non-boolean (undefined from a caller that forgot the arg, a truthy
+    // proxy, a stringy value) drops to the LOCAL_ONLY refusal branch.
+    return executeMenuItem(topLevelItem, index, win, sender, senderIsLocal === true);
   }
 
   function setDevMode(enabled) {

@@ -16,7 +16,8 @@ import { ArtifactChatPanel } from '../components/ArtifactChatPanel'
 import { CommentThreadPopover } from '../components/CommentThreadPopover'
 // Artifact body renderers, extracted here so the chat side panel shares them.
 import { ArtifactBodyNative, ArtifactBodyIframe, ArtifactBodyImage } from '../components/ArtifactBody'
-import { PublishHub, publishNoticeKey } from '../components/PublishHub'
+import { PublishHub } from '../components/PublishHub'
+import { publishNoticeKey } from '../lib/publishHelpers'
 import type { Artifact, ArtifactEvent, ArtifactComment } from '../types'
 
 import { i18nT } from '../i18n/t'
@@ -453,6 +454,7 @@ export function ArtifactDetailPageBody({
           <span className="min-w-0 flex-1">{i18nT(publishNoticeKey({
             rolling_out: 'pages.artifactDetailPage.publication_still_rolling_out',
             distribution_disabled: 'pages.artifactDetailPage.publication_distribution_disabled',
+            origin_mismatch: 'pages.artifactDetailPage.publication_origin_mismatch',
             notice_generic: 'pages.artifactDetailPage.publication_notice_generic',
           }, artifact.publication.notice_code))}</span>
           {/* A notice is recorded once, at publish time, and the ordinary happy path
@@ -531,6 +533,9 @@ export function ArtifactDetailPageBody({
               ref={bodyRef}
               className="relative"
               style={contentWidthStyle}
+              // cli-mode.css anchors its chat rules here when the reading-width
+              // style is set (see its header).
+              data-chat-scope={contentWidthStyle ? '' : undefined}
             >
               <CodeCommentsScope
                 commentable={commentable} isMarkdown={artifact.kind === 'markdown'}
@@ -620,8 +625,10 @@ export function ArtifactDetailPageBody({
             {/* IN THIS COLUMN, its only mount: the remedy names the composer below it, and a
                 page-top banner puts that instruction a column away from the control it means. */}
             {contextNotice}
+            {/* Not until the create returns: the gateway lists the new session before it
+                answers, and a chat mounted from that frame never reads the prompt staged after. */}
             <ArtifactChatPanel
-              slotKey={boundSlot?.key ?? null}
+              slotKey={chatCreating ? null : boundSlot?.key ?? null}
               creating={chatCreating}
               onNewChat={() => { void newCompanionChat() }}
               onOpenFull={openChatFull}

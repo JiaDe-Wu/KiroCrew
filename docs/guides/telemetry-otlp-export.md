@@ -7,21 +7,22 @@ pushing the same metrics to an **OpenTelemetry Collector**, and from there to
 whatever backend you already run (Amazon CloudWatch, Datadog, or any service that
 accepts OTLP).
 
-Nothing here is on by default, and turning it on takes two separate decisions:
-collection, then egress.
+Local recording is on by default; export is not. Sending metrics anywhere takes
+two separate decisions: an explicit opt-in to collection, then egress.
 
 ## Default posture
 
 | | Default | What it means |
 |---|---|---|
-| `telemetry.enabled` | `false` | Nothing is recorded. Metric call sites are cheap no-ops. |
+| `telemetry.enabled` | `true` | Metrics are recorded to the local JSONL sink only. The default alone never permits export: egress needs `"enabled": true` written in a config file, or `KIROCREW_TELEMETRY=1`. Turning it off (`false`, `KIROCREW_TELEMETRY=0`, `DO_NOT_TRACK=1`, or `kirocrew telemetry disable`) makes metric call sites cheap no-ops. |
 | `telemetry.otlp_endpoint` | `""` (empty) | Nothing leaves the machine. Local JSONL sink only. |
 | `telemetry.otlp_endpoints` | `[]` (empty) | Same: no extra collectors. See [Several collectors](#several-collectors-otlp_endpoints). |
 | OTLP exporter package | not installed | The OTLP exporter is not importable until installed separately. |
 
-Collection and egress are deliberately separate switches. Enabling collection
-gives you the local sink and the Telemetry panel; it does **not** send anything
-anywhere. Egress needs the endpoint set *and* the exporter package installed.
+Collection and egress are deliberately separate switches. Collection gives you
+the local sink and the Telemetry panel; it does **not** send anything anywhere.
+Egress needs the endpoint set, the exporter package installed, *and* collection
+turned on explicitly rather than by default.
 
 The local sink is never replaced by OTLP — it is additive. When you configure an
 endpoint you get both readers, so the dashboard keeps working and you keep a
@@ -52,9 +53,10 @@ OTLP receiver's `http` protocol enabled (port 4318 by convention, not 4317).
 If the exporter package is missing but an endpoint is configured, Kiro Crew logs
 a warning and stays local-only rather than failing to start.
 
-### 2. Enable collection
+### 2. Opt in to collection explicitly
 
-Either edit `~/.kiro/crew/config.json`:
+Recording is on by default, but a default never permits export: write the
+switch yourself. Either edit `~/.kiro/crew/config.json`:
 
 ```json
 {
@@ -126,15 +128,14 @@ as above; the list adds to it.
 | `name` | no | Shown in logs and in Settings -> Privacy instead of the URL. Letters, digits, `.`, `_`, `-`; at most 64 characters. Defaults to `otlp_endpoints.<index>`. |
 | `enabled` | no | `false` turns the entry off. A disabled entry is not checked. |
 | `headers_env` | no | Header name -> environment variable name. The value is read from the gateway's environment when the exporter is built, so a secret is never in `config.json`. If the variable is unset or blank, that entry sends nothing and a warning names the variable. There is no key for a literal header value: an entry with a `headers` key is skipped with a warning that points here. |
-| `temporality` | no | `""` (the default described in [Temporality](#temporality-the-setting-that-decides-whether-your-backend-accepts-the-data)), `"cumulative"` or `"delta"`. A value here pins every instrument kind for this entry only, and `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` no longer moves it. `"delta"` is the OpenTelemetry delta preset: counters and histograms delta, up-down counters cumulative. |
+| `temporality` | no | `""` (the default described in [Temporality](#temporality-the-setting-that-decides-whether-your-backend-accepts-the-data)), `"cumulative"` or `"delta"`. A value here pins every instrument kind for this entry only, and `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` does not move it. `"delta"` is the OpenTelemetry delta preset: counters and histograms delta, up-down counters cumulative. |
 | `allow` | no | A list of full metric names, or the preset name `"PRODUCT_METRICS"` (the reviewed list in `src/kiro_crew/metrics/product_metrics.py`). Without it the entry gets every metric. An unknown preset name refuses the entry rather than sending everything. |
 | `point_attributes` | no | Fixed labels added to every data point of this entry. Keys come from a reviewed set (`ClientType` today); values are short constants (letters, digits, `.`, `_`, `-`). |
 | `resource_allow` | no | Keep only these resource keys on this entry's batches. |
 
 An entry sends only the headers it names in `headers_env`. The process-wide
 `OTEL_EXPORTER_OTLP_METRICS_HEADERS` / `OTEL_EXPORTER_OTLP_HEADERS` variables, and
-the OpenTelemetry credential-provider variable, apply to `otlp_endpoint` only, as
-they did before the list existed. A list entry with no `headers_env` sends no
+the OpenTelemetry credential-provider variable, apply to `otlp_endpoint` only. A list entry with no `headers_env` sends no
 authentication at all, so a credential you set for one collector never reaches a
 second host you add later. To send the same credential to a list entry, name its
 variable in that entry's `headers_env`.
@@ -151,6 +152,15 @@ An entry counts there even while it sends nothing for a reason that can clear on
 its own, such as an unset `headers_env` variable. The list, like `otlp_endpoint`,
 can only be set in `config.json`, not from the dashboard.
 
+#### LTS build: the policy names the collector
+
+In an LTS build your `telemetry.otlp_endpoint` and `telemetry.otlp_endpoints`
+are ignored. The admin's security policy names the collector instead, as
+`capabilities.telemetry.otlp_endpoint`, and metrics go there (still only while
+collection is on). With no endpoint in the policy, no metrics leave the machine.
+The LTS build also sends no daily heartbeat, install receipt or
+feedback survey, and does not show the first-run Privacy chapter.
+
 #### Collectors a build ships
 
 A build of Kiro Crew can ship a collector of its own. It does so in code, through
@@ -165,8 +175,8 @@ your `config.json`; the public build ships none. What that means for you:
 - It never bypasses the gates above. Turning collection off stops it, and a
   policy can refuse its host.
 
-An enterprise build ignores `otlp_endpoint` and `otlp_endpoints` from local
-config, as it ignores `otlp_endpoint` today; collectors the build ships still
+An LTS build ignores `otlp_endpoint` and `otlp_endpoints` from local
+config; collectors the build ships still
 apply, under the policy.
 
 ### Other settings worth knowing
@@ -175,8 +185,8 @@ apply, under the policy.
 |---|---|---|
 | `telemetry.export_interval_seconds` | `60` | Applies to both readers. |
 | `telemetry.local_dir` | `~/.kiro/crew/metrics` | Local JSONL shard directory. |
-| `telemetry.retention_days` | `0` | `0` never prunes by age. |
-| `telemetry.max_total_mb` | `0` | `0` never prunes by size. |
+| `telemetry.retention_days` | `30` | `0` never prunes by age. |
+| `telemetry.max_total_mb` | `100` | `0` never prunes by size. |
 
 ## Temporality: the setting that decides whether your backend accepts the data
 
@@ -438,9 +448,10 @@ every attribute value on it comes from a closed set. Histograms,
 |---|---|
 | Sessions and turns | `session.started`, `session.idle_expired`, `subagent.spawned`, `subagent.completed`, `context.compactions`, `turn.completed`, `turn.timeout.cause` |
 | Crew sessions | `crew.session.started`, `crew.turn.started`, `crew.session.tree.depth`, `crew.session.tree.child`, `crew.session_control.calls` |
-| Work ledger and Ultra Mode | `work.created`, `work.item_closed`, `work.dispatches`, `work.reports`, `crew_mode.turned_on`, `crew_mode.new_chats`, `crew_mode.runs_finished`, `crew_mode.steers_per_run`, `crew_mode.worker_waits` |
+| Work ledger and conductor mode | `work.created`, `work.item_closed`, `work.dispatches`, `work.reports`, `crew_mode.turned_on`, `crew_mode.new_chats`, `crew_mode.runs_finished`, `crew_mode.steers_per_run`, `crew_mode.worker_waits` |
 | Features | `cron.fires`, `artifact.created`, `workflow.runs`, `approval.decisions`, `autonudge.loops.started`, `autonudge.loops.stopped`, `autonudge.ticks`, `monitor.decisions`, `webhook.requests`, `memory.recalled`, `lesson.injected`, `skill.lazy_load.count`, `app.task.completed`, `channel.message.received`, `ui.control.clicked` |
-| Inventory (gauges) | `inventory.crons.active`, `inventory.monitor_loops.active`, `inventory.skills.installed`, `inventory.memory.migrated`, `inventory.knowledge.documents`, `inventory.lessons`, `inventory.mcp.servers`, `inventory.config.toggle`, `inventory.probe.failures`, `inventory.members` |
+| Inventory (gauges) | `inventory.crons.active`, `inventory.monitor_loops.active`, `inventory.skills.installed`, `inventory.memory.migrated`, `inventory.knowledge.documents`, `inventory.lessons`, `inventory.mcp.servers`, `inventory.config.toggle`, `inventory.probe.failures`, `inventory.members`, `inventory.voice.provider` |
+| Voice | `voice.stt.started`, `voice.stt.ended`, `voice.stt.errors`, `voice.unavailable`, `voice.tts.replies` |
 | Recommendations | `tips.feedback`, `feature_video.status`, `milestone.panel_opened`, `milestone.starter_clicked`, `milestone.reached`, `milestone.skipped`, `milestone.mark_all_done`, `milestone.notice_shown`, `milestone.features_completed` |
 
 `PRODUCT_METRICS` groups its names by the question they answer. One group covers
@@ -448,7 +459,7 @@ in-product recommendations (feature tips, the Explore panel, feature videos):
 
 | Metric | Attributes |
 |---|---|
-| `kirocrew.tips.feedback` | `Feature` = `tips`, `Activity` (the action: `shown` / `ack` / `dismiss` / `snooze` / `helpful` / `optout` / `optin` / `other`), `Entity` (a shipped feature doc name or `other`), `source` (`curated` / `catalog` / `generated` / `other`) |
+| `kirocrew.tips.feedback` | `Feature` = `tips`, `Activity` (the action: `shown` / `ack` / `dismiss` / `snooze` / `helpful` / `optout` / `optin` / `other`), `Entity` (a shipped curated tip id, a shipped feature doc name, or `other`), `source` (`curated` / `catalog` / `generated` / `other`) |
 | `kirocrew.feature_video.status` | `Feature` = `feature_video`, `Activity` (the status: `seen` / `dismissed` / `other`), `Entity` (a shipped feature key or `other`) |
 | `kirocrew.milestone.starter_clicked`, `.skipped` | `Feature` = `milestone`, `Activity` = the last name segment, `Entity` (a catalog milestone id, `all` or `other`), `surface`, and `send` on `starter_clicked` |
 | `kirocrew.milestone.reached` | `Feature` = `milestone`, `Activity` = `reached`, `Entity` (a catalog milestone id), `group`, `via`, `recommended_by` (`tip` / `explore` / `video` / `several` / `none`) |
@@ -461,6 +472,21 @@ collector can admit user behavior by scope without taking the inventory gauges.
 Every other metric uses the scope `kiro_crew`. `Feature` and `Activity` are
 constants or values the emit site already closed; `Entity` carries the closed
 target id that earlier releases sent as `feature` or `milestone`.
+
+The voice group (`src/kiro_crew/metrics/voice.py`) answers what a speech
+provider's own backend cannot: which provider each install uses, and how
+dictation and spoken replies end. `provider` is a built-in name, `registered` for
+a provider an edition registers through the speech seam, or `other`. Latency and
+length are bucket attributes, because the preset takes no histograms.
+
+| Metric | Attributes |
+|---|---|
+| `kirocrew.inventory.voice.provider` | `kind` (`stt` / `tts`), `provider`; value 1 |
+| `kirocrew.voice.stt.started` | `provider` |
+| `kirocrew.voice.stt.ended` | `provider`, `outcome` (`ok` / `error` / `timeout` / `refused` / `other`), `duration` (`lt_10s` … `gt_60m`), `first_partial` (`lt_500ms` … `gt_5s` / `none`), `transcript` (`nonempty` / `empty`) |
+| `kirocrew.voice.stt.errors` | `provider`, `code` (a dictation error code or `other`) |
+| `kirocrew.voice.unavailable` | `reason` (`forbidden_origin` / `stt_disabled` / `provider_off` / `streaming_off` / `provider_not_streaming` / `busy` / `other`) |
+| `kirocrew.voice.tts.replies` | `provider`, `outcome` (`ok` / `cancelled` / `busy` / `invalid` / `unavailable` / `sandbox_refused` / `error`), `first_audio` (`lt_500ms` … `gt_5s` / `none`) |
 
 None carries a tip id, a video id, a timestamp or tip text. `recommended_by` is
 computed on the machine from a 14-day local record and only the label is sent;
@@ -486,8 +512,9 @@ continuity is unavailable on that broken host.
 
 ### What these can and cannot tell you
 
-They describe **the machines you run and have opted in**, and nothing wider. Both
-switches default off and OTLP additionally needs the optional exporter package,
+They describe **the machines you run and have opted in**, and nothing wider.
+Export needs an explicit opt-in and an endpoint, and OTLP additionally needs the
+optional exporter package,
 so an aggregate over these gauges is a statement about your own fleet — useful
 for spotting a host that stopped scheduling crons or whose skills tree drifted,
 not a measurement of how a feature is used in general. Kiro Crew's own install
@@ -502,15 +529,13 @@ once per process. If you see process metrics from a host but no inventory metric
 the gateway on that host is not running or not exporting — that is the signal, not
 a gap in collection.
 
-### Traces are not exported
+### Traces have their own settings
 
-Kiro Crew emits the OpenTelemetry **metrics** signal only. There are no spans
-and no log records, so a trace-oriented backend (Langfuse, Jaeger, Tempo, or a
-vendor's trace view) receives nothing from it, and nothing in this page turns
-traces on. Pointing `otlp_endpoint` at a `/v1/traces` or `/v1/logs` URL does not
-change that: the collector rejects every metric batch. The gateway logs a
-warning naming the destination when the endpoint's path is one of those routes.
-Trace support is tracked in issue #1643.
+This page covers the **metrics** signal. Traces are a separate switch and
+endpoint: see [telemetry-otlp-traces.md](telemetry-otlp-traces.md). Pointing
+`otlp_endpoint` at a `/v1/traces` or `/v1/logs` URL sends metrics there, which the
+collector rejects; the gateway logs a warning naming the destination when the
+endpoint's path is one of those routes. There are no log records.
 
 ### What is deliberately not exported
 
@@ -607,10 +632,11 @@ the collector, or temporality — not collection.
 | Symptom | Likely cause |
 |---|---|
 | No `telemetry OTLP export active` line | `otlp_endpoint` empty, or the OTLP exporter package is not installed — check for the warning naming the missing package. |
+| `telemetry export waits for an explicit opt-in to recording` | Recording is on by default, and a default does not permit export. Write `"enabled": true` under `telemetry` in `config.json`, or set `KIROCREW_TELEMETRY=1`. |
 | `OTLP exporter init failed` warning | Malformed endpoint. The message deliberately omits the URL, since it can carry a credential. |
 | Local shards fill, nothing at the backend | Endpoint missing `/v1/metrics`, collector on 4317 (gRPC) instead of 4318 (HTTP), or the collector's `http` protocol not enabled. |
-| `points at an OTLP traces route` warning | The endpoint ends in `/v1/traces` (or `/v1/logs`). Kiro Crew exports metrics only, so a trace backend such as Langfuse receives nothing. See "Traces are not exported". |
+| `points at an OTLP traces route` warning | The endpoint ends in `/v1/traces` (or `/v1/logs`). This setting exports metrics only, so a trace backend such as Langfuse receives nothing. Traces use `telemetry.traces_otlp_endpoint`; see [Traces have their own settings](#traces-have-their-own-settings). |
 | Metrics arrive but counters look like resets | Temporality mismatch. See the temporality section. |
 | `unknown type: "awsemf"` at collector startup | Running the core `otelcol`; vendor exporters need `otelcol-contrib`. |
 | One expected series is absent | That probe could not read its source. Absence is a gap, never a zero. |
-| Nothing recorded at all | Collection consent: `telemetry.enabled` is `false` and `KIROCREW_TELEMETRY` is unset. |
+| Nothing recorded at all | Collection is off: `telemetry.enabled` is `false`, `KIROCREW_TELEMETRY` is `0`, or `DO_NOT_TRACK` is set. |

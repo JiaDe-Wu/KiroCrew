@@ -206,6 +206,18 @@ def test_non_git_project_shows_its_folder_without_a_worktree(tmp_path, audits):
     assert h.client.of("remove_view") == []
 
 
+def test_a_git_file_naming_a_missing_gitdir_records_and_audits_that_reason(tmp_path, audits):
+    folder = tmp_path / "linked"
+    folder.mkdir()
+    (folder / ".git").write_text(f"gitdir: {tmp_path / 'gone'}\n", newline="\n")
+    h = Harness(tmp_path)
+    rec = h.run(h.svc.ensure(FakeBinding("C1", project_dir=str(folder))))
+    assert rec.worktree_skipped == "broken_gitfile" and rec.worktree == ""
+    assert service.worktree_settled(rec)
+    rows = [a for a in audits if a[0] == "code_channel_worktree"]
+    assert rows[-1][1] == "denied" and rows[-1][3].startswith("broken_gitfile: fatal:")
+
+
 def test_git_project_gets_a_fresh_worktree_off_main_despite_a_dirty_checkout(
     tmp_path, repo, audits
 ):
@@ -1076,7 +1088,7 @@ def test_a_git_timeout_finding_the_repo_is_counted_too(tmp_path, repo, audits, m
         tries.append(1)
         raise subprocess.TimeoutExpired(["git", "rev-parse"], 30)
 
-    monkeypatch.setattr(git_ops, "toplevel", slow)
+    monkeypatch.setattr(git_ops, "toplevel_or_refusal", slow)
     for _ in range(5):
         rec = h.run(h.svc.ensure(binding))
         assert rec is not None and rec.worktree_skipped == "worktree_timeout"
@@ -1310,6 +1322,44 @@ def test_a_turn_that_does_not_end_schedules_nothing(tmp_path, repo, audits, monk
     dash._slots["chat-elsewhere"].turn_running = False
     h.run(h.svc.watch_tick(dash))
     assert calls == [1]
+
+
+def test_a_suspended_channel_stays_suspended_while_its_workers_run(
+    tmp_path, repo, audits, monkeypatch
+):
+    """The agent's ``suspended`` outlasts its turn end and the workers' turns: only
+    the next bound turn (its start) hands the status back."""
+    from kiro_crew.slack.code_channels import status
+
+    h, dash, _made, statuses = _conductor_harness(tmp_path, monkeypatch)
+    folder_id, _wt = h.run(
+        h.svc.plan_session(
+            dash,
+            channel_id="C1",
+            team_id="T1",
+            title="t",
+            channel_name="c",
+            project_dir=str(repo),
+            parent_folder_id="F0",
+        )
+    )
+    worker = dash.add_slot("chat-worker", folder_id, running=True)
+    status.hold_after_turn("C1", "suspended")
+    try:
+        h.run(status._on_end(FakeBinding("C1", session_key="chat-conductor"), None))
+        h.run(h.svc.watch_tick(dash))  # a worker runs while the agent waits
+        worker.turn_running = False
+        h.run(h.svc.watch_tick(dash))
+        assert [s for s in statuses if s[0] == "C1"] == []
+        h.run(status._on_start(FakeBinding("C1", session_key="chat-conductor"), None))
+        assert "C1" not in status._held
+        # Once the hold is gone, a worker still running shows "Working..." again.
+        h.run(status._on_end(FakeBinding("C1", session_key="chat-conductor"), None))
+        worker.turn_running = True
+        h.run(h.svc.watch_tick(dash))
+        assert statuses[-1] == ("C1", "processing")
+    finally:
+        status.hold_after_turn("C1", None)
 
 
 def test_a_bound_turn_between_watch_passes_does_not_strand_a_running_worker_at_ready(
@@ -1615,7 +1665,8 @@ def test_the_folder_reuse_scan_resolves_paths_off_the_event_loop(tmp_path, monke
 
 # ── outbound redaction ──────────────────────────────────────────────────────
 
-_FAKE_KEY = "AKIA" + "IOSFODNN7EXAMPLE"
+# A synthetic 40-character AWS secret, split so no source line spells one.
+_FAKE_KEY = "Qh4Tm2Vx9KpRc/Z8Nw3Hd/" + "Jf1Lb5Gs0Ye9Ua2WkE"
 
 
 def test_a_credential_written_into_a_file_never_reaches_slack(tmp_path, repo, audits):

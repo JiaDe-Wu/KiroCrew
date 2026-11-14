@@ -68,6 +68,29 @@ of excerpts from the last three days (headings, bullets and each paragraph's
 first line), and the body arrives only when `memory_recall`
 asks for it.
 
+### Narrowing a recall by kind and time
+
+`memory_recall` also takes four optional arguments. Leave them out and the answer
+is the one it always gave.
+
+| Argument | Meaning |
+|---|---|
+| `kind` | `fact`, `episode` or `lesson`: return only that part of the answer. |
+| `since`, `until` | Keep what was written in the half-open range `[since, until)`: an episode by when it was recorded, a fact by when its current value was set (rewriting a fact moves that time). An ISO date means midnight UTC, so "October" is `since=2026-10-01`, `until=2026-11-01`. |
+| `as_of` | Keep what was valid at that moment, judged by the same validity check recall applies now. A fact with a validity window counts only inside it (`valid_from` up to, not including, `valid_until`), so a fact whose window has since closed is found by a date inside it. A fact with no window counts from when its current value was set, so one rewritten after that moment is not returned for it. |
+
+Time filters apply to facts and episodes. Lessons are standing rules, so time
+filters beside `kind=lesson` are dropped, and a timed query without a `kind` leaves
+the lessons block out. A malformed or conflicting filter (an unknown `kind`, a date
+that does not parse, `since` not earlier than `until`) is never a refusal: it is
+dropped, the recall runs without it, and the answer carries a warning saying what
+was ignored (a `Warning:` line from the tool, a `warning` field from the dashboard
+route). Valid filters beside a dropped one still apply. A fact that was replaced or forgotten is removed from the store,
+so `as_of` cannot find it; its history stays in the revision log. Pages from the
+Markdown notebook carry no dates, so a timed query does not search them. The
+filters narrow the ranked candidates: a date range asks for the best matches inside
+it, not for every record in it.
+
 ### Lessons
 
 Corrections and rules you teach Kiro Crew. Two ways to create:
@@ -112,6 +135,13 @@ Switches that change what is written or injected:
 | `memory.writes_enabled: false` | No automatic writes | Unchanged |
 | `memory.lesson_extraction_enabled: false` | No extracted lessons; other writes and `learn_add` unchanged | Unchanged |
 | `memory.kind_routing: "enforce"` | Consolidation skips a `state` fact; facts and events are written as before (`"shadow"` only logs; default `"off"` does neither) | Unchanged |
+| `memory.lesson_origin_gate: "enforce"` | A lesson from turns no person sent is saved as an `on_topic` finding, never a standing rule (`"shadow"` only counts; default `"off"` does neither) | Unchanged |
+| `memory.lesson_tier_policy: "enforce"` | A new consolidation lesson is a standing rule only when your own words in a message back it; otherwise it is saved as an `on_topic` finding (`"shadow"` only counts; default `"off"` does neither) | Unchanged |
+| `memory.lesson_fold: "enforce"` | Unchanged | A rule that repeats another one takes no room in the rule block; the block says how many were folded, `learn_list` shows all, and rules you taught are never folded (`"shadow"` only records what would fold; default `"off"` does neither) |
+| `memory.rule_authority_order: "enforce"` | Unchanged | Rules saved as yours (`learn_add`, dashboard, CLI) come first in the rule block, then inferred rules (`"shadow"` only records what would change; default `"off"` does neither) |
+| `memory.member_lesson_dedup: "enforce"` | A private store skips a lesson that copies a stored one, and retires a new near-copy before a dashboard turn sees it (turning it off restores them); lessons you taught are never folded (`"shadow"` only counts; default `"off"` does neither) | Unchanged |
+| `memory.relevance_rule: "enforce"` | Unchanged | Past findings, task facts and project and history sections join a new session only when they share a word of 3 or more letters, or a two-character Chinese or Japanese pair, with your first message; a fact also needs the private store's evidence check. The rule block is unchanged (`"shadow"` only records what would change; default `"off"` does neither) |
+| `memory.dream: "propose"` | While no chat runs, an offline pass lists copies, near-copies, work status and old untagged rules it would clean up; read the list with `kirocrew memory dream list`. Nothing is applied, and lessons you taught are never proposed for change | Unchanged |
 | `memory.inject_memory: false` | Unchanged | Stored memory block withheld |
 | `memory.inject_lessons: false` | Unchanged | Lessons and user-profile blocks withheld |
 
@@ -119,6 +149,31 @@ Incognito sessions still read stored memory but write none, and Temporary
 sessions neither read nor write it, whatever these keys say. The keys apply to
 every surface (dashboard, channels, cron, sub-agents) at once, where a memory
 mode is chosen per session.
+
+To see what the `"shadow"` (and `"propose"`) stages above have recorded, run
+`kirocrew memory shadow report`. Per stage it prints the flag, when its window
+started, the days and session starts seen against the bar (14 days and 200
+session starts), and how many items the new policy would change. It shows
+counts only, never memory text, and writes nothing. `--stage <name>` adds counts
+by day, `--since 7d` or `--since YYYY-MM-DD` moves the start, `--store <name>`
+reads another store, and `--json` prints the same data as JSON. Only `shadow`
+counters and sampled fields count; Dreaming keeps `propose`.
+
+Each stage also gets a miss rate and a verdict. A row a stage would drop counts
+as missed when something later shows it was needed: a `memory_recall` that
+returned it, or a `learn_add` close to it (cosine above 0.85). A render stage
+counts only that session's later events; a write stage counts any later one. A
+small hashed sample of rows the stage keeps is scored the same way, as a control.
+The verdict is `wait` until 14 days, 200 session starts, a control sample and at
+least one outcome line exist,
+then `pass` when the miss rate is at most 1 in 100 and no higher than the
+control's, else `fail`. While any stage flag is on, recalls and `learn_add`s write
+small outcome lines with memory keys and a session hash only, never the query or
+the rule; incognito and temporary sessions write none. If a window starts
+partway through a UTC day, the report excludes that day from counters, samples
+and session starts and reports the next UTC midnight as `window_start`. This
+conservatively undercounts readiness by at most one day, avoiding counters that
+mix policy versions. A start exactly at UTC midnight keeps that day.
 
 ## Memory Modes
 
@@ -178,6 +233,10 @@ Just tell it naturally:
 Kiro Crew saves these via the `learn_add` MCP tool. View them with `learn_list`
 or on the dashboard Overview → Lessons tab.
 
+To change whether a saved lesson applies in every session (`always`) or only
+when the task is about it (`on_topic`), ask Kiro Crew: the `learn_update` tool
+changes that one setting in place and keeps the lesson's wording and history.
+
 ## Workspaces
 
 Markdown memory is workspace-scoped: each workspace stores `memory/preferences.md`, `memory/projects.md`, and `memory/history/{date}.md` beneath its workspace directory. Legacy JSONL lessons are also workspace-local; vector memory defaults to `memory.db` under the Kiro Crew data directory. Lessons are global unless their optional `repo_scope` restricts them to a project tree.
@@ -188,8 +247,10 @@ The vector-memory subsystem is always enabled:
 
 - **Semantic memory**: structured key-value store with confidence scoring
 - **Episodic memory**: conversation fragments searchable by meaning
-- **Embeddings**: Qwen3-Embedding-0.6B running in-process (no Ollama or any
-  other server to install — the runtime is bundled; no data leaves your machine)
+- **Embeddings**: Qwen3-Embedding-0.6B running in-process by default (no Ollama
+  or any other server to install — the runtime is bundled; no data leaves your
+  machine). An Ollama server can serve them instead; see
+  [Using an Ollama server](#using-an-ollama-server).
 
 The embedding model (~610MB) downloads automatically in the background the
 first time the gateway starts, over HTTPS from the Kiro Crew CDN — failed
@@ -201,9 +262,44 @@ semantic search as soon as the model is ready — no restart needed. Requires
 ~610MB disk for the model and ~700MB RAM once the model is loaded. The model
 loads when something first needs a vector and unloads after 60 minutes without
 one (`memory.embedding_idle_evict_secs`, `0` keeps it loaded); the first search
-after that waits a few seconds for it to load again.
+after that waits a few seconds for it to load again. Background work (filling in
+missing vectors, consolidation) never holds up your message: your search runs
+first and the background text starts over.
 
 The bundled model is `qwen3-embedding:0.6b` (1024 dimensions). `KIROCREW_EMBED_MODEL_URL` overrides `memory.embed_model_url` for the download URL; `KIROCREW_EMBED_MODEL_PATH` or `memory.embed_model_path` selects a local GGUF instead of the bundled model.
+
+### Using an Ollama server
+
+A machine short on RAM, or one that already runs Ollama on a GPU, can embed
+through an Ollama server instead of the bundled model:
+
+```bash
+kirocrew config set memory.embedding_provider ollama_http
+kirocrew config set memory.ollama_model nomic-embed-text
+kirocrew config set memory.embedding_dim 768   # the model's output width
+kirocrew restart
+```
+
+`memory.ollama_url` defaults to `http://127.0.0.1:11434`. The server must list
+the model in `/api/tags` (`ollama pull nomic-embed-text`). Kiro Crew calls
+`/api/embed` with `truncate` on, so the server cuts an input longer than the
+model's context instead of failing it.
+
+- **Your text goes to the server.** A loopback URL keeps it on this machine. To
+  use another host, set `memory.ollama_allow_remote` to `true` and give an
+  `https://` URL; a plain `http://` remote host is refused. An SSH tunnel to a
+  loopback port is the simplest way to reach a server elsewhere.
+- **Switching re-embeds everything.** The vector space is `ollama:<model>` at
+  `memory.embedding_dim`, so switching provider or model regenerates every
+  stored embedding in the background, the same as a model change in Settings.
+  Moving the server to another URL does not.
+- **When the server is down, memory falls back to keyword search**, and picks
+  vectors up again once the server answers. The log warns once per outage.
+- **The width must match.** If the model returns vectors of another width,
+  embedding stops and the log names the `memory.embedding_dim` to set; set it
+  and restart.
+- With `ollama_http` the bundled model is not downloaded at startup, and
+  `memory.embed_model_path` is ignored.
 
 ## Rebuilding vectors after a model change
 
@@ -252,6 +348,21 @@ interface rather than the on-disk layout:
 
 Both run non-interactively (no TTY or editor needed), so they work from
 scheduled jobs.
+
+## Checking and Moving Memory from the CLI
+
+- `kirocrew memory stats` — counts for the default store: active and deleted
+  facts and episodes, how many episodes have embeddings, and the search index.
+  Rows that wait for embeddings are still found by keyword search.
+- `kirocrew memory audit` — scan every memory store for suspicious content,
+  such as text that tries to give the agent instructions. It lists each finding
+  with its store, or says memory is clean.
+- `kirocrew memory import <file> [--store <name>]` — load a file written by
+  `kirocrew memory export` into the default store, or into the named one. The
+  file is checked before anything is written; a bad file imports nothing and
+  exits 1. The `markdown` collection is never imported, and a private Bot (V2)
+  store refuses the import: use the dashboard copy, which keeps provenance.
+  Embeddings are built later by the gateway; `memory stats` shows the progress.
 
 ## Editing Memory
 

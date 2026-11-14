@@ -189,10 +189,10 @@ def _get_sandbox_mode(config: Optional[dict] = None) -> str:
 
 
 class KnowledgeHarnessUnavailable(RuntimeError):
-    """An enterprise knowledge pool would fall back to the Kiro CLI harness.
+    """An LTS knowledge pool would fall back to the Kiro CLI harness.
 
-    Enterprise only (RFC D6): KAS is the floor and the Kiro CLI harness is being
-    retired, so an enterprise build never falls back to it. The pool cannot run on
+    LTS only (RFC D6): KAS is the floor and the Kiro CLI harness is being
+    retired, so an LTS build never falls back to it. The pool cannot run on
     KAS (it needs a client KAS has no arm in), so it runs on Kiro CLI only when the
     user picked Kiro CLI (``agent.acp_backend`` ``"kiro"``) and the remote
     ``agent_backend`` policy allows it. Otherwise it refuses before any process.
@@ -203,7 +203,7 @@ class KnowledgeHarnessUnavailable(RuntimeError):
     def __init__(self, reason: str) -> None:
         super().__init__(
             f"{self.code}: knowledge extraction cannot run here ({reason}). Kiro Crew "
-            "does not fall back to the Kiro CLI harness in an enterprise build. Run "
+            "does not fall back to the Kiro CLI harness in an LTS build. Run "
             "`kiro-cli update` to get a kiro-cli that supports `--agent-engine v3`, "
             "and to run knowledge extraction on the Kiro CLI harness, pick it "
             '(agent.acp_backend "kiro") and ask your administrator to allow `kiro` '
@@ -212,17 +212,28 @@ class KnowledgeHarnessUnavailable(RuntimeError):
         )
 
 
+class LLMPoolClosed(RuntimeError):
+    """A send on a shut-down pool, or one its shutdown cut short.
+
+    Not a failed item: the reply never comes, so an ingest must fail rather
+    than store the chunk with no extraction.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("the LLM pool is shut down")
+
+
 def _kiro_fallback(reason: str) -> str:
     """``ACP_BACKEND_KIRO`` as the pool's FALLBACK harness: ``oss`` only.
 
     Every automatic move to Kiro CLI in this module goes through here. In an ``oss``
-    build it returns Kiro CLI, as before. In an enterprise build it always raises
+    build it returns Kiro CLI, as before. In an LTS build it always raises
     :class:`KnowledgeHarnessUnavailable`: there is no automatic fallback to Kiro CLI
     there (RFC D6), and an explicit Kiro CLI pick never reaches this function.
     """
     from kiro_crew import edition
 
-    if edition.is_enterprise():
+    if edition.is_lts():
         raise KnowledgeHarnessUnavailable(reason)
     return ACP_BACKEND_KIRO
 
@@ -231,12 +242,12 @@ def _kiro_pick_allowed() -> str:
     """``ACP_BACKEND_KIRO`` for a worker that STARTS on Kiro CLI again (a restart).
 
     Kiro CLI reaches a worker only as an explicit pick (``_get_acp_backend``), so a
-    restart repeats that pick. In an enterprise build the pick must still be one the
+    restart repeats that pick. In an LTS build the pick must still be one the
     governed selection allows (``selectable_backends()``); otherwise it refuses.
     """
     from kiro_crew import edition
 
-    if edition.is_enterprise() and ACP_BACKEND_KIRO not in selectable_backends():
+    if edition.is_lts() and ACP_BACKEND_KIRO not in selectable_backends():
         raise KnowledgeHarnessUnavailable("the agent_backend policy does not allow `kiro`")
     return ACP_BACKEND_KIRO
 
@@ -253,8 +264,8 @@ def _get_acp_backend(config: Optional[dict] = None) -> str:
     ``SessionCapabilities.honors_zero_tool_ban`` (kiro-cli/KAS natively, claude
     because a zero-tool session there mounts no tool at all, plus
     opencode/goose/deepseek/pi via ``AcpClient._deny_zero_tools``; not codex, whose
-    sessions run on ``AcpRuntime`` with no such refusal) and
-    ``.acp_client_spawnable`` (not
+    ``AcpRuntime`` sessions refuse every permission request but still run some
+    calls without asking) and ``.acp_client_spawnable`` (not
     kas/codex, which need ``AcpRuntime`` and have no arm in ``AcpClient._spawn``).
 
     The pool reads raw ``config.json``, which never passed the loader's
@@ -547,13 +558,13 @@ class AcpWorker(Worker):
         if acp_backend == ACP_BACKEND_KIRO:
             # A worker restarts with the backend it chose before (a recycle or a
             # stalled client), or a caller hands one in, so every start that would
-            # run Kiro CLI asks the same enterprise check as the first pick does.
+            # run Kiro CLI asks the same LTS check as the first pick does.
             # In-memory; unchanged in an oss build.
             acp_backend = _kiro_pick_allowed()
         logger.info(
             "AcpWorker: starting with agent=%s backend=%s",
             AGENT_NAME,
-            POLICY_ID_BY_BACKEND.get(acp_backend, acp_backend),
+            _label(acp_backend),
         )
         self._client, authored_before_spawn = await self._spawn_client(acp_backend, sandbox_mode)
         # A zero-tool spec must be CONFIRMED, not assumed. A backend that is not
@@ -566,7 +577,7 @@ class AcpWorker(Worker):
             logger.warning(
                 "AcpWorker: backend=%s session did not confirm the zero-tool spec "
                 '("tools": [] missing, malformed, or shadowed); restarting worker on %s',
-                POLICY_ID_BY_BACKEND.get(acp_backend, acp_backend),
+                _label(acp_backend),
                 ACP_BACKEND_KIRO,
             )
             try:
@@ -628,7 +639,7 @@ class AcpWorker(Worker):
                 'AcpWorker: agent=%s backend=%s spec does not declare "tools": []; '
                 "refusing to start the worker",
                 AGENT_NAME,
-                POLICY_ID_BY_BACKEND.get(acp_backend, acp_backend),
+                _label(acp_backend),
             )
             try:
                 await self._client.shutdown()
@@ -752,7 +763,7 @@ class AcpWorker(Worker):
                 logger.warning(
                     "AcpWorker: effort=%s unsupported on backend=%s; using provider default",
                     requested,
-                    POLICY_ID_BY_BACKEND.get(backend, backend),
+                    _label(backend),
                 )
                 return
             # Resolved per backend, like every other effort site: writing the
@@ -1134,6 +1145,18 @@ class CCWorker(Worker):
         self.calls_since_reset = 0
 
 
+async def _stop_workers(workers: list[Worker]) -> None:
+    """Shut *workers* down at the same time, logging a failure instead of raising it.
+
+    A worker's shutdown can wait on its child process (an ACP client gives the
+    agent a moment to exit once stdin is closed), so stopping them one after
+    another would make a pool's stop cost that wait once per worker.
+    """
+    for result in await asyncio.gather(*(w.shutdown() for w in workers), return_exceptions=True):
+        if isinstance(result, Exception):
+            logger.debug("Worker shutdown error", exc_info=result)
+
+
 class LLMPool:
     """Bounded pool of long-lived LLM workers.
 
@@ -1170,6 +1193,8 @@ class LLMPool:
         self._workers: list[Worker] = []
         self._available: asyncio.Queue[int] = asyncio.Queue()
         self._started = False
+        # Set by shutdown() for good: acquire() would otherwise respawn the pool.
+        self._closed = False
         self._provider_type: str = ""
         self._config: dict = {}
         self._start_lock = asyncio.Lock()
@@ -1348,9 +1373,12 @@ class LLMPool:
         """Acquire a worker from the pool. Blocks if all busy.
 
         Returns (worker_index, worker). Caller must release after use.
-        Transparently restarts the pool if the idle reaper scaled it to zero.
+        Transparently restarts the pool if the idle reaper scaled it to zero,
+        never after shutdown().
         """
         while True:
+            if self._closed:
+                raise LLMPoolClosed()
             if not self._started:
                 await self.start()
             await self._semaphore.acquire()
@@ -1470,11 +1498,7 @@ class LLMPool:
             self._reaping_workers = workers
 
         try:
-            for worker in workers:
-                try:
-                    await worker.shutdown()
-                except Exception:
-                    logger.debug("Worker shutdown error", exc_info=True)
+            await _stop_workers(workers)
         except asyncio.CancelledError:
             # shutdown() cancelled us mid-teardown; leave _reaping_workers set
             # so shutdown() drains the survivors, then finish cancelling.
@@ -1497,6 +1521,10 @@ class LLMPool:
         idx, worker = await self.acquire()
         try:
             return await worker.send_message(prompt, timeout=timeout)
+        except Exception as exc:
+            if self._closed:
+                raise LLMPoolClosed() from exc
+            raise
         finally:
             try:
                 await self._maybe_recycle(idx, worker)
@@ -1547,7 +1575,7 @@ class LLMPool:
         async def _do_one(idx: int, prompt: str) -> None:
             try:
                 results[idx] = await self.send(prompt, timeout=timeout)
-            except KnowledgeHarnessUnavailable:
+            except (KnowledgeHarnessUnavailable, LLMPoolClosed):
                 # Not a failed item: no prompt in the batch can run, and an empty
                 # reply would let the ingest commit a document with no extraction.
                 raise
@@ -1559,7 +1587,8 @@ class LLMPool:
         return results
 
     async def shutdown(self) -> None:
-        """Destroy all workers and stop the idle reaper."""
+        """Destroy all workers and stop the idle reaper; the pool stays closed."""
+        self._closed = True
         task = self._reaper_task
         self._reaper_task = None
         if task is not None:
@@ -1581,11 +1610,7 @@ class LLMPool:
             self._started = False
             self._in_use = 0
             self._idle_since = None
-        for worker in workers:
-            try:
-                await worker.shutdown()
-            except Exception:
-                logger.debug("Worker shutdown error", exc_info=True)
+        await _stop_workers(workers)
         logger.info("LLMPool: all workers shut down")
 
     async def __aenter__(self) -> "LLMPool":

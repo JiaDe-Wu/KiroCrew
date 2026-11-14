@@ -26,6 +26,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, within, waitFor, fireEvent, act } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { Provider } from 'react-redux'
+import { createConnectedTestStore } from './helpers'
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 import type { AppsData } from '../pages/apps/useAppsData'
 
@@ -128,16 +130,18 @@ function PathProbe() {
 function discoverUi(initialPath: string) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return (
-    <QueryClientProvider client={qc}>
-      <MemoryRouter initialEntries={[initialPath]}>
-        <PathProbe />
-        <Routes>
-          <Route path="/apps" element={<DiscoverPage />} />
-          <Route path="/apps/-/updates" element={<DiscoverPage />} />
-          <Route path="/apps/library" element={<div data-testid="library-route" />} />
-        </Routes>
-      </MemoryRouter>
-    </QueryClientProvider>
+    <Provider store={createConnectedTestStore()}>
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={[initialPath]}>
+          <PathProbe />
+          <Routes>
+            <Route path="/apps" element={<DiscoverPage />} />
+            <Route path="/apps/-/updates" element={<DiscoverPage />} />
+            <Route path="/apps/library" element={<div data-testid="library-route" />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    </Provider>
   )
 }
 
@@ -224,12 +228,15 @@ describe('Updates sub-page — list rendering', () => {
     // The pending row's button swaps to the in-flight form and disables;
     // its accessible name changes with it, so locate it by the new label.
     const pendingButton = await screen.findByRole('button', { name: 'pages.discoverPage.updating' })
-    expect(pendingButton).toBeDisabled()
+    // Held, not natively disabled: it is the pressed button and keeps focus
+    // (UpdatesList.focus.test.tsx); a press while held is refused.
+    expect(pendingButton).toHaveAttribute('aria-disabled', 'true')
     // EVERY row freezes while one update runs: `updatePending` is a single
     // slot, so a clickable sibling would invite a dispatch the hook refuses —
     // a dead click. Mirrors the Update All freeze.
     expect(rowUpdateButtons()[0]).toBeDisabled()
-    expect(mocks.apiUpdateApp).toHaveBeenCalledExactlyOnceWith('notes')
+    // A path install with a registry update: the registry source, never a folder re-copy.
+    expect(mocks.apiUpdateApp).toHaveBeenCalledExactlyOnceWith('notes', 'registry:notes')
 
     await act(async () => { deferred[0].resolve() })
     // Settled: the in-flight form leaves and both rows read Update again.
@@ -264,11 +271,11 @@ describe('Updates sub-page — list rendering', () => {
     renderDiscover('/apps/-/updates')
 
     fireEvent.click(updateAllButton())
-    // The disabled button IS the progress surface.
+    // The held button IS the progress surface.
     await waitFor(() =>
       expect(updateAllButton()).toHaveTextContent('pages.appsPage.updating_progress {"done":0,"total":2}'),
     )
-    expect(updateAllButton()).toBeDisabled()
+    expect(updateAllButton()).toHaveAttribute('aria-disabled', 'true')
     for (const btn of rowUpdateButtons()) expect(btn).toBeDisabled()
 
     await act(async () => { deferred[0].resolve() })
@@ -282,8 +289,8 @@ describe('Updates sub-page — list rendering', () => {
     )
     // The batch's success lands in the page's own notice surface.
     expect(screen.getByText('pages.appsPage.updated_app {"count":2}')).toBeInTheDocument()
-    expect(mocks.apiUpdateApp).toHaveBeenNthCalledWith(1, 'notes')
-    expect(mocks.apiUpdateApp).toHaveBeenNthCalledWith(2, 'docs')
+    expect(mocks.apiUpdateApp).toHaveBeenNthCalledWith(1, 'notes', 'registry:notes')
+    expect(mocks.apiUpdateApp).toHaveBeenNthCalledWith(2, 'docs', 'registry:docs')
   })
 })
 

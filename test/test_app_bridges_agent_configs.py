@@ -53,12 +53,8 @@ class TestBuiltinAgentNamesAreNamespaced:
                     f"collide with any other install claiming that global name"
                 )
                 checked += 1
-        if checked == 0:
-            # No shipped builtin declares an agent yet, so there is nothing to
-            # check — but a guard that passes on an empty sample is worthless, so
-            # say so out loud rather than pass silently. The first agent-declaring
-            # builtin turns this on.
-            pytest.skip("no builtin declares agents yet — guard is vacuous")
+        # A guard that passes on an empty sample is worthless.
+        assert checked, "no shipped builtin declares an agent -- the guard is vacuous"
 
 
 class TestUserAgentEditsSurviveRefresh:
@@ -184,10 +180,7 @@ class TestUserAgentEditsSurviveRefresh:
         }
         root = _REPO_ROOT / "src/kiro_crew/apps/builtins"
         templates = sorted(root.glob("*/agents/*.json"))
-        if not templates:
-            # Same reasoning as the namespacing guard above: nothing ships an
-            # agent template yet, and a silent pass would hide that.
-            pytest.skip("no builtin ships an agent template yet")
+        assert templates, "no builtin ships an agent template -- the guard is vacuous"
         for tpl in templates:
             keys = set(json.loads(tpl.read_text(encoding="utf-8")))
             undecided = keys - _FRAMEWORK_OWNED_AGENT_KEYS - preferences
@@ -222,6 +215,8 @@ class TestBuiltinDeclaredResourcesActuallyRegister:
         # Parser diagnostics reject a manifest; they are not declarations copied
         # into a valid builtin's persisted manifest.
         declared.discard("config_keys_error")
+        declared.discard("credential_masks_errors")
+        declared.discard("agent_readonly_dirs_errors")
 
         manifest = AppManifest.from_dict(
             {
@@ -241,6 +236,8 @@ class TestBuiltinDeclaredResourcesActuallyRegister:
                 "tags": ["t"],
                 "mcpServers": {"m": {"command": "c"}},
                 "config_keys": ["probe-owned"],
+                "credentialMasks": ["secrets.json"],
+                "agentReadOnlyDirs": ["notes"],
                 "platform": {"requiresDesktopApp": True},
                 "permissions": {"storage": True},
                 "ui": {"entry": "ui/dist/index.js"},
@@ -251,6 +248,17 @@ class TestBuiltinDeclaredResourcesActuallyRegister:
                 "publishProvider": {"id": "p", "label": "P"},
                 "notifications": {"channels": [{"id": "n", "name": "N"}]},
                 "l10n": {"de": {"displayName": "Sonde"}},
+                "desktop": {"windows": [{"id": "w", "entry": "ui/w.js", "kind": "overlay"}]},
+                "agentTools": {
+                    "route": "agent-tools",
+                    "tools": [
+                        {
+                            "name": "probe_note",
+                            "description": "d",
+                            "inputSchema": {"type": "object", "properties": {}},
+                        }
+                    ],
+                },
                 "contributes": {
                     "commands": [
                         {
@@ -388,6 +396,91 @@ class TestNeutralizeEntryShape:
         )
         missing = [k for k, v in out["mcpServers"].items() if not v.get("command")]
         assert missing == [], f"entries without command: {missing}"
+
+
+class TestAGrantResolvesWhatTheDefaultAgentMounts:
+    """A built-in app's grant takes its launch spec from the servers the default agent mounts.
+
+    The rebuild merges the MCP page's store, registry installs and edition servers
+    over the global ``mcp.json`` into the default agent's spec, the store winning a
+    tie. A copied server that is muted (turned off, or a ``secret://`` reference
+    nothing resolves) is withheld, and so is another app's own server.
+    """
+
+    def test_a_grant_takes_the_mounted_spec_and_withholds_a_muted_one(self, tmp_path, monkeypatch):
+        from kiro_crew import agent as agent_mod
+        from kiro_crew.apps import bridges
+        from kiro_crew.mcp_provenance import DERIVED_KEY, WITHHELD_KEY
+
+        spec = tmp_path / "kirocrew.json"
+        mounted = {
+            "store-srv": {"command": "store-cmd", DERIVED_KEY: {"from": "kirocrew"}},
+            "both-srv": {"command": "store-cmd"},
+            "off-srv": {"command": "off-cmd", "disabled": True},
+            "vault-srv": {"command": "vault-cmd", "disabled": True, WITHHELD_KEY: True},
+            "other-app:srv": {"command": "other-cmd"},
+        }
+        spec.write_text(json.dumps({"mcpServers": mounted}), encoding="utf-8")
+        monkeypatch.setattr(bridges, "_mcp_json_path", lambda: spec)
+        monkeypatch.setattr(agent_mod, "_app_owned_mcp_keys", lambda: {"other-app:srv": True})
+        monkeypatch.setattr(
+            bridges,
+            "_global_mcp_specs",
+            lambda: {
+                "both-srv": {"command": "global-cmd"},
+                "off-srv": {"command": "off-cmd"},
+                "global-srv": {"command": "global-cmd"},
+                "global-off-srv": {"command": "global-cmd", "disabled": True},
+            },
+        )
+        names = [*mounted, "global-srv", "global-off-srv"]
+        out = bridges._apply_agent_mcp_policy(
+            {"name": "a", "tools": [], "mcpServers": {}},
+            "a",
+            {"agents": {"a": {"servers": {name: {} for name in names}}}},
+            builtin=True,
+        )
+        assert out["mcpServers"] == {
+            "store-srv": {"command": "store-cmd"},
+            "both-srv": {"command": "store-cmd"},
+            "global-srv": {"command": "global-cmd"},
+        }
+        assert out["tools"] == ["@store-srv", "@both-srv", "@global-srv"]
+
+    def test_a_user_installed_app_grant_never_reaches_a_mounted_only_server(
+        self, app_env, tmp_path, monkeypatch
+    ):
+        """A user-installed app writes its own grant file, so its grant keeps main's
+        sources, even under a shipped built-in's name; once the built-in holds the
+        install, the same grant copies the server, which shows the grant was read."""
+        from kiro_crew import agent as agent_mod
+        from kiro_crew.apps import bridges, execution
+        from kiro_crew.apps.manager import InstalledApp, _write_installed, app_dir
+
+        mounted = {"mcpServers": {"store-srv": {"command": "store-cmd"}}}
+        (tmp_path / "mcp.json").write_text(json.dumps(mounted), encoding="utf-8")
+        monkeypatch.setattr(bridges, "_global_mcp_specs", lambda: {})
+        monkeypatch.setattr(agent_mod, "_app_owned_mcp_keys", lambda: {})
+        src = _make_app_source(tmp_path, name="grant-app")
+        monkeypatch.setattr(execution, "_builtin_manifest_sources", lambda: (src.parent.resolve(),))
+        manifest = AppManifest.from_dict(json.loads((src / APP_MANIFEST_FILENAME).read_text()))
+        grant = {"agents": {"my-agent": {"servers": {"store-srv": {}}}}}
+        policy = app_dir("grant-app") / "data" / bridges.AGENT_MCP_POLICY_FILE
+        policy.parent.mkdir(parents=True)
+        policy.write_text(json.dumps(grant), encoding="utf-8")
+        written = app_env["kiro_agents"] / "grant-app--my-agent.json"
+
+        _write_installed("grant-app", InstalledApp(name="grant-app", source=str(src)))
+        bridges._register_agents("grant-app", manifest, src)
+        user_installed = json.loads(written.read_text())
+        assert "store-srv" not in user_installed.get("mcpServers", {})
+        assert "@store-srv" not in user_installed.get("tools", [])
+
+        _write_installed("grant-app", InstalledApp(name="grant-app", source="builtin"))
+        bridges._register_agents("grant-app", manifest, src)
+        assert json.loads(written.read_text())["mcpServers"]["store-srv"] == {
+            "command": "store-cmd"
+        }
 
 
 class TestDeclaredMcpToolsAreEnforced:
@@ -658,6 +751,18 @@ class TestAppPromptPathIsContained:
         merged, _ = self._call(tmp_path, f"file://{prompt}")
         assert merged["prompt"] == f"file://{prompt.resolve()}"
 
+    def test_a_file_uri_spelled_path_inside_the_app_root_is_kept(self, tmp_path, monkeypatch):
+        """``file:///C:/...``, what ``Path.as_uri()`` writes on Windows, is an absolute path."""
+        from kiro_crew.apps import bridges, manager
+
+        monkeypatch.setattr(manager, "app_data_dir", lambda n: tmp_path / "data")
+        monkeypatch.setattr(bridges, "app_data_dir", lambda n: tmp_path / "data")
+        (tmp_path / "app").mkdir(exist_ok=True)
+        prompt = tmp_path / "app" / "persona.md"
+        prompt.write_text("you are")
+        merged, _ = self._call(tmp_path, "file:///" + prompt.as_posix().lstrip("/"))
+        assert merged["prompt"] == f"file://{prompt.resolve()}"
+
     def test_a_symlink_escaping_the_app_is_refused(self, tmp_path, monkeypatch):
         from kiro_crew.apps import bridges, manager
 
@@ -813,6 +918,48 @@ class TestPruneAbortsOnUnreadableAgent:
         assert (
             keep.is_file()
         ), "prune must retain the agent — a non-object spec is unreadable, not removed"
+
+    def test_non_object_mcp_servers_manifest_is_unreadable_not_empty(self, tmp_path, app_env):
+        """A non-object ``mcpServers`` makes the manifest UNPARSEABLE, not empty.
+
+        ``from_dict`` raises on it, so ``get_app_manifest`` returns None and the boot
+        prune (``_prune_stale_app_resources``) is never handed a malformed manifest
+        whose empty map it would read as "declares none" and use to delete every
+        live bridge. The empty forms ``dict()`` accepted (``[]``, ``""``) still parse
+        to an empty map, so this does not newly reject a manifest main accepted.
+        """
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        app_dir = app_env["home"] / "apps" / "test-app"
+        from kiro_crew.apps.manager_records import get_app_manifest
+
+        with pytest.raises(ValueError, match="mcpServers must be an object"):
+            AppManifest.from_dict(
+                {
+                    "name": "test-app",
+                    "version": "1.0.0",
+                    "displayName": "Test App",
+                    "description": "d",
+                    "author": "a",
+                    "mcpServers": 5,
+                }
+            )
+        # On disk: a non-object mcpServers makes get_app_manifest fail closed (None),
+        # the same signal an otherwise-unreadable manifest gives.
+        (app_dir / APP_MANIFEST_FILENAME).write_text(
+            json.dumps(
+                {
+                    "name": "test-app",
+                    "version": "1.0.0",
+                    "displayName": "Test App",
+                    "description": "d",
+                    "author": "a",
+                    "mcpServers": 5,
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert get_app_manifest("test-app") is None
 
 
 class TestShippedAgentTemplatesAreRenderedByTheGateway:
@@ -1336,12 +1483,33 @@ class TestRefreshAppAgentsReportsIoFailures:
 
 
 class TestRenderFailureIsClassifiedByCause:
-    """`_render_shipped_agent` returns None for three reasons; one is retryable.
+    """`_render_shipped_agent` returns None for four reasons; two are retryable.
 
     An unresolved placeholder and invalid rendered JSON are properties of the template
     and fail identically forever — reporting them to a caller that retries would spin
-    without converging. Only the write failure can succeed later.
+    without converging. Only the read and write failures can succeed later.
     """
+
+    def test_a_read_failure_registers_nothing_even_if_the_next_read_succeeds(
+        self, monkeypatch, tmp_path, app_env
+    ):
+        root, manifest = _installed_templated_app(tmp_path, app_env["home"], _HOST_TEMPLATE)
+        template = root / "agents" / "my-agent.json"
+        real_read_text = Path.read_text
+        failed: list[Path] = []
+
+        def _locked_once(self, *args, **kwargs):
+            if self == template and not failed:
+                failed.append(self)
+                raise PermissionError("sharing violation")
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", _locked_once)
+
+        collected: list[str] = []
+        assert _register_agents("test-app", manifest, root, io_failures=collected) == []
+        assert collected == [str(template)]
+        assert not (app_env["kiro_agents"] / "test-app--my-agent.json").exists()
 
     def _template(self, tmp_path, body: str):
         src = tmp_path / "agent.json"

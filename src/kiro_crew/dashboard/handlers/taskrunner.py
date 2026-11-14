@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
-from kiro_crew.apps.manager import TASK_RUNNER_APP, TASK_RUNNER_DISABLED_MESSAGE, app_disabled
 from kiro_crew.constants import DENY_CAUSE_SURFACE_POLICY
 from kiro_crew.dashboard.handlers._shared import (
     read_bounded_json,
@@ -25,6 +24,7 @@ from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.execution_context import ExecutionContext, bind_session_execution
 from kiro_crew.hooks import FileTooLargeError, validate_file_path
 from kiro_crew.llm_helpers import _steer_host_deny, unfinished_turn_error
+from kiro_crew.messaging.driver import strip_steering_markers
 from kiro_crew.security import (
     is_sensitive_path,
     is_sensitive_resolved_path,
@@ -35,6 +35,7 @@ from kiro_crew.shared_crew.turn_gate import TurnRefused
 from kiro_crew.start_priority import StartPriority
 from kiro_crew.task_planner import plan_to_yaml
 from kiro_crew.taskrunner import WorkflowInitializing
+from kiro_crew.taskrunner_switch import task_runner_off
 from kiro_crew.workflow_memory import capture_admission_execution
 
 if TYPE_CHECKING:
@@ -157,13 +158,24 @@ async def _require_taskrunner_owner(request: web.Request, operation: str) -> web
     the class ``is_owner_dashboard_request`` can rule on at all. The other two
     caller classes keep the control that already governs them -- an
     ``X-Internal-Secret`` loopback process (the ``task_run`` MCP tool) reaches
-    here with ``app`` ABSENT, and an app token (the Projects app declares
+    here with ``app`` ABSENT, and an app token (an app whose manifest declares
     ``/api/taskrunner``) is confined to its manifest's declared paths by
     ``_enforce_app_scope``.
     """
     if request.get("app") != "":
         return None
     return await require_owner_dashboard_request(request, operation)
+
+
+async def _task_runner_disabled() -> web.Response | None:
+    """409 while Task Runner is turned off (``taskrunner.enabled``, or the ``apps`` policy).
+
+    The code stays ``app_disabled``, the answer every start gave while Task Runner was
+    an app, so a client reading it needs no change.
+    """
+    if (refusal := await asyncio.to_thread(task_runner_off)) is None:
+        return None
+    return web.json_response({"error": refusal, "code": "app_disabled"}, status=409)
 
 
 async def _gate_auto_approve(
@@ -484,12 +496,8 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
         spec_path = validated
 
     # Checked before the inline spec is written, so a refusal leaves nothing behind.
-    # Disabled in Library means no new runs: the run would have no page to
-    # watch or stop it from.
-    if await asyncio.to_thread(app_disabled, TASK_RUNNER_APP):
-        return web.json_response(
-            {"error": TASK_RUNNER_DISABLED_MESSAGE, "code": "app_disabled"}, status=409
-        )
+    if (disabled := await _task_runner_disabled()) is not None:
+        return disabled
 
     # Fair admission (Shared Crew): a background run starts now or is refused,
     # before the inline spec is written so a refusal leaves nothing behind.
@@ -830,6 +838,8 @@ async def api_taskrunner_retry(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     if not state.task_runner:
         return web.json_response({"error": "task runner not available"}, status=400)
+    if (disabled := await _task_runner_disabled()) is not None:
+        return disabled
     task_id = _canonical_task_reference(state.task_runner, request.match_info["task_id"])
     body, body_err = await read_bounded_json(request, allow_absent=True)
     if body_err is not None:
@@ -852,9 +862,7 @@ async def api_taskrunner_retry(request: web.Request) -> web.Response:
         return refused
     try:
         with principal_scope(run_principal):
-            await state.task_runner.retry_from_task(
-                task_id, from_step, agent=state.task_runner._agent or ""
-            )
+            await state.task_runner.retry_from_task(task_id, from_step)
     except WorkflowInitializing as exc:
         await run_admission.abandon()
         return web.json_response({"error": str(exc), "code": exc.code}, status=503)
@@ -1073,6 +1081,8 @@ async def api_taskrunner_plan(request: web.Request) -> web.Response:
                 {"error": "invalid spec path", "code": "invalid_spec_path"}, status=400
             )
         spec_path = validated
+    if (disabled := await _task_runner_disabled()) is not None:
+        return disabled
     try:
         plan_coro = state.task_runner.plan(
             input_text=input_text,
@@ -1210,6 +1220,8 @@ async def api_taskrunner_execute_plan(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     if not state.task_runner:
         return web.json_response({"error": "task runner not available"}, status=400)
+    if (disabled := await _task_runner_disabled()) is not None:
+        return disabled
     task_id = request.match_info["task_id"]
     body, body_err = await read_bounded_json(request, allow_absent=True)
     if body_err is not None:
@@ -1293,6 +1305,8 @@ async def api_taskrunner_from_chat(request: web.Request) -> web.Response:
     task_id = body.get("task_id", "")
     if not steps or not isinstance(steps, list):
         return web.json_response({"error": "steps array required"}, status=400)
+    if (disabled := await _task_runner_disabled()) is not None:
+        return disabled
     try:
         # This path allocates its own placeholder before calling update_plan.
         state.task_runner._require_workflow_ready()
@@ -1468,6 +1482,8 @@ async def _run_refine(
         state._refine_error = str(exc)
         state._refine_status = "error"
     finally:
+        # kiro-cli's [STEERING steer-…] ack is protocol: drop it before any await below.
+        state._refine_text = strip_steering_markers(state._refine_text)
         state._refine_answer_future = None  # type: ignore[attr-defined]
         state._refine_session_key = ""  # type: ignore[attr-defined]
         try:
@@ -1518,6 +1534,8 @@ async def api_taskrunner_refine(request: web.Request) -> web.Response:
     user_input = user_input.strip()
     if not user_input:
         return web.json_response({"error": "input is required"}, status=400)
+    if (disabled := await _task_runner_disabled()) is not None:
+        return disabled
 
     # Cancel any existing refine
     if state._refine_task and not state._refine_task.done():

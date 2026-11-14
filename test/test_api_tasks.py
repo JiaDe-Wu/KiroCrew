@@ -19,6 +19,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 from overload_fakes import Clock, open_task_store
+from redaction_structured_cases import github_classic
 
 from kiro_crew.dashboard import session_health
 from kiro_crew.dashboard.handlers import spawn_resume
@@ -289,7 +290,9 @@ async def test_detail_404_for_unknown_id(store: TaskStore) -> None:
 #: A credential the redaction table matches, and an exfiltration URL whose
 #: payload is that same credential. Real shapes, not placeholders: a pin over
 #: a string the redactor does not match would pass on an unredacted surface.
-_CRED = "AKIAIOSFODNN7EXAMPLE"
+#: An AWS key ID is an Identifier with the structured detectors on, so the
+#: credential is a GitHub token.
+_CRED = github_classic(seed=20)
 _EXFIL_HOST = "collector.example.invalid"
 _EXFIL_URL = f"https://{_EXFIL_HOST}/ingest?token={_CRED}"
 
@@ -1050,3 +1053,28 @@ def test_routes_are_registered_in_order() -> None:
     assert paths.index("/api/tasks/summary") < paths.index("/api/tasks/{task_id}")
     assert "/api/tasks/{task_id}/cancel" in paths
     assert "/api/tasks" in paths
+
+
+def test_the_task_route_table_is_exactly_these_routes() -> None:
+    """Every ``/api/tasks`` route by method and path, so adding or dropping one is a
+    deliberate edit here: a new route, a mutating one above all, also needs its gate
+    reviewed."""
+    from kiro_crew.dashboard.routes import system as system_routes
+
+    app = web.Application()
+    system_routes.register(app)
+    routes = {
+        (r.method, r.resource.canonical)
+        for r in app.router.routes()
+        if r.resource is not None
+        and r.resource.canonical.startswith("/api/tasks")
+        and r.method != "HEAD"  # aiohttp adds a HEAD twin to every add_get
+    }
+    assert routes == {
+        ("GET", "/api/tasks"),
+        ("GET", "/api/tasks/summary"),
+        ("GET", "/api/tasks/{task_id}"),
+        ("POST", "/api/tasks/{task_id}"),
+        ("POST", "/api/tasks/{task_id}/cancel"),
+        ("GET", "/api/tasks/{task_id}/timeline"),
+    }

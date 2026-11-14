@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -11,6 +10,11 @@ import pytest
 
 from kiro_crew.auth.login import builder_id
 from kiro_crew.auth.login.builder_id import BuilderIdAuthError, RegisteredClient
+from kiro_crew.auth.login.endpoints import (
+    OIDC_SCOPES,
+    OIDC_SCOPES_EXTRA_KEY,
+    oidc_scopes,
+)
 from kiro_crew.auth.login.portal import (
     PortalAuthError,
     exchange_code,
@@ -26,6 +30,9 @@ from kiro_crew.auth.refresh import (
 from kiro_crew.auth.store import KasToken, SocialProvider, TokenStore
 
 pytestmark = pytest.mark.asyncio
+
+# A made-up prefix: the tests never name a real non-prod one.
+_TEST_SCOPES = oidc_scopes("test_prefix")
 
 
 class _FakeResp:
@@ -51,7 +58,7 @@ class _FakeSession:
         self._responses = list(responses)
         self.calls: list[tuple[str, dict]] = []
 
-    def post(self, url, *, json=None, data=None, headers=None):  # noqa: A002
+    def post(self, url, *, json=None, data=None, headers=None, proxy=None):  # noqa: A002
         self.calls.append((url, json if json is not None else (data or {})))
         return self._responses.pop(0)
 
@@ -228,15 +235,16 @@ async def test_builder_id_start_device_authorization_ok_and_failure():
 
 
 @pytest.mark.parametrize(
-    "description, advice",
+    "description, advice, names_start_url",
     [
-        # Both bodies are what SSO-OIDC answered when probed: an unknown host or
-        # path, and a well-formed portal looked up in the wrong region.
-        ("Invalid start url provided", "access portal URL"),
-        ("Invalid request", "in region eu-west-1"),
+        # Both bodies are what SSO-OIDC answered when probed: a host that is not an
+        # access portal or a wrong path; and a portal that does not exist or is
+        # looked up in the wrong region.
+        ("Invalid start url provided", "access portal URL", True),
+        ("Invalid request", "in region eu-west-1", False),
     ],
 )
-async def test_idc_start_url_refusal_says_what_to_change(description, advice):
+async def test_idc_start_url_refusal_says_what_to_change(description, advice, names_start_url):
     body = json.dumps({"error": "invalid_request", "error_description": description})
     session = _FakeSession([_FakeResp(400, body)])
     with pytest.raises(builder_id.StartUrlRejectedError) as raised:
@@ -250,6 +258,27 @@ async def test_idc_start_url_refusal_says_what_to_change(description, advice):
     assert advice in message
     assert "https://acme.awsapps.com/start" in message
     assert f"(AWS: {description})" in message
+    assert getattr(raised.value, "names_start_url", None) is names_start_url
+
+
+async def test_a_bare_idc_refusal_names_the_start_url_before_the_region():
+    """A portal that does not exist gets the same bare answer as one in the wrong
+    region, so the mistyped company name is not sent off to change a right region."""
+    body = json.dumps({"error": "invalid_request", "error_description": "Invalid request"})
+    session = _FakeSession([_FakeResp(400, body)])
+    with pytest.raises(builder_id.StartUrlRejectedError) as raised:
+        await builder_id.start_device_authorization(
+            RegisteredClient("cid", "csec"),
+            region="us-east-1",
+            start_url="https://example-not-a-real-company.awsapps.com/start",
+            session=session,
+        )
+    assert str(raised.value) == (
+        "AWS found no Identity Center for "
+        "'https://example-not-a-real-company.awsapps.com/start' in region us-east-1. "
+        "Check the start URL for a typo; if it is right, set Region to the "
+        "region your company's Identity Center is in. (AWS: Invalid request)"
+    )
 
 
 async def test_builder_id_400_is_not_blamed_on_a_start_url():
@@ -389,6 +418,39 @@ async def test_refresh_sso_oidc_success(tmp_path: Path):
     assert out.client_id == "cid"  # creds carried forward for next refresh
 
 
+async def test_register_client_sends_the_scopes_it_is_given():
+    session = _FakeSession([_FakeResp(200, {"clientId": "c", "clientSecret": "s"})] * 2)
+    public = await builder_id.register_client("us-east-1", session=session)
+    prefixed = await builder_id.register_client("us-east-1", session=session, scopes=_TEST_SCOPES)
+    assert session.calls[0][1]["scopes"] == list(OIDC_SCOPES)
+    assert session.calls[1][1]["scopes"] == list(_TEST_SCOPES)
+    assert (public.scopes, prefixed.scopes) == (OIDC_SCOPES, _TEST_SCOPES)
+
+
+async def test_refresh_sso_oidc_keeps_the_registrations_scopes(tmp_path: Path):
+    """Refresh sends only the client credentials (the scopes are the registration's),
+    and carries the recorded scopes forward so the next sign-in can reuse it."""
+    store = TokenStore(tmp_path)
+    stale = KasToken(
+        access_token="old",
+        expires_at=datetime.now(timezone.utc) + timedelta(seconds=10),
+        provider="Enterprise",
+        identity="identity_center",
+        refresh_token="rt",
+        profile_arn="arn:x",
+        region="us-east-1",
+        client_id="cid",
+        client_secret="csec",
+        extra={OIDC_SCOPES_EXTRA_KEY: list(_TEST_SCOPES)},
+    )
+    store.save(stale)
+    session = _FakeSession([_FakeResp(200, {"accessToken": "new", "expiresIn": 3600})])
+    out = await ensure_fresh(store, stale, session=session)
+    assert "scopes" not in session.calls[0][1]
+    assert session.calls[0][1]["clientId"] == "cid"
+    assert out.extra[OIDC_SCOPES_EXTRA_KEY] == list(_TEST_SCOPES)
+
+
 async def test_refresh_sso_oidc_http_error_raises(tmp_path: Path):
     store = TokenStore(tmp_path)
     stale = KasToken(
@@ -459,7 +521,7 @@ async def test_concurrent_ensure_fresh_serializes_single_flight(tmp_path: Path):
         pass
 
     class _CountingSession:
-        def post(self, url, *, json=None, data=None, headers=None):  # noqa: A002
+        def post(self, url, *, json=None, data=None, headers=None, proxy=None):  # noqa: A002
             calls["n"] += 1
             return _CountingResp(
                 200,
@@ -498,7 +560,6 @@ async def test_logout_before_refresh_does_not_resurrect_the_token(tmp_path: Path
     assert session.calls == []
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="contention timing assumes POSIX flock")
 async def test_logout_during_refresh_leaves_no_token_behind(tmp_path: Path):
     """The refresh-then-delete half: a logout that arrives while a refresh holds
     the lock across its HTTP round-trip waits for the save, then deletes it, so
@@ -545,7 +606,6 @@ async def test_logout_during_refresh_leaves_no_token_behind(tmp_path: Path):
     assert store.load("social") is None
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="contention timing assumes POSIX flock")
 async def test_account_switch_during_refresh_is_not_overwritten(tmp_path: Path):
     """A sign-in that lands a different account in the slot while a refresh of the
     old one is in flight waits for the refresher's save and then replaces it, so
@@ -749,3 +809,45 @@ async def test_provider_maps_rejection_to_the_same_failure_as_before(tmp_path: P
     with pytest.raises(RefreshRejected):
         await provider.current()
     assert store.refresh_rejected("social") is not None
+
+
+# ---- a forced refresh of a token a service refused before its expiry -----------
+
+
+def _new_social() -> _FakeResp:
+    body = {"accessToken": "new-at", "refreshToken": "new-rt", "expiresIn": 3600}
+    return _FakeResp(200, {**body, "profileArn": "arn:x"})
+
+
+async def test_a_rejected_token_still_stored_is_refreshed_before_expiry(tmp_path: Path):
+    store = TokenStore(tmp_path)
+    tok = _fresh("social", "Google")
+    store.save(tok)
+    session = _FakeSession([_new_social()])
+    out = await ensure_fresh(store, tok, session=session, rejected_access_token=tok.access_token)
+    assert out.access_token == "new-at"
+    assert len(session.calls) == 1
+    assert store.load("social").access_token == "new-at"
+
+
+async def test_a_rejected_token_a_peer_already_replaced_is_not_refreshed(tmp_path: Path):
+    store = TokenStore(tmp_path)
+    tok = _fresh("social", "Google")
+    from dataclasses import replace
+
+    store.save(replace(_fresh("social", "Google"), access_token="peer-at"))
+    session = _FakeSession([])  # must not be called
+    out = await ensure_fresh(store, tok, session=session, rejected_access_token=tok.access_token)
+    assert out.access_token == "peer-at"
+    assert session.calls == []
+
+
+async def test_a_rejected_token_whose_identity_is_gone_is_signed_out(tmp_path: Path):
+    tok = _fresh("social", "Google")
+    with pytest.raises(IdentitySignedOut):
+        await ensure_fresh(
+            TokenStore(tmp_path),
+            tok,
+            session=_FakeSession([]),
+            rejected_access_token=tok.access_token,
+        )

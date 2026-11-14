@@ -201,14 +201,16 @@ class TestOutboundRedaction:
     async def test_an_option_echo_cannot_reassemble_a_credential(self) -> None:
         """The choice text is model-authored.
 
-        `AKIA**IOSF**ODNN7EXAMPLE` does not match a credential pattern as written,
-        and Webex's own renderer removes the emphasis and shows the intact key.
+        A secret key split by `**` emphasis does not match a credential pattern as
+        written, and Webex's own renderer removes the emphasis and shows the
+        intact key.
         """
+        secret = "Qh4Tm2Vx9KpRc" + "Z8Nw3HdJf1Lb5Gs0Ye9Ua2WkEQR"
         provider = FakeProvider([AcpEvent(kind=EVENT_COMPLETE)])
         client = FakeClient()
         d = _dispatcher(FakeSessions(provider), FakeCtx(), client)
         key = d._session_key(_EMAIL)
-        d._choices.publish(key, "N1", ["AKIA**IOSF**ODNN7EXAMPLE"])
+        d._choices.publish(key, "N1", [f"{secret[:13]}**{secret[13:20]}**{secret[20:]}"])
 
         async def _capture(turn, *, sessions, ctx_builder):
             pass
@@ -217,7 +219,7 @@ class TestOutboundRedaction:
             await d.handle_message(_options_press("0", "N1"))
 
         echo = client.sent[0][1]
-        assert "AKIAIOSFODNN7EXAMPLE" not in echo.replace("*", "")
+        assert secret not in echo.replace("*", "")
 
     @pytest.mark.asyncio
     async def test_our_own_markdown_survives_the_scan(self) -> None:
@@ -277,6 +279,7 @@ class TestOutboundRedaction:
 class TestApprovalCardPress:
     @staticmethod
     async def _pending(d: WebexDispatcher, key: str, request_id: int = 1):
+        webex_dispatch._APPROVALS.reserve(key, request_id)
         task = asyncio.create_task(
             webex_dispatch._APPROVALS.decide_with_cause(key, SimpleNamespace(request_id=request_id))
         )
@@ -403,9 +406,18 @@ class TestApprovalCardPress:
         assert outcomes == ["denied", "approved"]
 
     @pytest.mark.asyncio
-    async def test_governance_blocks_an_approve_but_still_resolves_a_deny(self) -> None:
+    @pytest.mark.parametrize("text", ["", "/stop"])
+    async def test_governance_blocks_an_approve_but_still_resolves_a_deny(self, text) -> None:
         """A policy that forbids this channel has no interest in keeping a tool
-        request alive for its whole window."""
+        request alive for its whole window.
+
+        A press carrying a typed ``/stop`` is still a press: the pure-cancel
+        exemption belongs to a typed stop, never to an approve.
+        """
+        from dataclasses import replace
+
+        from kiro_crew.messaging import dispatch
+
         client = FakeClient()
         d = _dispatcher(FakeSessions(FakeProvider([])), FakeCtx(), client)
         key = d._session_key(_EMAIL)
@@ -415,8 +427,8 @@ class TestApprovalCardPress:
         async def _denied(_channel: str) -> bool:
             return False
 
-        with mock.patch("kiro_crew.webex.transport_dispatch.inbound_permitted", _denied):
-            await d.handle_message(_approval_press("approve", nonce))
+        with mock.patch.object(dispatch, "channel_inbound_permitted", _denied):
+            await d.handle_message(replace(_approval_press("approve", nonce), text=text))
             assert webex_dispatch._APPROVALS.has_pending(key)
             await d.handle_message(_approval_press("deny", nonce))
 
@@ -436,7 +448,7 @@ class TestGovernanceOnPresses:
         key = d._session_key(_EMAIL)
         d._choices.publish(key, "N1", ["Keep going"])
 
-        async def _denied(_channel: str) -> bool:
+        async def _denied(_channel: str, **_kw: object) -> bool:
             return False
 
         with mock.patch("kiro_crew.webex.transport_dispatch.inbound_permitted", _denied):

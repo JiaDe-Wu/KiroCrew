@@ -66,7 +66,6 @@ vi.mock('../pages/settings/SecurityPanel', () => ({ SecurityPanel: () => <div />
 vi.mock('../pages/settings/PrivacyPanel', () => ({ PrivacyPanel: () => <div /> }))
 vi.mock('../pages/settings/NotificationsPanel', () => ({ NotificationsPanel: () => <div /> }))
 vi.mock('../pages/settings/DeveloperPanel', () => ({ DeveloperPanel: () => <div /> }))
-vi.mock('../pages/settings/ReleasesPanel', () => ({ default: () => <div /> }))
 vi.mock('../pages/settings/ChannelsPanel', () => ({ ChannelsPanel: () => <div />, CHANNEL_KEYS: [] }))
 
 vi.mock('../store', () => ({ useAppSelector: () => '1.0.0' }))
@@ -122,9 +121,11 @@ describe('Settings > Agent Harness sign-in deep link, through the real tab', () 
     const anchor = await screen.findByTestId('kiro-sign-in-card')
     expect(anchor).toHaveAttribute('data-setting-key', KIRO_SIGN_IN_HIGHLIGHT_ANCHOR)
     expect(screen.getByTestId('agent-harness-detail').contains(anchor)).toBe(true)
-    // The compact, in-detail form: a section with its own heading, not a Card.
-    expect(anchor.tagName).toBe('SECTION')
+    // The compact, in-detail form: a fold with the heading as its summary, not a
+    // Card -- and the deep link opens it, whatever the sign-in state.
+    expect(anchor.tagName).toBe('DETAILS')
     expect(anchor).toHaveTextContent('Kiro sign-in')
+    await waitFor(() => expect(anchor).toHaveAttribute('open'))
 
     // Rung by the Settings highlight hook, and the parameter consumed.
     await waitFor(() => expect(anchor.scrollIntoView).toHaveBeenCalledTimes(1))

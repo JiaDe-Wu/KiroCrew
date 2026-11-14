@@ -26,11 +26,10 @@ import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional
 
-from kiro_crew.config.fields import _safe_float
 from kiro_crew.relay_client.client import STATE_CONNECTED, STATE_ERROR, RelayClient
-from kiro_crew.relay_client.connection import RelayTimings
 from kiro_crew.relay_client.ingress import CrewIngress, LoopbackIngress
 from kiro_crew.relay_client.lease import (
+    SIGN_IN_CREDENTIAL,
     TOKEN_TYPE_API_KEY,
     TOKEN_TYPES,
     LeaseHostTokenSource,
@@ -39,8 +38,6 @@ from kiro_crew.relay_client.lease import (
 )
 from kiro_crew.relay_client.protocol import (
     CREW_HOST_RE,
-    MOVE_QUIET_GRACE_MAX_SECONDS,
-    MOVE_QUIET_GRACE_SECONDS,
     WS_MESSAGE_MAX_BYTES,
     host_url_problem,
     is_loopback_host,
@@ -53,7 +50,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 #: The relay's own names have no built-in default: they come from the lease
-#: answer, or from ``tunnel.relay_host_url`` and ``tunnel.relay_crew_domain``.
+#: answer, or from ``RelaySettings.host_url`` and ``crew_domain`` when an edition
+#: builds the settings with its own host token source.
 #: Room for one endpoint label (63) and its dot inside a 253-character host.
 _CREW_DOMAIN_MAX_CHARS = 189
 
@@ -66,18 +64,17 @@ class RelaySettingsError(ValueError):
 class RelaySettings:
     """The relay's names for this Crew, resolved from ``config.json``'s ``tunnel`` section.
 
-    Every name is a setting, because the relay's names are provisional and differ
-    by stage. The lease answer's ``hostUrl`` and ``crewUrl`` take precedence over
-    ``host_url`` and ``crew_domain``. ``lease_url`` names the lease service; while
-    it is empty there is no host token source. ``lease_credential`` says where the
-    Crew's credential for that service is, never the credential itself.
+    The lease answer's ``hostUrl`` and ``crewUrl`` take precedence over
+    ``host_url`` and ``crew_domain``, which ``config.json`` never sets: an edition
+    with its own host token source passes them when it builds the settings.
+    ``lease_url`` names the lease service; while it is empty there is no host
+    token source. ``lease_credential`` says where the Crew's credential for that
+    service is, never the credential itself.
     """
 
     enabled: bool
     host_url: str
     crew_domain: str
-    #: Seconds an old connection stays open, quiet, after a move (0 to 30).
-    move_grace: float = MOVE_QUIET_GRACE_SECONDS
     lease_url: str = ""
     lease_credential: str = field(default="", repr=False)
     #: The lease call's ``TokenType`` header; empty sends none.
@@ -86,19 +83,11 @@ class RelaySettings:
     @classmethod
     def from_config(cls, cfg: Any) -> "RelaySettings":
         tunnel = getattr(cfg, "tunnel", None)
-        host_url = str(getattr(tunnel, "relay_host_url", "") or "").strip()
-        crew_domain = str(getattr(tunnel, "relay_crew_domain", "") or "").strip().lower()
         return cls(
             # ``is True``: a stand-in config object answers any attribute truthily.
             enabled=getattr(tunnel, "relay_enabled", False) is True,
-            host_url=host_url,
-            crew_domain=crew_domain,
-            move_grace=_safe_float(
-                getattr(tunnel, "relay_move_grace_seconds", MOVE_QUIET_GRACE_SECONDS),
-                MOVE_QUIET_GRACE_SECONDS,
-                0.0,
-                MOVE_QUIET_GRACE_MAX_SECONDS,
-            ),
+            host_url="",
+            crew_domain="",
             lease_url=_setting_text(tunnel, "relay_lease_url"),
             lease_credential=_setting_text(tunnel, "relay_lease_credential"),
             lease_token_type=_setting_text(tunnel, "relay_lease_token_type"),
@@ -113,14 +102,14 @@ class RelaySettings:
         service, under the same rule.
 
         With a lease service the relay's names come from each lease answer
-        (``hostUrl`` and ``crewUrl``), so the two name settings may stay empty.
-        Without one, nothing else names the relay, so both must be set: no name
-        is guessed.
+        (``hostUrl`` and ``crewUrl``), so ``host_url`` and ``crew_domain`` may stay
+        empty. Without one, only an edition that builds the settings names the
+        relay, so both must be set: no name is guessed.
         """
         if not self.lease_url:
             for name, value in (
-                ("tunnel.relay_host_url", self.host_url),
-                ("tunnel.relay_crew_domain", self.crew_domain),
+                ("the relay host URL", self.host_url),
+                ("the relay Crew domain", self.crew_domain),
             ):
                 if not value:
                     raise RelaySettingsError(
@@ -134,15 +123,23 @@ class RelaySettings:
             or not CREW_HOST_RE.match(self.crew_domain)
         ):
             raise RelaySettingsError(
-                f"tunnel.relay_crew_domain is not a host name: {self.crew_domain!r}"
+                f"the relay Crew domain is not a host name: {self.crew_domain!r}"
             )
         if self.lease_url:
             problem = lease_url_problem(self.lease_url)
             if problem is not None:
                 raise RelaySettingsError(f"tunnel.relay_lease_url: {problem}")
-            problem = credential_reference_problem(self.lease_credential)
-            if problem is not None:
-                raise RelaySettingsError(problem)
+            if self.lease_credential == SIGN_IN_CREDENTIAL:
+                # The sign-in names its own TokenType.
+                if self.lease_token_type:
+                    raise RelaySettingsError(
+                        "tunnel.relay_lease_token_type must be empty when "
+                        f"tunnel.relay_lease_credential is {SIGN_IN_CREDENTIAL}"
+                    )
+            else:
+                problem = credential_reference_problem(self.lease_credential)
+                if problem is not None:
+                    raise RelaySettingsError(problem)
             if self.lease_token_type and self.lease_token_type not in TOKEN_TYPES:
                 # Not echoed: a credential pasted in here by mistake stays out of logs.
                 raise RelaySettingsError(
@@ -159,14 +156,14 @@ class RelaySettings:
         return self.lease_token_type == TOKEN_TYPE_API_KEY
 
     def crew_url_for(self, endpoint_id: str) -> str:
-        """The Crew's relay URL from ``tunnel.relay_crew_domain``.
+        """The Crew's relay URL from ``crew_domain``.
 
         Only reached when the credential names no ``crewUrl``. A lease answer
         always does, so with the domain empty this refuses rather than guess.
         """
         if not self.crew_domain:
             raise RelaySettingsError(
-                "tunnel.relay_crew_domain is not set and the host token names no Crew URL"
+                "the relay Crew domain is not set and the host token names no Crew URL"
             )
         return f"https://{endpoint_id}.{self.crew_domain}"
 
@@ -174,7 +171,7 @@ class RelaySettings:
 def validate_host_url(url: str) -> None:
     problem = host_url_problem(url)
     if problem is not None:
-        raise RelaySettingsError(f"tunnel.relay_host_url: {problem}")
+        raise RelaySettingsError(f"the relay host URL: {problem}")
 
 
 def _setting_text(tunnel: Any, name: str) -> str:
@@ -294,7 +291,6 @@ class RelayTunnelProvider:
             token_source=self._tokens,
             ingress=ingress,
             client_version=self._client_version or _crew_version(),
-            timings=RelayTimings(move_grace=self._settings.move_grace),
         )
         client.register_callbacks(on_connect=self._on_connect, on_disconnect=self._on_disconnect)
         self._client = client
@@ -366,6 +362,8 @@ def lease_token_source(settings: RelaySettings) -> Optional[HostTokenSource]:
     """
     if not settings.lease_url:
         return None
+    if settings.lease_credential == SIGN_IN_CREDENTIAL:
+        return _sign_in_lease_source(settings)
     return LeaseHostTokenSource(
         lease_url=settings.lease_url,
         credential=settings.lease_credential,
@@ -373,6 +371,32 @@ def lease_token_source(settings: RelaySettings) -> Optional[HostTokenSource]:
         # An unknown type is refused by validate() when the provider starts, so the
         # composition root, which builds this before any start, never raises here.
         token_type=settings.lease_token_type if settings.lease_token_type in TOKEN_TYPES else None,
+    )
+
+
+def _sign_in_lease_source(settings: RelaySettings) -> HostTokenSource:
+    """A personal Crew's lease client, on the Crew's own Kiro sign-in.
+
+    Each call reads the sign-in (refreshed as needed), and the profile ARN that
+    read named goes on the same call. The sign-in module loads only here.
+    """
+    from kiro_crew.relay_client.lease_signin import LeaseSignIn, read_lease_sign_in
+
+    latest: dict[str, str] = {}
+
+    async def sign_in(rejected: Optional[str]) -> LeaseSignIn:
+        signed_in = await read_lease_sign_in(rejected)
+        latest["profile_arn"] = signed_in.profile_arn
+        return signed_in
+
+    return LeaseHostTokenSource(
+        lease_url=settings.lease_url,
+        credential=settings.lease_credential,
+        crew_version=_crew_version(),
+        # validate() refuses a token type beside the sign-in; the sign-in names its own.
+        token_type=None,
+        profile_arn=lambda: latest.get("profile_arn"),
+        sign_in=sign_in,
     )
 
 

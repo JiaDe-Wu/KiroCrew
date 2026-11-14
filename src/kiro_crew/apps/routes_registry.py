@@ -31,8 +31,11 @@ from kiro_crew.apps.registry import (
     _REGISTRY_TRUST_TIERS,
     _TRUST_INDEX,
     _TRUST_OWNER,
+    _effective_registries,
+    _external_registry_fetch_status,
     _git_url_host,
     _pinned_registries,
+    _public_registry_name,
     _registry_identity_key,
     _registry_trust_tier_of,
     _same_git_target,
@@ -45,12 +48,19 @@ from kiro_crew.apps.registry import (
 from kiro_crew.apps.routes_art import _SAFE_REPO_RE, _is_safe_repo_identifier
 from kiro_crew.apps.routes_install import _resync_app_crons_after_update
 from kiro_crew.apps.routes_lifecycle import (
+    _announce_app_ui_changed,
     _app_may_run_after_install,
     _register_app_off_loop,
+    _reinstall_from_registry,
+    _rerun_on_enable_after_update,
     _start_backend_after_install,
     _suspend_app_for_session_approval_reconsent,
 )
-from kiro_crew.apps.update_notify import deliver_app_update_notes, prepare_app_update_notes
+from kiro_crew.apps.update_notify import (
+    deliver_app_update_notes,
+    prepare_app_update_notes,
+    resolve_app_update_notes,
+)
 from kiro_crew.config.loader import (
     ConfigReadError,
     KiroCrewConfig,
@@ -87,16 +97,56 @@ async def _announce_app_updates(request: web.Request, rows: list[dict[str, Any]]
         deliver_app_update_notes(state, notes)
 
 
+async def _resolve_app_update_notes(request: web.Request, rows: list[dict[str, Any]]) -> None:
+    """Mark read the update notes these rows show installed.
+
+    Called with the seed fallback's rows too, unlike the announce: what it
+    reads is the INSTALLED version, which comes from the local install record
+    whichever source built the row.
+    """
+    state = request.app.get("state")
+    if state is not None:
+        await resolve_app_update_notes(state, rows)
+
+
+def _registry_fetch_failures() -> list[dict[str, Any]]:
+    """``{"name", **fetch status}`` for each registry in force whose latest index fetch failed.
+
+    Read after the listing has fetched, so each status describes the fetch that
+    built (or, inside the failure window, held back) the rows just listed.
+    Blocking: reads the config and one marker per registry.
+    """
+    failures: list[dict[str, Any]] = []
+    for reg in _effective_registries():
+        status = _external_registry_fetch_status(reg)
+        if status is not None:
+            failures.append({"name": _public_registry_name(reg), **status})
+    return failures
+
+
 async def handle_registry(request: web.Request) -> web.Response:
     """GET /api/apps/registry — list all apps available for installation."""
     # The published catalog is the storefront's source of truth when it is
     # reachable: its rows replace the seed + per-app manifest fetch. Offline the
     # catalog is empty and the seed listing answers instead.
     apps = await list_catalog_apps()
+    # Said out loud because the fallback listing renders with a 200 like any
+    # other: without it, the store's refresh cannot tell the user that the list
+    # they now see is the offline one, nor why most apps left it.
+    catalog_unavailable = not apps
     if apps:
         await _announce_app_updates(request, apps)
     else:
         apps = await list_registry()
+    await _resolve_app_update_notes(request, apps)
+    # Said out loud for the same reason: a registry whose index fetch failed adds
+    # no rows, or only its last-synced ones, to a listing that still answers 200.
+    # A report on the listing, so a failure to read it never fails the listing.
+    try:
+        registry_status = await asyncio.to_thread(_registry_fetch_failures)
+    except Exception:
+        logger.warning("ignoring the registries' fetch status", exc_info=True)
+        registry_status = []
     # Published rail order and layout ride along on the response the store already
     # makes, rather than endpoints the page would have to wait on separately. They
     # are two documents with two caches, loaded CONCURRENTLY: each cold-cache load
@@ -122,6 +172,8 @@ async def handle_registry(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "apps": apps,
+            "catalogUnavailable": catalog_unavailable,
+            "registryStatus": registry_status,
             "serverPlatform": get_server_platform(),
             "categoryOrder": category_order,
             "editorialSections": sections,
@@ -135,9 +187,9 @@ async def handle_registry_refresh(request: web.Request) -> web.Response:
     Drops the on-disk caches of all three published documents (catalog,
     category order, editorial), so the NEXT ``GET /api/apps/registry`` is
     rebuilt from fresh fetches. This exists because the caches degrade
-    SILENTLY: a failed fetch overwrites the catalog cache with a failure
-    sentinel and the store quietly falls back to the seed listing, and without
-    an explicit refresh the user's only remedy is waiting out ``CACHE_TTL``.
+    SILENTLY: with no fresh catalog copy, a failed fetch is remembered and the
+    store quietly falls back to the seed listing, and without an explicit
+    refresh the user's only remedy is waiting out the back-off or the cache.
 
     Deliberately OUTSIDE ``/api/apps/``: token_auth's ``_app_owns_path``
     grants an app token implicit ownership of everything under
@@ -158,6 +210,15 @@ async def handle_registry_refresh(request: web.Request) -> web.Response:
       fetch on the exact same code path as a cold start, so refresh cannot
       behave differently from the load it is trying to repair.
     """
+    # A dashboard subject must be the owner, as on every sibling registry
+    # write. An app token reaches this path only through an explicit
+    # ``permissions.api`` grant that token auth already checked, so it keeps it.
+    if not request.get("app"):
+        from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+        denied = await require_owner_dashboard_request(request, "app_store.refresh")
+        if denied is not None:
+            return denied
     # Off the event loop like every other disk touch on these routes; three
     # unlinks gathered because none depends on another.
     await asyncio.gather(
@@ -166,6 +227,23 @@ async def handle_registry_refresh(request: web.Request) -> web.Response:
         asyncio.to_thread(forget_editorial_cache),
     )
     return web.json_response({"ok": True})
+
+
+def _held_mcp_servers(info: dict[str, Any] | None) -> bool:
+    """Whether an open chat may hold the MCP servers of the app *info* describes: it is
+    enabled and declares ``mcpServers``."""
+    return bool(info and info.get("enabled") and (info.get("manifest") or {}).get("mcpServers"))
+
+
+async def _reach_open_chats(request: web.Request, name: str) -> None:
+    """End as an MCP page write does, so a chat already open gets *name*'s MCP change;
+    a failure is logged, since the install has committed."""
+    from kiro_crew.dashboard.handlers.template_server_request import _reach_sessions
+
+    try:
+        await _reach_sessions(request)
+    except Exception:  # noqa: BLE001 - the install has committed
+        logger.warning("Open chats did not get %s's MCP change", name, exc_info=True)
 
 
 async def handle_registry_install(request: web.Request) -> web.Response:
@@ -177,6 +255,7 @@ async def handle_registry_install(request: web.Request) -> web.Response:
     from kiro_crew.dashboard.handlers._shared import (
         body_not_object_error,
         require_owner_dashboard_request,
+        string_field_error,
     )
 
     denied = await require_owner_dashboard_request(request, "app_registry_install")
@@ -184,13 +263,15 @@ async def handle_registry_install(request: web.Request) -> web.Response:
         return denied
     try:
         body = await request.json()
-    except json.JSONDecodeError:
+    except (LookupError, RecursionError, ValueError):
         return web.json_response({"error": "invalid JSON"}, status=400)
     not_object = body_not_object_error(body)
     if not_object is not None:
         return not_object
 
     name = body.get("name", "")
+    if (wrong_type := string_field_error("name", name)) is not None:
+        return wrong_type
     if not name:
         return web.json_response({"error": "app name required"}, status=400)
 
@@ -199,9 +280,14 @@ async def handle_registry_install(request: web.Request) -> web.Response:
     # single acquisition covering clone/build → copy → register → backend.
     async with app_lifecycle_lock(name):
         # Read before the install writes the app: an app already installed makes
-        # this install an update, whose rewritten crons must reach the scheduler.
-        was_installed = await asyncio.to_thread(lambda: get_app(name) is not None)
-        result = await install_from_registry(name)
+        # this install an update, which takes the app down to replace its files and
+        # whose rewritten crons must reach the scheduler.
+        prior = await asyncio.to_thread(get_app, name)
+        was_installed = prior is not None
+        if was_installed:
+            result = await _reinstall_from_registry(name, name)
+        else:
+            result = await install_from_registry(name)
 
         # Redact install log and error before returning to client — build output
         # may contain internal hostnames, package URLs, or credential fragments.
@@ -253,10 +339,20 @@ async def handle_registry_install(request: web.Request) -> web.Response:
             backend_refused = await _start_backend_after_install(result["name"])
             if backend_refused:
                 result["backend_refused"] = backend_refused
+            if was_installed:
+                # An update: the new tree gets back what onEnable installed into the
+                # installed folder (see handle_update_app). This is also how an
+                # adopted app takes a catalog update.
+                result.update(await _rerun_on_enable_after_update(request, result["name"]))
     result["registration"] = reg.to_dict()
+    # An update ends as handle_update_app does, so a chat already open gets the app's
+    # MCP change (app-kit-platform §1).
+    if was_installed and (reg.mcp_servers or _held_mcp_servers(prior)):
+        await _reach_open_chats(request, name)
     sel().log_api_access(
         caller="dashboard", operation="app_registry_install", outcome="completed", resources=name
     )
+    _announce_app_ui_changed(request, result["name"])
     return web.json_response(result, status=201)
 
 
@@ -277,6 +373,7 @@ async def handle_registry_install_stream(request: web.Request) -> web.StreamResp
     from kiro_crew.dashboard.handlers._shared import (
         body_not_object_error,
         require_owner_dashboard_request,
+        string_field_error,
     )
 
     denied = await require_owner_dashboard_request(request, "app_registry_install")
@@ -284,13 +381,17 @@ async def handle_registry_install_stream(request: web.Request) -> web.StreamResp
         return denied
     try:
         body = await request.json()
-    except json.JSONDecodeError:
+    except (LookupError, RecursionError, ValueError):
         return web.json_response({"error": "invalid JSON"}, status=400)
     not_object = body_not_object_error(body)
     if not_object is not None:
         return not_object
 
     name = body.get("name", "")
+    # Before the stream opens, as the non-stream route does: a non-string name
+    # otherwise reached the install as a 200 stream ending in a Python TypeError.
+    if (wrong_type := string_field_error("name", name)) is not None:
+        return wrong_type
     if not name:
         return web.json_response({"error": "app name required"}, status=400)
 
@@ -364,11 +465,18 @@ async def handle_registry_install_stream(request: web.Request) -> web.StreamResp
     # Run install + drain concurrently. The complete lifecycle transaction —
     # install, resource registration, backend start — runs under one per-app
     # lock (install_from_registry is lock-free internally).
+    reach_open_chats = False
+
     async def _locked_install() -> dict[str, Any]:
+        nonlocal reach_open_chats
         async with app_lifecycle_lock(name):
             # Read before the install, as in handle_registry_install.
-            was_installed = await asyncio.to_thread(lambda: get_app(name) is not None)
-            r = await install_from_registry(name, log_lines=streaming_log)
+            prior = await asyncio.to_thread(get_app, name)
+            was_installed = prior is not None
+            if was_installed:
+                r = await _reinstall_from_registry(name, name, log_lines=streaming_log)
+            else:
+                r = await install_from_registry(name, log_lines=streaming_log)
             if r.get("ok") and not r.get("needsClientInstall"):
                 may_run = await _app_may_run_after_install(r["name"])
                 if not may_run:
@@ -388,6 +496,12 @@ async def handle_registry_install_stream(request: web.Request) -> web.StreamResp
                     r["registration"] = reg.to_dict()
                     if backend_refused:
                         r["backend_refused"] = backend_refused
+                    if was_installed:
+                        # An update, as in handle_registry_install: onEnable runs again.
+                        r.update(await _rerun_on_enable_after_update(request, r["name"]))
+                reach_open_chats = was_installed and bool(
+                    reg.mcp_servers or _held_mcp_servers(prior)
+                )
             return r
 
     install_task = asyncio.create_task(_locked_install())
@@ -437,13 +551,17 @@ async def handle_registry_install_stream(request: web.Request) -> web.StreamResp
         return resp
 
     # Resource registration + backend start already ran inside the locked
-    # transaction above; result carries "registration".
+    # transaction above; result carries "registration". An update ends as in
+    # handle_registry_install.
+    if reach_open_chats:
+        await _reach_open_chats(request, name)
     sel().log_api_access(
         caller="dashboard",
         operation="app_registry_install_stream",
         outcome="completed",
         resources=name,
     )
+    _announce_app_ui_changed(request, result["name"])
     await _send_sse("done", json.dumps(result))
     await _finish_stream()
     return resp
@@ -838,7 +956,13 @@ async def handle_registries_refresh(request: web.Request) -> web.Response:
     cache-bust + re-fetch is offloaded inside ``refresh_registries`` (async).
     """
     from kiro_crew.apps.registry import refresh_registries
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 
+    # Busts every configured registry's cache and re-fetches it: the owner's
+    # call, as on the PUT that configures them.
+    denied = await require_owner_dashboard_request(request, "registries.refresh")
+    if denied is not None:
+        return denied
     caller = request.get("user", "dashboard")
     repo: str | None = None
     body_bytes = await request.read()

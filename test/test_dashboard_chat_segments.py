@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from chat_test_helpers import _make_state
 from dashboard_chat_helpers import _provider_mock
+from redaction_structured_cases import github_classic
 
 
 class TestFlushSegment:
@@ -134,7 +135,7 @@ class TestFlushSegment:
 
         from kiro_crew.dashboard.chat import _flush_segment
 
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        secret = github_classic(seed=43)
 
         async def _run():
             _flush_segment(state, slot, f'<mcwidget title="W">key={secret}</mcwidget>')
@@ -224,11 +225,12 @@ class TestRunChatSegmentFlush:
         """
         from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
 
-        # AKIAIOSFODNN7EXAMPLE split exactly as in the pentest reproduction.
+        # A GitHub token split in three, as a model's stream splits it.
+        secret = github_classic(seed=41)
         events = [
-            LLMEvent(kind=EVENT_TEXT_CHUNK, text="The access key is AKIA"),
-            LLMEvent(kind=EVENT_TEXT_CHUNK, text="IOSFODNN7"),
-            LLMEvent(kind=EVENT_TEXT_CHUNK, text="EXAMPLE"),
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text="The token is " + secret[:8]),
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text=secret[8:22]),
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text=secret[22:]),
             LLMEvent(kind=EVENT_COMPLETE),
         ]
         state = self._make_state_for_run_chat(tmp_path, monkeypatch)
@@ -248,12 +250,12 @@ class TestRunChatSegmentFlush:
         wire = "".join(contents)
         # No individual frame — and not the reassembled wire — leaks the key.
         for frame in contents:
-            assert "AKIAIOSFODNN7EXAMPLE" not in frame
-        assert "AKIAIOSFODNN7EXAMPLE" not in wire
+            assert secret not in frame
+        assert secret not in wire
         # The credential fragments must not be recoverable across frames.
-        assert "AKIA" not in wire.replace("[REDACTED: credential]", "")
+        assert secret[:8] not in wire.replace("[REDACTED: credential]", "")
         assert "[REDACTED: credential]" in wire
-        assert wire == "The access key is [REDACTED: credential]"
+        assert wire == "The token is [REDACTED: credential]"
 
     @pytest.mark.asyncio
     async def test_credential_split_across_thinking_chunks_not_streamed_raw(
@@ -268,10 +270,11 @@ class TestRunChatSegmentFlush:
             LLMEvent,
         )
 
+        secret = github_classic(seed=42)
         events = [
-            LLMEvent(kind=EVENT_THINKING_CHUNK, text="the key looks like AKIA"),
-            LLMEvent(kind=EVENT_THINKING_CHUNK, text="IOSFODNN7"),
-            LLMEvent(kind=EVENT_THINKING_CHUNK, text="EXAMPLE"),
+            LLMEvent(kind=EVENT_THINKING_CHUNK, text="the token looks like " + secret[:8]),
+            LLMEvent(kind=EVENT_THINKING_CHUNK, text=secret[8:22]),
+            LLMEvent(kind=EVENT_THINKING_CHUNK, text=secret[22:]),
             LLMEvent(kind=EVENT_TEXT_CHUNK, text="done"),
             LLMEvent(kind=EVENT_COMPLETE),
         ]
@@ -291,10 +294,37 @@ class TestRunChatSegmentFlush:
         ]
         wire = "".join(thinking)
         for frame in thinking:
-            assert "AKIAIOSFODNN7EXAMPLE" not in frame
-        assert "AKIAIOSFODNN7EXAMPLE" not in wire
-        assert "AKIA" not in wire.replace("[REDACTED: credential]", "")
+            assert secret not in frame
+        assert secret not in wire
+        assert secret[:8] not in wire.replace("[REDACTED: credential]", "")
         assert "[REDACTED: credential]" in wire
+
+    @pytest.mark.asyncio
+    async def test_reply_quoting_a_render_result_is_saved_without_the_marker(
+        self, tmp_path, monkeypatch
+    ):
+        """A reply that repeats an MCP app tool's result is saved without its render
+        marker; the marker split across two deltas is cut too."""
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+        sid = "0123456789abcdef0123456789abcdef"
+        events = [
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text="Result:\n[kirocrew-mcp-app:0123456789"),
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text=f"{sid[10:]}] 3 rows found\nDONE"),
+            LLMEvent(kind=EVENT_COMPLETE),
+        ]
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_mock_client(events)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "render the app, then repeat the tool result")
+
+        assert [m["content"] for m in slot.messages if m.get("role") == "assistant"] == [
+            "Result:\n3 rows found\nDONE"
+        ]
 
     @pytest.mark.asyncio
     async def test_text_tool_text_complete_produces_two_segments(self, tmp_path, monkeypatch):
@@ -336,6 +366,36 @@ class TestRunChatSegmentFlush:
         ws_types = [t for t, _ in ws_calls]
         assert "chat_segment" in ws_types
         assert "tool_call" in ws_types
+
+    @pytest.mark.asyncio
+    async def test_reply_quoting_a_directive_result_is_saved_without_the_marker(
+        self, tmp_path, monkeypatch
+    ):
+        """A reply that repeats a directive tool's result is saved without its marker line.
+
+        The directive was applied from its tool row; the saved reply row is what
+        the finished bubble and every reload show, so the marker must not be in it.
+        """
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+        events = [
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text="Tagged.\n[[KIROCREW_SESSION_DIRECTIVE]]"),
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text='{"kind":"chat_tag","args":{"add":["x"]}}'),
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text="\nDONE"),
+            LLMEvent(kind=EVENT_COMPLETE),
+        ]
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_mock_client(events)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "tag this chat, then repeat the tool result")
+
+        assert [m["content"] for m in slot.messages if m.get("role") == "assistant"] == [
+            "Tagged.\nDONE"
+        ]
 
     @pytest.mark.asyncio
     async def test_tool_turn_progress_claim_surfaces_idle_notice(self, tmp_path, monkeypatch):

@@ -342,24 +342,24 @@ def test_a_pin_without_a_usable_overlay_pools_nothing(tmp_path, pins, pinned_ove
 
 
 def test_the_parent_spawn_allowlist_is_the_pinned_parents(tmp_path, pins):
-    from kiro_crew.subagent_parts.agent_policy import _scan_parent_spawn_allowlists
+    from kiro_crew.subagent_parts.spawn_allowlists import _scan_parent_spawn_allowlists
 
     agents = tmp_path / "agents"
     _write(agents, "PkgA-lead.json", name="lead", toolsSettings=_spawn(["alpha"]))
     _write(agents, "PkgB-lead.json", name="lead", toolsSettings=_spawn(["beta"]))
-    both, _ = _scan_parent_spawn_allowlists(agents, "lead", "spawn_available_agents")
+    both, _, _ = _scan_parent_spawn_allowlists(agents, "lead", "spawn_available_agents")
     assert both is not None and len(both) == 2
     pins["lead"] = "PkgB-lead.json"
-    pinned, _ = _scan_parent_spawn_allowlists(agents, "lead", "spawn_available_agents")
+    pinned, _, _ = _scan_parent_spawn_allowlists(agents, "lead", "spawn_available_agents")
     assert pinned is not None and len(pinned) == 1 and "beta" in json.dumps(pinned)
     # A pin chooses among user-level files only: the project scan keeps every
     # claimant's allowlist even when a project file shares the pinned name.
-    project, _ = _scan_parent_spawn_allowlists(agents, "lead", "spawn_available_agents_project")
+    project, _, _ = _scan_parent_spawn_allowlists(agents, "lead", "spawn_available_agents_project")
     assert project is not None and len(project) == 2
 
 
 def test_a_broken_pin_leaves_the_parent_spawn_allowlist_unknown(tmp_path, pins):
-    from kiro_crew.subagent_parts.agent_policy import _scan_parent_spawn_allowlists
+    from kiro_crew.subagent_parts.spawn_allowlists import _scan_parent_spawn_allowlists
 
     agents = tmp_path / "agents"
     _write(agents, "PkgA-lead.json", name="lead", toolsSettings=_spawn(["alpha"]))
@@ -369,6 +369,7 @@ def test_a_broken_pin_leaves_the_parent_spawn_allowlist_unknown(tmp_path, pins):
     assert _scan_parent_spawn_allowlists(agents, "lead", "spawn_available_agents") == (
         None,
         False,
+        (),
     )
 
 
@@ -595,11 +596,37 @@ def test_cli_sets_lists_and_clears_a_pin(user_agents, capsys):
     _cli("helper", "PkgB-helper.json")
     assert _stored_pins() == {"helper": "PkgB-helper.json"}
     assert agent_spec_pins.spec_pins() == {"helper": "PkgB-helper.json"}
+    assert "It applies to sessions started from now on" in capsys.readouterr().out
     _cli()
     assert "helper -> PkgB-helper.json" in capsys.readouterr().out
     _cli("helper", "--clear")
     assert _stored_pins() == {}
     assert "Cleared" in capsys.readouterr().out
+
+
+def test_cli_says_a_pin_on_an_uncontested_name_is_ignored(user_agents, capsys):
+    # Only other.json declares `other`; the resolver ignores a pin with no choice.
+    _cli("other", "other.json")
+    assert _stored_pins() == {"other": "other.json"}
+    out = capsys.readouterr().out
+    assert "Only one spec declares other, so the pin is ignored" in out
+    assert "It applies to sessions" not in out
+
+
+def test_cli_keeps_the_general_wording_when_the_contest_read_fails(
+    user_agents, capsys, monkeypatch
+):
+    from kiro_crew import agent_spec_pin_ops
+
+    def unreadable(**_kwargs):
+        raise OSError("agents directory vanished")
+
+    monkeypatch.setattr(agent_spec_pin_ops, "contested_agents", unreadable)
+    _cli("other", "other.json")
+    assert _stored_pins() == {"other": "other.json"}
+    out = capsys.readouterr().out
+    assert "It applies to sessions started from now on" in out
+    assert "Only one spec declares" not in out
 
 
 @pytest.mark.parametrize(

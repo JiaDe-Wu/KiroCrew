@@ -34,6 +34,7 @@ from kiro_crew.cron_service.schedule import (
     is_local_timezone,
     is_valid_skip_date,
     is_valid_timezone,
+    pin_random_cron_fields,
     runs_more_than_once_a_day,
     validate_cron_expr,
 )
@@ -167,6 +168,7 @@ _CRON_STRING_FIELD_CAPS: tuple[tuple[str, int], ...] = (
     # this length gate). Per the no-schema convention they use the general ID cap.
     ("secret_env_pin", MAX_SHORT_STRING),
     ("secret_env_pending_pin", MAX_SHORT_STRING),
+    ("secret_env_resurfaced_pin", MAX_SHORT_STRING),
 )
 
 
@@ -345,6 +347,7 @@ def build_job(
     valid_approval_modes = ("", "auto")
     if approval_mode not in valid_approval_modes:
         raise ValueError(f"Invalid approval_mode: {approval_mode!r}")
+    refuse_policy_denied_auto(approval_mode)
     # Writer mirror of _job_from_record's representable-number type-shape
     # check: the reader may skip a record with a non-representable
     # schedule numeric (NaN/Infinity/bignum) precisely BECAUSE no write
@@ -409,10 +412,11 @@ def build_job(
     for _d in skip_dates:
         if not is_valid_skip_date(_d):
             raise ValueError(f"Invalid skip_date: {_d!r} (expected YYYY-MM-DD)")
+    job_id = uuid.uuid4().hex[:8]
     if cron_expr:
         if not validate_cron_expr(cron_expr):
             raise ValueError(f"Invalid cron expression: {cron_expr}")
-        schedule = CronSchedule(kind="cron", cron_expr=cron_expr)
+        schedule = CronSchedule(kind="cron", cron_expr=pin_random_cron_fields(cron_expr, job_id))
     elif every_secs:
         schedule = CronSchedule(kind="every", every_secs=max(every_secs, _MIN_INTERVAL_SECS))
     elif at_ts:
@@ -423,7 +427,7 @@ def build_job(
         raise ValueError(_NEW_CHAT_PER_RUN_TOO_OFTEN)
 
     return CronJob(
-        id=uuid.uuid4().hex[:8],
+        id=job_id,
         name=name,
         message=message,
         schedule=schedule,
@@ -431,6 +435,7 @@ def build_job(
         thread_ts=thread_ts,
         enabled=enabled,
         user_paused=not enabled,
+        user_pause_requested=not enabled,
         created_ts=time.time(),
         delete_after_run=delete_after_run,
         created_by=created_by,
@@ -477,6 +482,10 @@ def apply_job_update(
         valid_approval_modes = ("", "auto")
         if kwargs["approval_mode"] not in valid_approval_modes:
             raise ValueError(f"Invalid approval_mode: {kwargs['approval_mode']!r}")
+        if job.approval_mode != "auto":
+            # Refuse only a NEW ``auto``: an edit that resends the stored value must
+            # still save; the fire path already runs it as asking.
+            refuse_policy_denied_auto(kwargs["approval_mode"])
     # Validate before any mutations
     # Table-driven type+length gate for every updatable string
     # field. Falsy values are intentional no-ops (the assignment
@@ -536,7 +545,9 @@ def apply_job_update(
     # leaves; only a request that names either one is checked.
     _schedule = job.schedule
     if kwargs.get("cron_expr"):
-        _schedule = CronSchedule(kind="cron", cron_expr=kwargs["cron_expr"])
+        _schedule = CronSchedule(
+            kind="cron", cron_expr=pin_random_cron_fields(kwargs["cron_expr"], job.id)
+        )
     elif kwargs.get("every_secs"):
         _schedule = CronSchedule(kind="every", every_secs=int(kwargs["every_secs"]))
     _per_run = (
@@ -753,6 +764,8 @@ def apply_job_update(
             # Withdraw/deny clears the whole request record.
             job.secret_env_pending_pin = ""
             job.secret_env_pending_ts = 0.0
+    if "secret_env_resurfaced_pin" in kwargs and kwargs["secret_env_resurfaced_pin"] is not None:
+        job.secret_env_resurfaced_pin = str(kwargs["secret_env_resurfaced_pin"])
     # Per-wake budget (the asyncio.wait_for deadline in
     # _execute_with_timeout). Distinct from ``timeout``, which
     # bounds only script/command subprocesses. This is the only
@@ -775,8 +788,71 @@ def apply_job_update(
     # deleted after its first run, so a one-shot made recurring clears
     # ``delete_after_run``.
     if "cron_expr" in kwargs and kwargs["cron_expr"]:
-        job.schedule = CronSchedule(kind="cron", cron_expr=kwargs["cron_expr"])
+        job.schedule = CronSchedule(
+            kind="cron", cron_expr=pin_random_cron_fields(kwargs["cron_expr"], job.id)
+        )
         job.delete_after_run = False
     elif "every_secs" in kwargs and kwargs["every_secs"]:
         job.schedule = CronSchedule(kind="every", every_secs=int(kwargs["every_secs"]))
         job.delete_after_run = False
+
+
+def refuse_policy_denied_auto(approval_mode: str) -> None:
+    """Refuse a job's ``auto`` when the ``permission_mode`` policy denies ``trust``.
+
+    ``auto`` approves every tool of the job's own session without asking, which is a
+    session Trust. The fire path re-checks (:func:`effective_job_approval_mode`), so a
+    job saved before the policy landed asks instead of auto-approving.
+
+    The refusal is a governance decision, not input validation, so it is audited
+    here, once, for every writer (CLI, apps SDK, dashboard, import). The audit is
+    best-effort: the refusal outranks it, as in ``mcp_cron._log_cron_denial``.
+    """
+    if approval_mode == "auto" and not cron_job_auto_permitted():
+        msg = "approval_mode 'auto' is disabled by your organization's policy"
+        try:
+            from kiro_crew import cron as seams  # the facade holds the patched names
+
+            seams.sel.sel().log_api_access(
+                caller="cron",
+                operation="cron.approval_mode",
+                outcome="denied",
+                source="cron",
+                resources="approval_mode=auto",
+                error=msg,
+            )
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).debug("approval_mode denial audit failed", exc_info=True)
+        raise ValueError(msg)
+
+
+def cron_job_auto_permitted() -> bool:
+    """Whether a job's ``approval_mode="auto"`` may auto-approve now. From memory."""
+    from kiro_crew.approval_mode_policy import session_mode_permitted
+
+    return session_mode_permitted("trust")
+
+
+def effective_job_approval_mode(approval_mode: str) -> str:
+    """The mode a job fires with: its own, minus an ``auto`` the policy now denies."""
+    if approval_mode == "auto" and not cron_job_auto_permitted():
+        return ""
+    return approval_mode
+
+
+def auto_job_approver(fallback: Any) -> Any:
+    """The approver an ``auto`` job's turn runs with: approve while ``auto`` holds.
+
+    The turn's ``AUTO_APPROVE`` policy is fixed when it starts, so a deny that lands
+    mid-turn is honoured here, per request: the call goes to *fallback* (the cron's
+    interactive approval) instead.
+    """
+
+    async def _approve(event: Any) -> bool:
+        if cron_job_auto_permitted():
+            return True
+        return bool(await fallback(event))
+
+    return _approve

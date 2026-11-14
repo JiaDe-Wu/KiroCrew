@@ -66,6 +66,7 @@ from kiro_crew.apps.builtin_adoption_state import (
     write_grant_and_marker,
     write_ledger,
 )
+from kiro_crew.sandbox import SandboxUnavailableError
 
 logger = logging.getLogger("kiro_crew.apps.builtin_adoption")
 
@@ -280,6 +281,12 @@ async def staging_pass(*, now: Callable[[], datetime]) -> dict[str, str]:
             outcomes[name] = await _stage_one(pins[name], now())
         except asyncio.CancelledError:
             raise
+        except SandboxUnavailableError as exc:
+            # The fetch runs in the sandbox, and a host with no backend refuses it on
+            # every pass. The refusal's own text names the host's remedy; a stack
+            # trace under it on each gateway start reads as a crash.
+            logger.warning("Adoption staging of %s failed: %s", name, exc)
+            outcomes[name] = "error"
         except Exception:  # noqa: BLE001 - one pin must not stop the others
             logger.exception("Adoption staging of %s failed", name)
             outcomes[name] = "error"
@@ -357,8 +364,8 @@ def _record_eligible(name: str) -> bool:
         return False
     tmp_data = path.parent / f".{name}-data-tmp"
     if _owned_data_dir(tmp_data) and _owned_data_dir(path / "data"):
-        # Data in two places: ``update_app`` would delete the moved-aside copy as
-        # stale, and it may be the only copy a killed swap preserved.
+        # Data in two places: ``update_app`` refuses it, since the moved-aside
+        # copy may be the only one a killed swap preserved.
         logger.warning("Adoption of %s skipped: its data is in two places", name)
         return False
     return not _temp_data_name_obstruction(tmp_data)
@@ -602,18 +609,30 @@ async def _record_missing_nav(
         return
     from kiro_crew.apps.builtin_adoption import record_is_adopted_from
     from kiro_crew.apps.manager import _read_installed
+    from kiro_crew.config.loader import PendingEditBlocksSave
 
     try:
         record = await asyncio.to_thread(_read_installed, pin.name)
         if record_is_adopted_from(record, pin.repository):
             await record_legacy_nav(pin.name, pin)
+    except PendingEditBlocksSave:
+        # Expected while a change made outside Kiro Crew waits for review, which the
+        # person is already shown; the next boot tries again.
+        logger.debug("Legacy nav of %s not recorded: review pending", pin.name, exc_info=True)
     except Exception:  # noqa: BLE001 - display state; the next boot tries again
         logger.warning("Could not record the legacy nav of %s", pin.name, exc_info=True)
 
 
 async def apply_all() -> dict[str, str]:
-    """APPLY every pin in name order: ``{name: outcome}``."""
+    """APPLY every pin in name order: ``{name: outcome}``.
+
+    A pin whose ``config.json`` write is refused because the file has a change made
+    outside Kiro Crew pending review is ``waiting_for_review``: its ledger is left as
+    it was, so the next boot tries again, and the whole pass logs one warning naming
+    the pending file, with each refusal's trace at DEBUG.
+    """
     from kiro_crew.apps.manager import app_lifecycle_lock
+    from kiro_crew.config.loader import PendingEditBlocksSave
     from kiro_crew.platform import PlatformCompositionError
 
     active = await asyncio.to_thread(_active)
@@ -621,6 +640,7 @@ async def apply_all() -> dict[str, str]:
         return {}
     pins, markers, navs = active
     outcomes: dict[str, str] = {}
+    pending_leaves: set[str] = set()
     for name in sorted(pins):
         try:
             async with app_lifecycle_lock(name):
@@ -629,7 +649,20 @@ async def apply_all() -> dict[str, str]:
                     await _record_missing_nav(pins[name], markers.get(name), navs.get(name))
         except (asyncio.CancelledError, PlatformCompositionError):
             raise
+        except PendingEditBlocksSave as exc:
+            logger.debug("Adoption of %s waits for a pending review", name, exc_info=True)
+            pending_leaves.add(exc.leaf)
+            outcomes[name] = "waiting_for_review"
         except Exception:  # noqa: BLE001 - one pin must not stop the boot
             logger.exception("Adoption of %s failed; the built-in keeps running", name)
             outcomes[name] = "error"
+    waiting = sorted(name for name, outcome in outcomes.items() if outcome == "waiting_for_review")
+    if waiting:
+        logger.warning(
+            "Adoption of %s waits: %s has a change made outside Kiro Crew. Apply or "
+            "discard it in Settings > Security; until then each keeps running as it "
+            "is, and the next start tries again.",
+            ", ".join(waiting),
+            ", ".join(sorted(pending_leaves)),
+        )
     return {name: outcome for name, outcome in outcomes.items() if outcome != "skipped"}

@@ -1,10 +1,11 @@
 import { lazy, Suspense, useEffect } from 'react'
-import { useLocation, useNavigate } from 'react-router-dom'
-import { Bell, Code, Cpu, Fingerprint, Globe, History, Import, Info, Keyboard, KeyRound, Link2, MessageSquare, Mic, Palette, PanelsTopLeft, Plug, Server, ShieldCheck, Sparkles, SquareMousePointer, Users, Webhook } from 'lucide-react'
+import { Navigate, useLocation, useNavigate } from 'react-router-dom'
+import { Bell, Code, Cpu, Fingerprint, Globe, Import, Info, Keyboard, KeyRound, Link2, MessageSquare, Mic, Palette, PanelsTopLeft, Plug, Server, ShieldCheck, Sparkles, SquareMousePointer, Users, Webhook } from 'lucide-react'
 import { useAppSelector } from '../store'
 import SidePanelLayout from '../components/SidePanelLayout'
 import { SUBNAV_PARAM, SUBNAV_LEGACY_PARAMS, deleteSubSelection, toPathSegment, parsePathSegments } from '../components/subNavParams'
 import { useSettingHighlight } from '../hooks/useSettingHighlight'
+import { RemoteControlCard } from './settings/RemoteControlCard'
 import { RemoteCrewPanel } from './settings/RemoteCrewPanel'
 import { PeoplePanel } from './settings/PeoplePanel'
 import { useSharedCrewCapabilities } from '../hooks/sharedCrew/useSharedCrew'
@@ -20,14 +21,13 @@ import { ChannelsPanel, CHANNEL_KEYS } from './settings/ChannelsPanel'
 import { OverviewPanel } from './settings/OverviewPanel'
 import { NotificationsPanel } from './settings/NotificationsPanel'
 import { ShortcutsPanel } from './settings/ShortcutsPanel'
-import { AboutPanel } from './settings/AboutPanel'
-import ReleasesPanel from './settings/ReleasesPanel'
+import { RELEASE_NOTES_LINK, RELEASE_PARAM } from './settings/ReleasesPanel'
 import { ImportPanel } from './settings/ImportPanel'
 import { ComputerUsePanel } from './settings/ComputerUsePanel'
 import { WebhooksPanel } from './settings/WebhooksPanel'
 import { PrivacyPanel } from './settings/PrivacyPanel'
-import { SecretsPanel } from './settings/SecretsPanel'
-import { ConnectionsPanel } from './settings/ConnectionsPanel'
+import { SecretsPanelLegacy } from './settings/SecretsPanelLegacy'
+import { useConnectionsUiEnabled, useConnectionsUiPending } from '../hooks/useConnectionsUi'
 import SettingsSearch from './settings/SettingsSearch'
 import { Btn, ContentSkeleton } from '../components/ui'
 import { DataHomeOwnerStatusNotice } from '../components/DataHomeOwnerNotice'
@@ -45,6 +45,14 @@ const AgentBackendTab = lazy(() =>
 const AgentRunSettings = lazy(() =>
   import('./overview/KiroCrewCfgTab').then(m => ({ default: m.AgentRunSettings })),
 )
+/** Lazy: the Connections gallery (cards, connect flow, OAuth app parts) is
+ *  only needed when that tab opens, so it stays out of the Settings chunk. */
+const ConnectionsPage = lazy(() => import('./connections/ConnectionsPage'))
+/** Lazy: the list-detail Secrets panel draws only behind the Secrets vault
+ *  redesign preview. The default panel stays in this chunk, as it is on main. */
+const SecretsPanel = lazy(() =>
+  import('./settings/SecretsPanel').then(m => ({ default: m.SecretsPanel })),
+)
 /** Lazy: the Browser tab's status card and live-view settings are only needed when that tab opens. */
 const BrowserPanel = lazy(() =>
   import('./settings/BrowserPanel').then(m => ({ default: m.BrowserPanel })),
@@ -56,11 +64,16 @@ const BrowserPanel = lazy(() =>
 const SessionEnvironmentsCard = lazy(() =>
   import('./settings/SessionEnvironmentsCard').then(m => ({ default: m.SessionEnvironmentsCard })),
 )
+/** Lazy: the About tab (version, update flow, release notes) is only needed when that tab opens. */
+const AboutPanel = lazy(() =>
+  import('./settings/AboutPanel').then(m => ({ default: m.AboutPanel })),
+)
 import { SettingsCard } from '../components/settings'
 
 import { i18nT } from '../i18n/t'
 import { usePreviewFlag } from '../hooks/usePreviewFlag'
-import { PREVIEW_SESSION_ENVIRONMENTS, PREVIEW_WEBHOOKS } from '../utils/previewFlags'
+import { useConfigPendingCount } from './settings/configPendingQuery'
+import { PREVIEW_SECRETS_VAULT, PREVIEW_SESSION_ENVIRONMENTS, PREVIEW_WEBHOOKS } from '../utils/previewFlags'
 import { GuideTrustRootRegion } from '../guide/trustRoot'
 // Group headers double as the grouping KEY (SidePanelLayout starts a new header
 // whenever this string changes), so they are resolved inside `buildTabs()` —
@@ -109,19 +122,9 @@ function buildTabs() {
     { key: 'secrets', tile: 'var(--tile-gray)', label: i18nT('settings.tabs.secrets.label'), icon: <KeyRound size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.secrets.description') },
     { key: 'session-environments', tile: 'var(--tile-blue)', label: i18nT('sessionEnvironments.title'), icon: <Server size={16} />, group: GROUP_SYSTEM, description: i18nT('sessionEnvironments.settingsDescription') },
     { key: 'developer', tile: 'var(--tile-gray)', label: i18nT('settings.tabs.developer.label'), icon: <Code size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.developer.description'), hostsSubNav: true },
-    // The trailing divider fences off the entries that are not settings at all.
-    // About was its only occupant; the release archive is the same kind of thing
-    // (a document about the product, not a preference), so it joins the fence
-    // rather than opening a second exception. The divider flag rides the FIRST
-    // entry after it -- `SidePanelLayout` renders one separator per flagged row,
-    // so leaving it on About too would draw two lines and strand this row
-    // outside the fence. About stays last, where every platform puts it.
-    // The one Settings tab that is contained rather than page-scrolled: it has
-    // its own version rail beside the notes, and letting the page grow scrolled
-    // the rail and the "Releases" heading off the top while the reader was
-    // still inside one release's notes.
-    { key: 'releases', tile: 'var(--tile-purple)', label: i18nT('settings.tabs.releases.label'), icon: <History size={16} />, dividerBefore: true, fixedContent: true, description: i18nT('settings.tabs.releases.description') },
-    { key: 'about', tile: 'var(--tile-gray)', label: i18nT('settings.tabs.about.label'), icon: <Info size={16} />, description: i18nT('settings.tabs.about.description') },
+    // The trailing divider fences off About, the one entry that is not a
+    // setting at all. About stays last, where every platform puts it.
+    { key: 'about', tile: 'var(--tile-gray)', label: i18nT('settings.tabs.about.label'), icon: <Info size={16} />, dividerBefore: true, description: i18nT('settings.tabs.about.description'), drillInParams: [RELEASE_PARAM] },
   ]
 }
 
@@ -235,6 +238,10 @@ export default function SettingsPage() {
   // `=== true` is required, not cosmetic: the gateway sends null for a check that
   // never ran or failed, and a truthiness test would keep that dark while a
   // `!== false` test would light it on no evidence.
+  // Every `kirocrew://remote-crew/add` link remounts Remote Crew, so a panel
+  // already on screen comes back on its first tab with the newest link's values
+  // in its add form.
+  const crewAddLinkSeq = useAppSelector(s => s.instances.crewForms?.addLinkSeq ?? 0)
   const gatewayUpdateAvailable = useAppSelector(s => s.dashboard.status?.update_available)
   const desktopUpdateAvailable = useAppSelector(s => s.dashboard.desktopUpdateAvailable)
   const updateAvailable = gatewayUpdateAvailable === true || desktopUpdateAvailable
@@ -245,7 +252,16 @@ export default function SettingsPage() {
   // bare `readPreviewFlag`, so toggling it in Settings > Developer > Feature Previews updates this
   // rail without a reload.
   const webhooksPreview = usePreviewFlag(PREVIEW_WEBHOOKS)
+  // The `connections_ui` escape hatch: false empties the Connections tab's gallery.
+  const connectionsUiEnabled = useConnectionsUiEnabled()
+  // Until that config is read, the tab cannot know which layout it has: the
+  // OAuth-apps-only forms (off) or the gallery (on). Showing the off forms first
+  // would drop a draft typed into them when the read flips the page to on.
+  const connectionsUiPending = useConnectionsUiPending()
   const sessionEnvironmentsPreview = usePreviewFlag(PREVIEW_SESSION_ENVIRONMENTS)
+  // The list-detail Secrets panel hosts its own sub-nav; off, the tab is the
+  // single-page panel and hosts none.
+  const secretsVaultPreview = usePreviewFlag(PREVIEW_SECRETS_VAULT)
   // People exists only while the gateway reports the Shared Crew preview
   // (`KIROCREW_SHARED_CREW_PREVIEW=1`); a browser setting cannot turn it on.
   const sharedCrew = useSharedCrewCapabilities()
@@ -255,12 +271,38 @@ export default function SettingsPage() {
     && (t.key !== 'session-environments' || sessionEnvironmentsPreview)
     && (t.key !== 'people' || sharedCrewPreview),
   )
-  const tabs = updateAvailable ? allTabs.map(t => (t.key === 'about' ? { ...t, dot: true } : t)) : allTabs
+  // Review nudge: dot on the Security entry while a settings file edited outside
+  // the dashboard waits for Apply or Discard there.
+  const configPending = useConfigPendingCount() > 0
+  const tabs = allTabs.map(t => (
+    t.key === 'secrets' && secretsVaultPreview ? { ...t, hostsSubNav: true }
+    : t.key === 'about' && updateAvailable ? { ...t, dot: true }
+      : t.key === 'security' && configPending
+        ? { ...t, dot: true, dotLabel: i18nT('pages.settings.securityPanel.configPending.nav_dot') }
+        : t
+  ))
 
   const memorySelection = new URLSearchParams(search)
   const memberMemoryView = pathname.replace(/\/$/, '') === '/settings/overview'
     && memorySelection.get('view') === 'memory' && !!memorySelection.get('store')
     && memorySelection.get('store') !== 'default'
+
+  // The release notes used to be a Releases tab of their own and now sit at the
+  // foot of About, so its old addresses (`/settings/releases`,
+  // `/settings/releases/<version>` and the legacy `?tab=releases`) land there,
+  // with the release notes section, or a named version in it, scrolled into
+  // view. Rendered in place of
+  // the layout so no other tab paints for a frame on the way.
+  const releasesSegments = parsePathSegments(SETTINGS_BASE_PATH, pathname)
+  const legacyReleasesTab = !releasesSegments[0] && memorySelection.get('tab') === 'releases'
+  if (releasesSegments[0] === 'releases' || legacyReleasesTab) {
+    const qs = new URLSearchParams(search)
+    qs.delete('tab')
+    // A named version opens that release; the bare address opens the section.
+    qs.set(RELEASE_PARAM, releasesSegments[1] || RELEASE_NOTES_LINK)
+    const rest = qs.toString()
+    return <Navigate replace to={{ pathname: `${SETTINGS_BASE_PATH}/about`, search: rest ? `?${rest}` : '' }} />
+  }
 
   return (
     <SidePanelLayout
@@ -319,12 +361,31 @@ export default function SettingsPage() {
         )}
         {tab === 'computer-use' && <GuideTrustRootRegion><ComputerUsePanel /></GuideTrustRootRegion>}
         {tab === 'webhooks' && <WebhooksPanel />}
-        {tab === 'instances' && <RemoteCrewPanel />}
+        {tab === 'instances' && (
+          <>
+            <RemoteControlCard />
+            <RemoteCrewPanel key={crewAddLinkSeq} />
+          </>
+        )}
         {tab === 'people' && sharedCrewPreview && <PeoplePanel />}
         {tab === 'privacy' && <PrivacyPanel />}
         {tab === 'security' && <GuideTrustRootRegion><SecurityPanel basePath={SETTINGS_BASE_PATH} /></GuideTrustRootRegion>}
-        {tab === 'connections' && <ConnectionsPanel />}
-        {tab === 'secrets' && <GuideTrustRootRegion><SecretsPanel /></GuideTrustRootRegion>}
+        {tab === 'connections' && (
+          <Suspense fallback={<ContentSkeleton rows={6} />}>
+            {connectionsUiPending
+              ? <ContentSkeleton rows={6} />
+              : <ConnectionsPage servicesEnabled={connectionsUiEnabled} />}
+          </Suspense>
+        )}
+        {tab === 'secrets' && (
+          <GuideTrustRootRegion>
+            {secretsVaultPreview ? (
+              <Suspense fallback={<ContentSkeleton rows={6} />}>
+                <SecretsPanel basePath={SETTINGS_BASE_PATH} />
+              </Suspense>
+            ) : <SecretsPanelLegacy />}
+          </GuideTrustRootRegion>
+        )}
         {tab === 'session-environments' && sessionEnvironmentsPreview && (
           <SettingsCard>
             <Suspense fallback={<ContentSkeleton rows={6} />}>
@@ -333,8 +394,11 @@ export default function SettingsPage() {
           </SettingsCard>
         )}
         {tab === 'developer' && <DeveloperPanel basePath={SETTINGS_BASE_PATH} />}
-        {tab === 'releases' && <ReleasesPanel />}
-        {tab === 'about' && <AboutPanel />}
+        {tab === 'about' && (
+          <Suspense fallback={<ContentSkeleton rows={6} />}>
+            <AboutPanel />
+          </Suspense>
+        )}
       </>}
     </SidePanelLayout>
   )

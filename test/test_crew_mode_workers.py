@@ -16,11 +16,16 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
+# Loaded here, before any test patches chat_delivery / chat_runner: chat_handlers
+# copies those names in at import, so a first import under a patch would keep the
+# fake for every later test on this worker.
+import kiro_crew.dashboard.chat_handlers  # noqa: F401
 from kiro_crew import crew_mode
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from mcp_dashboard_folders_helpers import _FOLDERS, _call, _writes  # noqa: E402
+from redaction_structured_cases import github_classic  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -322,7 +327,12 @@ async def _slots_get(monkeypatch, query: str = "", internal: bool = False) -> li
         {"key": "w1", crew_mode.ROOT_FIELD: False, crew_mode.WORKER_FIELD: "root"},
         {"key": "plain", crew_mode.ROOT_FIELD: False},
     ]
-    state = SimpleNamespace(_slots={}, serialize_slots=lambda **_k: [dict(p) for p in payloads])
+    state = SimpleNamespace(
+        _slots={},
+        slot_list_held_keys=lambda: [],
+        slot_list_hold_channels=lambda: False,
+        serialize_slots=lambda **_k: [dict(p) for p in payloads],
+    )
 
     async def _noop():
         return None
@@ -497,6 +507,8 @@ def _state(rows: list[dict[str, Any]], live: dict[str, Any] | None = None) -> An
     live = live or {}
     return SimpleNamespace(
         serialize_slots=serialize_slots,
+        slot_list_held_keys=lambda: [],
+        slot_list_hold_channels=lambda: False,
         get_slot=lambda key: live.get(key),
         push_slots_update=lambda: None,
     )
@@ -846,7 +858,7 @@ async def test_a_held_steer_is_reported_queued_persisted_and_shown(_open_gate, m
     monkeypatch.setattr(
         chat_delivery, "start_queue_persist", lambda st, sl: persisted.append(sl.key)
     )
-    monkeypatch.setattr(chat_delivery, "warn_if_not_durable", lambda *a: None)
+    monkeypatch.setattr(chat_delivery, "warn_if_not_durable", lambda *a: True)
     monkeypatch.setattr(crew_log_emit, "on_message_queued", lambda *a, **k: None)
     monkeypatch.setattr("kiro_crew.dashboard.relay_archive.is_relay_archive", lambda s: False)
     queue: list[dict[str, Any]] = []
@@ -897,7 +909,7 @@ def test_the_routes_are_registered_under_the_slot():
         "/api/chat/slots/{slot}/crew-workers/{worker}/approve": ["POST"],
         # A session's in-place recap on the crewmate Sessions tab.
         "/api/chat/slots/{slot}/crew-workers/{worker}/recap": ["GET"],
-        # Ultra Mode Pause all / Resume all.
+        # Conductor mode Pause all / Resume all.
         "/api/chat/slots/{slot}/crew-workers/pause": ["POST"],
         "/api/chat/slots/{slot}/crew-workers/resume": ["POST"],
     }
@@ -973,25 +985,25 @@ async def test_the_board_is_adopted_for_a_swapped_in_conductor(monkeypatch):
     assert adopted == ["root"]
 
 
-# A fake AWS key id, split so no scanner reads it as a real one.
-_FAKE_KEY = "AKIA" + "ABCDEFGHIJKLMNOP"
+# A synthetic GitHub classic token with a valid checksum, which the plan redacts.
+_FAKE_KEY = github_classic(seed=41)
 
 
 def test_a_long_last_reply_is_redacted_before_it_is_cut():
     from kiro_crew.dashboard.handlers import crew_workers
 
-    secret = "AKIA" + "Q" * 16
-    text = "x" * 140 + " **AKIA**" + secret[4:] + " done"
+    secret = github_classic(seed=42)
+    text = "x" * 140 + " " + secret + " done"
     slot = SimpleNamespace(messages=[{"role": "assistant", "content": text}])
     seed = "[sent by session c via session_send] go"
     line = crew_workers._worker_line({"last_message": seed}, "", slot)
-    assert "Q" * 8 not in line
+    assert secret[4:12] not in line
 
 
 def test_a_last_reply_standing_in_for_a_seed_is_redacted():
     from kiro_crew.dashboard.handlers import crew_workers
 
-    secret = "AKIA" + "Z" * 16
+    secret = github_classic(seed=43)
     slot = SimpleNamespace(messages=[{"role": "assistant", "content": f"key {secret} saved"}])
     seed = "[sent by session c via session_send] go"
     line = crew_workers._worker_line({"last_message": seed}, "", slot)

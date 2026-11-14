@@ -49,7 +49,8 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         False,
         "(self, session_key: 'str', approval_id: 'str', approved: "
-        "'bool', decision: 'str' = '', *, instance: 'str' = '') -> 'None'",
+        "'bool', decision: 'str' = '', *, origin: 'str' = '', instance: 'str' = '', "
+        "mid: 'str' = '') -> 'None'",
     ),
     "_audit_approval": (
         "function",
@@ -59,6 +60,12 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "decision: 'str' = '') -> 'None'",
     ),
     "_background_turn_sema": ("function", False, False, "(self) -> 'asyncio.Semaphore'"),
+    "_bridge_note": (
+        "function",
+        False,
+        False,
+        "(self, note: 'dict[str, Any]', publisher: 'str' = '') -> 'None'",
+    ),
     "_broadcast": ("function", False, False, "(self, note: 'dict[str, Any]') -> 'None'"),
     "_broadcast_chat_message": (
         "function",
@@ -259,6 +266,12 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
     ),
     "_yolo": ("property", False, False, "(self) -> 'bool'"),
     "ack_notification": ("function", True, False, "(self, ts: 'str') -> 'bool'"),
+    "acknowledge_notifications_where": (
+        "function",
+        True,
+        False,
+        "(self, matches: 'Callable[[dict[str, Any]], bool]') -> 'int'",
+    ),
     "add_fold_watch_listener": (
         "function",
         False,
@@ -609,7 +622,8 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         "(self, approval_id: 'str', source: 'str', tool: 'str', *, tool_input: "
         "'str' = '', tool_purpose: 'str' = '', slot: 'str' = '', is_background: "
-        "'bool' = False) -> 'bool'",
+        "'bool' = False, run_task_id: 'str' = '', task_index: 'int | None' = None, "
+        "on_host_decision: 'Callable[[str], object] | None' = None) -> 'bool'",
     ),
     "request_question": (
         "function",
@@ -735,6 +749,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "(self, ws: 'web.WebSocketResponse', slots: 'object') -> 'frozenset[str]'",
     ),
     "slot_exists": ("function", False, False, "(self, name: 'str') -> 'bool'"),
+    "session_still_loading": ("function", True, False, "(self, name: 'str') -> 'bool'"),
     "slot_list_held_keys": ("function", False, False, "(self) -> 'list[str]'"),
     "slot_list_hold_channels": ("function", False, False, "(self) -> 'bool'"),
     "source_link_urls": ("function", False, False, "(self) -> 'list[str]'"),
@@ -749,15 +764,22 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "update_available: 'bool | None' = None, update_can_apply: 'bool' = "
         "False, update_check_status: 'str' = 'unchecked', update_command: 'str' = "
         "'', update_latest_version: 'str' = '', update_latest_version_display: "
-        "'str' = '', update_channel: 'str' = '', update_channel_move_pending: "
+        "'str' = '', update_channel: 'str' = '', update_upcoming: "
+        "'dict[str, Any] | None' = None, update_channel_move_pending: "
         "'bool' = False, update_managed_by: 'str' = '', update_policy_file: 'str' "
         "= '', update_commits_ahead: 'int' = 0, update_commits_behind: 'int' = 0, "
         "update_last_checked_at: "
         "'float | None' = None, update_check_interval_secs: 'int' = 43200, "
         "update_required: 'bool' = False, update_min_version: 'str' = '', "
         "update_can_arm: 'bool' = False, update_auto_effect: 'str' = 'unknown', "
-        "update_bundled_by_app: 'bool' = False, version_display: 'str' = '', "
-        "bundle_id: 'str' = '') -> 'dict[str, Any]'",
+        "update_auto_manual_only: 'bool' = False, "
+        "update_bundled_by_app: 'bool' = False, update_restart_ready: 'bool' = False, "
+        "update_restart_ready_version: 'str' = '', update_restart_ready_reason: 'str' = '', "
+        "update_armed_version: 'str | None' = None, "
+        "update_armed_at: 'float | None' = None, "
+        "pending_apply_error: 'str | None' = None, "
+        "version_display: 'str' = '', bundle_id: 'str' = '', "
+        "background_turns: 'dict[str, int] | None' = None) -> 'dict[str, Any]'",
     ),
     "subscribe_logs": ("function", False, False, "(self, ws: 'web.WebSocketResponse') -> 'None'"),
     "subscribe_subagents": (

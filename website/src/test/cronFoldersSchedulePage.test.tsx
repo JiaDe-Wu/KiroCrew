@@ -15,6 +15,21 @@ const mkJob = (id: string, name: string, folderId?: string): CronJob => ({
   folder_id: folderId || '',
 } as CronJob)
 
+// The batch move is a submenu of the batch bar's Actions menu (Radix needs keyboard-open in jsdom).
+const openBatchMove = async () => {
+  fireEvent.keyDown(screen.getByLabelText('Actions for the checked jobs'), { key: 'Enter' })
+  const subTrigger = await screen.findByText('Move to folder')
+  fireEvent.keyDown(subTrigger, { key: 'ArrowRight' })
+  return screen.findByRole('menuitem', { name: 'Ungrouped' })
+}
+const pickFolder = async (name: string) => {
+  await waitFor(() => {
+    const item = screen.getAllByRole('menuitem').find(el => el.textContent?.includes(name))
+    expect(item).toBeTruthy()
+    fireEvent.click(item!)
+  })
+}
+
 vi.mock('../api/client', () => ({
   api: {
     crons: vi.fn(),
@@ -601,15 +616,14 @@ describe('SchedulePage cron folders', () => {
     renderWithProviders(<SchedulePage />)
     await waitFor(() => expect(screen.getByText('Job A')).toBeInTheDocument())
 
-    // Select two jobs
-    const checkboxes = screen.getAllByRole('checkbox', { name: /Select/ })
-    fireEvent.click(checkboxes[0])
-    fireEvent.click(checkboxes[1])
+    fireEvent.click(screen.getByLabelText('Select Job A'))
+    fireEvent.click(screen.getByLabelText('Select Job B'))
 
-    // Batch toolbar should show "Move to folder" button
-    const batchMoveBtn = screen.getAllByLabelText('Move to folder')
-    // At least one in the batch toolbar
-    expect(batchMoveBtn.length).toBeGreaterThanOrEqual(1)
+    await openBatchMove()
+    await pickFolder('Target')
+    await waitFor(() => expect(vi.mocked(api).updateCron).toHaveBeenCalledWith('j1', { folder_id: 'f1' }))
+    expect(vi.mocked(api).updateCron).toHaveBeenCalledWith('j2', { folder_id: 'f1' })
+    expect(vi.mocked(api).updateCron).not.toHaveBeenCalledWith('j3', expect.anything())
   })
 
   it('CronJobMoveMenu with zero folders has no double separator', async () => {
@@ -622,24 +636,12 @@ describe('SchedulePage cron folders', () => {
     renderWithProviders(<SchedulePage />)
     await waitFor(() => expect(screen.getByText('Some Job')).toBeInTheDocument())
 
-    // Exercised through the BATCH toolbar: that is `CronJobMoveMenu`'s remaining
-    // call site. The row's own move affordance is now a submenu inside the ⋯
-    // menu (see CronRowActions), which builds its items separately.
     fireEvent.click(screen.getByRole('checkbox', { name: /Select Some Job/ }))
-    const moveBtn = await screen.findByLabelText('Move to folder')
-    fireEvent.keyDown(moveBtn, { key: 'Enter' })
+    const ungrouped = await openBatchMove()
 
-    // Wait for menu to open
-    await waitFor(() => expect(screen.getByText('Ungrouped')).toBeInTheDocument())
-
-    // Count separators (role=separator in Radix)
-    const menuContent = moveBtn.closest('[data-radix-popper-content-wrapper]') ||
-      document.querySelector('[role="menu"]')
-    if (menuContent) {
-      const separators = menuContent.querySelectorAll('[role="separator"]')
-      // With zero folders: should be exactly 1 separator (between Ungrouped and New folder)
-      expect(separators.length).toBe(1)
-    }
+    // With zero folders: exactly 1 separator (between Ungrouped and New folder).
+    const submenu = ungrouped.closest('[role="menu"]')!
+    expect(submenu.querySelectorAll('[role="separator"]').length).toBe(1)
   })
 
   it('batch-move error renders near batch toolbar', async () => {
@@ -659,20 +661,8 @@ describe('SchedulePage cron folders', () => {
     fireEvent.click(screen.getByLabelText('Select Job A'))
     fireEvent.click(screen.getByLabelText('Select Job B'))
 
-    // Open batch move menu (Radix needs keyboard-open in jsdom). Scope to the
-    // selection toolbar -- per-row move buttons share the same aria-label.
-    const toolbarLabel = screen.getByText((_, el) => el?.tagName === 'SPAN' && el.textContent === '2 selected')
-    const toolbar = toolbarLabel.parentElement as HTMLElement
-    const batchMoveBtn = within(toolbar).getByLabelText('Move to folder')
-    fireEvent.keyDown(batchMoveBtn, { key: 'Enter' })
-
-    // Click the folder option
-    await waitFor(() => {
-      const menuItems = screen.getAllByRole('menuitem')
-      const targetItem = menuItems.find(el => el.textContent?.includes('Target'))
-      expect(targetItem).toBeTruthy()
-      fireEvent.click(targetItem!)
-    })
+    await openBatchMove()
+    await pickFolder('Target')
 
     // Error should render near the toolbar, through the shared ErrorNotice
     // (role="alert"; the message no longer sits on a text-danger span of its own).
@@ -681,5 +671,50 @@ describe('SchedulePage cron folders', () => {
       expect(errorEl).toHaveAttribute('role', 'alert')
       expect(errorEl).toHaveTextContent(/could not be moved/)
     })
+  })
+
+  it('clears the batch-move error once a retry of the failed jobs succeeds', async () => {
+    const { api } = await import('../api/client')
+    vi.mocked(api).cronFolders.mockResolvedValue([{ id: 'f1', name: 'Target', order: 1 }])
+    vi.mocked(api).crons.mockResolvedValue({
+      jobs: [mkJob('j1', 'Job A'), mkJob('j2', 'Job B')],
+    })
+    vi.mocked(api).updateCron.mockRejectedValueOnce(new Error('Move failed'))
+    vi.mocked(api).updateCron.mockResolvedValue({})
+
+    renderWithProviders(<SchedulePage />)
+    await waitFor(() => expect(screen.getByText('Job A')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('Select Job A'))
+    fireEvent.click(screen.getByLabelText('Select Job B'))
+    await openBatchMove()
+    await pickFolder('Target')
+    await screen.findByTestId('schedule-batch-move-error')
+
+    // The failed job stays selected; moving it again works.
+    await openBatchMove()
+    await pickFolder('Target')
+    await waitFor(() => expect(vi.mocked(api).updateCron).toHaveBeenCalledTimes(3))
+    await waitFor(() => expect(screen.queryByTestId('schedule-batch-move-error')).toBeNull())
+  })
+
+  it('clears a single job move error once a retried move succeeds', async () => {
+    const { api } = await import('../api/client')
+    vi.mocked(api).cronFolders.mockResolvedValue([{ id: 'f1', name: 'Target', order: 1 }])
+    vi.mocked(api).crons.mockResolvedValue({ jobs: [mkJob('j1', 'Moving Job')] })
+    vi.mocked(api).updateCron.mockRejectedValueOnce(new Error('zz-move-refused'))
+    vi.mocked(api).updateCron.mockResolvedValue({})
+    const moveViaRow = async () => {
+      fireEvent.keyDown(screen.getByLabelText('Actions'), { key: 'Enter' })
+      fireEvent.keyDown(await screen.findByText('Move to folder'), { key: 'ArrowRight' })
+      await pickFolder('Target')
+    }
+
+    renderWithProviders(<SchedulePage />)
+    await waitFor(() => expect(screen.getByText('Moving Job')).toBeInTheDocument())
+    await moveViaRow()
+    expect(await screen.findByText(/zz-move-refused/)).toBeInTheDocument()
+    await moveViaRow()
+    await waitFor(() => expect(vi.mocked(api).updateCron).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.queryByText(/zz-move-refused/)).toBeNull())
   })
 })

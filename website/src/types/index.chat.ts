@@ -5,7 +5,7 @@
 // content blocks; notifications and their channels; approvals; history session
 // rows. Consumers import them from `types/index.ts`.
 import type { WebAppMetadata } from './index.artifacts'
-import type { SessionAttribution } from './index.sharedCrew'
+import type { PublicPrincipal, SessionAttribution } from './index.sharedCrew'
 import type { SourceProviderId } from './index.sources'
 
 /** One open ledger item that does not name a person (`crew_work.items`). */
@@ -110,6 +110,32 @@ export interface McpSessionReport {
    * Optional because an older gateway sends no such key.
    */
   restart_to_load?: string[]
+  /**
+   * The servers this session cannot use right now, by what is true of each.
+   * Optional: a gateway or an agent backend that does not report it sends no
+   * such key, and then no server is known to be connecting.
+   */
+  states?: McpSessionStates
+  /**
+   * Not zero when the report left servers out because one of its lists was
+   * full: it is then partial. A total of what each list left out, not a
+   * number of servers.
+   */
+  states_omitted?: number
+}
+
+/** A session's not-ready servers by state; a state with no server is left out. */
+export interface McpSessionStates {
+  /** Declared and not reported yet: still starting. */
+  connecting?: string[]
+  /** Waits for a person to authorize it. */
+  needs_sign_in?: string[]
+  /** Reported a failed start. */
+  failed?: string[]
+  /** Switched off by its owner, or reported disabled by the host. */
+  disabled?: string[]
+  /** Dropped by the host's registry instead of started. */
+  registry_dropped?: string[]
 }
 
 /** A Slack code channel a session runs in (`slack/code_channels/dashboard_view.py`).
@@ -292,6 +318,9 @@ export interface ChatSlot extends TurnIdentityFields {
   incarnation?: string
   /** Prompts held for a later turn on this slot. */
   queue_depth?: number
+  /** Of those, the restored cards no drain starts on its own (`readyQueueDepth`).
+   *  Absent on an older gateway. */
+  queue_held_depth?: number
   /** Set when this session is a Slack code channel's (see `CodeChannelInfo`). */
   code_channel?: CodeChannelInfo
   /** Code channels are on but not read yet, so this Slack-linked row may still
@@ -317,6 +346,11 @@ export interface ChatSlot extends TurnIdentityFields {
   /** Shared Crew creator (`shared_crew.attribution`), public shape. Display only. */
   attribution?: SessionAttribution | null
   created_by?: string
+  /** Shared Crew: the people who have written here, creator first, then most
+   *  recent (`shared_crew.participants`), public shape. Display only. */
+  participants?: PublicPrincipal[]
+  /** How many people the gateway's capped `participants` list dropped. */
+  participants_dropped?: number
   /** True on a Crew Mode root: a root session running a conductor template
    *  (`crew_mode.stamp_rows`). The session list styles and filters on it. */
   crew_mode_root?: boolean
@@ -425,6 +459,12 @@ export interface ChatSlot extends TurnIdentityFields {
   /** The language `preparing_text` is written in (`en`, `zh`, ...). The client
    * shows the text only when this is its UI language. */
   preparing_lang?: string
+  /** The greeting the agent's spec carries (`welcomeMessage`), capped and
+   * redacted by the gateway, while the chat has no row: an unstarted chat
+   * writes none, so the welcome page draws it from here. "" from the first row
+   * on, when the transcript's welcome row (`meta.kind` `agent_welcome`) carries
+   * it; absent from an older gateway. Plain text, never markdown or HTML. */
+  welcome_message?: string
   /** A cooperative Stop was declined moments ago (compaction); the next press
    * escalates to the force stop. Read from the same window the backend uses. */
   stop_declined?: boolean
@@ -578,6 +618,10 @@ export interface ChatSlotDetailResponse extends TurnIdentityFields {
   context_pct?: number
   context_used_tokens?: number
   context_window_tokens?: number
+  /** Incremental-read cursor, present when the read asked for one (`cursor=1`). */
+  cursor?: unknown
+  /** Set on a response that carries only the rows after the echoed cursor. */
+  delta?: unknown
 }
 
 export interface SubagentActivity {
@@ -638,6 +682,8 @@ export interface SubagentActivity {
   stalledAt?: number
   retrying?: boolean      // transient-backend retry (or cancel auto-continue) in flight
   approval_id?: string
+  /** The coordinator request a pending spawn waits on (types/approvalTarget). */
+  approval_target?: CoordinatorApprovalTarget
   approving?: boolean
   /** The `approval_id` a resolve attempt found gone (`isTerminalApprovalRefusal`):
    *  decided or expired where this client could not see it. Scoped by id so a
@@ -680,6 +726,8 @@ export interface ToolActivity {
   execution_started_at?: number // when execution began (after approval); survives remount
   auto?: boolean        // auto-approved tool call
   approval_id?: string  // pending approval ID
+  /** The request a pending approval entry was raised for (types/approvalTarget). */
+  approval_target?: ApprovalTarget
   approval_type?: string // 'chat' or 'spawn'
   tool_call_id?: string  // for matching tool results
   rejected?: boolean     // true when approval was rejected
@@ -720,6 +768,8 @@ export interface ContentBlock {
 export interface Notification {
   kind: string; title: string; body: string; ts: string
   acked?: boolean; job_id?: string; task_id?: string; approval_id?: string
+  /** On a cron result note: the job's `last_result_ts` for the result the note carries. */
+  result_ts?: number
   /** OS-banner collapse tag the gateway stamps on every delivered note
    *  (`native_notification_tag`). The service worker's Web Push banner carries
    *  the same value, so one event shows one banner. Absent on client-made notes. */
@@ -749,6 +799,9 @@ export interface Notification {
   /** Server-stamped on a replacement no more urgent than the note it replaced:
    *  it lands in the bell, but no sound, banner or OS notification announces it. */
   quiet?: boolean
+  /** Server-stamped on a keyed note that replaced an earlier note under the
+   *  same source and key; the feed marks the row as edited. */
+  replaced?: boolean
   /** The crewmate that published the note, stamped by the gateway from the
    *  publishing session. Persisted rows are untrusted: read it through
    *  `noteMember`, which checks the shape. */
@@ -765,13 +818,36 @@ export interface NotificationChannel {
   registered: boolean
   default_priority: string | null
   protected: boolean
-  settings: { muted?: boolean; priority?: string }
+  /** `deliver_to` / `deliver_min_priority` are the channel's bridge route:
+   *  the chat apps its notes are also sent to, and the lowest priority sent. */
+  settings: { muted?: boolean; priority?: string; deliver_to?: string[]; deliver_min_priority?: string }
 }
+
+/** The one pending request a control decides, retires or adopts; built and
+ *  matched by types/approvalTarget. A coordinator target is bound by the
+ *  server-issued `instance` and its owning `slot` ('' when slotless), a native
+ *  target by the slot that holds the request and its permission row's `mid`.
+ *  `id` is carried for the route and for display only. */
+export interface CoordinatorApprovalTarget {
+  readonly origin: 'coordinator'
+  readonly id: string
+  readonly slot: string
+  readonly instance: string
+}
+
+export interface NativeApprovalTarget {
+  readonly origin: 'native'
+  readonly id: string
+  readonly slot: string
+  readonly mid: string
+}
+
+export type ApprovalTarget = CoordinatorApprovalTarget | NativeApprovalTarget
 
 export interface PendingApproval {
   origin?: 'native' | 'coordinator'
   request_mid?: string
-  /** A coordinator record's instance: pins a decision to that one record. */
+  /** A coordinator request's server-issued instance (see types/approvalTarget). */
   request_instance?: string
   tool_purpose?: string
   tool: string

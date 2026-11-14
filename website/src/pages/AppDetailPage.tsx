@@ -25,13 +25,15 @@ import { uiLocation } from '../uiLocations/uiLocation'
 import SessionApprovalModes from '../components/appstore/SessionApprovalModes'
 import AppIcon from '../components/AppIcon'
 import TrustAppModal, {
-  APP_EXECUTION_DENIED, DESKTOP_BUILD_STEP_UNSUPPORTED, isTrustDeniedError, useTrustGate,
+  APP_EXECUTION_DENIED, DESKTOP_BUILD_STEP_UNSUPPORTED, isSessionApprovalConsentRequiredError,
+  isTrustDeniedError, localOnlyTrustRepository, SESSION_APPROVAL_CONSENT_REQUIRED, useTrustGate,
 } from '../components/appstore/TrustAppModal'
 import { isRegistrySourced } from '../components/appstore/types'
+import { desktopRequestOf } from '../components/appstore/desktopRequest'
 import { REGISTRY_STALE_MS, registryQueryFn } from './apps/useAppsData'
 import AppSource from '../components/appstore/AppSource'
 import { consentTierFor } from '../components/appstore/registryTier'
-import { backendRefusedNotice } from '../components/appstore/backendRefused'
+import { appActionNotice, backendRefusedNotice } from '../components/appstore/backendRefused'
 import { recordEvent } from '../rum'
 import { useTheme } from '../hooks/useTheme'
 import { useActionsInFlight } from '../hooks/useActionsInFlight'
@@ -50,47 +52,27 @@ import {
   appDisplayName, appDescription, appHighlights, appUseCases, appConfiguration,
 } from '../components/appstore/appManifest'
 import { isBuiltinServerRow, mergeBuiltinRow } from '../components/appstore/mergeBuiltinRow'
-import { classifyManifestArt, installedArt, installedArtList, installedArtListAligned, installedIcon } from '../components/appstore/useHeroArt'
+import { installedArt, installedArtList, installedArtListAligned, installedIcon, installedPageIcon } from '../components/appstore/useHeroArt'
 import { fmtDateNumeric, fmtCompact, fmtNumber, fmtList } from '../i18n/format'
 import { HeroBanner, ScreenshotGallery } from './AppDetailPageArt'
 import { messageActionGrantLabel } from '../messageActions/messageActionRegistry'
 import AppDetailAdoptionNotice from './AppDetailAdoptionNotice'
 import AppDetailLinks from './AppDetailLinks'
+import AppDetailPageLocalOnlyNotice from './AppDetailPageLocalOnlyNotice'
+import { openLocalSourceSwitch } from './appDetailPageLocalSwitch'
 import { selectionActionGrantLabel } from '../selectionActions/selectionActionRegistry'
 import type { AppInfo, NormalizedRegistryEntry, RegistryEntry } from './appDetailPageTypes'
 import { actionGrant } from '../composerActions/composerActionRegistry'
-import { memoryAccessLabel } from '../components/appstore/memoryAccessLabel'
+import { memoryAccessLabel, memoryRequested } from '../components/appstore/memoryAccessLabel'
+import { managerLabel, originLabel } from './appDetailPageLabels'
+import { ChatSlotsBox, UserSessionReachBox, UserSessionReachStaged, WorkerAutoApproveBox, reachVerbs } from './AppDetailGrantBoxes'
+import { trustGrants } from '../components/appstore/trustGrants'
 // The page's parts live in sibling owners that never import this module:
 // `AppDetailPageArt.tsx` (the hero banner and the screenshot gallery, each with
-// its local-art second chance) and `appDetailPageTypes.ts` (the page's view
-// model). Callers import the two art components from this module.
+// its local-art second chance), `appDetailPageTypes.ts` (the page's view
+// model) and `appDetailPageLabels.ts` (the origin and lifecycle words).
+// Callers import the two art components from this module.
 export { HeroBanner, ScreenshotGallery }
-
-// Display words for the installed record's origin, resources and lifecycle
-// values. A value outside these maps is shown as it is.
-const ORIGIN_LABEL_KEYS = {
-  builtin: 'pages.appDetailPage.origin_builtin',
-  registry: 'pages.appDetailPage.origin_registry',
-  local: 'pages.appDetailPage.origin_local',
-  external: 'pages.appDetailPage.origin_external',
-} as const
-const MANAGER_LABEL_KEYS = {
-  gateway: 'pages.appDetailPage.managed_by_gateway',
-  app: 'pages.appDetailPage.managed_by_app',
-  locked: 'pages.appDetailPage.lifecycle_locked',
-} as const
-
-function originLabel(value: string): string {
-  return Object.hasOwn(ORIGIN_LABEL_KEYS, value)
-    ? i18nT(ORIGIN_LABEL_KEYS[value as keyof typeof ORIGIN_LABEL_KEYS])
-    : value
-}
-
-function managerLabel(value: string): string {
-  return Object.hasOwn(MANAGER_LABEL_KEYS, value)
-    ? i18nT(MANAGER_LABEL_KEYS[value as keyof typeof MANAGER_LABEL_KEYS])
-    : value
-}
 
 export default function AppDetailPage() {
   const { name } = useParams<{ name: string }>()
@@ -122,9 +104,6 @@ export default function AppDetailPage() {
    * Stays until the next action, which is the user's chance to act on it.
    */
   const [backendRefusedMsg, setBackendRefusedMsg] = useState('')
-  // The page is reused across /apps/detail/:name, so a refusal belongs to the
-  // app it was reported for and goes when the route names another one.
-  useEffect(() => { setBackendRefusedMsg('') }, [name])
   const reconsentMsg = app?.sessionApprovalConsentPending
     ? i18nT('pages.appDetailPage.session_approval_reconsent_notice', { name: appDisplayName(app) })
     : ''
@@ -151,7 +130,10 @@ export default function AppDetailPage() {
   // Selection actions an update added or changed (a new source, more text, a new effect).
   const stagedSelection = app?.selectionActionGrant?.staged || []
   const declaredSelectionActions = (app?.manifest as { contributes?: { selectionActions?: unknown } } | undefined)?.contributes?.selectionActions
-  const hasStagedGrants = stagedApi.length + stagedEvents.length + stagedLinkHosts.length + stagedLinkPatterns.length + stagedMessageActions.length + stagedOpenHosts.length + stagedComposerActions.length + stagedSelection.length > 0 || stagedFullUrl || stagedOpenFullUrl
+  // An update that added `permissions.workerAutoApprove` waits the same way.
+  const stagedWorkerAutoApprove = app?.workerAutoApproveGrant?.staged === true
+  const stagedUserSessionReach = app?.userSessionReachGrant?.staged || []
+  const hasStagedGrants = stagedApi.length + stagedEvents.length + stagedLinkHosts.length + stagedLinkPatterns.length + stagedMessageActions.length + stagedOpenHosts.length + stagedComposerActions.length + stagedSelection.length + stagedUserSessionReach.length > 0 || stagedFullUrl || stagedOpenFullUrl || stagedWorkerAutoApprove
   // Shown where the notice was once the owner approves, so the moment is confirmed.
   const [grantsApprovedMsg, setGrantsApprovedMsg] = useState('')
   const enableLabel = app?.sessionApprovalConsentPending
@@ -193,6 +175,8 @@ export default function AppDetailPage() {
    * permanent refusal from a failure worth retrying.
    */
   const installFailureRef = useRef<{ message: string; code: string }>({ message: '', code: '' })
+  /** An `app_trust_local_only` refusal's repository, offered while its message is the error. */
+  const [localSwitch, setLocalSwitch] = useState<{ message: string; repository: string } | null>(null)
   const [clientInstall, setClientInstall] = useState<{ shell?: string; postInstall?: string } | null>(null)
   const [copied, setCopied] = useState(false)
   const [serverHostname, setServerHostname] = useState('')
@@ -258,6 +242,11 @@ export default function AppDetailPage() {
 
   // Abort in-flight streaming install on unmount
   useEffect(() => () => { installAbortRef.current?.abort() }, [])
+  // A failed Retry refocuses the new Retry if focus fell to <body>; only the load Retry starts claims the press.
+  const retryRef = useRef<HTMLButtonElement>(null)
+  const retryPressed = useRef(false)
+  const [refocusRetry, setRefocusRetry] = useState(false)
+  useEffect(() => { if (!refocusRetry) return; setRefocusRetry(false); if (!document.activeElement || document.activeElement === document.body) retryRef.current?.focus() }, [refocusRetry])
 
   /**
    * Resolve the page's record. The three reads are independent, so they run at
@@ -272,14 +261,18 @@ export default function AppDetailPage() {
    * server again, because the rows carry server-stamped install state that the
    * action just changed.
    */
-  const load = useCallback(async ({ shareListing = false }: { shareListing?: boolean } = {}) => {
+  const load = useCallback(async ({ shareListing = false, keepView = false }: { shareListing?: boolean; keepView?: boolean } = {}) => {
     if (!name) return
-    setLoading(true)
-    // Drop the previous record before resolving the new name: a genuine miss
-    // sets nothing below, and without this an in-session navigation from a
-    // loaded app to a non-existent one would keep rendering the old app under
-    // the new URL instead of the not-found page.
-    setApp(null)
+    const fromRetry = retryPressed.current; retryPressed.current = false; let failed = false
+    // `keepView` refreshes in place: the loader would unmount the pressed button.
+    if (!keepView) {
+      setLoading(true)
+      // Drop the previous record before resolving the new name: a genuine miss
+      // sets nothing below, and without this an in-session navigation from a
+      // loaded app to a non-existent one would keep rendering the old app under
+      // the new URL instead of the not-found page.
+      setApp(null)
+    }
     clearError()
     try {
       const [installedRead, registryRead, systemRead] = await Promise.allSettled([
@@ -368,6 +361,8 @@ export default function AppDetailPage() {
             linkOpenGrant: installed.linkOpenGrant,
             composerActionGrant: installed.composerActionGrant,
             selectionActionGrant: installed.selectionActionGrant,
+            workerAutoApproveGrant: installed.workerAutoApproveGrant,
+            userSessionReachGrant: installed.userSessionReachGrant,
             managed: installed.managed,
             source: installed.source,
             installedAt: installed.installedAt,
@@ -391,17 +386,6 @@ export default function AppDetailPage() {
           // since the app IS installed those paths resolve against its own
           // install directory through `installedArt` — no repo identifier, no
           // clone, no network.
-          // A page's own icon ships inside the app's UI bundle, not at the repo
-          // root, so a relative value resolves against the app's UI asset route —
-          // the same base the rail and the command palette use. A cross-origin
-          // value is refused here for the same reason it is everywhere else on
-          // this path: the manifest is untrusted, and requesting it would leak the
-          // viewer to whatever host it names.
-          const pageIcon: unknown = m.ui?.pages?.[0]?.iconUrl
-          const pageIconKind = classifyManifestArt(pageIcon)
-          const pageIconUrl = pageIconKind === 'same-origin' ? pageIcon as string
-            : pageIconKind === 'relative' ? `/apps/${installed.name}/ui/${pageIcon as string}`
-              : ''
           setApp({
             name: installed.name,
             displayName: installed.displayName || m.displayName || installed.name,
@@ -429,7 +413,7 @@ export default function AppDetailPage() {
             // through the same resolver rather than straight to `<img>`, so a
             // manifest naming an external host is refused on this surface too.
             iconUrl: registryEntry?.iconUrl
-              || installedIcon(m.iconPath, m.iconUrl, installed.name) || pageIconUrl || '',
+              || installedIcon(m.iconPath, m.iconUrl, installed.name) || installedPageIcon(m.ui?.pages?.[0]?.iconUrl, installed.name) || '',
             iconUrlDark: registryEntry?.iconUrlDark
               || installedIcon(m.iconPathDark, m.iconUrlDark, installed.name) || '',
             // The app IS installed on this branch, so its icon bytes are on
@@ -502,6 +486,8 @@ export default function AppDetailPage() {
             linkOpenGrant: installed.linkOpenGrant,
             composerActionGrant: installed.composerActionGrant,
             selectionActionGrant: installed.selectionActionGrant,
+            workerAutoApproveGrant: installed.workerAutoApproveGrant,
+            userSessionReachGrant: installed.userSessionReachGrant,
             managed: installed.managed,
             source: installed.source,
             installedAt: installed.installedAt,
@@ -527,14 +513,16 @@ export default function AppDetailPage() {
         // Neither installed nor in the catalog — but the catalog read FAILED, so
         // this is a load failure, not a missing app.
         throw sideFailure
+      } else {
+        // A real not-found (null app, no error) shows the "doesn't exist" page;
+        // a `keepView` refresh still holds the old record, so drop it here.
+        setApp(null)
       }
-      // Otherwise a real not-found: `app` stays null with no error, and the
-      // render below shows the "doesn't exist" page for exactly that pair.
       if (sideFailure) setError(sideFailure instanceof Error ? sideFailure.message : String(sideFailure))
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : i18nT('pages.appDetailPage.failed_to_load_app'))
+      failed = true; setError(e instanceof Error ? e.message : i18nT('pages.appDetailPage.failed_to_load_app'))
     } finally {
-      setLoading(false)
+      setLoading(false); if (fromRetry && failed) setRefocusRetry(true)
     }
   }, [name, clearError, queryClient])
 
@@ -558,12 +546,9 @@ export default function AppDetailPage() {
     autoActionTriggered.current = true
     // Clear the state so a refresh or Back/Forward doesn't re-fire it.
     navigate(`${location.pathname}${location.search}`, { replace: true, state: null })
-    // An installed app whose bytes came from a directory on this machine has no
-    // registry row to install from — its refresh is the update endpoint, which
-    // re-copies the source directory recorded at install. The streaming registry
-    // install is for everything else: a registry-sourced app, and an app not
-    // installed at all.
-    if (stateAction === 'update' && app.installed && !isRegistrySourced(app)) {
+    // A directory install with no registry update pending is this page's Sync (a
+    // re-copy). Everything else runs the streaming registry install, as Update does.
+    if (stateAction === 'update' && app.installed && !isRegistrySourced(app) && !app.updateAvailable) {
       handleAction('update')
       return
     }
@@ -593,6 +578,7 @@ export default function AppDetailPage() {
     // Drop the previous attempt's reason: a retry that fails for a new cause (or
     // is aborted, which has none) must never show the first attempt's.
     installFailureRef.current = { message: '', code: '' }
+    setLocalSwitch(null)
     setBackendRefusedMsg('')
     setClientInstall(null)
     installAbortRef.current?.abort()
@@ -642,10 +628,18 @@ export default function AppDetailPage() {
       if (result.ok) {
         recordEvent('app_install', { app: app.name, source: 'registry', version: app.version })
         setBackendRefusedMsg(backendRefusedNotice(appDisplayName(app), result))
-        await load()
+        // Refresh in place: the loader would unmount the install log being read.
+        await load({ keepView: true })
         window.dispatchEvent(new Event('mc:apps-changed'))
       } else {
-        reportInstallFailure(result.error || i18nT('pages.appDetailPage.install_failed'), 'system', result.code || '')
+        const message = result.error || i18nT('pages.appDetailPage.install_failed')
+        reportInstallFailure(message, 'system', result.code || '')
+        const repository = localOnlyTrustRepository(result)
+        if (repository) {
+          // Refused before the clone: the log is empty and the banner's button is the way on.
+          setShowInstallLog(false)
+          setLocalSwitch({ message, repository })
+        }
         return 'failed'
       }
     } catch (e: unknown) {
@@ -678,12 +672,18 @@ export default function AppDetailPage() {
     return 'done'
   }
 
-  /** The single enable path — shared by the action buttons and the trust retry. */
-  const runEnable = useCallback(async (name: string) => {
-    const result = await api.enableApp(name, app?.sessionApprovalConsentPending === true)
+  /**
+   * The single enable path — shared by the action buttons and the trust retry.
+   * `memberThreads` is what the confirmed disclosure named; the trust retry
+   * passes none, so it falls back to the same `app` snapshot its modal showed.
+   */
+  const runEnable = useCallback(async (name: string, memberThreads?: boolean) => {
+    const consent = app?.sessionApprovalConsentPending === true
+    const shownMemberThreads = memberThreads ?? app?.manifest?.permissions?.memberThreads === true
+    const result = await api.enableApp(name, consent, undefined, consent && shownMemberThreads)
     recordEvent('app_enable', { app: name, version: app?.installedVersion || app?.version })
-    setBackendRefusedMsg(backendRefusedNotice(app ? appDisplayName(app) : name, result))
-    await load()
+    setBackendRefusedMsg(appActionNotice(app ? appDisplayName(app) : name, result, 'enable'))
+    await load({ keepView: true })
     window.dispatchEvent(new Event('mc:apps-changed'))
   }, [app, load])
 
@@ -698,7 +698,9 @@ export default function AppDetailPage() {
   // instead of the first-party fallback label (#20656).
   // Until the registries list lands (or when it fails) the tier is unknown, so
   // the not-vetted box shows (`consentTierFor`) rather than read it as vetted.
-  const consentTarget = trust.target && app && app.name === trust.target.name && app.origin !== 'local' && app._registry
+  // Except a local-source switch: it asks to trust the listing's own repository.
+  const consentTarget = trust.target && app && app.name === trust.target.name
+    && (app.origin !== 'local' || trust.target.switchesLocalSource === true) && app._registry
     ? { ...trust.target, _registry: app._registry, ...consentTierFor(app._registry, sourceNames, registriesData === undefined) }
     : trust.target
   const { confirm: confirmConsent, confirmDialog: consentDialog } = useConfirm()
@@ -721,7 +723,8 @@ export default function AppDetailPage() {
         displayName: app.displayName,
         trustRepository: app.trustRepository,
         origin: app.origin,
-        sessionApproval: app.manifest?.permissions?.sessionApproval === true,
+        ...trustGrants(app.manifest?.permissions),
+        desktop: desktopRequestOf(app.manifest),
         retryInstalls: true,
         // The Update buttons funnel here too, over an app that is already there.
         replacesInstalled: app.installed === true,
@@ -756,6 +759,21 @@ export default function AppDetailPage() {
     )
   }
 
+  // The local-only refusal's way on (`appDetailPageLocalSwitch.ts`).
+  const openLocalSwitch = () => {
+    if (!app || !localSwitch) return
+    openLocalSourceSwitch(app, localSwitch.repository, {
+      openTrust: trust.open,
+      settle: async () => {
+        clearError(); setLocalSwitch(null); setShowInstallLog(false)
+        await load({ keepView: true })
+        window.dispatchEvent(new Event('mc:apps-changed'))
+      },
+      setBackendRefusedMsg,
+      showSuccess: (msg) => { setSuccessMsg(msg); setTimeout(() => setSuccessMsg(''), 4000) },
+    })
+  }
+
   const handleAction = async (action: 'enable' | 'disable' | 'uninstall' | 'update') => {
     if (!app) return
     // Intercept uninstall to show confirmation modal
@@ -775,25 +793,40 @@ export default function AppDetailPage() {
         // the untrusted path alike, so the button has one ceremony: a dialog
         // that names the grant, then enable (the trust modal may still follow
         // for an untrusted repository).
+        // What the dialog names is what the enable consents to: an update that
+        // adds the scope while the dialog is open is refused, not lent this click.
+        const memberThreads = app.manifest?.permissions?.memberThreads === true
         if (app.sessionApprovalConsentPending) {
+          // The dialog is the consent moment, and for a trusted repository the
+          // only one (no trust modal follows), so it must name everything the
+          // grant reaches: when the manifest widens it to member threads --
+          // which may be the very reason re-consent is pending -- say so here,
+          // in the same words as the Permissions box and the trust modal.
           const ok = await confirmConsent({
             title: i18nT('pages.appDetailPage.session_approval_confirm_title', { name: appDisplayName(app) }),
-            body: i18nT('pages.appDetailPage.session_approval_desc'),
+            body: memberThreads
+              ? (
+                <>
+                  <p className="m-0">{i18nT('pages.appDetailPage.session_approval_desc')}</p>
+                  <p className="m-0 mt-1">{i18nT('pages.appDetailPage.session_approval_member_threads')}</p>
+                </>
+              )
+              : i18nT('pages.appDetailPage.session_approval_desc'),
             confirmLabel: i18nT('pages.appDetailPage.enable_and_allow_chat_control'),
             danger: false,
           })
           if (!ok) return
         }
-        await runEnable(app.name)
-        await load()
+        await runEnable(app.name, memberThreads)
         return
       }
-      if (action === 'disable') await api.disableApp(app.name)
+      if (action === 'disable') setBackendRefusedMsg(appActionNotice(appDisplayName(app), await api.disableApp(app.name), 'disable'))
       else if (action === 'update') updateResult = await api.updateApp(app.name)
       if (action === 'disable') {
         recordEvent('app_disable', { app: app.name, version: app.installedVersion || app.version })
       }
-      await load()
+      // Reload in place: Sync keeps its focus, and the page never drops to the loader.
+      await load({ keepView: true })
       // `load()` clears the error but does not speak to success, and a same-version
       // re-copy changes nothing visible, so say it explicitly. The Sync button that
       // reaches here is not gated on source, and `handle_update_app` re-clones a
@@ -826,8 +859,14 @@ export default function AppDetailPage() {
           displayName: app.displayName,
           trustRepository: app.trustRepository,
           origin: app.origin,
-          sessionApproval: app.manifest?.permissions?.sessionApproval === true,
+          ...trustGrants(app.manifest?.permissions),
+          desktop: desktopRequestOf(app.manifest),
         })
+      } else if (action === 'enable' && isSessionApprovalConsentRequiredError(e)) {
+        // The grant changed under the dialog (an update added a scope it did not
+        // name). Reload so the next click shows the grant as it now stands.
+        await load()
+        setError(e instanceof Error ? e.message : i18nT('pages.appDetailPage.failed_to', { action }))
       } else {
         setError(e instanceof Error ? e.message : i18nT('pages.appDetailPage.failed_to', { action }))
       }
@@ -880,7 +919,7 @@ export default function AppDetailPage() {
           {/* Nothing on this page is editable, so the hand-off loses nothing. */}
           <ErrorNotice message={error} askAgent />
           <div className="flex items-center gap-2">
-            {error && <Btn onClick={() => { void load() }}>{i18nT('pages.appDetailPage.retry')}</Btn>}
+            {error && <Btn ref={retryRef} onClick={() => { retryPressed.current = true; void load() }}>{i18nT('pages.appDetailPage.retry')}</Btn>}
             <Btn onClick={() => navigate('/apps')}><ArrowLeft size={14} /> {i18nT('pages.appDetailPage.back_to_apps')}</Btn>
           </div>
         </div>
@@ -976,6 +1015,7 @@ export default function AppDetailPage() {
   // the journal key, so a later unrelated `setError` never inherits an install
   // failure's code.
   const errorReport = error ? findReport(error) : undefined
+  const localOnlyRepo = localSwitch && localSwitch.message === error ? localSwitch.repository : ''
   // The desktop build-step refusal is permanent for this app as it is: the
   // Install / Update buttons below are disabled while its banner is up, because
   // pressing them runs the same clone and build into the same refusal. The
@@ -1009,6 +1049,14 @@ export default function AppDetailPage() {
         disabledTitle: i18nT('pages.appDetailPage.dismiss_notice_to_install_again'),
       }
   const installDisabledTitle = refusalCopy?.disabledTitle
+  // An enable refused for a `memberThreads` scope the dialog did not name shows
+  // the catalog's sentence, picked by the journal entry's code like the build
+  // refusal above; `error` keeps the server's English, the report's key. The
+  // grant's own pending refusal shares the code and keeps the server's text
+  // unless the reloaded manifest declares the scope.
+  const memberThreadsRefused = Boolean(error)
+    && errorReport?.code === SESSION_APPROVAL_CONSENT_REQUIRED
+    && app.manifest?.permissions?.memberThreads === true
 
   return (
     <>
@@ -1178,6 +1226,10 @@ export default function AppDetailPage() {
               {stagedOpenFullUrl && (
                 <div className="text-[13px]">{i18nT('pages.appDetailPage.grants_reconsent_link_open_full_url')}</div>
               )}
+              {stagedWorkerAutoApprove && (
+                <div className="text-[13px]">{i18nT('pages.appDetailPage.grants_reconsent_worker_auto_approve')}</div>
+              )}
+              <UserSessionReachStaged staged={stagedUserSessionReach} />
               {app.enabled && (
                 <span className="text-[13px] text-muted">{i18nT('pages.appDetailPage.grants_reconsent_undo', { name: appDisplayName(app) })}</span>
               )}
@@ -1190,7 +1242,7 @@ export default function AppDetailPage() {
               primary
               onClick={async () => {
                 startAction('approve_grants')
-                const approved = [...stagedApi, ...stagedEvents, ...stagedLinkHosts, ...stagedLinkPatterns, ...(stagedFullUrl ? ['fullUrl'] : []), ...stagedMessageActions.map(e => messageActionGrantLabel(e, declaredMessageActions)), ...stagedOpenHosts, ...(stagedOpenFullUrl ? ['fullUrl'] : []), ...stagedComposerActions, ...stagedSelection.map(e => selectionActionGrantLabel(e, declaredSelectionActions))].join(', ')
+                const approved = fmtList([...stagedApi, ...stagedEvents, ...stagedLinkHosts, ...stagedLinkPatterns, ...(stagedFullUrl ? ['fullUrl'] : []), ...stagedMessageActions.map(e => messageActionGrantLabel(e, declaredMessageActions)), ...stagedOpenHosts, ...(stagedOpenFullUrl ? ['fullUrl'] : []), ...stagedComposerActions, ...stagedSelection.map(e => selectionActionGrantLabel(e, declaredSelectionActions)), ...(stagedWorkerAutoApprove ? ['workerAutoApprove'] : []), ...stagedUserSessionReach], { style: 'narrow' })
                 try {
                   const result = await api.enableApp(app.name, false, {
                     api: stagedApi,
@@ -1203,10 +1255,12 @@ export default function AppDetailPage() {
                     linkOpenFullUrl: stagedOpenFullUrl ? ['fullUrl'] : [],
                     composerActions: stagedComposerActions.map(actionGrant),
                     selectionActions: stagedSelection,
+                    workerAutoApprove: stagedWorkerAutoApprove ? ['ownSlots'] : [],
+                    reachableByUserSessions: stagedUserSessionReach,
                   })
-                  setBackendRefusedMsg(backendRefusedNotice(appDisplayName(app), result))
+                  setBackendRefusedMsg(appActionNotice(appDisplayName(app), result, 'enable'))
                   setGrantsApprovedMsg(i18nT('pages.appDetailPage.grants_approved', { entries: approved }))
-                  await load()
+                  await load({ keepView: true })
                   window.dispatchEvent(new Event('mc:apps-changed'))
                 } catch (e) {
                   setError(e instanceof Error ? e.message : String(e))
@@ -1268,8 +1322,16 @@ export default function AppDetailPage() {
             dismissLabelVisible
             className="mb-4 animate-rise"
           />
+        ) : localOnlyRepo ? (
+          // The refusal's error notice keeps the trust-and-update path in its footer.
+          <AppDetailPageLocalOnlyNotice name={appDisplayName(app)} repository={localOnlyRepo}
+            report={errorReport} busy={actionBusy} onTrust={openLocalSwitch} onDismiss={clearError} />
         ) : (
-          <ErrorNotice message={error} askAgent onDismiss={clearError} className="mb-4 animate-rise" />
+          <ErrorNotice
+            message={memberThreadsRefused ? i18nT('pages.appDetailPage.session_approval_member_threads_refused') : error}
+            report={memberThreadsRefused ? errorReport : undefined}
+            askAgent onDismiss={clearError} className="mb-4 animate-rise"
+          />
         )}
 
         {/* Third-party execution-trust consent. Opened when an enable OR a
@@ -1476,7 +1538,7 @@ export default function AppDetailPage() {
                     </>
                   )}
                   {canUpdate && app.updateAvailable && <Btn {...uiLocation('apps.detail.update')} onClick={handleInstall} disabled={actionBusy || installRefusedForGood} title={installDisabledTitle} className="!bg-[var(--info)] !text-info-fg hover:!opacity-80">{isActionRunning('install') ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.updating')}</> : <><ArrowUp size={14} /> {i18nT('pages.appDetailPage.update')}</>}</Btn>}
-                  {canUpdate && !app.updateAvailable && <Btn {...uiLocation('apps.detail.sync')} onClick={() => handleAction('update')} disabled={actionBusy} title={i18nT('pages.appDetailPage.sync_app_from_its_source_directory')}><RefreshCw size={14} /> {i18nT('pages.appDetailPage.sync')}</Btn>}
+                  {canUpdate && !app.updateAvailable && <Btn {...uiLocation('apps.detail.sync')} onClick={() => { if (!actionBusy) void handleAction('update') }} aria-disabled={isActionRunning('update') || undefined} disabled={actionBusy && !isActionRunning('update')} className="aria-disabled:cursor-not-allowed aria-disabled:opacity-30" title={i18nT('pages.appDetailPage.sync_app_from_its_source_directory')}><RefreshCw size={14} /> {i18nT('pages.appDetailPage.sync')}</Btn>}
                   {canUninstall && <Btn {...uiLocation('apps.detail.uninstall')} danger onClick={() => handleAction('uninstall')} disabled={actionBusy}><Trash2 size={14} /> {i18nT('pages.appDetailPage.uninstall')}</Btn>}
                 </>
               )}
@@ -1723,20 +1785,29 @@ export default function AppDetailPage() {
                       <ShieldAlert size={13} className="mt-[2px] shrink-0 text-warn" />
                       <span>{i18nT('pages.appDetailPage.session_approval_desc')}</span>
                     </div>
+                    {app.manifest.permissions.memberThreads && (
+                      <div className="mt-1 text-text">
+                        {i18nT('pages.appDetailPage.session_approval_member_threads')}
+                      </div>
+                    )}
                     <SessionApprovalModes
                       className="mt-1.5 text-[12px]"
                       label={i18nT('pages.appDetailPage.session_approval_modes')}
                     />
                     <div className="mt-1.5 text-[11px] text-muted">
                       {i18nT('pages.appDetailPage.session_approval_manifest_key')}: <code>sessionApproval</code>
+                      {app.manifest.permissions.memberThreads && <>, <code>memberThreads</code></>}
                     </div>
                   </div>
                 )}
+                {app.manifest.permissions.workerAutoApprove && <WorkerAutoApproveBox staged={stagedWorkerAutoApprove} />}
+                {app.manifest.permissions.chatSlots === true && <ChatSlotsBox />}
+                <UserSessionReachBox declared={reachVerbs(app.manifest.permissions.reachableByUserSessions)} staged={stagedUserSessionReach} />
                 <div className="flex flex-wrap gap-3 text-[12px] text-muted mt-1">
                   {app.manifest.permissions.storage && <span className="flex items-center gap-1">{i18nT('pages.appDetailPage.storage_yes')}</span>}
                   {app.manifest.permissions.cron && <span className="flex items-center gap-1">{i18nT('pages.appDetailPage.cron_yes')}</span>}
                   {app.manifest.permissions.network && <span className="flex items-center gap-1">{i18nT('pages.appDetailPage.network_yes')}</span>}
-                  {app.manifest.permissions.memory && <span className="flex items-center gap-1">{memoryAccessLabel(app.manifest.permissions.memory)}</span>}
+                  {memoryRequested(app.manifest.permissions.memory) && <span className="flex items-center gap-1">{memoryAccessLabel(app.manifest.permissions.memory as boolean | string)}</span>}
                 </div>
               </div>
             </Card>

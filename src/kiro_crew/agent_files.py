@@ -29,10 +29,9 @@ PIPELINE_CONDUCTOR_AGENT_FILENAME = "kirocrew-pipeline-conductor.json"
 LEDGER_CONDUCTOR_AGENT_FILENAME = "kirocrew-ledger-conductor.json"
 SECURITY_CONDUCTOR_AGENT_FILENAME = "kirocrew-security-conductor.json"
 WORKER_AGENT_FILENAME = "kirocrew-worker.json"
-# The mate conductor: the agent a crewmate's own chat runs on. Derived from the
-# default template (same prompt, tools and mcpServers), so it behaves like
-# `kirocrew.json` under its own name. It does not read or write
-# `~/.kiro/mates/agents/` (docs/request-for-change/rfc-mate-owned-agent-config.md).
+# The mate conductor: the agent a crewmate's own chat runs on, derived from the
+# default template and written to ``~/.kiro/mates/agents/``. Unlike the mate
+# worker, no crewmate's own file is layered onto it.
 MATE_CONDUCTOR_AGENT_FILENAME = "kirocrew-mate-conductor.json"
 # The mate worker: the agent a crewmate's worker sessions run on (the session a
 # crewmate's own chat opens with ``session_create``). Source-defined like the
@@ -102,11 +101,7 @@ KIROCREW_DEFAULT_AGENT_NAMES = frozenset(
 
 
 def is_kirocrew_default_agent(agent: object) -> bool:
-    """Whether *agent* is one of :data:`KIROCREW_DEFAULT_AGENT_NAMES`.
-
-    Every ``is_custom`` check in ``context.py`` and ``context_assembly/`` reads
-    this instead of repeating the name literal.
-    """
+    """Whether *agent* is one of :data:`KIROCREW_DEFAULT_AGENT_NAMES`."""
     return agent in KIROCREW_DEFAULT_AGENT_NAMES
 
 
@@ -119,6 +114,26 @@ def is_assistant_member(name: object, entry: object) -> bool:
     """
     del entry
     return name == ASSISTANT_MEMBER_NAME
+
+
+def member_label(name: object, entry: object) -> str:
+    """The label a crew member is shown by: its ``display_name``, else its key.
+
+    The first crewmate is the exception: its key is ``mate``, an internal id
+    nobody chose, so with no ``display_name`` it reads
+    :data:`ASSISTANT_DEFAULT_DISPLAY_NAME`. Every surface that labels a member
+    calls this, which is what keeps the key out of one of them while the rest
+    say "Bot".
+
+    *entry* is the member's config row. A missing ``display_name``, an empty one
+    and one that is only spaces all read the same, so no surface can show a
+    label made of whitespace. The label is presentation only -- ``name`` stays
+    the identity every per-member route and binding is keyed on.
+    """
+    display = str(getattr(entry, "display_name", "") or "").strip()
+    if display:
+        return display
+    return ASSISTANT_DEFAULT_DISPLAY_NAME if is_assistant_member(name, entry) else str(name)
 
 
 # Collective allowlists — the EXACT filenames KiroCrew owns in each dir. Used by
@@ -221,9 +236,12 @@ def kas_wire_agent_id(agent_id: str) -> str:
     advertised modes read back), so the rest of Kiro Crew keeps the crewmate's
     own id and kiro-cli, which reserves none of these, never sees the alias.
 
-    A session registers exactly one agent, so the alias cannot meet a second
-    entry of the same id in its batch; an on-disk spec that happens to carry it
-    is replaced by the wire definition (the ``kirocrew-conductor`` row above).
+    Only a session's own agent is sent under an alias: a sub-agent target with a
+    reserved id is not registered, and one named like the alias is dropped
+    (:mod:`kiro_crew.acp.kas_subagent_targets`), so the alias cannot meet a
+    second entry of the same id in its batch; an on-disk spec that happens to
+    carry it is replaced by the wire definition (the ``kirocrew-conductor`` row
+    above).
     """
     if agent_id in KAS_RESERVED_AGENT_IDS:
         return f"{agent_id}{KAS_WIRE_ID_SUFFIX}"

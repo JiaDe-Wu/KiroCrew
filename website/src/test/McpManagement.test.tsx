@@ -98,7 +98,7 @@ function mount() {
   return render(
     <MemoryRouter>
       <QueryClientProvider client={qc}>
-        <McpManagement initialAdvancedOpen />
+        <McpManagement />
       </QueryClientProvider>
     </MemoryRouter>,
   )
@@ -516,6 +516,23 @@ describe('sharing assessment', () => {
     await openAssessment()
     const btn = await screen.findByRole('button', { name: M('assessment.measure_none_left') }, { timeout: 5000 })
     expect((btn as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('counts the rows the gateway says a pass can measure, not every unmeasured row', async () => {
+    // Counting by verdict would give 2 here: the two unmeasured rows the pass never reaches.
+    vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status() as never)
+    vi.spyOn(api, 'mcpMeasureProgress').mockResolvedValue(idle as never)
+    vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({
+      servers: [
+        withRec({ name: 'other-agent-mcp', measure_due: false }, unknown),
+        withRec({ name: 'panel-mcp', measure_due: false }, unknown),
+        withRec({ name: 'alpha-mcp', measure_due: true }, noObjection),
+      ],
+    } as never)
+    await openAssessment()
+    expect(
+      await screen.findByRole('button', { name: M('assessment.measure_unmeasured', { count: 1 }) }, { timeout: 5000 }),
+    ).toBeTruthy()
   })
 
   it('starts the pass through the measure endpoint', async () => {

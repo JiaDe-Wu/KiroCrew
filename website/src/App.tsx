@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef, createContext, lazy, Suspense, type ReactNode } from 'react'
+import { useEffect, useState, useCallback, useRef, useSyncExternalStore, createContext, lazy, Suspense, type ReactNode } from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
 import { useAppSelector, useAppDispatch } from './store'
 import { setUpdateProgress } from './store/dashboardSlice'
@@ -24,6 +24,7 @@ import ChatPage from './pages/ChatPage'
 import PopoutFrame from './pages/PopoutFrame'
 import ArtifactPopoutFrame from './pages/ArtifactPopoutFrame'
 import TerminalPopoutFrame from './pages/TerminalPopoutFrame'
+import FilePopoutFrame from './pages/FilePopoutFrame'
 import AppPopoutFrame, { AppPopoutHardExit } from './pages/AppPopoutFrame'
 
 import ErrorBoundary from './components/ErrorBoundary'
@@ -71,10 +72,12 @@ import BottomTerminalPanel, { TerminalDetachedBar } from './components/BottomTer
 import { toggleBottomTerminal, useTerminalFullscreen } from './hooks/useBottomTerminal'
 import { RunInTerminalShellNotice, useRunInTerminalShellBridge } from './shell/runInTerminalShellBridge'
 import { TerminalHostContext } from './hooks/useTerminalCommand'
+import { usePinnedScrollOrigin } from './hooks/usePinnedScrollOrigin'
 // Side effect: closes a terminal tab when its shell exits (main window and popout).
 import './utils/terminalExitClose'
 import { focusPopout as focusTerminalPopout } from './utils/terminalPopout'
 import { mainStackingClass } from './utils/terminalFullscreen'
+import { REGISTERED_OVERLAYS_PACK, readExperience, subscribeExperience } from './utils/themeConsent'
 import MigrationCheck from './components/MigrationCheck'
 import CrashReportNotice from './components/CrashReportNotice'
 import RemoteUpdateOffer from './components/RemoteUpdateOffer'
@@ -90,13 +93,15 @@ import KiroAccountModal from './components/KiroAccountModal'
 
 import { i18nT } from './i18n/t'
 import { isAppNavId } from './appNotificationBadges'
-import { lazyPage, TasksRedirect, ChatRedirect, OrchestratedRedirect } from './shell/routes'
+import { lazyPage, ConnectionsRedirect, McpRedirect, TasksRedirect, ChatRedirect, OrchestratedRedirect } from './shell/routes'
 import { NAV_ITEMS } from './shell/nav/navItems'
 import { RailHeaderGlyph } from './shell/nav/railChrome'
 import { AdaptiveMobileRail } from './shell/nav/adaptiveMobileRail'
 import { guideTarget } from './uiLocations/targetRegistry'
 import { useAppShell } from './shell/appShell'
 import { ShellHeader } from './shell/topbar/shellHeader'
+import { hiddenChromeProps } from './shell/focus/focusChrome'
+import { RelayReconnectingView } from './shell/RelayReconnectingView'
 import { ShellNavRail } from './shell/nav/navRail'
 import { NavItem, NavBadge } from './shell/nav/navRow'
 import { DockMatesTiles, useDockMates } from './shell/nav/matesDock'
@@ -126,6 +131,7 @@ const LibraryPage = lazy(() => import('./pages/apps/LibraryPage'))
 // popout frame): a lazy boundary there would not move their code.
 const NotificationsPage = lazyPage(() => import('./pages/NotificationsPage'))
 const WebhooksPage = lazyPage(() => import('./pages/WebhooksPage'))
+const ProjectsPage = lazyPage(() => import('./pages/ProjectsPage'))
 const CapabilitiesPage = lazyPage(() => import('./pages/CapabilitiesPage'))
 const ArtifactsPage = lazyPage(() => import('./pages/ArtifactsPage'))
 const RemoteArtifactDetailPage = lazyPage(() => import('./pages/RemoteArtifactDetailPage'))
@@ -135,7 +141,7 @@ const EmbedSettingsPage = lazyPage(() => import('./pages/EmbedSettingsPage'))
 const DeveloperPage = lazyPage(() => import('./pages/DeveloperPage'))
 const SchedulePage = lazyPage(() => import('./pages/SchedulePage'))
 const AppPage = lazyPage(() => import('./pages/AppPage'))
-const AppDetailPage = lazyPage(() => import('./pages/AppDetailPage'))
+const AppDetailPage = lazyPage(() => import('./pages/AppDetailRoute'))
 const MigrationPage = lazyPage(() => import('./pages/MigrationPage'))
 const HooksPage = lazyPage(() => import('./pages/HooksPage'))
 
@@ -315,14 +321,14 @@ export { NavItem, NavBadge }
 export default function App() {
   const shell = useAppShell()
   const {
-    isEmbed, isPopout, initialPopoutPath, appPopoutRoute, updateAvailable, terminalEnabled, terminalPoppedOut,
+    isEmbed, isPopout, initialPopoutPath, appPopoutRoute, updateAvailable, settingsDotLabel, terminalEnabled, terminalPoppedOut,
     bottomTerminalOpen, mobileConnect, activeSlotProject, terminalPosition, navigate, mayLeaveForNavigation,
     colorTheme, onboarded, privacyAcked, markOnboarded, markImportOnboarded, markPrivacyAcked, firstRun,
     lookPreviewFrame, branding, avatar, isMobile, bottomDock, activeInstanceId, macFullscreen, macInset,
     topReservePx, focusActive, topPeek, railPeek, topPeekTrigger, railPeekTrigger, topChromeShown,
-    gatewayStatusMsg, focusModeExitMsg, focusChromeInert,
+    gatewayStatusAnnounce, relayCrewWindow, relayRetrying, focusModeExitMsg, focusChromeInert,
     localHeaderDragGaps, shellEntered, setShellEntered, shellRef, setMembersBar, advertisedNavItems,
-    sortedAppGroup, slotOwners, appBadges, discoverBadges, railAppBadges, railAppRunStates, shortcutsOpen,
+    sortedAppGroup, slotOwners, commandBarOn, quickSearchLauncher, appBadges, discoverBadges, railAppBadges, railAppRunStates, shortcutsOpen,
     setShortcutsOpen, toggleShortcutsModal, commandPalette, agentSwitchNotice, kiroUsageOpen, setKiroUsageOpen,
     kiroUsageState, kiroAccountEntry, metrics, subscribeLogs, subscribeSubagents, forceReconnect,
     updateFlow, updating, setUpdating, showUpdateModal, setShowUpdateModal, showChangelog, updateError,
@@ -331,12 +337,18 @@ export default function App() {
   } = shell
   // "Run in terminal" from a code block outside every chat, on any route.
   const runInTerminal = useRunInTerminalShellBridge(activeSlotProject, !isPopout && !isEmbed)
+  usePinnedScrollOrigin(shellRef)
   // The dock terminal fills the content area only while maximized, so <main>
   // becomes its own stacking context ONLY then — confining the fullscreen panel
   // above the in-content chat layers it covers. Docked or closed, <main> creates
   // no stacking context, so a page-level inline modal (fixed inset-0 z-[100])
   // still paints over the dock as it does elsewhere.
   const terminalFullscreen = useTerminalFullscreen()
+  // Read during render, so turning the part off never mounts an overlay for one frame.
+  const overlaysOn = useSyncExternalStore(
+    useCallback((onChange: () => void) => subscribeExperience(colorTheme, onChange), [colorTheme]),
+    () => readExperience(colorTheme, REGISTERED_OVERLAYS_PACK).overlays,
+  )
 
   /**
    * Phone chat page: the main navigation as a 72px icon rail.
@@ -401,7 +413,7 @@ export default function App() {
       }
       const settingsSurface = NAV_ITEMS.find(n => n.id === 'settings')!
       const capabilitiesSurface = NAV_ITEMS.find(n => n.id === 'capabilities')!
-      const searchLabel = slotOwners['quick-search']
+      const searchLabel = quickSearchLauncher
         ? i18nT('app.open_command_bar')
         : i18nT('app.search_sessions_files_and_commands')
       return (
@@ -507,7 +519,7 @@ export default function App() {
               touch
               replace
               onClickOverride={navRowActive(settingsSurface.path) ? onActivate : undefined}
-              badge={updateAvailable ? <span title={i18nT('app.update_available')} role="status" aria-label={i18nT('app.update_available_2')} className="absolute top-1 right-1 w-2 h-2 bg-accent rounded-full z-10" /> : undefined}
+              badge={settingsDotLabel ? <span title={settingsDotLabel.title} role="status" aria-label={settingsDotLabel.label} className="absolute top-1 right-1 w-2 h-2 bg-accent rounded-full z-10" /> : undefined}
             />
             <button
               type="button"
@@ -574,6 +586,7 @@ export default function App() {
         <Route path="/popout/chat/:slug?" element={<ErrorBoundary><PopoutFrame /></ErrorBoundary>} />
         <Route path="/popout/artifact/:slug" element={<ErrorBoundary><ArtifactPopoutFrame /></ErrorBoundary>} />
         <Route path="/popout/terminal" element={<ErrorBoundary><TerminalPopoutFrame /></ErrorBoundary>} />
+        <Route path="/popout/file" element={<ErrorBoundary><FilePopoutFrame /></ErrorBoundary>} />
         {/* Belt-and-braces: any stray in-window navigation re-pins to the
             frame this window loaded as (isPopout is sticky, so the dashboard
             branch is unreachable — without this the wildcard would bounce a
@@ -737,7 +750,7 @@ export default function App() {
               matters (the gateway dropping mid focus mode). Only while the
               header is actually aria-hidden (focusChromeInert). */}
           {!topChromeShown && focusChromeInert && (
-            <span role="status" className="sr-only" data-testid="focus-gateway-status">{gatewayStatusMsg}</span>
+            <span role="status" className="sr-only" data-testid="focus-gateway-status">{gatewayStatusAnnounce}</span>
           )}
         </>
       )}
@@ -822,11 +835,14 @@ export default function App() {
           : { gridArea: 'content' }}
       >
         <div className={`relative flex min-h-0 min-w-0 flex-1 ${terminalPosition === 'right' ? 'flex-row' : 'flex-col'}`}>
+        {relayCrewWindow && <RelayReconnectingView active={relayRetrying} />}
         {/* `outline-hidden`: main is a programmatic focus target (the skip
             link, and focus mode's hand-off when the chrome hides), not a
             control, so it opts out of the global :focus-visible ring the way
-            the tabIndex={-1} page headings do. */}
-        <main id="main-content" tabIndex={-1} className={`outline-hidden ${mainStackingClass({ isTerminalFullscreen: terminalFullscreen, terminalEnabled, terminalPoppedOut })} flex flex-col min-h-0 min-w-0 flex-1 overflow-x-hidden ${needsFixedHeight ? 'overflow-hidden p-0' : 'overflow-y-auto'}`}>
+            the tabIndex={-1} page headings do. Inert while the reconnecting
+            view covers it, so focus and keystrokes cannot reach a composer
+            the user cannot see. */}
+        <main id="main-content" tabIndex={-1} {...hiddenChromeProps(relayRetrying)} className={`outline-hidden ${mainStackingClass({ isTerminalFullscreen: terminalFullscreen, terminalEnabled, terminalPoppedOut, relayRetrying })} flex flex-col min-h-0 min-w-0 flex-1 overflow-x-hidden ${needsFixedHeight ? 'overflow-hidden p-0' : 'overflow-y-auto'}`}>
           <MigrationCheck />
           {/* Route-independent, unlike MigrationCheck: "you crashed" is true of
               the app, not of the page, and the launch after a crash rarely lands
@@ -884,15 +900,18 @@ export default function App() {
             <Route path="/overview" element={<Navigate to="/settings/overview" replace />} />
             <Route path="/crew-board" element={<ErrorBoundary><Suspense fallback={null}><CrewBoardPage /></Suspense></ErrorBoundary>} />
             <Route path="/schedule" element={<SchedulePage />} />
-            {/* Agents and Connections live in the Agent Capabilities panel. */}
+            {/* Task Runner: a core page, routed here rather than through the builtin app registry. */}
+            <Route path="/projects/*" element={<ProjectsPage />} />
+            {/* Agents live in the Agent Capabilities panel; Connections is a Settings tab. */}
             <Route path="/agents" element={<Navigate to="/capabilities" replace />} />
             <Route path="/mc-agents" element={<Navigate to="/capabilities" replace />} />
-            <Route path="/connections" element={<Navigate to="/capabilities?tab=mcp" replace />} />
+            <Route path="/connections" element={<ConnectionsRedirect />} />
             <Route path="/tasks" element={<TasksRedirect />} />
             <Route path="/logs" element={<LogsPage />} />
             <Route path="/hooks" element={<HooksPage />} />
             <Route path="/webhooks" element={<ErrorBoundary><WebhooksPage /></ErrorBoundary>} />
             <Route path="/capabilities" element={<CapabilitiesPage />} />
+            <Route path="/mcp" element={<McpRedirect />} />
             {/* Instances setup moved into Settings; switching happens via the header tab strip. */}
             <Route path="/instances" element={<Navigate to="/settings/instances" replace />} />
             {/* Static segments (library, detail, migrate) MUST stay registered
@@ -937,7 +956,13 @@ export default function App() {
         {/* App-wide docked terminal panel — renders beside <main> (right) or
             below it (bottom). The detached bar (popped-out state) always renders
             below the flex wrapper as a full-width strip regardless of position. */}
-        {terminalEnabled && !terminalPoppedOut && <BottomTerminalPanel />}
+        {terminalEnabled && !terminalPoppedOut && (
+          // Inert under the reconnecting view like <main>. A maximized panel
+          // (z-[51]) paints above that view's z-40, so it is left alone.
+          <div className="contents" {...hiddenChromeProps(relayRetrying && !terminalFullscreen)}>
+            <BottomTerminalPanel />
+          </div>
+        )}
         </div>{/* /flex-row or flex-col wrapper */}
         {terminalEnabled && terminalPoppedOut && <TerminalDetachedBar />}
 
@@ -962,16 +987,16 @@ export default function App() {
       {/* Remote instance panes — embedded dashboards kept warm (mounted, hidden)
           so switching is instant; the active instance fills the pane. */}
       <InstancesViewport macInset={macInset} />
-      {/* macOS: window-drag strips for the LOCAL header's gaps while it is on
+      {/* macOS and Windows: window-drag strips for the LOCAL header's gaps while it is on
           screen (docked, or peeked in focus mode), placed to be structurally
           identical to the pane strips that provably work — the
           .host-drag-strip mechanism, in the same top-level container, OUTSIDE
           the shell's grid/overflow/stacking context, painted after everything
           drag-related. Every in-shell variant failed on the desktop app. Why
           docked needs them as well: useFocusChrome's localHeaderDragGaps. */}
-      {activeInstanceId === null && macInset && (!focusActive || topChromeShown) &&
+      {activeInstanceId === null && (macInset || isWinElectron) && (!focusActive || topChromeShown) &&
         localHeaderDragGaps.map((g, i) => (
-          <div key={`mac-drag-${i}`} aria-hidden data-testid="mac-header-drag-strip" className="host-drag-strip" style={{ left: g.x, width: g.w, zIndex: 63 }} />
+          <div key={`header-drag-${i}`} aria-hidden data-testid="header-drag-strip" className="host-drag-strip" style={{ left: g.x, width: g.w, zIndex: 63 }} />
         ))}
       </div>{/* /pane stack */}
     </div>
@@ -985,16 +1010,19 @@ export default function App() {
     <AppConfirmHost />
     <QuickSearchSurface
       owners={slotOwners}
+      commandBar={commandBarOn}
       open={commandPalette.open}
       onClose={commandPalette.close}
+      opener={commandPalette.opener}
       openShortcuts={toggleShortcutsModal}
     />
-    {/* Theme decoration: always-mounted decorative overlays (widgets,
-        transitions) contributed by the active theme's branding. Absent unless
-        a registered theme declares them. Each overlay is isolated in its own
+    {/* Theme decoration: decorative overlays (widgets, transitions)
+        contributed by the active theme's branding. Absent unless a registered
+        theme declares them, and while the user has turned that theme's
+        Overlays part off. Each overlay is isolated in its own
         ErrorBoundary (fallback=null) so a throwing overlay disables only itself,
         not the shell or its siblings. */}
-    {branding?.overlays?.map((Overlay, i) => (
+    {overlaysOn && branding?.overlays?.map((Overlay, i) => (
       <ErrorBoundary key={`${colorTheme}:${i}`} scope={`theme-overlay:${i}`} fallback={null}>
         <Overlay />
       </ErrorBoundary>

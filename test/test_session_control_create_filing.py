@@ -18,6 +18,7 @@ import asyncio
 
 import pytest
 from chat_test_helpers import _make_state
+from redaction_structured_cases import github_classic
 from session_control_helpers import (  # noqa: F401 -- the autouse fixtures register by import
     _enabled_fixture,
     _fresh_create_budget,
@@ -334,7 +335,7 @@ def test_create_refuses_a_model_the_picker_refuses(tmp_path, monkeypatch):
 
 
 def test_create_refuses_a_credential_shaped_model(tmp_path):
-    credential_shaped_id = "AKIA" + "Q" * 16
+    credential_shaped_id = github_classic(seed=24)
     assert sc.redact(credential_shaped_id) != credential_shaped_id
     state = _make_state(tmp_path)
     caller = _slot(state, "chat-1")
@@ -591,6 +592,7 @@ def test_the_empty_window_merge_mirrors_the_full_saves_slot_owned_fields(tmp_pat
         "closed_id",
         "app",
         "forked_from",
+        "forked_from_created_at",
         "linked_session_key",
         # The relay-archive binding, written all-three-or-none by both the
         # full save and the merge. A plain local newborn carries none of it.
@@ -650,6 +652,25 @@ def test_the_empty_window_merge_keeps_a_named_memory_store(tmp_path):
     meta = state.conversation_log.get_metadata(slot_history_key(child))
     assert not meta.get("memory_store"), meta.get("memory_store")
     assert store_of_session(state.conversation_log, slot_history_key(child)) == ""
+
+
+def test_the_empty_window_merge_writes_a_forks_parent_identity(tmp_path):
+    """The parent transcript a fork was copied from is slot-owned, like the link."""
+    from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+    child = state.get_slot(created["target"])
+
+    child.forked_from = "dashboard:chat-1"
+    child.forked_from_created_at = "2026-10-01T09:00:00+00:00"
+    asyncio.run(save_slot_off_loop(state, child, force=True))
+    meta = state.conversation_log.get_metadata(slot_history_key(child))
+    assert (meta.get("forked_from"), meta.get("forked_from_created_at")) == (
+        "dashboard:chat-1",
+        "2026-10-01T09:00:00+00:00",
+    )
 
 
 def test_the_empty_window_merge_reads_slot_state_at_write_time(tmp_path):

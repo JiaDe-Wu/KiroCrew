@@ -11,14 +11,20 @@ and a change to any input the answer depends on is still seen.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from kiro_crew import skill_trust
 from kiro_crew.config import paths
 from kiro_crew.config.loader import KiroCrewConfig
+
+# A GitHub token with a valid checksum, which the plan redacts. An AWS key ID
+# stays visible as an identifier, so it cannot show that a value is redacted.
+_SECRET_TOKEN = github_classic(seed=37)
 
 
 @pytest.fixture
@@ -248,6 +254,35 @@ class TestVisibleRows:
         loader._invalidate_iter_cache()
         assert loader._visible_memo == {}
 
+    def test_the_apps_root_is_resolved_once_for_many_skills(self, tmp_path, monkeypatch, opened):
+        from kiro_crew.apps import manager
+        from kiro_crew.skills import SkillsLoader
+
+        apps_root = tmp_path / "apps"
+        monkeypatch.setattr(manager, "apps_dir", lambda: apps_root)
+        skills = apps_root / "tool" / "skills"
+        for key in ("one", "two", "three"):
+            _skill(skills, key)
+        rows = [(key, skills / key / "SKILL.md") for key in ("one", "two", "three")]
+        loader = opened(SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False))
+        real = os.path.realpath
+        resolved: list[str] = []
+
+        def counting(path, *args, **kwargs):
+            if os.fspath(path) == str(apps_root):
+                resolved.append(os.fspath(path))
+            return real(path, *args, **kwargs)
+
+        monkeypatch.setattr(os.path, "realpath", counting)
+        assert [loader._owning_app(*row) for row in rows] == ["tool"] * 3
+        assert len(resolved) == 1, "the apps root was resolved again for every skill"
+        moved = tmp_path / "moved-apps"
+        _skill(moved / "other" / "skills", "four")
+        monkeypatch.setattr(manager, "apps_dir", lambda: moved)
+        assert (
+            loader._owning_app("four", moved / "other" / "skills" / "four" / "SKILL.md") == "other"
+        )
+
 
 class TestLastMessagePreview:
     @pytest.fixture(autouse=True)
@@ -274,11 +309,11 @@ class TestLastMessagePreview:
     def test_an_equal_string_in_another_object_answers_the_same(self):
         from kiro_crew.dashboard import chat_utils_display as cud
 
-        text = "token AKIAIOSFODNN7EXAMPLE in a message " * 3
+        text = f"token {_SECRET_TOKEN} in a message " * 3
         twin = "".join(list(text))
         assert twin is not text
         assert cud._redacted_preview(text, 80) == cud._redacted_preview(twin, 80)
-        assert "AKIAIOSFODNN7EXAMPLE" not in cud._redacted_preview(twin, 80)
+        assert _SECRET_TOKEN not in cud._redacted_preview(twin, 80)
 
     def test_a_changed_exempt_host_set_is_seen(self, monkeypatch):
         from kiro_crew.dashboard import chat_utils_display as cud

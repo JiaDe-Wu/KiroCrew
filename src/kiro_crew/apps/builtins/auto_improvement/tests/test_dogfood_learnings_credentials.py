@@ -18,6 +18,11 @@ import pytest
 from kiro_crew.apps.builtins.auto_improvement.tests.dogfood_learnings_helpers import (  # noqa: F401
     _cwd_is_the_scratch_dir,
 )
+from kiro_crew.testing.synthetic_credentials import aws_secret
+
+#: An AWS secret of the real shape (40 characters): after its label the redactor
+#: removes only a value of that shape.
+_SECRET = aws_secret(seed=61)
 
 
 class TestSubprocessFallbackIsAudited:
@@ -272,7 +277,7 @@ class TestBrowserServedFeedsFailClosed:
         from kiro_crew.apps.builtins.auto_improvement.backend import pr_watchers
         from kiro_crew.apps.builtins.auto_improvement.backend import runner as R
 
-        assert "REDACTED" in pr_watchers._redact("aws_secret_" "access_key=glpat-IOSFODNN7EXAMPLE")
+        assert "REDACTED" in pr_watchers._redact("aws_secret_" "access_key=" + _SECRET)
         assert pr_watchers._redact("gate: build GREEN") == "gate: build GREEN"
         assert R._redact_activity({"d": "propose: 3 candidates"}) == {"d": "propose: 3 candidates"}
 
@@ -298,7 +303,7 @@ class TestAgentTestsCannotWriteKiroCrewConfig:
         this fix changed nothing."""
         from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import profile as P
 
-        targets = P._write_protected_targets()
+        targets = P.write_protected_targets()
         for t in targets:
             assert Path(t).is_dir(), f"{t} is not a directory — the mask would be a no-op"
 
@@ -308,7 +313,7 @@ class TestAgentTestsCannotWriteKiroCrewConfig:
         from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import profile as P
         from kiro_crew.security import write_protected_home_paths
 
-        masked = {Path(t) for t in P._write_protected_targets()}
+        masked = {Path(t) for t in P.write_protected_targets()}
         home = Path.home()
         native = set(home_leaves())
         for rel in write_protected_home_paths():
@@ -330,7 +335,7 @@ class TestAgentTestsCannotWriteKiroCrewConfig:
         crew_dir = tmp_path / ".kiro" / "crew"
         crew_dir.mkdir(parents=True, exist_ok=True)
 
-        masked = {Path(t) for t in P._write_protected_targets()}
+        masked = {Path(t) for t in P.write_protected_targets()}
         assert crew_dir in masked, "Kiro Crew's own config dir must still be hidden"
         assert not native_parents & masked, sorted(str(p) for p in native_parents & masked)
 
@@ -354,7 +359,7 @@ class TestAgentTestsCannotWriteKiroCrewConfig:
 
         src = inspect.getsource(P._run)
         assert (
-            "extra_hidden_dirs=_write_protected_targets()" in src
+            "extra_hidden_dirs=write_protected_targets()" in src
         ), "the sandbox spawn does not mask Kiro Crew's write-protected paths"
 
     def test_a_broken_helper_still_runs_the_suite(self, monkeypatch) -> None:
@@ -366,7 +371,7 @@ class TestAgentTestsCannotWriteKiroCrewConfig:
             raise RuntimeError("unavailable")
 
         monkeypatch.setattr(security_mod, "write_protected_home_paths", _boom)
-        assert P._write_protected_targets() == ()
+        assert P.write_protected_targets() == ()
 
 
 class TestFallbackAgentCannotSeeCredentials:
@@ -936,7 +941,7 @@ class TestTerminalErrorsAreRedacted:
     def test_a_credential_in_a_terminal_error_does_not_reach_the_response(self) -> None:
         from kiro_crew.apps.builtins.auto_improvement.backend import runner as runner_mod
 
-        secret = "glpat-IOSFODNN7EXAMPLE"
+        secret = _SECRET
         sup = runner_mod.RunSupervisor()
         sup._fail(RuntimeError(f"clone failed: aws_secret_access_key={secret}"))
         status = sup.status()
@@ -950,7 +955,7 @@ class TestTerminalErrorsAreRedacted:
         leaves the same string on the same response."""
         from kiro_crew.apps.builtins.auto_improvement.backend import runner as runner_mod
 
-        secret = "glpat-IOSFODNN7EXAMPLE"
+        secret = _SECRET
         sup = runner_mod.RunSupervisor()
         sup._fail(RuntimeError(f"boom {secret}"))
         assert secret not in str(sup.status()["activity"]), "the feed copy is unredacted"
@@ -1075,7 +1080,7 @@ class TestMcpErrorsAreRedacted:
     def test_a_credential_in_an_argument_does_not_come_back(self, tmp_path, monkeypatch) -> None:
         import json
 
-        secret = "glpat-IOSFODNN7EXAMPLE"
+        secret = _SECRET
         resp = self._call(tmp_path, monkeypatch, f"aws_secret_access_key={secret}")
         assert secret not in json.dumps(
             resp
@@ -1098,7 +1103,7 @@ class TestMcpErrorsAreRedacted:
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
         from kiro_crew.apps.builtins.auto_improvement.backend import mcp_server as m
 
-        secret = "glpat-IOSFODNN7EXAMPLE"
+        secret = _SECRET
         resp = m.handle(
             {
                 "jsonrpc": "2.0",
@@ -1205,7 +1210,7 @@ class TestWatcherSnapshotsAreRedacted:
         from kiro_crew.apps.builtins.auto_improvement.backend import pr_watchers as pw
         from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
 
-        secret = "glpat-IOSFODNN7EXAMPLE"
+        secret = _SECRET
         st = pw.WatcherState(fp="fp1", pr="https://github.com/o/r/pull/1")
         st.target = f"src/m.py::aws_secret_access_key={secret}"
         st.last_note = f"agent said {secret}"
@@ -1261,7 +1266,7 @@ class TestCommitErrorsReachTheBrowserRedacted:
     def test_a_credential_in_git_stderr_is_scrubbed(self) -> None:
         from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
 
-        secret = "glpat-IOSFODNN7EXAMPLE"
+        secret = _SECRET
         stderr = f"fatal: could not read Username for 'https://x:{secret}@github.com'"
         assert secret not in routes_mod._redact_for_display(
             stderr

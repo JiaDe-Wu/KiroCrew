@@ -226,6 +226,11 @@ WAIT_SCHEMA = ToolSchema(
     ],
 )
 
+MCP_SERVER_WAIT_SCHEMA = ToolSchema(
+    tool_name="mcp_server_wait",
+    fields=[FieldSpec("server", str, required=True, max_len=MAX_SHORT_STRING)],
+)
+
 REGISTER_HOOK_SCHEMA = ToolSchema(
     tool_name="register_hook",
     fields=[
@@ -393,6 +398,10 @@ SESSION_CREATE_SCHEMA = ToolSchema(
         # crewmate's", which an empty string would also read as, so the
         # schema leaves absence to the handler rather than spelling it.
         FieldSpec("reasoning_effort", str, required=False, max_len=32),
+        # The harness (ACP backend) the new session runs on, spelled the way
+        # ``spawn_run.backend`` spells it (``kiro``, ``claude``, ``codex``, ...).
+        # The route refuses one that cannot start here; this only bounds it.
+        FieldSpec("backend", str, required=False, max_len=MAX_SHORT_STRING),
         # The new session's own compaction threshold, the override the context
         # meter's "Auto-compact at" slider sets. This range check is the early
         # refusal; create_session repeats it with the NaN guard, because the HTTP
@@ -536,6 +545,14 @@ SESSION_SET_COLOR_SCHEMA = ToolSchema(
     ],
 )
 
+SESSION_SET_NOTE_SCHEMA = ToolSchema(
+    tool_name="session_set_note",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+        FieldSpec("note", str, required=True, max_len=MAX_LONG_STRING),
+    ],
+)
+
 SESSION_CLOSE_SCHEMA = ToolSchema(
     tool_name="session_close",
     fields=[
@@ -613,6 +630,7 @@ WORK_DISPATCH_SCHEMA = ToolSchema(
             pattern=_MODEL_NAME_RE,
         ),
         FieldSpec("reasoning_effort", str, required=False, max_len=32),
+        FieldSpec("backend", str, required=False, max_len=MAX_SHORT_STRING),
     ],
 )
 
@@ -697,5 +715,31 @@ SESSION_SUMMARY_SCHEMA = ToolSchema(
     tool_name="session_summary",
     fields=[
         FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+    ],
+)
+
+# A queue id is ``uuid4().hex[:12]`` (``slot_queue_repository``). The field has no
+# shape check: ``queue_target`` only compares it for equality with the ids already
+# in the queue, so any other string ends in ``entry_not_found``.
+QUEUE_ENTRY_ID_MAX_CHARS = 64
+
+SESSION_QUEUE_SCHEMA = ToolSchema(
+    tool_name="session_queue",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+        FieldSpec(
+            "action",
+            str,
+            required=False,
+            allowed=frozenset({"list", "move"}),
+            default="list",
+        ),
+        FieldSpec(
+            "entry",
+            str,
+            required=False,
+            max_len=QUEUE_ENTRY_ID_MAX_CHARS,
+        ),
+        FieldSpec("position", int, required=False, min_val=0, max_val=10_000),
     ],
 )

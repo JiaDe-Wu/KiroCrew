@@ -79,7 +79,7 @@ class _Log:
 
 
 def _connected_status():
-    return SimpleNamespace(state=TunnelState.CONNECTED, local_port=17777)
+    return SimpleNamespace(state=TunnelState.CONNECTED, local_port=17777, remote_port=0)
 
 
 class _Mgr:
@@ -366,7 +366,7 @@ class TestSearchAllEndpoint:
         """Defense in depth: a peer's rows are re-redacted locally even though a
         well-behaved peer already redacted them."""
         _enable_instances(monkeypatch)
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        secret = "Qh4Tm2Vx9KpRc" + "Z8Nw3HdJf1Lb5Gs0Ye9Ua2WkEQR"
         mgr = _Mgr({"a": (True, {"sessions": [{"key": "r", "title": f"creds {secret}"}]})})
         state = _state([], mgr)
 

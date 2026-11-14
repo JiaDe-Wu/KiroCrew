@@ -27,6 +27,7 @@ WORK_ACTIONS: tuple[str, ...] = (
     "verdict",
     "close",
     "accept",
+    "ask",
     "report",
     "steer",
     "retire",
@@ -81,12 +82,13 @@ WORK_EVENT_KINDS: tuple[str, ...] = (
     "steer",
     "retire",
     "destroy",
+    "ask",
 )
 #: Item records the ``work`` fold may hold for one board at once: a memory bound on
 #: the fold, not on the board's life. The fold holds the open items (at most 32) plus
 #: :data:`WORK_CLOSED_WINDOW` closed ones, so a board the store admits never reaches
-#: this; it guards a log something else wrote. Also the highest goal ``item_cap``
-#: the store accepts. Here because the fold and the store may not import each other.
+#: this; it guards a log something else wrote. Here because the fold and the store
+#: may not import each other.
 WORK_STORED_ITEM_LIMIT: int = 256
 #: Closed items the ``work`` fold keeps whole, newest-closed last, for the surfaces
 #: that draw recent history. Older closed items leave the fold; their full history
@@ -115,9 +117,22 @@ WORK_CONDUCTOR_FIELDS: dict[str, tuple[str, ...]] = {
     "verdict": ("verdict", "fails"),
     "close": ("state", "decision"),
     "accept": ("acceptance",),
+    "ask": ("ask",),
     "retire": ("worker_session_key", "worker_instance_id", "retired_bindings"),
     "destroy": ("retired_bindings",),
 }
+
+#: The acceptance conditions the evaluator can judge, one example object per kind, as
+#: the text a tool description shows a conductor. ``work_ledger_record`` quotes it on
+#: its ``acceptance`` argument and ``work_dispatch`` points there, so the object can
+#: be written from the description alone; a kind's field names are otherwise only in
+#: the evaluator's source. ``cmd`` is absent because the evaluator refuses it.
+ACCEPTANCE_SHAPES: str = (
+    'One of: {"kind": "pr_checks", "pr": 123, "repo": "owner/name"}; {"kind": '
+    '"pr_merged", "pr": 123, "repo": "owner/name"}; {"kind": "file", "path": '
+    '"/absolute/path"} (add "exists": false for a path that must be gone); {"kind": '
+    '"human_approval"}; {"kind": "edition_check", "check": "<name>", "ref": "<id>"}.'
+)
 
 
 #: Most retired bindings an item keeps; past it the oldest destroyed one goes first.
@@ -169,6 +184,61 @@ def coerce_retired_bindings(raw: Any) -> list[dict[str, Any]]:
         if clean["worker_session_key"] and clean["worker_instance_id"]:
             out.append(clean)
     return out
+
+
+#: The ``ask`` record's caps: what the item needs from the person, why, each option
+#: with what it leads to, and the pick with its reason. The conductor writes it once
+#: per item when it relays a question to the person; ``decide`` and ``close`` clear it.
+WORK_ASK_WHAT_CHARS: int = 200
+WORK_ASK_WHY_CHARS: int = 600
+WORK_ASK_LABEL_CHARS: int = 120
+WORK_ASK_OUTCOME_CHARS: int = 300
+WORK_ASK_MAX_OPTIONS: int = 6
+
+
+def coerce_ask(raw: Any) -> dict[str, Any] | None:
+    """Stored or folded *raw* as a clean ``ask`` record, or ``None``. NEVER raises.
+
+    A record needs ``what`` and the gateway's ``written_at``; an option needs a
+    label; a ``pick`` that is not one of the labels is dropped with its reason.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    def text(name: str, cap: int, value: Any = None) -> str:
+        value = raw.get(name) if value is None else value
+        return value[:cap] if isinstance(value, str) else ""
+
+    what = text("what", WORK_ASK_WHAT_CHARS)
+    written_at = text("written_at", WORK_MAX_STAMP_CHARS)
+    if not what or not written_at:
+        return None
+    options: list[dict[str, str]] = []
+    raw_options = raw.get("options")
+    for option in raw_options if isinstance(raw_options, list) else []:
+        if not isinstance(option, dict):
+            continue
+        label = option.get("label")
+        outcome = option.get("outcome")
+        if isinstance(label, str) and label:
+            options.append(
+                {
+                    "label": label[:WORK_ASK_LABEL_CHARS],
+                    "outcome": outcome[:WORK_ASK_OUTCOME_CHARS] if isinstance(outcome, str) else "",
+                }
+            )
+    options = options[:WORK_ASK_MAX_OPTIONS]
+    pick = text("pick", WORK_ASK_LABEL_CHARS)
+    if pick not in {option["label"] for option in options}:
+        pick = ""
+    return {
+        "what": what,
+        "why": text("why", WORK_ASK_WHY_CHARS),
+        "options": options,
+        "pick": pick,
+        "pick_why": text("pick_why", WORK_ASK_OUTCOME_CHARS) if pick else "",
+        "written_at": written_at,
+    }
 
 
 def worker_statuses(remote_dispatch: bool) -> tuple[str, ...]:
@@ -223,6 +293,8 @@ class WorkBoardItem(TypedDict):
     status: str | None
     #: One of :data:`WORK_BLOCKED_REASONS` on a blocked/question report, or unset.
     reason: str | None
+    #: When a ``progress`` report's worker will resume; present only while set.
+    wake_at: NotRequired[str]
     summary: str
     artifacts: dict[str, str]
     pr: int | None
@@ -233,6 +305,8 @@ class WorkBoardItem(TypedDict):
     decided_at: str | None
     #: When the item's current run of ``pending`` verdicts began, or unset.
     pending_since: str | None
+    #: The conductor's ``ask`` record (:func:`coerce_ask`); present only while set.
+    ask: NotRequired[dict[str, Any]]
     events: list[WorkBoardEvent]
 
 

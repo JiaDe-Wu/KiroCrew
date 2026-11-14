@@ -27,7 +27,9 @@ from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 from chat_regenerate_cov80_helpers import state_fixture  # noqa: F401
 from chat_regenerate_cov80_helpers import _client, _make_regen_app
+from redaction_structured_cases import github_classic
 
+from kiro_crew.config import KiroCrewConfig
 from kiro_crew.dashboard import chat_regenerate
 from kiro_crew.dashboard.chat_regenerate import (
     api_chat_slot_edit_resend,
@@ -148,6 +150,8 @@ async def test_regenerate_never_crosses_a_newer_user_turn(state) -> None:
 async def test_readiness_latch_blocks_before_the_dispatch(state) -> None:
     """An unverified backend is rejected before any turn is dispatched or any
     replace target is armed."""
+    # The gate asks only when the applied harness signs in via kiro-cli.
+    state.sessions._cfg = KiroCrewConfig.load()
     slot = state.get_or_create_slot("s1")
     slot.append("user", "hi")
     slot.append("assistant", "hello v1")
@@ -403,8 +407,10 @@ async def test_switch_variant_broadcasts_redacted_content(state) -> None:
     slot = state.get_or_create_slot("s1")
     slot.append("user", "what is the key?")
     slot.append("assistant", "v2")
+    # A GitHub token with a valid checksum is redacted; an AWS key ID stays visible.
+    secret = github_classic(seed=131)
     slot.messages[-1]["variants"] = [
-        {"content": "the key is AKIAIOSFODNN7EXAMPLE", "ts": "t1"},
+        {"content": f"the key is {secret}", "ts": "t1"},
         {"content": "v2", "ts": "t2"},
     ]
     async with _client(state) as client:
@@ -415,9 +421,9 @@ async def test_switch_variant_broadcasts_redacted_content(state) -> None:
     msg_type, payload = state.broadcast_ws.call_args.args
     assert msg_type == "chat_variant_switch"
     assert payload["index"] == 0
-    assert "AKIAIOSFODNN7EXAMPLE" not in payload["content"]
+    assert secret not in payload["content"]
     # The stored row keeps the real content; only the wire copy is redacted.
-    assert slot.messages[-1]["content"] == "the key is AKIAIOSFODNN7EXAMPLE"
+    assert slot.messages[-1]["content"] == f"the key is {secret}"
     assert slot.messages[-1]["ts"] == "t1"
 
 
@@ -832,6 +838,8 @@ async def test_edit_resend_rejected_while_a_turn_is_in_flight(state) -> None:
 
 @pytest.mark.asyncio
 async def test_edit_resend_readiness_latch_blocks_before_the_truncation(state) -> None:
+    # The gate asks only when the applied harness signs in via kiro-cli.
+    state.sessions._cfg = KiroCrewConfig.load()
     slot = state.get_or_create_slot("s1")
     slot.append("user", "first")
     blocked = web.json_response({"error": "kiro not verified"}, status=503)
@@ -1352,7 +1360,7 @@ async def test_no_variants_refusal_carries_its_own_code(state) -> None:
 async def test_a_paused_crew_session_keeps_its_history_when_asked_to_redo_it(
     state, monkeypatch, path, body
 ) -> None:
-    """Ultra Mode "Pause all" holds the session: its replacement turn could not
+    """Conductor mode "Pause all" holds the session: its replacement turn could not
     run, so the history is left as it is and the refusal says why."""
     from kiro_crew import crew_pause
 

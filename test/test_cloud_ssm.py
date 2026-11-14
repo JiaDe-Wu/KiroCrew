@@ -218,6 +218,31 @@ class TestOpenPortForward:
         assert str(install_dir) in child_path  # the plugin's install dir
         assert child_path.index(str(inherited)) < child_path.index(str(install_dir))
 
+    def test_child_gets_no_python_interpreter_settings(self, monkeypatch):
+        """aws-cli v1 is Python: the gateway's PYTHONPATH/PYTHONHOME must not reach it.
+
+        Everything else ``aws_spawn_env`` builds, the widened PATH included, still does.
+        """
+        captured: dict = {}
+
+        def fake_popen(argv, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+        spawn_env = {
+            "PATH": "<widened>",
+            "PYTHONPATH": "<gw>",
+            "PYTHONHOME": "<gw>",
+            "AWS_PROFILE": "k",
+        }
+        monkeypatch.setattr(ssm, "aws_spawn_env", lambda head: dict(spawn_env))
+        monkeypatch.setattr(ssm, "require_session_manager_plugin", lambda: None)
+        monkeypatch.setattr(ssm.subprocess, "Popen", fake_popen)
+
+        ssm.open_port_forward("i-0abc", 5476, 5599, "dev", "us-east-1")
+
+        assert captured["env"] == {"PATH": "<widened>", "AWS_PROFILE": "k"}
+
     @pytest.mark.skipif(os.name == "nt", reason="provenance branch is dead on Windows")
     def test_refused_aws_binary_is_not_put_back_on_the_child_path(self, monkeypatch, tmp_path):
         """A provenance-REFUSED aws must not become reachable again via the env.
@@ -399,6 +424,15 @@ class TestSessionManagerPluginProbe:
         assert result.ok is False
         assert refusal.path in result.message
         assert refusal.remedy_command in result.message
+
+    def test_the_next_step_for_a_refusal_in_aws_install_tree_is_its_fix(self, monkeypatch):
+        """An install that leaves AWS's tree refused must not end by offering a reinstall."""
+        monkeypatch.setattr(ssm, "session_manager_plugin_refusal", _pkg_tree_refusal)
+        monkeypatch.setattr(ssm, "session_manager_plugin_install_command", lambda: "brew install x")
+        assert ssm.session_manager_plugin_next_step("kirocrew cloud launch") == [
+            "Run this command, then rerun `kirocrew cloud launch`:",
+            f"  {_PKG_TREE_REMEDY}",
+        ]
 
     def test_a_refusal_with_no_known_fix_still_installs(self, monkeypatch):
         """A refused copy outside AWS's tree (a second account's Homebrew) can be
@@ -1151,16 +1185,21 @@ class TestSessionManagerPlugin:
         commands: list[list[str]] = []
 
         monkeypatch.setattr(ssm, "session_manager_plugin_installed", lambda: next(installed))
+        monkeypatch.setattr(ssm, "_sudo_cannot_prompt", lambda: False)
+        monkeypatch.setattr(ssm, "session_manager_plugin_refusal", lambda: None)
         monkeypatch.setattr(
             ssm,
             "_session_manager_plugin_install_plan",
             lambda tmpdir: (
                 "https://example.com/session-manager-plugin.deb",
+                "0" * 64,
                 tmpdir / "session-manager-plugin.deb",
                 [["sudo", "dpkg", "-i", str(tmpdir / "session-manager-plugin.deb")]],
             ),
         )
-        monkeypatch.setattr(ssm, "_download_file", lambda url, dest: downloaded.append((url, dest)))
+        monkeypatch.setattr(
+            ssm, "_download_file", lambda url, dest, _sha256: downloaded.append((url, dest))
+        )
         monkeypatch.setattr(
             ssm, "_run_install_command", lambda argv: commands.append(argv) or (0, "", "")
         )
@@ -1178,7 +1217,7 @@ class TestSessionManagerPlugin:
         plan = ssm._session_manager_plugin_install_plan(tmp_path)
 
         assert plan is not None
-        url, package_path, commands = plan
+        url, _sha256, package_path, commands = plan
         assert "mac_arm64/session-manager-plugin.pkg" in url
         assert package_path.name == "session-manager-plugin.pkg"
         assert commands[0][:3] == ["sudo", "installer", "-pkg"]
@@ -1193,7 +1232,7 @@ class TestSessionManagerPlugin:
         plan = ssm._session_manager_plugin_install_plan(tmp_path)
 
         assert plan is not None
-        url, package_path, commands = plan
+        url, _sha256, package_path, commands = plan
         assert "ubuntu_arm64/session-manager-plugin.deb" in url
         assert package_path.name == "session-manager-plugin.deb"
         assert commands == [["sudo", "dpkg", "-i", str(package_path)]]

@@ -138,15 +138,11 @@ def _agent_model_or_exit(raw: str, cfg: KiroCrewConfig, crew: str = "") -> str:
     except CrewmateHarnessUnavailable as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
-    from kiro_crew.crewmate_harness import crewmate_pin_for, kiro_spelling_applies
+    from kiro_crew.crewmate_harness import kiro_spelling_applies
 
-    # A crewmate pinned to a harness with its own model ids takes those ids as
-    # written; every other agent keeps the kiro-cli spelling check.
-    correction = (
-        model_registry.acp_id_correction(model)
-        if kiro_spelling_applies(backend, crewmate_pin_for(cfg, crew) is not None)
-        else None
-    )
+    # Judged on the harness the pin runs on: one with its own model ids takes
+    # those ids as written.
+    correction = model_registry.acp_id_correction(model) if kiro_spelling_applies(backend) else None
     if correction:
         print(
             f"Error: {model!r} is not a model kiro-cli serves; the registry maps that "
@@ -175,6 +171,12 @@ def _handle_agent(args: argparse.Namespace) -> None:
     """Dispatch agent subcommands: list, create, update, delete."""
 
     action = getattr(args, "agent_action", None)
+    if action == "validate":
+        # Offline by design: a config that does not load must not stop a spec check.
+        from kiro_crew.cli_agent_validate import agent_validate
+
+        agent_validate(args)
+        return
     cfg = KiroCrewConfig.load()
 
     if action == "list":
@@ -249,7 +251,20 @@ def _handle_agent(args: argparse.Namespace) -> None:
         # binding would be re-served by the cli_commands facade mirror and trip
         # its composition contract (every served name must be owner-DEFINED).
         from kiro_crew.crew_avatar_seed import default_icon_avatar
+        from kiro_crew.member_workspace import DEFAULT_WORKSPACE
 
+        # Saved as given, as `agent update` does, but an unconfigured name falls
+        # back to another workspace's directory, so the caller is told.
+        if (
+            args.workspace
+            and args.workspace not in cfg.workspaces
+            and args.workspace not in (DEFAULT_WORKSPACE, cfg.default_workspace)
+        ):
+            print(
+                f"Warning: workspace '{safe_terminal_line(args.workspace)}' is not "
+                "configured; the crew shares a fallback workspace directory",
+                file=sys.stderr,
+            )
         # A crew that carried this name before may still be listed on a team
         # (every removal path drops it best-effort). persist_member_config
         # purges that INSIDE the registry's locked mutation, right before the
@@ -480,7 +495,7 @@ def _handle_agent(args: argparse.Namespace) -> None:
         # exit 2, the argparse convention, so a script does not read 0 after a
         # typo.
         print(
-            "Usage: kirocrew agent {list|create|update|delete|pin|reset-model}",
+            "Usage: kirocrew agent {list|create|update|delete|pin|validate|reset-model}",
             file=sys.stderr,
         )
         sys.exit(2)

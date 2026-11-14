@@ -126,13 +126,22 @@ export function useCtx(): AppSdkContextValue {
 }
 
 
+/** The leading mark of an entry that names one path and no child (`=/api/apps`),
+ *  as `token_auth_app_scope.EXACT_API_ENTRY_MARK`. Seam level 7. */
+const EXACT_API_ENTRY_MARK = '='
+
 /** Whether a NORMALIZED pathname matches one of the declared API patterns.
  *  Mirrors token_auth._api_pattern_matches: only declared trailing wildcards
- *  are interpreted, and there are no implicit feature grants. */
+ *  are interpreted, an entry marked exact matches only itself, and there are
+ *  no implicit feature grants. */
 function matchesDeclared(allowedPaths: readonly string[], normalized: string): boolean {
   return allowedPaths.some(entry => {
     const pattern = entry.trim()
     if (!pattern) return false
+    if (pattern.startsWith(EXACT_API_ENTRY_MARK)) {
+      const exact = pattern.slice(EXACT_API_ENTRY_MARK.length)
+      return exact !== '' && normalized === exact
+    }
     if (pattern.endsWith('/*')) {
       const base = pattern.slice(0, -2)
       return normalized === base || normalized.startsWith(base + '/')
@@ -239,11 +248,21 @@ function createScopedApi(allowedPaths: string[], appName: string, sessionKey: st
     })
   }
 
+  // A session this app's page creates names the app (`embed_app`), the way the
+  // embed's own send does: the request carries the person's session, so only
+  // this client knows which app asks. The gateway records it on a conversation
+  // the create begins, so uninstalling the app resets that conversation.
+  const namingApp = (path: string, body: unknown): unknown => {
+    const plain = body == null || (typeof body === 'object' && !Array.isArray(body))
+    const creates = new URL(path, 'http://localhost').pathname === '/api/chat/slots'
+    return plain && creates ? { ...((body ?? {}) as Record<string, unknown>), embed_app: appName } : body
+  }
+
   return {
     raw: rawFetch,
     request: (path, init) => jsonFetch(path, init),
     get: (path, init) => jsonFetch(path, { ...init, method: 'GET' }),
-    post: (path, body, init) => jsonRequest(path, 'POST', body, init),
+    post: (path, body, init) => jsonRequest(path, 'POST', namingApp(path, body), init),
     put: (path, body, init) => jsonRequest(path, 'PUT', body, init),
     patch: (path, body, init) => jsonRequest(path, 'PATCH', body, init),
     del: (path, init) => jsonFetch(path, { ...init, method: 'DELETE' }),

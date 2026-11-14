@@ -25,13 +25,14 @@ code channels to the feature's process latch.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import subprocess
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from kiro_crew.platform.context import redact_via_context
 from kiro_crew.security import is_sensitive_path
@@ -95,7 +96,8 @@ _CHANNEL_DISABLING_ERRORS = frozenset(
 
 #: ``worktree_skipped`` reasons that describe the project or host, so a later
 #: bind would decide the same. Any other reason is a git error and is retried,
-#: at most :data:`_MAX_BIND_ATTEMPTS` times in all.
+#: at most :data:`_MAX_BIND_ATTEMPTS` times in all. The ``git_*`` and
+#: ``broken_gitfile`` reasons are git refusing to open the project folder at all.
 WORKTREE_REFUSED = "worktree_refused"  # git_ops.WorktreeRefused: the repository refuses one
 _SETTLED_SKIPS = frozenset(
     {
@@ -103,6 +105,10 @@ _SETTLED_SKIPS = frozenset(
         "no_project",
         "project_missing",
         "not_a_repo",
+        "broken_gitfile",
+        "git_dubious_ownership",
+        "git_permission_denied",
+        "git_probe_failed",
         "sensitive_path",
         "sandbox_unavailable",
         WORKTREE_REFUSED,
@@ -156,6 +162,9 @@ _ADOPTED_FIELDS = ("folder_id", "pointed_session", "view_id", "diff_hash")
 #: folder with no worktree) must still be able to remove the tab the old tree's
 #: diff opened.
 _CHANNEL_FIELDS = ("view_id",)
+
+#: Longest the archive's cleanup waits for a bind still cutting the worktree.
+_QUIET_WAIT_SECS = 120.0
 
 #: Points a dashboard session at a directory; returns whether it was applied.
 ProjectSetter = Callable[[str, str], Awaitable[bool]]
@@ -229,6 +238,24 @@ def _classify_version(text: str) -> str:
     if redacted == "\n".join(redact_via_context(line) for line in text.split("\n")):
         return MASK_LINES
     return WITHHOLD
+
+
+def _stamped_archived(channel_id: str) -> bool:
+    """Whether the STORED binding is stamped archived, for refusing a new worktree.
+
+    Unlike :func:`_archived` (which decides whether to publish, and lets the
+    caller's copy stand in), only the store counts here, and an unreadable store
+    counts as archived: cutting a worktree is the action to refuse, since the one
+    an Archive removed would be cut again and orphaned. Blocking.
+    """
+    from kiro_crew.slack.code_channels.store import store as channel_store
+
+    try:
+        stored = channel_store().get_binding(channel_id)
+    except Exception:
+        logger.debug("code channel %s: binding unreadable", channel_id, exc_info=True)
+        return True
+    return stored is not None and bool(stored.archived_at)
 
 
 def _gate_open() -> bool:
@@ -498,6 +525,12 @@ class WorkspaceService:
         key = f"{team}:{channel}"
         try:
             async with self._lock(key):
+                if await asyncio.to_thread(_stamped_archived, channel):
+                    # Every path to a workspace comes through here (a bind, a
+                    # message, a turn's start or end, a resume): an archived
+                    # channel gets no tree back, or the one its Archive removed
+                    # would be cut again and orphaned (no cleanup runs after).
+                    return None
                 record = await asyncio.to_thread(self._store.get, team, channel)
                 fresh = record is None or not await asyncio.to_thread(
                     self._record_matches, record, binding
@@ -685,7 +718,9 @@ class WorkspaceService:
                     record.worktree_skipped = "project_missing"
                     return record
                 project_real = recovered[0]
-            root = await asyncio.to_thread(git_ops.toplevel, project_real)
+            root, refusal, git_line = await asyncio.to_thread(
+                git_ops.toplevel_or_refusal, project_real
+            )
         except git_ops.SandboxUnavailable as exc:
             record.worktree_skipped = "sandbox_unavailable"
             _audit("code_channel_worktree", "denied", f"channel={channel}", str(exc)[:200])
@@ -693,7 +728,15 @@ class WorkspaceService:
         except (subprocess.TimeoutExpired, OSError) as exc:
             return _git_failed(record, exc, f"channel={channel} project={project}")
         if not root:
-            record.worktree_skipped = "not_a_repo"
+            # git's reason, so /create-pr can name it. Redact the whole line, then
+            # clip: a clip first can cut a credential URL before redaction sees it.
+            record.worktree_skipped = "not_a_repo" if refusal == "not_a_git_repository" else refusal
+            _audit(
+                "code_channel_worktree",
+                "denied",
+                f"channel={channel} project={project}",
+                f"{record.worktree_skipped}: {redact_via_context(git_line)[:300]}",
+            )
             return record
         rel = recovered[1] if recovered is not None else os.path.relpath(project_real, root)
         record.subdir = "" if rel == "." else rel
@@ -932,9 +975,16 @@ class WorkspaceService:
         bound session runs again or nothing runs. A clear Slack did not take is
         kept and sent again on the next pass.
         """
+        from kiro_crew.slack.code_channels import status as channel_status
+
         bound_running = now.get(record.session_key, False)
         workers = any(run for k, run in now.items() if k != record.session_key)
         key = record.key
+        if not bound_running and channel_status.held(record.channel_id):
+            # The agent asked the channel's people and waits on them: its workers
+            # neither replace nor clear that, only its next turn does.
+            self._working.discard(key)
+            return
         want = "processing" if workers and not bound_running else ""
         if want and key not in self._working:
             if await _set_status(record.channel_id, "processing"):
@@ -958,10 +1008,60 @@ class WorkspaceService:
         watcher's record of having written ``processing`` is stale after it."""
         self._working.discard(record_key(binding.team_id or "", binding.channel_id or ""))
 
+    @property
+    def store(self) -> WorkspaceStore:
+        """The service's record store (one lock for every writer of it)."""
+        return self._store
+
+    async def republish_bar(self, binding: Any) -> str | None:
+        """Publish the context bar now (the agent changed its own items).
+
+        Returns ``""`` when the bar is current, a Slack error code (or
+        ``publish_failed``) when it is not, and ``None`` when there is no
+        workspace record to publish from (the caller publishes the agent's items).
+        """
+        team, channel = str(binding.team_id or ""), str(binding.channel_id or "")
+        if not channel or not _gate_open():
+            return None
+        async with self._lock(f"{team}:{channel}"):
+            record = await asyncio.to_thread(self._store.get, team, channel)
+            if record is None:
+                return None
+            published = await self._publish_bar(record)
+            await asyncio.to_thread(self._store.put, record)
+            return "" if published else (record.slack_off or "publish_failed")
+
+    @contextlib.asynccontextmanager
+    async def channel_quiet(self, team_id: str, channel_id: str) -> AsyncIterator[None]:
+        """Hold the channel's lock with no bind in flight (the archive's cleanup).
+
+        A bind still cutting the worktree is waited for first (bounded), so the
+        cleanup sees what it made; a refresh in flight finishes before the lock
+        is granted.
+        """
+        key = f"{team_id}:{channel_id}"
+        for _ in range(2):
+            bind = self._binds.get(key)
+            if bind is None:
+                break
+            await asyncio.wait({bind}, timeout=_QUIET_WAIT_SECS)
+        async with self._lock(key):
+            yield
+
     async def on_turn_start(self, binding: Any, _event: Any = None) -> None:
-        """Turn-start hook: make sure the workspace exists before the model runs."""
+        """Turn-start hook: make sure the workspace exists before the model runs.
+
+        Admitted at the stop fence: a Stop during it leaves its bar and diff
+        writes unsent (``SurfaceClient._call``); the tree itself is still cut.
+        """
+        from kiro_crew.slack.code_channels import surface
+
         self._forget_worker_status(binding)
-        await self.ensure(binding)
+        token = surface.admit()
+        try:
+            await self.ensure(binding)
+        finally:
+            surface.release(token)
 
     async def on_turn_end(self, binding: Any, _event: Any = None) -> None:
         """Turn-end hook: schedule :meth:`refresh` and return at once.
@@ -998,7 +1098,24 @@ class WorkspaceService:
             await asyncio.gather(*list(self._tasks.values()), return_exceptions=True)
 
     async def refresh(self, binding: Any) -> None:
-        """Republish the context bar and the diff after a turn, each only on change."""
+        """Republish the context bar and the diff after a turn, each only on change.
+
+        Nothing after a Stop of the turn it follows, and a Stop during its own
+        awaits leaves the rest unsent (admitted at the stop fence). The next
+        turn's refresh publishes whatever changed.
+        """
+        from kiro_crew.slack.code_channels import surface
+
+        channel = str(binding.channel_id or "")
+        if channel and surface.channel_stopped(channel):
+            return
+        token = surface.admit()
+        try:
+            await self._refresh(binding)
+        finally:
+            surface.release(token)
+
+    async def _refresh(self, binding: Any) -> None:
         team, channel = str(binding.team_id or ""), str(binding.channel_id or "")
         if not channel or not _gate_open():
             return
@@ -1112,19 +1229,25 @@ class WorkspaceService:
             pr=pr,
         )
 
-    async def _publish_bar(self, record: WorkspaceRecord) -> None:
+    async def _publish_bar(self, record: WorkspaceRecord) -> bool:
+        """Publish the bar when it changed; False when a needed write failed."""
         if record.slack_off:
-            return
+            return False
         try:
             state = await self._bar_state(record)
         except git_ops.SandboxUnavailable:
             state = BarState(folder=record.project_dir)
-        items = build_items(state)
+        from kiro_crew.slack.code_channels.agent_bar import merge_for_channel
+
+        # The agent's own items (code_channel_set_context_bar) ride after these.
+        items = await asyncio.to_thread(merge_for_channel, build_items(state), record.channel_id)
         digest = _digest(items)
         if digest == record.bar_hash or (not items and not record.bar_hash):
-            return
+            return True
         if await self._call("set_context_bar", record, items) is not None:
             record.bar_hash = digest
+            return True
+        return False
 
     async def _publish_diff(self, record: WorkspaceRecord) -> None:
         if record.slack_off:

@@ -19,6 +19,7 @@ if TYPE_CHECKING:
         _RELEASE_REPUMP_SECS,
         DENY_CAUSE_APPROVAL_UNDELIVERABLE,
         MEMORY_PRESSURE_NEVER_STARTED,
+        HostSpawnDecision,
         SpawnAdmissionCoordinator,
         SpawnApprovalUnreachable,
         Stats,
@@ -1307,6 +1308,9 @@ class _PumpMixin(ManagerComponent):
         _log_decision: str = "rejected"
         _log_by: str = "host"
         _log_cause: str = ""
+        _trace_approval: Any = None
+        from kiro_crew.tracing import steps as trace_steps
+
         try:
             try:
                 from kiro_crew.security import (
@@ -1345,17 +1349,24 @@ class _PumpMixin(ManagerComponent):
                 _log_origin = self._record_crew_log_spawn_approval_requested(
                     info, approval_id=request_id, reason=f"spawn_run({task_preview})"
                 )
+                # Its span, under the parent's spawn tool span (tracing/steps.py).
+                _trace_approval = trace_steps.approval_opened(
+                    request_id, subagent_id=info.id, spawn=True
+                )
                 try:
-                    approved: bool = await self._manager._on_spawn_approval(
+                    answer = await self._manager._on_spawn_approval(
                         request_id, f"spawn_run({task_preview})", info.parent_session_key
                     )
                 finally:
                     info._awaiting_approval = False
-                # A person answered, at a surface this site cannot name, so the
-                # entry asserts neither who decided nor why.
+                if isinstance(answer, HostSpawnDecision):
+                    # The callback decided on its own, with nobody asked.
+                    approved, _log_by, _log_cause = answer.approved, "host", answer.cause
+                else:
+                    # A person answered, at a surface this site cannot name, so the
+                    # entry asserts neither who decided nor why.
+                    approved, _log_by, _log_cause = answer, "", ""
                 _log_decision = "approved" if approved else "rejected"
-                _log_by = ""
-                _log_cause = ""
             except SpawnApprovalUnreachable as unreachable:
                 # Not a refusal: nobody was there to refuse. Ordered ABOVE the
                 # generic handler below, which would otherwise flatten this into the
@@ -1419,6 +1430,11 @@ class _PumpMixin(ManagerComponent):
                 decision=_log_decision,
                 by=_log_by,
                 cause=_log_cause,
+            )
+            trace_steps.approval_closed(
+                _trace_approval,
+                approved=_log_decision == "approved",
+                by=trace_steps.decided_by(host=_log_by == "host", cause=_log_cause),
             )
 
         if not approved:
@@ -1808,6 +1824,7 @@ class _PumpMixin(ManagerComponent):
                 delegation=info.delegation,
                 backend=info.backend,
                 depth=info.depth,
+                silent=info.silent,
                 memory_store=info.memory_store,
                 execution_context=info.execution_context,
                 memory_mode=info.memory_mode,

@@ -8,7 +8,9 @@ base URL, the operation named in ``X-Amz-Target``. Each new ``hostToken`` an
 answer carries goes to the relay client, which sends it down the host connection
 in a ``token`` frame (section 4.3). Each call reports ``relay.connectionStatus``
 from the relay client itself, so it is ``CONNECTED`` only from ``ready`` until
-that connection ends (section 4.2).
+that connection ends (section 4.2), and ``connectedCount``, the people the relay
+client sees connected now. The count is display-only, so one that cannot be read
+is sent as 0 and never holds up the renewal.
 
 Timing follows section 11.1. The next call is timed from when the answer arrived,
 on a monotonic clock, never by comparing a time in the answer with this machine's
@@ -28,6 +30,14 @@ setting that names no credential stops the source. ``IdentityInUseException`` wa
 until ``takeoverAfter``, measured against the same answer's ``Date`` header; a
 refused sign-in (any HTTP 401, whatever its body) reads the credential again and
 retries once before it stops; anything else backs off.
+
+When Remote Control stops, the source makes one ``ReleaseCrewInstanceLease`` call
+(section 10.2) carrying only ``crewInstanceId``, so the lease ends at once instead
+of lapsing up to five minutes later. It is bounded by ``RELEASE_TIMEOUT_SECONDS``
+and any failure is only logged: the lease still lapses on its own.
+
+A personal Crew, built with a ``profile_arn`` reader, also sends ``profileArn`` on
+both calls; with no reader (the default, and every team Crew) the calls are as above.
 
 The credential is the Crew's own sign-in to the lease service. It is read from a
 file or from the Crew's secrets vault for each call, never held in the config,
@@ -59,6 +69,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 
+from kiro_crew.bounded_read import bounded_read
 from kiro_crew.relay_client.backoff import Backoff
 from kiro_crew.relay_client.connection import env_proxy_for
 from kiro_crew.relay_client.protocol import (
@@ -69,6 +80,7 @@ from kiro_crew.relay_client.protocol import (
     is_loopback_host,
 )
 from kiro_crew.relay_client.token_source import (
+    ConnectedPeople,
     HostCredential,
     HostTokenRetryLater,
     HostTokenUnavailable,
@@ -82,6 +94,7 @@ logger = logging.getLogger(__name__)
 #: The awsJson 1.0 envelope: every operation is ``POST /``, named in ``X-Amz-Target``.
 SERVICE_NAME = "KiroControlPlaneBearerService"
 RENEW_TARGET = f"{SERVICE_NAME}.RenewCrewLease"
+RELEASE_TARGET = f"{SERVICE_NAME}.ReleaseCrewInstanceLease"
 AWS_JSON_CONTENT_TYPE = "application/x-amz-json-1.0"
 #: The ``TokenType`` header values this client may send. IAM Identity Center,
 #: Builder ID and Kiro social sign-ins send none; a token straight from an outside
@@ -94,6 +107,10 @@ TOKEN_TYPE_API_KEY = "API_KEY"
 TOKEN_TYPES = frozenset({TOKEN_TYPE_EXTERNAL_IDP, TOKEN_TYPE_API_KEY})
 #: How long one call may take, connecting included.
 CALL_TIMEOUT_SECONDS = 15.0
+#: How long the release at a stop may take, credential read included. It runs
+#: after the relay client's ``STOP_BUDGET_SECONDS``, and both must fit in the
+#: gateway's tunnel stop budget.
+RELEASE_TIMEOUT_SECONDS = 1.5
 #: The largest answer read; a lease answer is well under a kilobyte.
 ANSWER_MAX_BYTES = 64 * 1024
 #: The largest credential file read.
@@ -127,15 +144,29 @@ INSTANCE_ID_FILE = Path("relay") / "crew-instance-id"
 #: The last leaseVersion the service returned, with the instance ID it was for.
 LEASE_VERSION_FILE = Path("relay") / "crew-lease-version"
 SECRET_URI_PREFIX = "secret://"
+#: The ``tunnel.relay_lease_credential`` value that leases with the Crew's own Kiro
+#: sign-in (a personal Crew) instead of a file or a stored secret.
+SIGN_IN_CREDENTIAL = "kiro-sign-in"
 
 #: Error types the service refuses this Crew with, and why. An access refusal
 #: waits ``RETRY_AFTER_MAX_SECONDS``; the others stop until Remote Control restarts.
 _ACCESS_DENIED = "AccessDeniedException"
+#: An ``AccessDeniedException`` reason, with case and underscores dropped, to why.
 _ACCESS_DENIED_REASONS = {
-    "RemoteAccessDisabled": "the organization does not allow remote access",
-    "CrewAccessNotGranted": "this sign-in has no access to the Crew, or its identity is not active",
+    "remoteaccessdisabled": "remote access is turned off for this Crew's account or organization",
+    "crewaccessnotgranted": "this sign-in has no access to the Crew, or its identity is not active",
 }
-_ACCESS_DENIED_DEFAULT = "this sign-in cannot host this Crew now"
+#: Covers a refusal with no reason, such as remote Crews not being enabled for the
+#: account: the refusal's message is never read, so the text names both causes.
+_ACCESS_DENIED_DEFAULT = (
+    "this sign-in cannot host this Crew now, or remote access is turned off for this "
+    "Crew's account or organization"
+)
+#: Refusals that retry on the backoff steps like any unlisted one, with the cause named.
+_BACK_OFF_WHY = {
+    "ServiceQuotaExceededException": "the account has reached its limit of remote Crews",
+    "ThrottlingException": "the relay is limiting requests; the host will try again",
+}
 _NOT_FOUND = "ResourceNotFoundException"
 _NOT_FOUND_WHY = "the Crew's identity is disabled or deleted"
 _VALIDATION = "ValidationException"
@@ -226,7 +257,7 @@ def read_lease_credential(ref: str, *, home: Optional[Path] = None) -> str:
     else:
         try:
             with open(os.path.expanduser(ref), "rb") as handle:
-                raw = handle.read(CREDENTIAL_MAX_BYTES + 1)
+                raw = bounded_read(handle, CREDENTIAL_MAX_BYTES + 1)
         except OSError as exc:
             raise LeaseCredentialError(
                 f"the credential file could not be read ({type(exc).__name__})"
@@ -547,6 +578,10 @@ def _never_connected() -> bool:
     return False
 
 
+def _nobody() -> int:
+    return 0
+
+
 Sleep = Callable[[float], Awaitable[Any]]
 
 
@@ -566,15 +601,27 @@ class LeaseHostTokenSource:
         sleep: Sleep = asyncio.sleep,
         monotonic: Callable[[], float] = time.monotonic,
         token_type: Optional[str] = None,
+        profile_arn: Optional[Callable[[], Optional[str]]] = None,
+        sign_in: Optional[Callable[[Optional[str]], Awaitable[Any]]] = None,
     ) -> None:
         if token_type is not None and token_type not in TOKEN_TYPES:
             raise ValueError("the lease credential's token type is not one this client sends")
+        if profile_arn is not None and token_type == TOKEN_TYPE_API_KEY:
+            raise ValueError("a team Crew on a crew API key has no profile ARN")
         # awsJson 1.0: every operation is POST / on the service's base URL.
         self._renew_url = lease_url.rstrip("/") + "/"
         # Only a lease service on loopback may name a plaintext loopback test relay.
         self._local_test = lease_url_is_loopback(lease_url)
         # The TokenType header, or None for a sign-in that sends none.
         self._token_type = token_type
+        # A personal Crew's profile ARN reader, or None: not personal, requests as today.
+        # shortcut: called on the event loop for each call, so it must return a cached
+        # value; move it into a thread if a reader ever does I/O.
+        self._profile_arn = profile_arn
+        self._logged_no_profile = False
+        # A personal Crew's sign-in reader (rejected bearer -> bearer, token_type),
+        # used instead of the credential reference; None reads the reference.
+        self._sign_in = sign_in
         # A reference to the credential (secret://NAME or a path), not the credential.
         self._credential_ref = credential
         self._crew_version = crew_version[:CREW_VERSION_MAX_CHARS]
@@ -591,6 +638,7 @@ class LeaseHostTokenSource:
         self._timer: Optional[asyncio.Task[None]] = None
         self._callback: Optional[NewTokenCallback] = None
         self._connected: RelayConnected = _never_connected
+        self._people: ConnectedPeople = _nobody
         self._instance_id: Optional[str] = None
         self._endpoint_id: Optional[str] = None
         #: The last answer's leaseVersion (or the one saved before a restart), sent
@@ -638,11 +686,16 @@ class LeaseHostTokenSource:
     def on_new_token(self, callback: Optional[NewTokenCallback]) -> None:
         self._callback = callback
 
-    def track_relay(self, connected: Optional[RelayConnected]) -> None:
+    def track_relay(
+        self,
+        connected: Optional[RelayConnected],
+        people: Optional[ConnectedPeople] = None,
+    ) -> None:
         self._connected = connected or _never_connected
+        self._people = people or _nobody
 
     async def aclose(self) -> None:
-        """End the renewals and forget the lease state, so a later start begins anew."""
+        """End the renewals and the lease, and forget its state, so a later start begins anew."""
         timer, self._timer = self._timer, None
         if timer is not None:
             timer.cancel()
@@ -652,11 +705,10 @@ class LeaseHostTokenSource:
         saving, self._saving = self._saving, None
         if saving is not None:
             await asyncio.gather(saving, return_exceptions=True)
-        session, self._session = self._session, None
-        if session is not None:
-            await session.close()
+        instance_id = self._instance_id
         self._callback = None
         self._connected = _never_connected
+        self._people = _nobody
         self._held = None
         # A later start reads the instance ID and its saved leaseVersion again.
         self._instance_id = self._lease_version = None
@@ -664,6 +716,16 @@ class LeaseHostTokenSource:
         self._held_until = self._next_at = self._hold_until = 0.0
         self._hold_reason = self._stopped = ""
         self._backoff.reset()
+        # Last, so a stop cancelled during the release has already forgotten the
+        # lease, and its session still closes.
+        try:
+            # An instance ID is read only by a renewal, so with none there is no lease.
+            if instance_id is not None:
+                await self._release(instance_id)
+        finally:
+            session, self._session = self._session, None
+            if session is not None:
+                await session.close()
 
     # ── calls ──
 
@@ -704,15 +766,20 @@ class LeaseHostTokenSource:
         endpoint_retry: bool = True,
         sign_in_retry: bool = True,
         with_version: bool = False,
+        rejected: Optional[str] = None,
     ) -> None:
-        """One ``RenewCrewLease`` call, with its outcome applied. The lock is held."""
+        """One ``RenewCrewLease`` call, with its outcome applied. The lock is held.
+
+        *rejected* is a sign-in bearer the service just answered 401, refreshed
+        before this retry; only a sign-in reader uses it.
+        """
         if self._stopped:
             raise _Stop(self._stopped)
         now = self._monotonic()
         if now < self._hold_until:
             raise _Later(f"{self._hold_reason}; next try in {self._hold_until - now:.0f}s")
         try:
-            credential = await asyncio.to_thread(self._read_credential, self._credential_ref)
+            credential = await self._credential(rejected)
         except LeaseCredentialReferenceError as exc:
             self._stop(f"tunnel.relay_lease_credential names no credential: {exc}")
         except LeaseCredentialError as exc:
@@ -729,7 +796,7 @@ class LeaseHostTokenSource:
             )
         body = self._request_body(host_token_requested, with_version or self._send_version)
         try:
-            answered = await self._post(credential, body)
+            answered = await self._post(credential, body, RENEW_TARGET)
         except _Unreachable as exc:
             self._back_off(str(exc))
         status, payload = answered.status, answered.payload
@@ -770,13 +837,15 @@ class LeaseHostTokenSource:
                     endpoint_retry=endpoint_retry,
                     sign_in_retry=False,
                     with_version=with_version,
+                    rejected=credential,
                 )
                 return
             self._stop(
-                "the lease service refused the Crew's credential (HTTP 401): check "
-                "tunnel.relay_lease_credential's credential and that "
-                "tunnel.relay_lease_token_type matches it (a team Crew on a crew API key "
-                "needs API_KEY), then restart Remote Control"
+                "the lease service refused the Crew's credential (HTTP 401): check that "
+                "tunnel.relay_lease_credential's credential is current and that "
+                "tunnel.relay_lease_token_type matches its kind (a team Crew on a crew API "
+                "key needs API_KEY, a token from an outside identity provider needs "
+                "EXTERNAL_IDP, and a Kiro sign-in leaves it empty), then restart Remote Control"
             )
         kind, reason = refusal_of(payload, answered.error_type)
         named = f"{kind} {reason}" if kind and reason else (kind or f"HTTP {status}")
@@ -784,7 +853,9 @@ class LeaseHostTokenSource:
             # Access can be granted again with no change on this machine, so the
             # Crew tries again on its own, at most every 15 minutes, as the refusals
             # fixture says.
-            why = _ACCESS_DENIED_REASONS.get(reason or "", _ACCESS_DENIED_DEFAULT)
+            why = _ACCESS_DENIED_REASONS.get(
+                (reason or "").replace("_", "").lower(), _ACCESS_DENIED_DEFAULT
+            )
             self._hold(
                 arrived + RETRY_AFTER_MAX_SECONDS,
                 f"the lease service refused this Crew ({named}): {why}",
@@ -839,7 +910,39 @@ class LeaseHostTokenSource:
             self._hold(arrived + wait, f"the lease service asked the Crew to wait ({named})")
             logger.warning("the lease service refused the renewal (%s); waiting %.0fs", named, wait)
             raise _Later(self._hold_reason)
-        self._back_off(f"the lease service refused the renewal ({named})")
+        cause = _BACK_OFF_WHY.get(kind or "")
+        self._back_off(
+            f"the lease service refused the renewal ({named})" + (f": {cause}" if cause else "")
+        )
+
+    async def _credential(self, rejected: Optional[str]) -> str:
+        """The bearer for one call: from the sign-in reader, else the reference.
+
+        A sign-in also names its ``TokenType``, kept for this call's headers.
+        """
+        if self._sign_in is None:
+            return await asyncio.to_thread(self._read_credential, self._credential_ref)
+        signed_in = await self._sign_in(rejected)
+        self._token_type = signed_in.token_type
+        return str(signed_in.bearer)
+
+    async def _release(self, instance_id: str) -> None:
+        """One best-effort ``ReleaseCrewInstanceLease``; a failure leaves the lease to lapse."""
+
+        async def call() -> int:
+            credential = await self._credential(None)
+            body = {"crewInstanceId": instance_id}
+            if arn := self._personal_profile_arn():
+                body["profileArn"] = arn
+            return (await self._post(credential, body, RELEASE_TARGET)).status
+
+        try:
+            status = await asyncio.wait_for(call(), RELEASE_TIMEOUT_SECONDS)
+        except Exception as exc:  # noqa: BLE001 - a release never fails the stop
+            logger.info("ending the lease failed (%s); it lapses on its own", type(exc).__name__)
+            return
+        if status != 200:
+            logger.info("the lease service did not end the lease (HTTP %d)", status)
 
     async def _save_version(self, home: Path, instance_id: str, version: int) -> None:
         # One at a time, so an older version never lands after a newer one.
@@ -861,8 +964,7 @@ class LeaseHostTokenSource:
             "protocolVersion": str(PROTOCOL_VERSION),
             "hostKind": "CREW",
             "relay": relay,
-            # Known gap: the people connected now are not counted yet.
-            "connectedCount": 0,
+            "connectedCount": self._connected_count(),
         }
         # Leaving out leaseVersion asks for a fresh host token: on the first call
         # after a start, and whenever the client holds no usable one (after a 4401
@@ -870,7 +972,28 @@ class LeaseHostTokenSource:
         # gets the version on every call instead (the stale-version fallback).
         if (with_version or not host_token_requested) and self._lease_version is not None:
             body["leaseVersion"] = self._lease_version
+        if arn := self._personal_profile_arn():
+            body["profileArn"] = arn
         return body
+
+    def _personal_profile_arn(self) -> Optional[str]:
+        """The profile ARN a personal Crew sends, or ``None``: not personal, or none yet.
+
+        With none yet the call goes out as today's, which the service refuses as
+        invalid. The value and any error reading it are never logged.
+        """
+        if self._profile_arn is None:
+            return None
+        try:
+            arn = self._profile_arn()
+        except Exception:  # noqa: BLE001 - a broken reader sends no profile ARN
+            arn = None
+        if isinstance(arn, str) and arn:
+            return arn
+        if not self._logged_no_profile:
+            self._logged_no_profile = True
+            logger.info("a personal Crew has no profile ARN yet; its lease calls carry none")
+        return None
 
     def _relay_connected(self) -> bool:
         try:
@@ -878,6 +1001,21 @@ class LeaseHostTokenSource:
         except Exception:  # noqa: BLE001 - a broken reader reports not connected
             logger.warning("reading the relay connection state failed", exc_info=True)
             return False
+
+    def _connected_count(self) -> int:
+        """The people connected through the relay now; 0 when that cannot be read.
+
+        The service shows it and decides nothing on it, so a broken count never
+        holds up a renewal.
+        """
+        try:
+            count = self._people()
+        except Exception:  # noqa: BLE001 - a broken count reports nobody
+            logger.warning("counting the people connected through the relay failed", exc_info=True)
+            return 0
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            return 0
+        return count
 
     def _client_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -887,22 +1025,22 @@ class LeaseHostTokenSource:
             self._session = aiohttp.ClientSession(trust_env=False)
         return self._session
 
-    def _headers(self, credential: str) -> dict[str, str]:
+    def _headers(self, credential: str, target: str) -> dict[str, str]:
         headers = {
             "Authorization": f"Bearer {credential}",
             "Content-Type": AWS_JSON_CONTENT_TYPE,
-            "X-Amz-Target": RENEW_TARGET,
+            "X-Amz-Target": target,
         }
         if self._token_type is not None:
             headers["TokenType"] = self._token_type
         return headers
 
-    async def _post(self, credential: str, body: dict) -> "_Answered":
+    async def _post(self, credential: str, body: dict, target: str) -> "_Answered":
         try:
             async with self._client_session().post(
                 self._renew_url,
                 data=json.dumps(body).encode("utf-8"),
-                headers=self._headers(credential),
+                headers=self._headers(credential, target),
                 allow_redirects=False,
                 proxy=env_proxy_for(self._renew_url),
                 timeout=aiohttp.ClientTimeout(total=CALL_TIMEOUT_SECONDS),

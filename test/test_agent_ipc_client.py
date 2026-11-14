@@ -10,6 +10,7 @@ import io
 import os
 import socket
 import sys
+import types
 import urllib.error
 import urllib.request
 
@@ -19,7 +20,12 @@ from kiro_crew import agent_ipc_client
 from kiro_crew.acp import ipc_pickup
 from kiro_crew.agent_ipc_wire import CAPABILITY_HEADER, GATEWAY_PID_ENV, PICKUP_ENV
 from kiro_crew.dashboard import agent_ipc
+from kiro_crew.mcp_gateway import STUB_MODULE
+from kiro_crew.mcp_gateway.hashing import STUB_FLAGS_FLAG, encode_target_args
 from kiro_crew.testing.ids import unallocatable_pids
+
+# The ``_set_non_dumpable`` tests below replace ``ctypes.CDLL``.
+pytestmark = pytest.mark.usefixtures("fresh_darwin_libc_handles")
 
 # Pids no live process can own, so nothing here can reach a real process.
 _ROOT_PID, _RESPAWNED_PID = unallocatable_pids(2)
@@ -79,6 +85,28 @@ def test_an_enforced_harness_gets_a_pickup_on_kirocrew_core_only(bound, backend)
     assert entry.runtime_pid() == _RESPAWNED_PID
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["-m", STUB_MODULE, "--server", "kirocrew-core", "--agent", "kirocrew"],
+        [
+            "-m",
+            STUB_MODULE,
+            f"{STUB_FLAGS_FLAG}={encode_target_args(['--server', 'kirocrew-core'])}",
+        ],
+        ["-m", STUB_MODULE, f"{STUB_FLAGS_FLAG}=!not-base64!"],
+    ],
+    ids=["plain", "enveloped", "unreadable"],
+)
+def test_a_broker_stub_for_kirocrew_core_gets_no_pickup(bound, args):
+    # A stub never takes the pickup out of its environment, so a same-uid shell in
+    # the session could read it from /proc/<stub>/environ and redeem it.
+    stub = {"name": "kirocrew-core", "command": sys.executable, "args": args, "env": []}
+    (out,) = _issue([stub])
+    assert PICKUP_ENV not in _env(out) and GATEWAY_PID_ENV not in _env(out)
+    assert not bound._pickups
+
+
 @pytest.mark.parametrize("backend", ["kiro", "kas", "claude"])
 def test_a_harness_that_reads_the_secret_keeps_its_array_unchanged(bound, backend):
     array = _array()
@@ -114,10 +142,59 @@ def test_the_runtime_session_path_issues_the_pickup():
 
 
 @pytest.fixture(autouse=True)
-def _fresh_client_state():
+def _fresh_client_state(_floor_monkeypatch):
+    # take_pickup makes the whole process non-dumpable, which nothing undoes; later
+    # tests on the worker then get EACCES on /proc/self/fd and fail their writes.
+    _floor_monkeypatch.setattr(agent_ipc_client, "_set_non_dumpable", lambda: None)
     agent_ipc_client._reset_for_tests()
     yield
     agent_ipc_client._reset_for_tests()
+
+
+# The fixture above stubs it for every test, so these call the real one through a
+# fake libc: the worker process itself is never made non-dumpable.
+_REAL_SET_NON_DUMPABLE = agent_ipc_client._set_non_dumpable
+
+
+class _FakeLibc:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def prctl(self, *args) -> int:
+        self.calls.append(args)
+        return 0
+
+
+def test_set_non_dumpable_calls_prctl_on_linux(monkeypatch):
+    import ctypes
+
+    libc = _FakeLibc()
+    monkeypatch.setattr(agent_ipc_client, "sys", types.SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(ctypes, "CDLL", lambda *a, **k: libc)
+    _REAL_SET_NON_DUMPABLE()
+    assert libc.calls == [(agent_ipc_client._PR_SET_DUMPABLE, 0, 0, 0, 0)]
+
+
+def test_set_non_dumpable_is_a_no_op_off_linux(monkeypatch):
+    import ctypes
+
+    def refuse(*_a, **_k):
+        raise AssertionError("libc must not be loaded off Linux")
+
+    monkeypatch.setattr(agent_ipc_client, "sys", types.SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(ctypes, "CDLL", refuse)
+    _REAL_SET_NON_DUMPABLE()
+
+
+def test_set_non_dumpable_swallows_a_libc_that_cannot_load(monkeypatch):
+    import ctypes
+
+    def fail(*_a, **_k):
+        raise OSError("no libc")
+
+    monkeypatch.setattr(agent_ipc_client, "sys", types.SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(ctypes, "CDLL", fail)
+    _REAL_SET_NON_DUMPABLE()
 
 
 def _held(gateway_pid: int = 777) -> dict[str, str]:

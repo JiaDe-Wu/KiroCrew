@@ -124,13 +124,16 @@ def _overlay_stt_provider() -> object:
     loop and opening a FIFO there would block it.
     """
     # Imported at call time: the loader imports this module.
-    from kiro_crew.config.loader import config_local_path, read_config_text
+    from kiro_crew.config.loader import config_local_path, read_endorsed_config_text
 
     try:
         local_path = config_local_path()
-        if not local_path.is_file():
+        # A name that exists but is not a regular file (a FIFO) is never opened. A
+        # MISSING one is still read: its endorsed copy, if any, is what the load
+        # merges, and the reader opens nothing at the name then.
+        if local_path.exists() and not local_path.is_file():
             return _ABSENT
-        raw = json.loads(read_config_text(local_path))
+        raw = json.loads(read_endorsed_config_text(local_path))
     except (OSError, ValueError):
         # ValueError covers malformed JSON and invalid UTF-8 alike.
         return _ABSENT
@@ -196,6 +199,15 @@ _TOOL_STALL_PAIR_NOTE = (
 # known cost of an explicit list. It is accepted because the alternative -- deriving
 # "was this value chosen or merely materialized" automatically -- is exactly the
 # provenance the config layer does not have.
+# Both metrics disk caps carry the same caveat: 0 is a real setting, and adopting
+# deletes the shards past the new cap.
+_METRICS_CAP_NOTE = (
+    "0 means no limit and is a supported setting; it only matters while local "
+    "metric recording is on, and adopting the new cap deletes the metric shards "
+    "past it."
+)
+
+
 SUPERSEDED_DEFAULTS: tuple[SupersededDefault, ...] = (
     # False costs env-declaring servers their pooling, so the default is True.
     #
@@ -479,6 +491,28 @@ SUPERSEDED_DEFAULTS: tuple[SupersededDefault, ...] = (
             "on every save, and on Windows it blocks every agent session"
         ),
         applies=_stale_unsandboxed_exec_false_applies,
+    ),
+    # The local metrics disk caps went from 0 (no limit) to 30 days and 100 MB
+    # when local recording became on by default. Older builds' first-boot save
+    # wrote the whole telemetry section, so most upgraded installs store 0 / 0
+    # without having chosen it.
+    #
+    # REPORT-ONLY: 0 is the documented way to turn each cap off, so a stored 0
+    # may be a choice, and adopting a cap prunes shards past it, which cannot be
+    # undone. The report says so and the user decides.
+    SupersededDefault(
+        dotted_key="telemetry.retention_days",
+        old_default=0,
+        new_default=30,
+        changed_in="#22397",
+        note=_METRICS_CAP_NOTE,
+    ),
+    SupersededDefault(
+        dotted_key="telemetry.max_total_mb",
+        old_default=0,
+        new_default=100,
+        changed_in="#22397",
+        note=_METRICS_CAP_NOTE,
     ),
 )
 

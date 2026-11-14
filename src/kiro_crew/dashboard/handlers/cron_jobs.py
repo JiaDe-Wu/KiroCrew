@@ -21,6 +21,7 @@ from typing import Any, TypeVar
 from aiohttp import web
 
 from kiro_crew import model_registry
+from kiro_crew.config.fields import _coerce_bool
 from kiro_crew.cron import (
     CronStoreBusy,
     CronStoreUnreadable,
@@ -44,6 +45,7 @@ from kiro_crew.dashboard.handlers.cron_shared import (
     _CRON_BUSY_BODY,
     _CRON_BUSY_STATUS,
     _app_caller,
+    _audit_app_cron,
     _cron_unreadable_response,
     _invalid_path_id_response,
     _refuse_foreign_app_job,
@@ -283,6 +285,11 @@ async def api_cron_tools(request: web.Request) -> web.Response:
             },
             status=400,
         )
+    from kiro_crew.dashboard.card_send import card_turn_cron_tool_refusal
+
+    card_refusal = card_turn_cron_tool_refusal(request, actual, name)
+    if card_refusal is not None:
+        return card_refusal
 
     presented_token = request.headers.get("X-Session-Token", "")
     # Read while the verified caller's tab is open; cron_add records the answer.
@@ -388,6 +395,66 @@ def _invalid_new_chat_per_run() -> web.Response:
     )
 
 
+#: The job flags this handler reads leniently: a non-bool is coerced with
+#: ``bool(...)`` downstream, under which the string ``"false"`` is truthy and
+#: would turn the flag ON. These four feed no cross-field refusal, so reading
+#: ``"false"`` as ``False`` changes no request's accept/reject outcome -- only
+#: the stored value, to the one the caller named. ``persistent_session`` is NOT
+#: here: downstream refusals key on it (a chat folder needs it on, a
+#: new-chat-per-run job needs it off), so flipping a string value there would
+#: turn a request main answers 200 into a 400; that flag is warned about, never
+#: coerced (see ``_warn_only_bool_flag``). ``enabled`` and ``new_chat_per_run``
+#: 400 on a non-bool and are not here either.
+_COERCED_BOOL_FLAGS = (
+    "silent",
+    "strict_schedule",
+    "hide_in_chat",
+    "minimal_context",
+)
+
+
+def _coerce_bool_flag(name: str, value: Any) -> tuple[Any, str | None]:
+    """Read a bool-named flag leniently, warning rather than rejecting it.
+
+    A real bool is returned unchanged with no warning. A string is read by
+    ``config.fields._coerce_bool``, the shared reader of the spellings a hand
+    edit produces (``"false"``, ``"0"``, ``"off"`` ... mean False), so a later
+    ``bool(...)`` sees the intended value, not a truthy string; it carries a
+    warning to send a JSON bool. Any other non-bool is returned unchanged, so the
+    downstream ``bool(...)`` still decides it, also with a warning. Nothing is
+    rejected.
+    """
+    if isinstance(value, bool):
+        return value, None
+    if isinstance(value, str):
+        coerced = _coerce_bool(value, bool(value))
+        return coerced, (
+            f"{name} was the string {value!r}; read as {coerced}. Send a JSON "
+            f"boolean (true/false), not a string."
+        )
+    return value, (
+        f"{name} should be a JSON boolean (true/false); got {type(value).__name__}, "
+        f"read with bool()."
+    )
+
+
+def _warn_only_bool_flag(name: str, value: Any) -> str | None:
+    """A warning for a non-bool flag whose value this handler must NOT change.
+
+    ``persistent_session`` feeds cross-field refusals, so its reading is left
+    exactly as ``bool(...)`` decides it; this only tells the caller to send a
+    JSON bool. A real bool earns no warning.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return (
+            f"{name} was the string {value!r}; it is read with bool() "
+            f"(a non-empty string is True). Send a JSON boolean (true/false)."
+        )
+    return f"{name} should be a JSON boolean (true/false); got {type(value).__name__}."
+
+
 def _refuse_mate_home_chat_folder(
     request: web.Request,
     state: DashboardState,
@@ -482,13 +549,52 @@ async def _persist_holding_folder(
     return await state.hold_folders(_section)
 
 
-def _with_schedule_warnings(body: dict[str, Any], job: Any) -> dict[str, Any]:
-    """Add a ``warnings`` list to a saved job's success body when its cron never fires."""
+def _with_schedule_warnings(
+    body: dict[str, Any], job: Any, extra_warnings: list[str] | None = None
+) -> dict[str, Any]:
+    """Add a ``warnings`` list to a saved job's success body.
+
+    Carries the never-fires schedule warning and any ``extra_warnings`` the
+    route gathered (e.g. a bool flag that arrived as a string), merged into one
+    list so a caller reads them all in one place.
+    """
+    warnings = list(extra_warnings or [])
     schedule = getattr(job, "schedule", None)
     warning = never_fires_warning(schedule) if schedule is not None else ""
     if warning:
-        body["warnings"] = [warning]
+        warnings.append(warning)
+    if warnings:
+        body["warnings"] = warnings
     return body
+
+
+#: ``update_job`` kwargs that change what a job does or where it reports; the same
+#: set as ``mcp_cron._AUTO_RESETTING_FIELDS`` (a test keeps the two equal).
+_APP_AUTO_RESETTING_FIELDS = frozenset(
+    {"message", "agent_id", "model", "cron_expr", "every_secs", "channel", "thread_ts"}
+)
+
+
+def _refuse_app_auto_approval(
+    request: web.Request, approval_mode: object, operation: str
+) -> web.Response | None:
+    """Refuse an app token setting ``approval_mode="auto"`` on a cron job.
+
+    ``auto`` approves every tool call the job's turns make with no person asked.
+    That is the person's call, so only the owner may set it; an app's job keeps
+    waiting for a human. The test is the same truthy ``app`` claim that skips the
+    owner gate, so no caller that skipped that gate can reach ``auto`` here.
+    """
+    if not request.get("app") or approval_mode != "auto":
+        return None
+    _audit_app_cron(_app_caller(request), operation, "denied", "approval_mode=auto")
+    return web.json_response(
+        {
+            "error": "approval_mode 'auto' can only be set by the owner, not an app",
+            "code": "app_auto_approval_refused",
+        },
+        status=403,
+    )
 
 
 async def api_crons_create(request: web.Request) -> web.Response:
@@ -569,6 +675,8 @@ async def api_crons_create(request: web.Request) -> web.Response:
         return web.json_response({"error": "invalid channel ID format"}, status=400)
     if approval_mode and approval_mode not in {"", "auto"}:
         return web.json_response({"error": "invalid approval_mode"}, status=400)
+    if (refused := _refuse_app_auto_approval(request, approval_mode, "crons.create")) is not None:
+        return refused
     silent = body.get("silent", False)
     strict_schedule = body.get("strict_schedule", False)
     # ``False`` creates the job already paused in the one locked write, so a
@@ -596,6 +704,31 @@ async def api_crons_create(request: web.Request) -> web.Response:
     if not isinstance(new_chat_per_run, bool):
         return _invalid_new_chat_per_run()
     persistent_session = body.get("persistent_session", not new_chat_per_run)
+    # Read the four side-effect-free flags leniently: a real bool is unchanged,
+    # "true"/"false" is read as the bool it names, and any other non-bool keeps
+    # the bool() reading the record build below applies. persistent_session is
+    # only warned about -- it feeds cross-field refusals, so changing a string
+    # reading could newly reject a request main answers 200. A string or odd
+    # value adds a warning to the success body; nothing is rejected.
+    flag_warnings: list[str] = []
+    _create_flags = dict(
+        zip(_COERCED_BOOL_FLAGS, (silent, strict_schedule, hide_in_chat, minimal_context))
+    )
+    for _flag_name, _flag_value in _create_flags.items():
+        if _flag_name not in body:
+            continue
+        _coerced, _warn = _coerce_bool_flag(_flag_name, _flag_value)
+        _create_flags[_flag_name] = _coerced
+        if _warn:
+            flag_warnings.append(_warn)
+    silent = _create_flags["silent"]
+    strict_schedule = _create_flags["strict_schedule"]
+    hide_in_chat = _create_flags["hide_in_chat"]
+    minimal_context = _create_flags["minimal_context"]
+    if "persistent_session" in body:
+        _ps_warn = _warn_only_bool_flag("persistent_session", persistent_session)
+        if _ps_warn:
+            flag_warnings.append(_ps_warn)
     timeout_secs, timeout_err = timeout_secs_from_body(body)
     if timeout_err is not None:
         return timeout_err
@@ -774,7 +907,13 @@ async def api_crons_create(request: web.Request) -> web.Response:
     # The fingerprint of the job as this write made it: a card step records it,
     # so its Undo's baseline is what the card made, not a later edit.
     created: dict[str, Any] = {"ok": True, "id": job.id, "revision": cron_job_revision(job)}
-    return web.json_response(_with_schedule_warnings(created, job))
+    job_schedule = getattr(job, "schedule", None)
+    if every and job_schedule is not None:
+        from kiro_crew.cron_service.schedule import raised_interval_warning
+
+        if raised := raised_interval_warning(every, job_schedule):
+            flag_warnings.append(raised)
+    return web.json_response(_with_schedule_warnings(created, job, flag_warnings))
 
 
 async def api_cron_delete(request: web.Request) -> web.Response:
@@ -805,7 +944,7 @@ async def api_cron_delete(request: web.Request) -> web.Response:
                 job_id,
                 expected_revision=expected_revision,
                 revision_of=cron_job_revision,
-                actor="dashboard",
+                actor=_removal_actor(request),
                 source="api_cron_delete",
             )
             if outcome == "changed":
@@ -819,7 +958,7 @@ async def api_cron_delete(request: web.Request) -> web.Response:
             ok = outcome == "removed"
         else:
             ok = await state.crons.remove_job_async(
-                job_id, actor="dashboard", source="api_cron_delete"
+                job_id, actor=_removal_actor(request), source="api_cron_delete"
             )
     except CronStoreBusy:
         return web.json_response(_CRON_BUSY_BODY, status=_CRON_BUSY_STATUS)
@@ -828,6 +967,21 @@ async def api_cron_delete(request: web.Request) -> web.Response:
     if ok:
         state.push_refresh("crons")
     return web.json_response({"ok": ok})
+
+
+def _removal_actor(request: web.Request) -> str:
+    """Who asked for a removal: ``app:<name>`` for a verified app token, else the dashboard.
+
+    The cron service records a person's delete of an app job so the app's next
+    registration does not bring it back; an app's removal of its own job is not
+    such a choice, so it must reach the service under the app's own name.
+    """
+    app_claim = request.get("app")
+    if isinstance(app_claim, str) and app_claim:
+        from kiro_crew.apps.cron_sdk import owner_tag
+
+        return owner_tag(app_claim)
+    return "dashboard"
 
 
 # Guardrail: cap batch size so a runaway/hostile payload can't pin the event
@@ -878,7 +1032,7 @@ async def api_cron_batch_delete(request: web.Request) -> web.Response:
         # would raise AFTER the on-disk delete and leave the scheduler timer
         # cancelled.
         deleted, failed = await state.crons.remove_jobs(
-            unique_ids, actor="dashboard", source="api_cron_batch_delete"
+            unique_ids, actor=_removal_actor(request), source="api_cron_batch_delete"
         )
     except Exception:
         # The batch itself raised (unexpected) — report everything as failed.
@@ -950,6 +1104,25 @@ async def api_cron_update(request: web.Request) -> web.Response:
     ):
         if key in body:
             kwargs[key] = body[key]
+    refused = _refuse_app_auto_approval(request, kwargs.get("approval_mode"), "crons.update")
+    if refused is not None:
+        return refused
+    # Same lenient read as create for the four side-effect-free bool flags PATCH
+    # passes through to a later bool(): "false" is read as False, and a string or
+    # odd value adds a warning instead of being rejected. persistent_session is
+    # only warned about, never changed, so a string value keeps main's reading
+    # and no cross-field refusal (chat folder, new-chat-per-run) newly trips.
+    update_flag_warnings: list[str] = []
+    for _flag_name in _COERCED_BOOL_FLAGS:
+        if _flag_name in kwargs:
+            _coerced, _warn = _coerce_bool_flag(_flag_name, kwargs[_flag_name])
+            kwargs[_flag_name] = _coerced
+            if _warn:
+                update_flag_warnings.append(_warn)
+    if "persistent_session" in kwargs:
+        _warn = _warn_only_bool_flag("persistent_session", kwargs["persistent_session"])
+        if _warn:
+            update_flag_warnings.append(_warn)
     if "new_chat_per_run" in kwargs:
         if not isinstance(kwargs["new_chat_per_run"], bool):
             return _invalid_new_chat_per_run()
@@ -1116,6 +1289,10 @@ async def api_cron_update(request: web.Request) -> web.Response:
             )
     if not kwargs:
         return web.json_response({"error": "no fields to update"}, status=400)
+    # The owner's ``auto`` covered the job as it was. An app that changes what the
+    # job does turns it off in the same write, as the MCP ``cron_update`` tool does.
+    if request.get("app") and _APP_AUTO_RESETTING_FIELDS.intersection(kwargs):
+        kwargs["approval_mode"] = ""
     try:
         job = await _persist_holding_folder(
             state,
@@ -1146,7 +1323,9 @@ async def api_cron_update(request: web.Request) -> web.Response:
             getattr(job, "chat_folder_id", ""),
         )
     state.push_refresh("crons")
-    return web.json_response(_with_schedule_warnings({"ok": True, "id": job.id}, job))
+    return web.json_response(
+        _with_schedule_warnings({"ok": True, "id": job.id}, job, update_flag_warnings)
+    )
 
 
 async def api_cron_enable(request: web.Request) -> web.Response:
@@ -1170,6 +1349,12 @@ async def api_cron_enable(request: web.Request) -> web.Response:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success
     enabled = body.get("enabled", True)
+    # Only a real bool, as on create: the store keeps the raw value, so a
+    # string "false" is truthy and the job would keep running behind an ok.
+    if not isinstance(enabled, bool):
+        return web.json_response(
+            {"error": "enabled must be a boolean", "code": "invalid_enabled"}, status=400
+        )
     try:
         ok = await state.crons.enable_job_async(job_id, enabled=enabled)
     except CronStoreBusy:

@@ -33,6 +33,7 @@ if TYPE_CHECKING:
         _prefetch_recent_session,
         _prefetch_rehydrate_inputs,
         _read_mcp_app_claims,
+        _read_open_slot_focus,
         _read_open_slots_snapshot,
         _recent_session_slot_name,
         _reconcile_mcp_app_claims,
@@ -41,8 +42,10 @@ if TYPE_CHECKING:
         _sanitize_open_slot_key,
         _sync_dashboard_slots,
         _transcripts_may_be_remote_only,
+        _window_tail,
         crew_bound_on_disk,
         effective_session_key,
+        foreground_slot_keys,
         live_loop_slot_keys,
         logger,
         notify_left_in_history,
@@ -75,9 +78,10 @@ def _window_can_wait(meta: dict) -> bool:
 
     Only a person's own dashboard tab waits. Something other than the person
     drives every other kind -- a linked channel, cron or workflow session, an
-    app, a remote binding, a session another session created -- and its next
-    delivery would arrive on a path that reads the window before anyone opens
-    the tab. Not either when the line carries a local turn the previous process
+    app, a remote binding -- and its next delivery would arrive on a path that
+    reads the window before anyone opens the tab. A session another session
+    created waits too: its deliveries (session_send, retry, read) load the
+    window off the loop before they read it. Not either when the line carries a local turn the previous process
     never tore down, nor held notes: settling those reconciles rows into the
     window, and the sidebar would show the tab as it was before that settles.
     The two kinds only the slot key can tell (a crew member's tab, a crew worker
@@ -87,7 +91,6 @@ def _window_can_wait(meta: dict) -> bool:
         str(meta.get("origin") or "") in _PERSON_ORIGINS
         and not meta.get("linked_session_key")
         and not meta.get("app")
-        and not meta.get("created_by")
         and not meta.get("remote_slot")
         and not _local_turn_generation(meta)
         and not meta.get("deferred_notes")
@@ -225,22 +228,58 @@ def _prefetch_open_slot_inputs(
                 )
     return (
         *_prefetch_rehydrate_inputs(
-            conv_log, history_key, kiro_model_map=kiro_model_map, with_status=True
+            conv_log,
+            history_key,
+            kiro_model_map=kiro_model_map,
+            with_status=True,
+            tail_window_above=_window_tail.TAIL_WINDOW_THRESHOLD_BYTES,
         ),
         None,
     )
 
 
+def _recent_row_tail(
+    conv_log: ConversationLog,
+    history_key: str,
+    meta: dict,
+    slot_name: str,
+    member_identity: tuple[str, str] | None,
+) -> list[dict] | None:
+    """The tail a recent session is built from as a sidebar row, or ``None``. BLOCKING.
+
+    The open-tab restore's row test (:func:`_prefetch_open_slot_inputs`) applied
+    to a recent session: only a person's own tab whose window can wait, never a
+    crew member's tab or a crew worker bound to an open work item. A tail with no
+    row at all returns ``None``, so the caller takes the full read.
+    """
+    if (
+        not slot_name
+        or not _window_can_wait(meta)
+        or member_identity is not None
+        or crew_bound_on_disk(slot_name)
+    ):
+        return None
+    return _display_tail(conv_log.read_messages_chained_tail(history_key, LAZY_TAIL_ROWS)) or None
+
+
+def _loop_slot_keys() -> set[str] | None:
+    """The slot keys an armed auto-nudge loop drives, or ``None`` if unknown. BLOCKING."""
+    looped = live_loop_slot_keys()
+    return stored_loop_slot_keys() if looped is None else looped
+
+
 def _open_slot_restore_plan(
     conv_log: ConversationLog, keys: list[object]
 ) -> tuple[list[object], set[str] | None]:
-    """Order the open-tab keys newest first and read which tabs a loop drives. BLOCKING.
+    """Order the open-tab keys focus first and read which tabs a loop drives. BLOCKING.
 
-    Newest is the transcript's mtime, which advances on every message, so the
-    tabs the restore budget keeps are the ones most recently used. The second
-    value is the set of slot keys an armed auto-nudge loop drives (always
-    restored), or ``None`` when the loop store cannot be read; the restore then
-    applies no budget rather than leave a loop's tab unbuilt, which ends the loop.
+    The tab focused at the last shutdown comes first, then the tabs that were
+    visible beside it, then the rest newest first. Newest is the transcript's
+    mtime, which advances on every message, so the tabs the restore budget keeps
+    are the ones most recently used. The second value is the set of slot keys an
+    armed auto-nudge loop drives (always restored), or ``None`` when the loop
+    store cannot be read; the restore then applies no budget rather than leave a
+    loop's tab unbuilt, which ends the loop.
     """
 
     def _mtime(raw: object) -> float:
@@ -250,10 +289,50 @@ def _open_slot_restore_plan(
         mtime = conv_log.session_mtime(slot_transcript_key(key))
         return float(mtime) if isinstance(mtime, (int, float)) else 0.0
 
-    looped = live_loop_slot_keys()
-    if looped is None:
-        looped = stored_loop_slot_keys()
-    return sorted(keys, key=_mtime, reverse=True), looped
+    focus, visible = _read_open_slot_focus()
+    rank: dict[str, int] = {}
+    for position, raw in enumerate([focus, *visible]):
+        name = _sanitize_open_slot_key(raw)
+        if name is not None:
+            rank.setdefault(name, position)
+
+    def _order(raw: object) -> tuple[int, float]:
+        name = _sanitize_open_slot_key(raw)
+        if name in rank:
+            return (0, float(rank[name]))
+        return (1, -_mtime(raw))
+
+    return sorted(keys, key=_order), _loop_slot_keys()
+
+
+def _restore_queue(state: DashboardState, keys: list[object]) -> "Iterator[tuple[int, object]]":
+    """Yield ``(index, key)`` in restore order, pulling forward tabs a client focused.
+
+    A tab focused while the restore still owes it moves to the front of what is
+    left. *keys* is reordered in place, so ``keys[index:]`` is always the unread
+    remainder, which the abort path carries.
+    """
+    # A focus reported before the owed keys were published (while the snapshot was
+    # still being read) was not enqueued by the report; the live foreground is the
+    # newer answer, so it goes ahead of the saved focus.
+    owed = state.restoring_open_slot_keys
+    live = foreground_slot_keys(state)
+    for name in sorted(live, key=lambda k: k != state.last_focused_slot):
+        if name in owed and name not in state._slots and name not in state.restore_front_keys:
+            state.restore_front_keys.append(name)
+    index = 0
+    while index < len(keys):
+        asked = state.restore_front_keys
+        moved = 0
+        while asked:
+            wanted = asked.pop(0)
+            for at in range(index + moved, len(keys)):
+                if _sanitize_open_slot_key(keys[at]) == wanted:
+                    keys.insert(index + moved, keys.pop(at))
+                    moved += 1
+                    break
+        yield index, keys[index]
+        index += 1
 
 
 def _over_restore_budget(state: DashboardState, key: str, looped: set[str] | None) -> bool:
@@ -436,7 +515,13 @@ def _restore_open_slots_steps(state: DashboardState) -> "Iterator[int]":
     # After the loop, so the counts are final. Not in a finally: on the abort path the
     # keys were just carried back into the seed, and this restore has no final answer
     # about them to record.
-    _record_unrestored_open_tabs(state, listed=len(keys), restored=restored, kept=dropped)
+    _record_unrestored_open_tabs(
+        state,
+        listed=len(keys),
+        restored=restored,
+        kept=dropped,
+        deferred=frozenset(state.deferred_member_slot_keys),
+    )
 
 
 def _carry_unread_slot_keys(raw_keys: "Sequence[object]", unrestored: set[str]) -> int:
@@ -464,12 +549,14 @@ def _record_unrestored_open_tabs(
     listed: int,
     restored: int,
     kept: "Iterable[str]",
+    deferred: "Iterable[str]" = (),
 ) -> None:
     """Leave a durable account of the listed tabs that should be here and are not.
 
     *kept* is the DROPPED subset, not the whole reopen seed: a remote-only seed
     stays in the seed across boots (see :func:`_apply_restored_open_slot`) and
-    would raise this notice on every healthy restart.
+    would raise this notice on every healthy restart. *deferred* names the crewmate
+    threads waiting for their retry: held like a dropped tab, but not counted.
 
     Blocking (one store read and one queued append per kept key); called from a
     worker thread, and only when a key was kept.
@@ -480,6 +567,8 @@ def _record_unrestored_open_tabs(
     fields eventually checks only the first.
     """
     keys = sorted(kept)
+    # Before the notice: until it is published every seed key is held anyway.
+    state.restore_deferred_slot_keys = frozenset(deferred)
     state.unrestored_slot_notice = {
         "count": len(keys),
         "keys": keys,
@@ -620,6 +709,14 @@ async def restore_open_slots_async(state: DashboardState) -> int:
         # copy of this line gives: the latch in the finally reads it, and so does the
         # report, which is a measured zero or an unknowable set depending on it.
         state.open_slots_knowable = known
+        # The tabs this restore still owes, published before any further await so a
+        # send naming one is told the session is loading instead of minting a fresh
+        # slot under its key (``session_still_loading``).
+        state.restoring_open_slot_keys = frozenset(
+            k for k in map(_sanitize_open_slot_key, keys) if k
+        )
+        if (known_event := getattr(state, "owed_slot_keys_known", None)) is not None:
+            known_event.set()
         if not keys:
             enumerated = True
             # Both ways, like the generator: a readable registry with no keys reports
@@ -649,7 +746,7 @@ async def restore_open_slots_async(state: DashboardState) -> int:
             kiro_model_map = await asyncio.to_thread(_build_kiro_model_map)
             # main's restore budget plan, kept.
             keys, looped = await asyncio.to_thread(_open_slot_restore_plan, conv_log, keys)
-            for reached, raw in enumerate(keys):
+            for reached, raw in _restore_queue(state, keys):
                 key = _sanitize_open_slot_key(raw)
                 if key is None or key in state._slots:
                     continue
@@ -744,6 +841,8 @@ async def restore_open_slots_async(state: DashboardState) -> int:
             listed=len(keys),
             restored=restored,
             kept=dropped,
+            # Copied here, on the loop: the report runs in a worker thread.
+            deferred=frozenset(state.deferred_member_slot_keys),
         )
         # Commit the tab-id backfills (each an os.replace) BEFORE returning: on
         # Windows a caller's on-loop read of a file still mid-replace raises
@@ -821,25 +920,30 @@ def _restore_recent_sessions_steps(
         slot_name = _recent_session_slot_name(key)
         if slot_name is None or slot_name in state._slots:
             continue
-        meta, messages, _member_id, agent, effort_marker = _prefetch_recent_session(
+        meta, messages, _member_id, agent, effort_marker, _tail = _prefetch_recent_session(
             conv_log, key, s, folders_only=folders_only, cutoff=cutoff
         )
         if meta is None or messages is None:
             continue
-        _apply_recent_session(
-            state,
-            key,
-            slot_name,
-            s,
-            meta,
-            messages,
-            conv_log=conv_log,
-            kiro_model_map=kiro_model_map,
-            restore_cfg=_restore_cfg,
-            member_identity=_member_id,
-            agent=agent,
-            effort_marker=effort_marker,
-        )
+        try:
+            _apply_recent_session(
+                state,
+                key,
+                slot_name,
+                s,
+                meta,
+                messages,
+                conv_log=conv_log,
+                kiro_model_map=kiro_model_map,
+                restore_cfg=_restore_cfg,
+                member_identity=_member_id,
+                agent=agent,
+                effort_marker=effort_marker,
+            )
+        except Exception:
+            # One bad session must not stop the rest; the build undid its own slot.
+            logger.debug("restore_recent_sessions: restore failed for %s", key, exc_info=True)
+            continue
         restored += 1
         # Recover an app flag whose claim outlived its row, as the open-slots
         # driver does. This driver's reads are inline by construction.
@@ -901,21 +1005,25 @@ async def restore_recent_sessions_async(
         sessions = await asyncio.to_thread(conv_log.list_sessions)
         kiro_model_map = await asyncio.to_thread(_build_kiro_model_map)
         _restore_cfg = await asyncio.to_thread(_load_restore_cfg)
+        looped = await asyncio.to_thread(_loop_slot_keys)
         for s in sessions:
             key = s.get("key", "")
             slot_name = _recent_session_slot_name(key)
             if slot_name is None or slot_name in state._slots:
                 continue
             started = time.time()
-            meta, messages, _member_id, agent, effort_marker = await asyncio.to_thread(
+            meta, messages, _member_id, agent, effort_marker, tail = await asyncio.to_thread(
                 _prefetch_recent_session,
                 conv_log,
                 key,
                 s,
                 folders_only=folders_only,
                 cutoff=cutoff,
+                # A tab a loop drives keeps its window (the next fire reads it),
+                # and so does every tab while which ones a loop drives is unknown.
+                row_tail=None if looped is None or slot_name in looped else _recent_row_tail,
             )
-            if meta is None or messages is None:
+            if meta is None or (messages is None and tail is None):
                 continue
             # POST-HOP REVALIDATION: the off-loop read left the pre-hop answers
             # seconds stale, so ask both again on the loop before mutating:
@@ -940,7 +1048,7 @@ async def restore_recent_sessions_async(
             # Third window: the session may have been permanently DELETED (or
             # deleted and recreated) during the read. Synchronous and last, so no
             # await separates it from the build it gates.
-            gone = _deletion_during_read(conv_log, key, meta, messages)
+            gone = _deletion_during_read(conv_log, key, meta, messages if tail is None else tail)
             if gone is not None:
                 logger.info(
                     "Restore abandoned: session %s was %s while its transcript "
@@ -950,26 +1058,33 @@ async def restore_recent_sessions_async(
                     gone,
                 )
                 continue
-            _apply_recent_session(
-                state,
-                key,
-                slot_name,
-                s,
-                meta,
-                messages,
-                conv_log=conv_log,
-                kiro_model_map=kiro_model_map,
-                restore_cfg=_restore_cfg,
-                member_identity=_member_id,
-                agent=agent,
-                effort_marker=effort_marker,
-                pending_backfills=pending_backfills,
-            )
+            try:
+                _apply_recent_session(
+                    state,
+                    key,
+                    slot_name,
+                    s,
+                    meta,
+                    messages if messages is not None else [],
+                    conv_log=conv_log,
+                    kiro_model_map=kiro_model_map,
+                    restore_cfg=_restore_cfg,
+                    member_identity=_member_id,
+                    agent=agent,
+                    effort_marker=effort_marker,
+                    pending_backfills=pending_backfills,
+                    lazy_tail=tail,
+                )
+            except Exception:
+                # As in the inline driver: skip this session, restore the rest.
+                logger.debug("restore_recent_sessions: restore failed for %s", key, exc_info=True)
+                continue
             restored += 1
             # Same recovery, with the spool read awaited: this driver is
-            # loop-affine, so a scan here would stall the gateway.
+            # loop-affine, so a scan here would stall the gateway. A sidebar row
+            # recovers its claims when its window loads.
             _recovered_slot = state._slots.get(slot_name)
-            if _recovered_slot is not None:
+            if _recovered_slot is not None and not _recovered_slot.window_pending:
                 await _recover_mcp_app_claims_async(_recovered_slot)
             await asyncio.sleep(0)
         _sync_dashboard_slots(state)
