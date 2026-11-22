@@ -9,15 +9,19 @@ approve_tool/reject_tool correctly.
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
+from redaction_structured_cases import aws_secret, github_classic
 
+from kiro_crew import session_directive
 from kiro_crew.acp.types import (
     EVENT_COMPACTION_STATUS,
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
     EVENT_STEER_CONSUMED,
     EVENT_TEXT_CHUNK,
+    EVENT_THINKING_CHUNK,
     EVENT_TOOL_CALL,
     EVENT_TOOL_RESULT,
     AcpEvent,
@@ -40,6 +44,8 @@ from kiro_crew.messaging.renderer import Renderer
 from kiro_crew.monitoring.completion import MonitorCompletionHook
 from kiro_crew.monitoring.models import MonitorActionCompletion, MonitorActionDisposition
 from kiro_crew.testing.wait import await_until, finished
+
+SECRET = github_classic(seed=142)
 
 
 class _RecordingRenderer(Renderer):
@@ -419,14 +425,7 @@ class TestTurnDriverTranslation:
 
     def test_steering_summary_is_redacted_before_structured_event(self):
         r = _RecordingRenderer()
-        # Split literal on purpose: Semgrep's detected-aws-access-key-id-value
-        # rule matches an AKIA-shaped STRING LITERAL and cannot tell a synthetic
-        # test fixture from a real leaked credential, so a one-piece literal
-        # fails the SAST gate. Concatenating keeps the runtime value identical --
-        # the test still proves an AWS-key-shaped secret is redacted -- while the
-        # scanner sees no hardcoded key. Do not "simplify" this back to one
-        # literal; it will break CI, not the test.
-        secret = "AKIA" + "1234567890ABCDEF"
+        secret = SECRET
         p = _ScriptedProvider(
             [
                 AcpEvent(
@@ -472,11 +471,12 @@ class TestTurnDriverTranslation:
         assert out == text
         assert "[OPTIONS: Continue | Stop]" in out
 
-    def test_compaction_summary_body_becomes_terse_notice(self):
+    @pytest.mark.parametrize("lead", ["\u2705 ", ""], ids=["saved-glyph", "plain"])
+    def test_compaction_summary_body_becomes_terse_notice(self, lead):
         r = _RecordingRenderer()
         p = _ScriptedProvider(
             [
-                AcpEvent(kind=EVENT_TEXT_CHUNK, text="✅ Conversation comp"),
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text=lead + "Conversation comp"),
                 AcpEvent(
                     kind=EVENT_TEXT_CHUNK,
                     text="acted: ## OBJECTIVE\ninternal operating instructions",
@@ -486,9 +486,66 @@ class TestTurnDriverTranslation:
         )
         out = _run(p, r)
         emitted = "".join(e[1] for e in r.events if e[0] == "text_chunk")
-        assert out == emitted == "✅ Context compacted."
+        assert out == emitted == "Context compacted."
         assert "OBJECTIVE" not in emitted
         assert "operating instructions" not in emitted
+
+    @pytest.mark.parametrize("terminal", [True, False], ids=["complete", "no-terminal"])
+    def test_a_quoted_directive_marker_line_never_reaches_the_channel(self, terminal):
+        """A reply that repeats a directive tool's result loses each marker line, one
+        split across frames and one indented, and keeps every other byte: the sentinel
+        inside a sentence, and a non-directive kind on the last line, which only the
+        turn's flush can hand on, stay as written."""
+        quoted = session_directive.encode("autonudge_stop", {"reason": "done"}, "Stop REQUESTED.")
+        marker = quoted.split("\n")[-1]
+        kept = (
+            f'DONE {session_directive.SENTINEL} stays\n{session_directive.SENTINEL}{{"kind":"x"}}'
+        )
+        r = _RecordingRenderer()
+        p = _ScriptedProvider(
+            [
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text=f"Result:\n{quoted[:-9]}"),
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text=f"{quoted[-9:]}\n  {marker}\n{kept}"),
+                *([AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn")] if terminal else []),
+            ]
+        )
+        out = _run(p, r)
+        emitted = "".join(e[1] for e in r.events if e[0] == "text_chunk")
+        assert out == emitted == f"Result:\nStop REQUESTED.\n{kept}"
+
+    def test_a_tool_call_ends_the_line_the_marker_filter_holds(self):
+        """A quoted marker the text before a tool call ends on is dropped at the call,
+        never joined to the text after it, and that text stays ahead of the card."""
+        quoted = session_directive.encode("autonudge_stop", {"reason": "done"}, "Stop REQUESTED.")
+        r = _RecordingRenderer()
+        p = _ScriptedProvider(
+            [
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text=f"Result:\n{quoted}"),
+                AcpEvent(kind=EVENT_TOOL_CALL, tool_call_id="t1", title="a"),
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text="Next."),
+                AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+            ]
+        )
+        assert _run(p, r) == "Result:\nStop REQUESTED.\nNext."
+        assert r.events[:2] == [
+            ("text_chunk", "Result:\nStop REQUESTED.\n"),
+            ("tool_call", "t1", "a"),
+        ]
+
+    def test_a_line_that_cannot_be_a_marker_streams_before_its_newline(self):
+        """Only a line that could still become a marker waits for its newline: the
+        start of any other line reaches the renderer before the next event does."""
+        r = _RecordingRenderer()
+        p = _ScriptedProvider(
+            [
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text="Hi there, "),
+                AcpEvent(kind=EVENT_THINKING_CHUNK, text="t"),
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text="done."),
+                AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+            ]
+        )
+        assert _run(p, r) == "Hi there, done."
+        assert r.events[:2] == [("text_chunk", "Hi there, "), ("thinking", "t")]
 
 
 def _unfinished_turn(stop_reason: str, *, with_text: bool = True) -> list[AcpEvent]:
@@ -574,6 +631,99 @@ class TestApprovalLadder:
 
         _run(p, r, approval_mode=APPROVAL_INTERACTIVE, decider=decider)
         assert p.approved == ["rq1"]
+
+    @pytest.mark.parametrize(
+        "rung",
+        [
+            {"approval_mode": APPROVAL_AUTO},
+            {"approval_mode": APPROVAL_INTERACTIVE, "tool_gate": lambda ev: "auto_approve"},
+            {"approval_mode": APPROVAL_INTERACTIVE, "auto_approve_tool": lambda ev: True},
+            {"approval_mode": APPROVAL_INTERACTIVE, "auto_approve_session": lambda: True},
+        ],
+        ids=["auto", "gate-name-grant", "auto-approve-tool", "session-trust"],
+    )
+    @pytest.mark.parametrize("held", [True, False])
+    def test_a_held_bot_limit_asks_the_decider_on_every_auto_rung(self, monkeypatch, held, rung):
+        """A call under a moved Bot's held limit is never auto-approved (``mate_held_rules``)."""
+        from kiro_crew import mate_held_rules
+        from kiro_crew.messaging import driver as driver_mod
+
+        monkeypatch.setattr(
+            mate_held_rules, "held_for", lambda *a, **k: ["deny shell"] if held else []
+        )
+        monkeypatch.setattr(
+            driver_mod.name_grant, "refusal_for_event", AsyncMock(return_value=None)
+        )
+        asked: list = []
+        seen: list = []
+
+        async def decider(event):
+            asked.append(event.request_id)
+            seen.append(mate_held_rules.call_is_held())
+            return False
+
+        r = _RecordingRenderer()
+        p = _ScriptedProvider(self._perm_script())
+        _run(p, r, decider=decider, **rung)
+        if held:
+            # Marked held, so YOLO or an auto source in the decider cannot answer it.
+            assert asked == ["rq1"] and p.approved == [] and p.rejected == ["rq1"]
+            assert seen == [True]
+        else:
+            assert asked == [] and p.approved == ["rq1"]
+
+    @pytest.mark.parametrize(
+        "rung",
+        [
+            {"approval_mode": APPROVAL_AUTO},
+            {"approval_mode": APPROVAL_INTERACTIVE, "auto_approve_tool": lambda ev: True},
+            {"approval_mode": APPROVAL_INTERACTIVE, "auto_approve_session": lambda: True},
+        ],
+        ids=["auto", "auto-approve-tool", "session-trust"],
+    )
+    @pytest.mark.parametrize("decided", [True, False], ids=["decider", "no-decider"])
+    @pytest.mark.parametrize("edition", ["lts", "oss"])
+    def test_an_org_ask_on_a_kas_web_call_is_never_auto_approved(
+        self, monkeypatch, rung, decided, edition
+    ):
+        """``web_ask_rule``: in LTS no auto rung answers KAS's ask on an organisation's
+        web rule. A decider is asked as a person's; with none the call is refused. An
+        ``oss`` build approves it on that rung as before."""
+        from types import SimpleNamespace
+
+        from kiro_crew import mate_held_rules, web_ask_rule
+
+        monkeypatch.setattr(mate_held_rules, "held_for", lambda *a, **k: [])
+        monkeypatch.setattr(
+            web_ask_rule, "edition", SimpleNamespace(is_lts=lambda: edition == "lts")
+        )
+        asked: list = []
+        seen: list = []
+
+        async def decider(event):
+            asked.append(event.request_id)
+            seen.append(mate_held_rules.call_is_held())
+            return False
+
+        script = [
+            AcpEvent(
+                kind=EVENT_PERMISSION_REQUEST,
+                request_id="rq1",
+                options=[{"id": "approve"}],
+                harness_tool_id="web_fetch",
+                kas_builtin_ids=True,
+                kas_managed_ask=True,
+            ),
+            AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+        ]
+        p = _ScriptedProvider(script)
+        _run(p, _RecordingRenderer(), decider=decider if decided else None, **rung)
+        if edition == "oss":
+            assert asked == [] and p.approved == ["rq1"]
+        elif decided:
+            assert asked == ["rq1"] and seen == [True] and p.approved == []
+        else:
+            assert p.approved == [] and p.rejected == ["rq1"]
 
 
 class _SteerRecordingProvider(_ScriptedProvider):
@@ -942,16 +1092,16 @@ class TestAutoApproveTool:
 class TestRedaction:
     def test_credentials_redacted_in_text(self):
         r = _RecordingRenderer()
-        secret = "aws_secret_access_key=AKIAIOSFODNN7EXAMPLE1234567890abcdEXAMPLEKEY"
+        value = aws_secret(seed=142)
         p = _ScriptedProvider(
             [
-                AcpEvent(kind=EVENT_TEXT_CHUNK, text=secret),
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text=f"aws_secret_access_key={value}"),
                 AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
             ]
         )
         out = _run(p, r)
         # The raw secret value must not survive into the emitted/accumulated text.
-        assert "AKIAIOSFODNN7EXAMPLE1234567890abcdEXAMPLEKEY" not in out
+        assert value not in out
 
 
 class TestStreamCredentialRedaction:
@@ -961,24 +1111,25 @@ class TestStreamCredentialRedaction:
 
     def test_credential_split_across_chunks_is_redacted(self):
         r = _RecordingRenderer()
-        # AKIA + 16 chars = a 20-char access-key-id, split down the middle.
+        # A 40-char GitHub token, split down the middle.
+        half = len(SECRET) // 2
         p = _ScriptedProvider(
             [
-                AcpEvent(kind=EVENT_TEXT_CHUNK, text="prefix AKIA1234567890"),
-                AcpEvent(kind=EVENT_TEXT_CHUNK, text="ABCDEX suffix"),
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text=f"prefix {SECRET[:half]}"),
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text=f"{SECRET[half:]} suffix"),
                 AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
             ]
         )
         out = _run(p, r)
-        # The full key spanned two chunks; neither the whole nor the leading
+        # The full token spanned two chunks; neither the whole nor the leading
         # half may survive, and the redaction marker must be present.
-        assert "AKIA1234567890ABCDEX" not in out
-        assert "AKIA1234567890" not in out
+        assert SECRET not in out
+        assert SECRET[:half] not in out
         assert "[REDACTED: credential]" in out
         # What the renderer actually emitted (what reaches Slack) is clean too,
         # and equals the accumulated return (single redaction pipeline).
         emitted = "".join(e[1] for e in r.events if e[0] == "text_chunk")
-        assert "AKIA" not in emitted
+        assert SECRET[:half] not in emitted
         assert emitted == out
 
     def test_credential_straddling_steering_frame_never_reassembles(self):
@@ -1016,7 +1167,7 @@ class TestStreamCredentialRedaction:
         r = _RecordingRenderer()
         p = _ScriptedProvider(
             [
-                AcpEvent(kind=EVENT_TEXT_CHUNK, text="tail AKIA1234567890ABCDEX"),
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text=f"tail {SECRET}"),
                 AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
             ]
         )
@@ -1024,7 +1175,7 @@ class TestStreamCredentialRedaction:
         kinds = [e[0] for e in r.events]
         assert kinds[-1] == "done"
         assert "text_chunk" in kinds  # flushed tail emitted before done
-        assert "AKIA1234567890ABCDEX" not in out
+        assert SECRET not in out
         assert "[REDACTED: credential]" in out
 
 
@@ -1102,9 +1253,7 @@ class TestTextAcrossAToolCall:
         # Both sides of this join are non-whitespace, so the break rule fires.
         # The redactor must still see the key joined: a break fed in between
         # would let each half pass the scan alone and show both.
-        # Split literal on purpose so Semgrep does not mistake the synthetic
-        # fixture for a hardcoded AWS access key.
-        secret = "AKIA" + "1234567890ABCDEF"
+        secret = SECRET
         joined, _ = _turn_across_tool([f"key {secret[:14]}"], [f"{secret[14:]} end"])
         assert secret[:14] not in joined
         assert secret[14:] not in joined
@@ -1113,7 +1262,7 @@ class TestTextAcrossAToolCall:
     def test_no_break_once_a_redaction_has_changed_the_output(self):
         # Residual, pinned: once the output differs from the raw text there is
         # no held text to anchor the break on, so the join stays glued.
-        secret = "AKIA" + "1234567890ABCDEF"
+        secret = SECRET
         joined, _ = _turn_across_tool([f"key {secret} then that time."], ["No logs."])
         assert "[REDACTED: credential]" in joined
         assert joined.endswith("time.No logs.")
@@ -1191,7 +1340,7 @@ class TestHeldRunEndsThePreCallText:
     def test_a_redaction_across_the_join_closes_the_run_empty(self):
         # The run cannot be told apart once a redaction spans it, so the
         # earlier text ends as it stands and the redacted text goes after.
-        secret = "AKIA" + "1234567890ABCDEF"
+        secret = SECRET
         events = _segments([_text(f"key {secret[:14]}"), _tool("a"), _text(f"{secret[14:]} end")])
         assert ("continuation", "") in events
         after = "".join(e[1] for e in events if e[0] == "text_chunk")
@@ -1216,6 +1365,59 @@ class TestHeldRunEndsThePreCallText:
         # The default continuation hook joins the run back in place.
         joined, _ = _turn_across_tool(["I looked around that time."], ["No logs."])
         assert joined == "I looked around that time.\n\nNo logs."
+
+
+_PLACEHOLDER = (
+    "(No assistant response was recorded for the preceding turn. This "
+    "placeholder was inserted automatically to preserve message "
+    "alternation \u2014 it is not a reply the assistant produced.)"
+)
+
+
+def _placeholder_turn(events: list[AcpEvent]) -> tuple[str, list[tuple], TurnDriver]:
+    r = _RecordingRenderer()
+    d = TurnDriver(
+        _ScriptedProvider([*events, AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn")]), r
+    )
+    out = asyncio.run(d.run("hello"))
+    assert "".join(e[1] for e in r.events if e[0] == "text_chunk") == out
+    return out, r.events, d
+
+
+class TestAlternationPlaceholderAtTurnStart:
+    """The backend's alternation placeholder a turn opens with is never posted.
+
+    A turn that ended on a tool result leaves the backend's history with no
+    assistant message after it, and the backend fills the gap with a placeholder
+    the model then repeats as the first text of a later turn. A channel posted
+    it as the reply; the dashboard runner already held and dropped it.
+    """
+
+    def test_the_placeholder_split_across_chunks_is_dropped_and_the_reply_kept(self):
+        out, _, _ = _placeholder_turn(
+            [_text(_PLACEHOLDER[:20]), _text(_PLACEHOLDER[20:]), _text("\n\nDone.")]
+        )
+        assert out == "Done."
+
+    def test_a_turn_that_is_only_the_placeholder_takes_the_empty_reply_notice(self):
+        out, events, d = _placeholder_turn([_text(_PLACEHOLDER[:50]), _text(_PLACEHOLDER[50:])])
+        assert out == ""
+        assert [e for e in events if e[0] == "text_chunk"] == []
+        assert d.empty_turn_notice == driver.EMPTY_TURN_NOTICE
+
+    def test_a_tool_call_ends_the_placeholder_segment(self):
+        out, events, _ = _placeholder_turn([_text(_PLACEHOLDER), _tool("a"), _text("Found it.")])
+        assert out == "Found it."
+        assert [e[0] for e in events][:2] == ["tool_call", "text_chunk"]
+
+    @pytest.mark.parametrize(
+        "chunks",
+        [["(No assistant", " here, but the build passed."], ["(No assistant"]],
+        ids=["diverges", "turn-ends-on-a-prefix"],
+    )
+    def test_text_that_only_opens_like_the_placeholder_is_delivered_whole(self, chunks):
+        out, _, _ = _placeholder_turn([_text(c) for c in chunks])
+        assert out == "".join(chunks)
 
 
 class TestToolGateEnforcement:
@@ -1500,13 +1702,13 @@ class TestPromptChoiceNamesItsOwnTool:
                 AcpEvent(
                     kind=EVENT_PERMISSION_REQUEST,
                     request_id="rq1",
-                    title="curl AKIAIOSFODNN7EXAMPLE",
+                    title=f"curl {SECRET}",
                     options=[{"id": "approve"}],
                 ),
                 AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
             ]
         )
-        assert "AKIAIOSFODNN7EXAMPLE" not in prompts[0][3]
+        assert SECRET not in prompts[0][3]
 
 
 def _drain_text(*chunks: str) -> tuple[str, list[str]]:
@@ -1578,6 +1780,34 @@ class TestProseMentioningSteeringSurvives:
         visible, steer = _drain_text("see [STEER", "ING acknowledgment format")
         assert visible == "see [STEERING acknowledgment format"
         assert steer == []
+
+    def test_a_whole_text_strip_keeps_long_unclosed_prose(self):
+        """``strip_steering_markers`` reads a finished text, so an unclosed
+        ``[Steering`` prose tail longer than the marker bound stays, and a marker
+        deep inside a long text still goes."""
+        prose = "Turn the [Steering wheel left, " + "x" * 20_000
+        assert driver.strip_steering_markers(prose) == prose
+        straddling = "a" * 4090 + "[STEERING steer-83cc1f2a: done]" + "b"
+        assert driver.strip_steering_markers(straddling) == "a" * 4090 + "b"
+
+    @pytest.mark.parametrize(
+        "answer",
+        ["[", "[S", "[steer", "see [STEERING", "see [STEERING steer-83cc1f2a: half"],
+    )
+    def test_a_whole_text_strip_keeps_an_unclosed_tail(self, answer):
+        """A finished answer ending in a marker prefix is the answer's own text:
+        only complete frames go, and nothing is held back for a later chunk."""
+        assert driver.strip_steering_markers(answer) == answer
+
+    def test_a_whole_text_strip_counts_from_the_original_text(self):
+        """``ß`` upper-cases to two letters, so a strip that indexed the
+        upper-cased copy would cut the wrong span."""
+        text = "Straße [steering steer-83cc1f2a: ok] end"
+        assert driver.strip_steering_markers(text) == "Straße  end"
+
+    def test_channel_replay_still_drops_a_cut_marker(self):
+        """The channel path keeps the stream filter's fail-closed flush."""
+        assert driver.sanitize_channel_replay_text("ok [STEERING steer-83cc1f2a: half") == "ok "
 
 
 class TestRealMarkersAreStillConsumed:

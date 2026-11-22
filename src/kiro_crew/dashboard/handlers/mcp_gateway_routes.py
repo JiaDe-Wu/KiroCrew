@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from types import SimpleNamespace
 from typing import Any
 
@@ -22,11 +22,11 @@ from aiohttp import web
 from kiro_crew.agent import kiro_agents_dir_path
 from kiro_crew.agent_discovery import _read_agent_spec
 from kiro_crew.agent_spec_format import iter_agent_spec_files
-from kiro_crew.config.loader import KiroCrewConfig, _resolve_stub_roster, read_config_text
+from kiro_crew.config.loader import KiroCrewConfig, _resolve_stub_roster, read_endorsed_config_text
 from kiro_crew.dashboard.chat_utils import run_to_completion
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.handlers.mcp_config_files import _is_valid_mcp_name, _offload_config_write
-from kiro_crew.dashboard.handlers.mcp_probe import _probe_currency
+from kiro_crew.dashboard.handlers.mcp_probe import _probe_view
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.mcp_discovery import managed_server_is_session_bound, probe_metadata
@@ -34,7 +34,7 @@ from kiro_crew.mcp_gateway import hazards, is_gateway_supported, launch_resolve
 from kiro_crew.mcp_gateway.hashing import hash_command
 from kiro_crew.mcp_gateway.launch_approval import refused_servers, refused_shares
 from kiro_crew.mcp_gateway.rewriter import records_dir
-from kiro_crew.mcp_gateway.shareability import ShareEvidence, ShareVerdict, assess
+from kiro_crew.mcp_gateway.shareability import ShareEvidence, ShareVerdict, Strength, assess
 from kiro_crew.mcp_gateway.verdict_cache import load_cache
 from kiro_crew.sel import sel
 
@@ -122,12 +122,12 @@ def _local_overlay_section() -> dict:
     from kiro_crew.config.loader import config_local_path
 
     path = config_local_path()
-    if not path.is_file():
-        return {}
     try:
-        raw = json.loads(read_config_text(path))
+        # Read as the load reads it, with no is_file() check first: a deleted overlay
+        # whose endorsed copy is in force is that copy.
+        raw = json.loads(read_endorsed_config_text(path))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        # Unreadable overlay: treat as absent. The loader logs and ignores it
+        # Absent (neither file nor endorsed copy) or unreadable overlay: treat as absent. The loader logs and ignores it
         # too, so behaving otherwise here would diverge from the runtime.
         return {}
     if not isinstance(raw, dict):
@@ -404,6 +404,18 @@ async def api_mcp_gateway_enable(request: web.Request) -> web.Response:
 # ─── Per-server poolability management ──────────────────────────────────
 
 
+def declared_launch(row: Mapping[str, Any] | None) -> str | None:
+    """The command+args hashes a server row declares, in the stored binding form.
+
+    ``None`` when the row is missing or declares no command, which every reader
+    treats as "cannot tell", never as a different launch.
+    """
+    from kiro_crew.mcp_gateway.launch_approval import serialize_identities
+
+    ids = row.get("launch_ids") if row else None
+    return serialize_identities(ids) if ids else None
+
+
 def _collect_server_rows() -> dict[str, dict[str, Any]]:
     """Scan the agent specs into one row per distinct server. BLOCKING.
 
@@ -416,6 +428,7 @@ def _collect_server_rows() -> dict[str, dict[str, Any]]:
     whether a per-session rotating credential is declared, never what it is.
     """
     # Imported here, not at module top, so the facade does not serve them.
+    from kiro_crew.mcp_cleanup import mcp_entry_is_remote
     from kiro_crew.mcp_gateway.launch_approval import env_fingerprint
     from kiro_crew.mcp_gateway.secret_uri import secret_reference_keys
 
@@ -442,7 +455,12 @@ def _collect_server_rows() -> dict[str, dict[str, Any]]:
             if row is None:
                 row = {
                     "agents": set(),
-                    "transport": "stdio" if "command" in entry else "http",
+                    # Asked of the same predicate the rewriter wraps by, so a
+                    # remote entry carrying a placeholder ``command`` is never
+                    # offered for a share that resolves no launch.
+                    "transport": (
+                        "stdio" if "command" in entry and not mcp_entry_is_remote(entry) else "http"
+                    ),
                     "entry_poolable": False,
                     "env_names": set(),
                     # One hash per DISTINCT launch seen under this name. A
@@ -622,7 +640,9 @@ async def api_mcp_gateway_servers(request: web.Request) -> web.Response:
     Whether a stubbed server SHARES its backend is not per-row: that is the one
     global switch (``mcp_gateway.enabled``), reported by the status endpoint.
     """
+    from kiro_crew.config.integration_sections import effective_cwd_answer
     from kiro_crew.config.loader import KiroCrewConfig  # noqa: F811
+    from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
     from kiro_crew.mcp_gateway.rewriter import (
         UNPOOLABLE_SERVERS,
         pool_identity_env_keys,
@@ -643,7 +663,7 @@ async def api_mcp_gateway_servers(request: web.Request) -> web.Response:
     # dashboard and every chat sharing it, and would also let two rows in one
     # payload disagree about the same file.
     observed, preflights = await asyncio.to_thread(_load_shareability_state)
-    probe_current = await asyncio.to_thread(_probe_currency)
+    probe_current, probeable = await asyncio.to_thread(_probe_view)
 
     result: list[dict[str, Any]] = []
     for name in sorted(rows):
@@ -689,6 +709,22 @@ async def api_mcp_gateway_servers(request: web.Request) -> web.Response:
         # must leave out a server that will share nothing once it is on, and
         # ``pooling_blocked_by_env`` reads false while sharing is off.
         nothing_shared = _env_blocks_every_share(row, forward_declared_env, identity_keys)
+        single_launch = len(row["launch_ids"]) <= 1
+        verdict = _assess_server(
+            name,
+            is_stdio=is_stdio,
+            env_names=tuple(sorted(row["env_names"])),
+            observed_hazards=observed.get(name, ()),
+            # A measurement describes ONE execution identity. When this
+            # name merged more than one distinct launch, the probe
+            # measured whichever definition won the merge, so serving that
+            # result here would tell the operator it is safe to share a
+            # backend nobody ran. Same invariant the cache-side check
+            # applies, enforced at the other place the information exists.
+            preflight=(preflights.get(name) if single_launch else None),
+            identity_keys=identity_keys,
+            probe_current=probe_current.get(name, True),
+        )
         result.append(
             {
                 "name": name,
@@ -699,6 +735,16 @@ async def api_mcp_gateway_servers(request: web.Request) -> web.Response:
                 # on page-wide never re-enables it (it only enables servers
                 # nobody chose for).
                 "declined": (getattr(gw_cfg, "stub_overrides", None) or {}).get(name) is False,
+                # The operator's answer to "does it work on the project's
+                # files?" (null when unanswered), and whether it is never asked.
+                # A ``not_used`` answer given for a different launch than the one
+                # this name declares now reads as unanswered, so the page asks.
+                "cwd_use": effective_cwd_answer(
+                    (getattr(gw_cfg, "cwd_use", None) or {}).get(name),
+                    (getattr(gw_cfg, "cwd_use_launch", None) or {}).get(name),
+                    declared_launch(row),
+                ),
+                "cwd_proven": name in KIROCREW_BIN_MCP_SERVERS,
                 "entry_poolable": row["entry_poolable"],
                 "pooling_blocked_by_env": pooling_blocked,
                 "pooling_blocked_by_env_when_shared": nothing_shared,
@@ -709,24 +755,33 @@ async def api_mcp_gateway_servers(request: web.Request) -> web.Response:
                 # Advisory only. Never auto-applied: the evidence is weaker
                 # than proof (the probe handshakes as a different client than
                 # the gateway does), so the operator decides.
-                "recommendation": _assess_server(
-                    name,
-                    is_stdio=is_stdio,
-                    env_names=tuple(sorted(row["env_names"])),
-                    observed_hazards=observed.get(name, ()),
-                    # A measurement describes ONE execution identity. When this
-                    # name merged more than one distinct launch, the probe
-                    # measured whichever definition won the merge, so serving that
-                    # result here would tell the operator it is safe to share a
-                    # backend nobody ran. Same invariant the cache-side check
-                    # applies, enforced at the other place the information exists.
-                    preflight=(preflights.get(name) if len(row["launch_ids"]) <= 1 else None),
-                    identity_keys=identity_keys,
-                    probe_current=probe_current.get(name, True),
-                ).to_dict(),
+                "recommendation": verdict.to_dict(),
+                # What the Measure button counts. Rows come from every agent
+                # spec, but a pass probes only ``list_servers()``.
+                "measure_due": name in probeable
+                and _measure_due(verdict, name in preflights, single_launch),
             }
         )
     return web.json_response({"servers": result})
+
+
+def _measure_due(verdict: ShareVerdict, preflight_stored: bool, single_launch: bool) -> bool:
+    """Whether a measure pass would change *verdict*, for a server it can probe.
+
+    ``unknown`` waits on a probe; a ``handshake_not_reproducible`` row is
+    re-measured every pass by design. ``declared`` and ``no_objection`` are the
+    two tiers a pre-flight can still raise, and only while none is stored and the
+    row has one launch: with two, the row never shows the stored pre-flight.
+    """
+    if verdict.strength is Strength.UNKNOWN or any(
+        r.code == "handshake_not_reproducible" for r in verdict.reasons
+    ):
+        return True
+    return (
+        not preflight_stored
+        and single_launch
+        and verdict.strength in (Strength.DECLARED, Strength.NO_OBJECTION)
+    )
 
 
 def _load_shareability_state() -> tuple[dict[str, tuple[str, ...]], dict[str, tuple[bool, bool]]]:

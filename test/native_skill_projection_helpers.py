@@ -20,9 +20,23 @@ import pytest
 
 from kiro_crew.acp import skill_projection as projection
 from kiro_crew.acp.skill_projection_parts import alias_reclaim as _reaper_owner
+from kiro_crew.acp.skill_projection_parts.native_projection import NativeSkillProjection
 
 # The queue the reaper thread drains, read before any test can swap it out.
 _REAPER_QUEUE = projection._COLLECTED_ENDS
+
+
+def _projection_finalizers_pending() -> bool:
+    """Whether a projection with an armed end finalizer still exists.
+
+    Only such a projection can queue an end when the collector frees it. A full
+    collection costs O(heap) and the worker's heap grows over the run (about 1 s
+    a test on Windows CI), so the teardown pays it only when this holds.
+    """
+    for info in tuple(weakref.finalize._registry.values()):  # type: ignore[attr-defined]
+        if isinstance(info.weakref(), NativeSkillProjection):
+            return True
+    return False
 
 
 def _hold_the_prune_clock(monkeypatch):
@@ -126,13 +140,20 @@ def _end_projections_started_since(before: dict[int, weakref.ref]) -> None:
     # A projection the test dropped has already left the weak registry above, so
     # its end is queued on the reaper rather than released here, and that end's
     # prune can still recreate the agents directory after tmp_path is removed.
-    # Collect what is left, then wait for the reaper to pass a marker queued
-    # behind every such end: it runs them in order.
-    # A test that swaps in its own queue (or stubs ``_reaper_alive``) queued its
-    # ends where no reaper reads, so there is nothing to wait for; the real
-    # thread and queue are read directly for that reason. The thread is read
-    # from the module that starts it: the facade keeps the value it had at import.
-    gc.collect()
+    _wait_for_dropped_projection_ends()
+
+
+def _wait_for_dropped_projection_ends() -> None:
+    """Collect what is left, then wait for the reaper to pass a marker queued
+    behind every end a dropped projection queued: it runs them in order.
+
+    A test that swaps in its own queue (or stubs ``_reaper_alive``) queued its
+    ends where no reaper reads, so there is nothing to wait for; the real
+    thread and queue are read directly for that reason. The thread is read
+    from the module that starts it: the facade keeps the value it had at import.
+    """
+    if _projection_finalizers_pending():
+        gc.collect()
     reaper = _reaper_owner._REAPER
     if projection._COLLECTED_ENDS is _REAPER_QUEUE and reaper is not None and reaper.is_alive():
         drained = threading.Event()
@@ -185,7 +206,7 @@ def native_tree(tmp_path, monkeypatch):
     monkeypatch.setattr(projection.platform_compat, "first_linked_ancestor", lambda path: None)
     monkeypatch.setattr(
         "kiro_crew.agent.managed_mcp_spec_entry",
-        lambda name: {"command": "test-core", "args": []},
+        lambda name, **_kw: {"command": "test-core", "args": []},
     )
     monkeypatch.setattr(
         projection,

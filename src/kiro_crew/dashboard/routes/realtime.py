@@ -22,7 +22,7 @@ from kiro_crew.feature_videos_cache import (
     api_feature_videos_fetch_all,
 )
 from kiro_crew.suggestions import api_suggestions
-from kiro_crew.tips import api_tips_feedback, api_tips_next, api_tips_status
+from kiro_crew.tips import api_tips_all, api_tips_feedback, api_tips_next, api_tips_status
 
 
 def register(app: web.Application) -> None:
@@ -97,15 +97,21 @@ def register(app: web.Application) -> None:
     # FIRST request, never at boot — route registration must add no gateway-boot
     # work for a subsystem most launches never touch. Python caches the module
     # after that first import, so the per-request cost is a dict lookup.
-    def _lazy_kas(handler_name: str):
+    def _lazy_kas(handler_name: str, module_name: str = "kas_login"):
         async def _dispatch(request):
-            from kiro_crew.dashboard.handlers import kas_login
+            import importlib
 
-            return await getattr(kas_login, handler_name)(request)
+            module = importlib.import_module(f"kiro_crew.dashboard.handlers.{module_name}")
+            return await getattr(module, handler_name)(request)
 
         return _dispatch
 
     app.router.add_get("/api/kas-login", _lazy_kas("api_kas_login_status"))
+    # A read like the status above, and behind the same dashboard auth: which stored
+    # sign-in sessions run as (Kiro Crew's own, or kiro-cli's).
+    app.router.add_get(
+        "/api/kas-login/sources", _lazy_kas("api_kas_login_sources", "kas_login_sources")
+    )
     app.router.add_post("/api/kas-login/device", _lazy_kas("api_kas_login_begin_device"))
     app.router.add_post("/api/kas-login/loopback", _lazy_kas("api_kas_login_begin_loopback"))
     app.router.add_post("/api/kas-login/poll", _lazy_kas("api_kas_login_poll"))
@@ -132,6 +138,7 @@ def register(app: web.Application) -> None:
     # Tips (feature discovery)
     app.router.add_get("/api/tips/next", api_tips_next)
     app.router.add_get("/api/tips/status", api_tips_status)
+    app.router.add_get("/api/tips/all", api_tips_all)
     app.router.add_post("/api/tips/feedback", api_tips_feedback)
 
     # Feature videos (feature-intro clips, sibling of tips above)

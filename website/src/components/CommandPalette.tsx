@@ -5,6 +5,7 @@ import { useQuery } from '@tanstack/react-query'
 
 import { useAppSelector } from '../store'
 import { selectSlotsWithLiveLastTs } from '../store/slotLastTs'
+import { selectSlotStreamState } from '../store/chatSlice'
 import { useListKeyboardNav } from '../hooks/useListKeyboardNav'
 import { useSimplifiedToolNames } from '../hooks/useSimplifiedToolNames'
 import type { Result, ResourceProvider } from './commandPalette/types'
@@ -180,10 +181,11 @@ export default function CommandPalette({
   // corpus. Apps sits next to Pages because both are pure navigation targets.
   //
   // Folders are deliberately ABSENT. Reaching a session folder by name is a
-  // Command Bar feature, and it lives in that app (`apps/command-bar/`) the way
+  // Command Bar feature, and it lives there (`components/commandBar/`) the way
   // session and artifact search reach their corpora there: one row you enter,
   // then a list that narrows. Registering a second folder surface here would make
-  // the host own a copy of a feature the app already owns, and the two would drift.
+  // the palette own a copy of a feature the Command Bar already owns, and the two
+  // would drift.
   const tabs = useMemo<ResourceProvider[]>(
     () => [all, sessions, knowledge, skills, prompts, artifacts, apps, pages, actions, settings],
     [all, sessions, knowledge, skills, prompts, artifacts, apps, pages, actions, settings],
@@ -376,6 +378,11 @@ export default function CommandPalette({
   // the setting between two opens leaves a running row on its pre-toggle label until
   // the next status tick or staleTime expiry.
   const simplifiedToolNames = useSimplifiedToolNames()
+  // A running row says "Compacting…" from the slot's run state, which a compaction
+  // changes without touching the status detail, so the key has to carry it too.
+  const compactingKeys = useAppSelector((st) =>
+    slots.filter((s) => selectSlotStreamState(st, s.key) === 'compacting').map((s) => s.key).join(','),
+  )
   const liveFingerprint = useMemo(
     () =>
       activeProvider.id === 'recents'
@@ -390,15 +397,15 @@ export default function CommandPalette({
                 s.pinned ? 1 : 0
               }:${slotRecency(s).timestamp ?? ''}:${detail}`
             })
-            .join('|') + `#${unreadSlots.join(',')}#${simplifiedToolNames ? 1 : 0}`
+            .join('|') + `#${unreadSlots.join(',')}#${simplifiedToolNames ? 1 : 0}#${compactingKeys}`
         : '',
-    [activeProvider.id, slots, unreadSlots, slotStatusDetail, simplifiedToolNames],
+    [activeProvider.id, slots, unreadSlots, slotStatusDetail, simplifiedToolNames, compactingKeys],
   )
   // The Sessions and All tabs rank open tabs first from the server's `open`
   // flag, so a tab opening or closing must re-run their search too.
   const openTabsKey = activeProvider.id === 'sessions' || activeProvider.id === 'all' ? openSessionsKey : ''
   const { data: results = [], isLoading: loading, isError, refetch } = useQuery({
-    queryKey: ['palette', 'search', activeProvider.id, debouncedQuery, liveFingerprint, openTabsKey],
+    queryKey: ['palette', 'search', activeProvider.id, debouncedQuery, liveFingerprint, openTabsKey, activeProvider.scope ?? ''],
     queryFn: () => Promise.resolve(activeProvider.search(debouncedQuery)),
     enabled: open,
     placeholderData: (prev) => prev ?? [],
@@ -594,7 +601,8 @@ export default function CommandPalette({
       role="dialog"
       aria-modal="true"
       aria-label={i18nT('components.commandPalette.search_everywhere')}
-      onMouseDown={onClose}
+      // The press's own default action would clear the focus this close gives back.
+      onMouseDown={e => { e.preventDefault(); onClose() }}
     >
       {/* Containment only: the panel's handlers perform no action. onMouseDown
           keeps a press inside the panel from reaching the backdrop's dismiss;

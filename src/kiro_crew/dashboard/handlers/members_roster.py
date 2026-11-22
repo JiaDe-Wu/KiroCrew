@@ -24,15 +24,19 @@ from aiohttp import web
 from kiro_crew import members as members_mod
 from kiro_crew.config.loader import load_config_with_content_stamp
 from kiro_crew.dashboard import members_roster_goals
+from kiro_crew.dashboard.conditional_get import conditional_json_response
 from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+from kiro_crew.dashboard.handlers.crew_board_flight import BoardAnswer, shared_board
 from kiro_crew.dashboard.handlers.members_access import (
     _audit_owner_read,
-    _deny_app_caller,
     _member_name_is_addressable,
 )
+from kiro_crew.dashboard.handlers.members_app import app_bot_list
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.external_text import redact_external_text
 from kiro_crew.members import MemberSlugError
+from kiro_crew.shared_crew.participants import dropped as participants_dropped
+from kiro_crew.shared_crew.participants import ordered as ordered_participants
 
 logger = logging.getLogger("kiro_crew.dashboard.handlers.members")
 
@@ -338,9 +342,11 @@ async def api_members(request: web.Request) -> web.Response:
     already-subscribed WS ``slots`` frames on the frontend, so this endpoint
     only fills the cold-start gap.
     """
-    denied = await _deny_app_caller(request, "members.list")
-    if denied is not None:
-        return denied
+    if request.get("app", ""):
+        # An app token never gets these rows: with `permissions.bots: read` it gets the
+        # trimmed list of the Bots the owner ticked for it, and otherwise the 404
+        # every member route sends an app (members_app / members_access).
+        return await app_bot_list(request)
     # Owner gate, the briefing and rules endpoints' boundary: every row carries the
     # owner's view of a crewmate (its last DM line, its slot, its projections), and
     # a non-owner dashboard session holds the same empty app claim the app-caller
@@ -350,6 +356,23 @@ async def api_members(request: web.Request) -> web.Response:
         return owner_denied
     _audit_owner_read(request, "members.list.read")
     state: DashboardState | None = request.app.get("state")
+    # Single flight (see crew_board_flight): reads that arrive together share one build
+    # that started after each of them arrived; nothing is kept afterwards, so a read
+    # still sees every change made before it, `running` included. Every caller that
+    # reaches here is an owner and gets the same rows. The owner gate and the audit
+    # line above run once per request, shared build or not.
+    answer = await shared_board("members.roster", repr(id(state)), lambda: _build_roster(state))
+    if answer.status != 200:
+        return web.Response(body=answer.body, status=answer.status, content_type="application/json")
+    return await conditional_json_response(request, answer.body)
+
+
+async def _build_roster(state: DashboardState | None) -> BoardAnswer:
+    """One build of the roster answer.
+
+    Takes the gateway state, never the request: the build is shared and outlives the
+    caller that started it.
+    """
     # Loaded WITH the digest of the bytes it was parsed from. Every config-derived row
     # field below comes from this one load, and the per-row reconcile that writes them
     # into the member log runs several awaited reads later, so a save landing in
@@ -430,6 +453,12 @@ async def api_members(request: web.Request) -> web.Response:
                 # crewmate's own model; the effort is load-time coerced.
                 "worker_model": _roster_mask(agent_cfg.worker_model),
                 "worker_reasoning_effort": agent_cfg.worker_reasoning_effort,
+                # How many workers this Bot may have open at once; the owner's
+                # limit, enforced by `session_create`.
+                "max_workers": agent_cfg.max_workers,
+                # The profile card's "Auto-compact at": 0 inherits the global
+                # session.autocompact_pct; load-time held to its range.
+                "autocompact_pct": float(getattr(agent_cfg, "autocompact_pct", 0.0) or 0.0),
                 # The per-crewmate Dynamic capabilities preview, the profile
                 # card's switch (``kiro_crew.crewmate_dynamic_capabilities``).
                 "dynamic_capabilities": bool(getattr(agent_cfg, "dynamic_capabilities", False)),
@@ -448,6 +477,9 @@ async def api_members(request: web.Request) -> web.Response:
                 "starred": bool(agent_cfg.starred),
                 # The row's place in the left dock (1 = top, 0 = not placed).
                 "star_order": int(agent_cfg.star_order),
+                # Whether a Dashboard-tab button may send its reply in one click
+                # (card_send); the Profile tab's switch reads and writes it.
+                "dashboard_card_send": bool(agent_cfg.dashboard_card_send),
                 # Whether the PERSON created this crewmate: the crew manager's
                 # own origin (`source == "kirocrew"`) AND a member id, which is
                 # assigned when its member memory is allocated. Both create
@@ -498,6 +530,10 @@ async def api_members(request: web.Request) -> web.Response:
         row["slot_key"] = slot_key
         slot = state._slots.get(slot_key) if (state and slot_key) else None
         row["running"] = bool(slot.running) if slot is not None else False
+        # Who has written in the DM thread (``shared_crew.participants``), read
+        # from the live slot only so the roster never opens a transcript for it.
+        row["participants"] = ordered_participants(slot) if slot is not None else []
+        row["participants_dropped"] = participants_dropped(slot) if slot is not None else 0
         # Read BEFORE the roster observation and the transcript read below: a
         # slot with unflushed rows has speech on the member log the disk does
         # not hold yet, so its speech-only read must not become a correction.
@@ -860,7 +896,9 @@ async def api_members(request: web.Request) -> web.Response:
     # scheduled run), as a messages app orders its conversations. Being listed
     # is `has_dm_message`: the thread holds a message.
 
-    return web.json_response({"members": rows})
+    return BoardAnswer(
+        200, bytes(web.json_response({"members": rows}).body or b"")  # type: ignore[arg-type]
+    )
 
 
 def _stamp_welcome_claimed(rows: list[dict]) -> None:

@@ -143,7 +143,13 @@ describe('CrewApprovalCards (owner decision B)', () => {
     api.crewWorkerApprove.mockRejectedValue(new ApiError(404, 'no pending approval'))
     await renderCards([waiting('w1')])
     fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
-    expect(await screen.findByTestId('crew-approval-failure')).toHaveTextContent('This approval has expired or was already decided')
+    const gone = await screen.findByTestId('crew-approval-gone')
+    expect(gone).toHaveTextContent('This approval expired, was already decided, or was replaced by a newer request')
+    expect(gone).toHaveAttribute('role', 'status')
+    expect(screen.queryByTestId('crew-approval-failure')).toBeNull()
+    // Nothing waits on it any more, so the heading stops asking for approval.
+    expect(screen.getByRole('heading')).toHaveTextContent('Worker w1')
+    expect(screen.getByRole('heading')).not.toHaveTextContent('needs approval')
     for (const name of ['Approve', 'Reject', 'Trust this crew member']) {
       expect(screen.getByRole('button', { name })).toBeDisabled()
     }
@@ -174,6 +180,7 @@ describe('CrewApprovalCards (owner decision B)', () => {
     act(() => { store.dispatch(updateSlot({ key: 'w1', pending_approval: true, pending_approval_info: { origin: 'coordinator', request_id: 'spawn:abc', request_instance: 'i2', tool: 'spawn_run', tool_input: '', tool_kind: 'spawn' } } as never)) })
     expect(screen.getByRole('button', { name: 'Approve' })).toBeEnabled()
     expect(screen.queryByTestId('crew-approval-failure')).toBeNull()
+    expect(screen.queryByTestId('crew-approval-gone')).toBeNull()
   })
 
   it('stacks several requests oldest first and shows a long input whole', async () => {
@@ -188,6 +195,36 @@ describe('CrewApprovalCards (owner decision B)', () => {
     await renderCards([{ ...row, pending_approval_info: { ...row.pending_approval_info, tool_input: long } }])
     const pre = screen.getByRole('region', { name: 'The exact tool input' })
     expect(pre.textContent).toBe(long)
+  })
+
+  it('styles an edit diff line by line and still shows every character of it', async () => {
+    const diff = [
+      '--- /home/u/project/src/app.ts',
+      '+++ /home/u/project/src/app.ts',
+      '@@ -1,3 +1,3 @@',
+      ' keep',
+      '-old line',
+      '+new line',
+      '',
+    ].join('\n')
+    api.crewWorkers.mockResolvedValue({ root: 'root', workers: [] })
+    const row = waiting('d')
+    await renderCards([{ ...row, pending_approval_info: { ...row.pending_approval_info, tool: 'Replace in File', tool_kind: 'edit', tool_input: diff } }])
+    const pre = screen.getByRole('region', { name: 'The exact tool input' })
+    expect(pre.textContent).toBe(diff)
+    const kinds = Array.from(pre.querySelectorAll('[data-diff-line]')).map(el => [el.getAttribute('data-diff-line'), el.textContent])
+    expect(kinds).toEqual([
+      ['old-header', '--- /home/u/project/src/app.ts'],
+      ['new-header', '+++ /home/u/project/src/app.ts'],
+      ['hunk', '@@ -1,3 +1,3 @@'],
+      ['ctx', ' keep'],
+      ['del', '-old line'],
+      ['add', '+new line'],
+      ['ctx', ''],
+    ])
+    // Nothing in the approved text becomes a control.
+    expect(within(pre).queryAllByRole('link')).toHaveLength(0)
+    expect(within(pre).queryAllByRole('button')).toHaveLength(0)
   })
 
   it('says so when the worker list cannot be read, and keeps the cards decidable', async () => {

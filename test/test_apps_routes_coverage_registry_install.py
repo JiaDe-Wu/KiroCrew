@@ -18,10 +18,12 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 from aiohttp.test_utils import TestClient, TestServer
 from apps_routes_coverage_helpers import (
     APP,
+    _deregister_into,
     _install,
     _make_app,
     _setup_env,
 )
+from redaction_structured_cases import github_classic
 
 import kiro_crew.apps.routes as routes_mod
 from kiro_crew.apps.manager import disable_app, enable_app
@@ -112,13 +114,14 @@ class TestRegistryInstall:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
+        token = github_classic(seed=61)
 
         async def _failed(name: str, **kwargs: Any) -> dict[str, Any]:
             return {
                 "ok": False,
                 "name": name,
-                "log": "cloning with token=ghp_0123456789abcdefghijABCDEFGHIJ0123456789",
-                "error": "auth failed for token=ghp_0123456789abcdefghijABCDEFGHIJ0123456789",
+                "log": f"cloning with token={token}",
+                "error": f"auth failed for token={token}",
             }
 
         monkeypatch.setattr(routes_mod, "install_from_registry", _failed)
@@ -126,8 +129,8 @@ class TestRegistryInstall:
             resp = await client.post("/api/apps/registry/install", json={"name": "some-app"})
             assert resp.status == 400
             body = await resp.json()
-        assert "ghp_0123456789abcdefghijABCDEFGHIJ0123456789" not in body["log"]
-        assert "ghp_0123456789abcdefghijABCDEFGHIJ0123456789" not in body["error"]
+        assert token not in body["log"]
+        assert token not in body["error"]
 
     @pytest.mark.asyncio
     async def test_fresh_install_returns_201_and_starts_nothing(
@@ -177,6 +180,52 @@ class TestRegistryInstall:
         assert body["registration"]["agents"] == []
         assert calls == ["stop", "deregister"]
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "path", ["/api/apps/registry/install", "/api/apps/registry/install-stream"]
+    )
+    @pytest.mark.parametrize("ok", [True, False])
+    async def test_reinstall_over_an_installed_app_takes_it_down_to_replace_its_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str, ok: bool
+    ) -> None:
+        # Replacing an installed app's files fails on Windows while its backend
+        # holds one open, so both routes stop the backend and scrub its resources
+        # at the replacement boundary, and a failed replacement brings it back.
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        enable_app(APP)
+        calls: list[str] = []
+
+        async def _reinstall(name: str, **kwargs: Any) -> dict[str, Any]:
+            await kwargs["before_replace"]()
+            calls.append("replace")
+            return {"ok": ok, "name": name, "error": "" if ok else "copy failed"}
+
+        def _register(name: str) -> SimpleNamespace:
+            calls.append("register")
+            return SimpleNamespace(to_dict=dict, mcp_servers=[])
+
+        monkeypatch.setattr(routes_mod, "install_from_registry", _reinstall)
+        monkeypatch.setattr(routes_mod, "register_app", _register)
+        monkeypatch.setattr(routes_mod, "deregister_app", _deregister_into(calls))
+        monkeypatch.setattr(routes_mod, "stop_app_backend", lambda n: calls.append("stop"))
+        monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: calls.append("start"))
+
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(path, json={"name": APP})
+            text = await resp.text()
+        if path.endswith("-stream"):
+            assert json.loads(_sse_events(text)[-1][1])["ok"] is ok
+        else:
+            assert resp.status == (201 if ok else 400), text
+        assert calls == [
+            "stop",
+            "deregister (agents kept)",
+            "replace",
+            "register",
+            "start",
+        ], calls
+
 
 # POST /api/apps/registry/install-stream (SSE)
 
@@ -199,6 +248,23 @@ class TestRegistryInstallStream:
         async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post("/api/apps/registry/install-stream", json={})
             assert resp.status == 400
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", [["a"], 123, {"x": 1}], ids=repr)
+    async def test_a_non_string_name_is_a_400_before_the_stream(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: Any
+    ) -> None:
+        # The same answer as the non-stream route, and no install is attempted.
+        _setup_env(tmp_path, monkeypatch)
+
+        async def _must_not_run(*a: Any, **kw: Any) -> dict:
+            raise AssertionError("install_from_registry must not run")
+
+        monkeypatch.setattr(routes_mod, "install_from_registry", _must_not_run)
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post("/api/apps/registry/install-stream", json={"name": name})
+            assert resp.status == 400
+            assert (await resp.json())["code"] == "invalid_field_type"
 
     @pytest.mark.asyncio
     async def test_streams_log_lines_then_done(

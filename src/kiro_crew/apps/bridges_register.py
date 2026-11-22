@@ -1,8 +1,8 @@
 """Registering and deregistering an app's resources as a whole.
 
 ``register_app`` / ``deregister_app`` and their :class:`RegistrationResult`, refreshing
-just an app's agents, pruning resources a manifest upgrade dropped, the startup
-reconcile of every enabled app, and dropping the session resume pointers an app's
+just an app's agents, pruning resources a manifest upgrade dropped, the per-app
+boot reconcile the gateway runs for each admitted enabled app, and dropping the session resume pointers an app's
 conversations held (``discard_app_session_pointers``).
 
 Part of the ``kiro_crew.apps.bridges`` family: callers and tests reach every name here
@@ -28,6 +28,7 @@ from kiro_crew.apps.bridges_mcp import (
 from kiro_crew.apps.bridges_mcp_config import (
     _mcp_lock,
     _read_mcp_json_unlocked,
+    _sync_app_tool_refs,
     _write_mcp_json_unlocked,
 )
 from kiro_crew.apps.bridges_skills import _deregister_skills, _register_skills
@@ -39,7 +40,7 @@ from kiro_crew.apps.bridges_sources import (
     _registration_source,
     _safe_link_name,
 )
-from kiro_crew.apps.manager import app_enabled_state, get_app, get_app_manifest, list_apps
+from kiro_crew.apps.manager import app_enabled_state, get_app, get_app_manifest
 from kiro_crew.apps.manifest import (
     AppManifest,
     Containment,
@@ -50,6 +51,7 @@ from kiro_crew.config.loader import config_dir
 from kiro_crew.gateway_lock import GatewayLock, GatewayLockError, LockFileError
 from kiro_crew.history import ConversationLog
 from kiro_crew.session_map import SUPPRESS_REPLAY_FLAG, SessionMap
+from kiro_crew.user_json import loads_user_json
 
 logger = logging.getLogger("kiro_crew.apps.bridges")
 
@@ -106,7 +108,7 @@ def _prune_stale_app_resources(app_name: str, manifest: AppManifest, app_root: P
                 # Outside the root or refused by the path screen: registration
                 # never links it, so it carries no current name either.
                 continue
-            data = json.loads(agent_path.read_text(encoding="utf-8"))
+            data = loads_user_json(agent_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
             # A declared agent we CANNOT read is not the same as a removed one. If
             # we skipped it, its name would be absent from `current_links` and the
@@ -170,6 +172,7 @@ def _prune_stale_app_resources(app_name: str, manifest: AppManifest, app_root: P
             for k in stale:
                 del servers[k]
             if stale:
+                _sync_app_tool_refs(data, app_name)
                 _write_mcp_json_unlocked(data)
                 logger.info("Pruned %d stale app MCP server(s) for %s", len(stale), app_name)
 
@@ -225,13 +228,12 @@ def register_app(
         return result
 
     # NOTE: pruning of resources a manifest UPGRADE removed is NOT done here.
-    # The enable/update route handlers all deregister_app() first, so nothing
-    # stale survives for them to prune — a prune here (a directory walk over
-    # every agent file + lock acquisition, scaling with agent count) would run
-    # redundantly on every one of those deregister-first calls. The one path
-    # that re-registers WITHOUT a preceding deregister — the boot reconcile —
-    # does the prune itself, off the loop, in
-    # reconcile_enabled_app_resources(). See that function.
+    # Every path either deregisters first, so nothing stale survives for it to
+    # prune — a prune here (a directory walk over every agent file + lock
+    # acquisition, scaling with agent count) would run redundantly on each of
+    # those calls — or re-registers over kept agent specs and prunes itself, off
+    # the loop: the boot reconcile (reconcile_enabled_app_resources) and an
+    # update (routes_lifecycle._prune_dropped_resources).
 
     # MCP servers BEFORE agents: _register_agents copies the app's own registered
     # server specs into each agent config, so registering them afterwards leaves
@@ -334,82 +336,52 @@ def refresh_app_agents_if_enabled(app_name: str) -> None:
         _deregister_agents(app_name)
 
 
-def reconcile_enabled_app_resources() -> dict[str, int]:
-    """Re-register resources for every ENABLED gateway-managed app.
+def reconcile_enabled_app_resources(app_name: str) -> RegistrationResult:
+    """Re-register *app_name*'s resources at gateway boot. Blocking.
 
-    Called once at gateway startup.  Registering ONLY in the enable path would
-    leave an app that gains agents/skills in a later version unregistered for a
-    user who has already enabled it — silently, because a missing resource only
-    logs a warning.  Reconciling at boot makes the on-disk state a function of
-    the current manifests rather than of install history.
+    The boot reconcile in ``backend_runtime.startup.start_enabled_app_backends``
+    calls this once per ENABLED app, after that app has passed its governance,
+    admission and execution vet; this function lists no apps, and its only check
+    is the execution one inside :func:`register_app`. Registering ONLY in the
+    enable path would leave an app that gains agents/skills in a later version
+    unregistered for a user who has already enabled it — silently, because a
+    missing resource only logs a warning. Reconciling at boot makes the on-disk
+    state a function of the current manifests rather than of install history.
 
     Idempotent: agent configs are rewritten from their template, skills/crons/MCP
     registration already overwrite in place.  Apps with ``resources="app"`` are
-    skipped by :func:`register_app` itself.
+    skipped by :func:`register_app` itself. Errors are returned in the result for
+    the caller to log.
     """
-    counts = {"apps": 0, "agents": 0, "skills": 0, "errors": 0}
+    # Prune stale resources a manifest UPGRADE removed, BEFORE re-registering.
+    # This runs ONLY here, on the off-loop boot reconcile: register_app no
+    # longer prunes (it is also called on the event loop, where the directory
+    # walk + lock would stall chat/heartbeat), and this is the one path that
+    # re-registers without a preceding deregister_app(), so a dropped agent or
+    # MCP server would otherwise stay registered and callable.
     try:
-        apps = list_apps()
-    except Exception as exc:  # noqa: BLE001 — never block startup
-        logger.warning("Resource reconcile skipped: cannot list apps: %s", exc)
-        return counts
-
-    for info in apps:
-        if not info.get("enabled"):
-            continue
-        name = info.get("name") or ""
-        if not name:
-            continue
-        # Prune stale resources a manifest UPGRADE removed, BEFORE re-registering.
-        # This runs ONLY here, on the off-loop boot reconcile: register_app no
-        # longer prunes (it is also called on the event loop, where the directory
-        # walk + lock would stall chat/heartbeat), and this is the one path that
-        # re-registers without a preceding deregister_app(), so a dropped agent or
-        # MCP server would otherwise stay registered and callable.
-        try:
-            _man, _root = _registration_source(name)
-            if _man is not None:
-                _prune_stale_app_resources(name, _man, _root)
-        except Exception as exc:  # noqa: BLE001 — a prune failure must not block reconcile
-            logger.warning("Could not prune stale resources for %s: %s", name, exc)
-        try:
-            result = register_app(name)
-        except Exception as exc:  # noqa: BLE001 — one bad app must not stop the rest
-            logger.warning("Resource reconcile failed for %s: %s", name, exc)
-            counts["errors"] += 1
-            continue
-        counts["apps"] += 1
-        counts["agents"] += len(result.agents)
-        counts["skills"] += len(result.skills)
-        counts["errors"] += len(result.errors)
-        # Finish the shared-file migration for apps that are ALREADY enabled.
-        # Registration now targets the agent config, but an older build wrote
-        # this app's servers into the shared ``~/.kiro/settings/mcp.json``, and
-        # re-registering does not remove what is already there. Scrubbing only
-        # on deregister meant the leak this change exists to fix (one app's
-        # private tools visible to Kiro IDE and every other kiro-cli agent, plus
-        # dead-port entries that break unrelated sessions) survived until the
-        # user happened to disable the app. Best-effort and idempotent.
-        scrubbed = _scrub_legacy_shared_mcp(name)
-        if scrubbed:
-            logger.info(
-                "Removed %d stale %s entr%s from the shared kiro MCP config",
-                scrubbed,
-                name,
-                "y" if scrubbed == 1 else "ies",
-            )
-        for err in result.errors:
-            logger.warning("Resource reconcile issue for %s: %s", name, err)
-
-    if counts["apps"]:
+        _man, _root = _registration_source(app_name)
+        if _man is not None:
+            _prune_stale_app_resources(app_name, _man, _root)
+    except Exception as exc:  # noqa: BLE001 — a prune failure must not block reconcile
+        logger.warning("Could not prune stale resources for %s: %s", app_name, exc)
+    result = register_app(app_name)
+    # Finish the shared-file migration for apps that are ALREADY enabled.
+    # Registration targets the agent config, but an install may still have
+    # this app's servers in the shared ``~/.kiro/settings/mcp.json``, and
+    # re-registering does not remove them. Scrubbing only on deregister would
+    # leave one app's private tools visible to Kiro IDE and every other
+    # kiro-cli agent, plus dead-port entries that break unrelated sessions,
+    # until the user disables the app. Best-effort and idempotent.
+    scrubbed = _scrub_legacy_shared_mcp(app_name)
+    if scrubbed:
         logger.info(
-            "Reconciled resources for %d enabled app(s): %d agent(s), %d skill(s), %d error(s)",
-            counts["apps"],
-            counts["agents"],
-            counts["skills"],
-            counts["errors"],
+            "Removed %d stale %s entr%s from the shared kiro MCP config",
+            scrubbed,
+            app_name,
+            "y" if scrubbed == 1 else "ies",
         )
-    return counts
+    return result
 
 
 def app_conversation_keys(app_name: str, *, mapped_keys: Iterable[str] | None = None) -> list[str]:
@@ -420,9 +392,10 @@ def app_conversation_keys(app_name: str, *, mapped_keys: Iterable[str] | None = 
     a conversation from the previous installation.
 
     Ownership comes from the ``app`` field every save writes into the conversation's
-    metadata line. Live ``_ChatSlot._app`` (absent on the CLI path, gone for a closed
-    slot) and ``open_slots.json`` (drops closed tabs while the pointer stays) both miss
-    the common case of a closed slot before uninstall.
+    metadata line, or from ``embed_app``, the app whose page embed began it with a
+    person's send (``app`` is then empty). Live ``_ChatSlot._app`` (absent on the CLI
+    path, gone for a closed slot) and ``open_slots.json`` (drops closed tabs while the
+    pointer stays) both miss the common case of a closed slot before uninstall.
 
     A caller that owns a live map must pass *mapped_keys*
     (``mapped_session_keys() | session_keys()``, the second covering an allocation in
@@ -435,6 +408,8 @@ def app_conversation_keys(app_name: str, *, mapped_keys: Iterable[str] | None = 
     """
     if not app_name:
         return []
+    from kiro_crew.history_schema import EMBED_APP_META_KEY
+
     try:
         log = ConversationLog()
         candidates = SessionMap().mapped_sids_by_key() if mapped_keys is None else set(mapped_keys)
@@ -442,7 +417,7 @@ def app_conversation_keys(app_name: str, *, mapped_keys: Iterable[str] | None = 
         unreadable: list[str] = []
         for key in candidates:
             meta, readable = log.get_metadata_status(key)
-            if meta.get("app") == app_name:
+            if app_name in (meta.get("app"), meta.get(EMBED_APP_META_KEY)):
                 owned.append(key)
             elif not readable:
                 # A record that could not be READ is not a record that says "not this
@@ -558,21 +533,26 @@ def discard_app_session_pointers(app_name: str) -> SessionPointerCleanup:
     return SessionPointerCleanup(dropped=cleared)
 
 
-def deregister_app(app_name: str) -> RegistrationResult:
+def deregister_app(app_name: str, *, keep_agents: bool = False) -> RegistrationResult:
     """Deregister all resources for an app.
 
     Removes symlinks and cron manifests.  Does not remove the app directory.
+
+    ``keep_agents`` leaves the agent specs for an update that registers the app
+    again: registration rewrites each in place, so one it cannot rewrite keeps its
+    last good copy and the user's edits (app-kit-platform §3).
 
     Does NOT touch session resume pointers — see
     :func:`discard_app_session_pointers` for why that belongs to uninstall alone.
     """
     result = RegistrationResult()
 
-    try:
-        n = _deregister_agents(app_name)
-        result.agents = [f"removed {n} agent(s)"]
-    except Exception as exc:
-        result.errors.append(f"agent deregistration failed: {exc}")
+    if not keep_agents:
+        try:
+            n = _deregister_agents(app_name)
+            result.agents = [f"removed {n} agent(s)"]
+        except Exception as exc:
+            result.errors.append(f"agent deregistration failed: {exc}")
 
     try:
         _deregister_skills(app_name)

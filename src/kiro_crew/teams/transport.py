@@ -33,6 +33,7 @@ import logging
 from dataclasses import replace
 from typing import Any, Awaitable, Callable, Iterable
 
+from kiro_crew.messaging.outbound_files import ExtractLimits, OutboundFile
 from kiro_crew.messaging.tables import TABLE_POLICY_AUTO
 from kiro_crew.messaging.transport import (
     ConfiguredChannelTarget,
@@ -65,22 +66,18 @@ DispatchFn = Callable[[TeamsInbound], Awaitable[None]]
 #   [OPTIONS:] chips real. The cap is below Slack's 10 because actions render as
 #   full-width buttons on mobile; overflow degrades to a numbered list through
 #   ``apply_options_cap``.
-# * ``files_inbound=True`` -- the dispatcher really does download the files on an
-#   activity and hand their content to the turn, AFTER the personal-scope and
-#   allow-list gates this module applies. Both Teams shapes are covered: a
-#   personal-chat upload (pre-authorized ``downloadUrl``, fetched with no
-#   credential) and an inline image (Teams-hosted ``contentUrl``, fetched with the
-#   bot token only on a recognized Microsoft host). The Teams app MANIFEST must
-#   also declare ``supportsFiles: true`` or the platform never sends the
-#   ``file.download.info`` attachment at all -- see ``docs/teams-integration.md``.
-# * ``files_outbound=True`` -- and deliberately narrower than the platform. The
-#   renderer really does deliver a local raster the reply referenced, as an inline
-#   ``data:`` URI attachment, which needs no hosting and no round trip. A
-#   NON-image file would need the ``FileConsentCard`` flow: consent card, user
-#   accept, an ``invoke`` activity carrying an upload URL, then a PUT of the bytes.
-#   This channel's ingress fast-acks a message activity and dispatches a turn; it
-#   handles no ``invoke``, so that flow is out of scope here and a non-inlinable
-#   reference is refused visibly instead (see ``teams/attachments.py``).
+# * ``files_inbound=True`` -- the dispatcher downloads an activity's files and
+#   gives their content to the turn, AFTER this module's personal-scope and
+#   allow-list gates. Both Teams shapes: a personal-chat upload (pre-authorized
+#   ``downloadUrl``, fetched with no credential) and an inline image (Teams-hosted
+#   ``contentUrl``, fetched with the bot token only on a recognized Microsoft
+#   host). The Teams app MANIFEST must declare ``supportsFiles: true`` or Teams
+#   never sends ``file.download.info`` -- see ``docs/teams-integration.md``.
+# * ``files_outbound=True`` -- narrower than the platform: the renderer sends a
+#   local raster the reply referenced as an inline ``data:`` URI. A NON-image file
+#   needs the ``FileConsentCard`` flow, which ends in an ``invoke`` activity; this
+#   ingress handles no ``invoke``, so such a reference is refused visibly (see
+#   ``teams/attachments.py``).
 def allowed_emails_from_config(entries: object) -> list[str] | None:
     """Normalize ``teams.allowed_emails`` to the lowercased identities to admit.
 
@@ -236,6 +233,43 @@ class TeamsTransport(MessagingTransport):
                 await self._store.flush()
             raise
         return mid or ""
+
+    async def outbound_image_limits(
+        self, conversation_id: str, thread_id: str | None = None
+    ) -> ExtractLimits | None:
+        """The renderer's own budgets; every learned route is a personal chat."""
+        from kiro_crew.teams.attachments import TEAMS_UPLOAD_LIMITS
+
+        return TEAMS_UPLOAD_LIMITS
+
+    async def send_outbound_image(
+        self, conversation_id: str, file: OutboundFile, *, thread_id: str | None = None
+    ) -> bool:
+        """Send one extracted image as an inline attachment, as the renderer does.
+
+        Only the raster types Teams renders inline; anything else answers False.
+        """
+        from kiro_crew.teams.attachments import (
+            TEAMS_INLINE_IMAGE_MIMES,
+            inline_image_attachment,
+            inline_image_name,
+        )
+
+        if file.mime not in TEAMS_INLINE_IMAGE_MIMES:
+            return False
+        await self._store.ensure_loaded()
+        service_url = self._store.get(conversation_id)
+        if not service_url:
+            return False
+        attachment = await asyncio.to_thread(
+            inline_image_attachment, file, inline_image_name("", file)
+        )
+        try:
+            await self._client.send_inline_image(conversation_id, attachment, service_url)
+        except TeamsSendError:
+            logger.warning("Teams: mirrored inline image delivery failed", exc_info=True)
+            return False
+        return True
 
     async def resolve_conversation(self, user_id: str) -> str:
         # DM sessions are keyed on the Teams conversation id, which the inbound

@@ -3,7 +3,7 @@
 import type { UiGuidePlan } from './types'
 
 /** The `build_digest` of the packaged index this bundle was built with (see `guideBuildDigest`). */
-export const GUIDE_BUILD_DIGEST = "sha256:5a660daf3a790cce2a2675a2a176e5bf0dcfaa841571622dead75aee7af21b8c"
+export const GUIDE_BUILD_DIGEST = "sha256:deb046e28fa25ddb753dca89d3089fe565e7924180db12ac5f53796ffad353e9"
 
 /** Curated location ids: the only ids a live observation may name. */
 export const GUIDE_OBSERVABLE_IDS: readonly string[] = [
@@ -37,6 +37,7 @@ export const GUIDE_OBSERVABLE_IDS: readonly string[] = [
   "artifacts.list",
   "artifacts.new",
   "artifacts.new-folder",
+  "artifacts.new-mobile",
   "artifacts.starred",
   "backup.export",
   "backup.import-file",
@@ -68,10 +69,15 @@ export const GUIDE_OBSERVABLE_IDS: readonly string[] = [
   "composer.send",
   "composer.stop",
   "composer.voice",
-  "connections.mcp-servers-tab",
+  "knowledge.add-source",
+  "knowledge.sources-tab",
   "mcp.add-custom",
   "mcp.add-server",
   "mcp.probe",
+  "mcp.review-approve",
+  "mcp.servers-view",
+  "mcp.share-switch",
+  "mcp.sharing-view",
   "members.add-menu",
   "members.add-menu.import",
   "members.add-menu.new",
@@ -102,6 +108,7 @@ export const GUIDE_OBSERVABLE_IDS: readonly string[] = [
   "notifications.page-mark-all-read",
   "overview.memory-details",
   "schedule.add-job",
+  "schedule.batch-actions",
   "schedule.cancel-run",
   "schedule.create-first",
   "schedule.delete",
@@ -136,7 +143,6 @@ export const GUIDE_OBSERVABLE_IDS: readonly string[] = [
   "sessions.show-all-older",
   "shell.connect-phone",
   "shell.focus-mode",
-  "shell.kiro-account",
   "shell.menu-search",
   "shell.mobile-menu",
   "shell.nav-toggle",
@@ -232,6 +238,10 @@ export const GUIDE_REVEAL_SCOPES = {
     "kind": "menu",
     "revealer": "members.switcher"
   },
+  "menu:schedule.batch-actions": {
+    "kind": "menu",
+    "revealer": "schedule.batch-actions"
+  },
   "menu:sessions.create-menu": {
     "kind": "menu",
     "revealer": "sessions.create-menu"
@@ -268,9 +278,13 @@ export const GUIDE_REVEAL_SCOPES = {
     "kind": "open",
     "revealer": "composer.automation"
   },
-  "open:connections.mcp-servers-tab": {
+  "open:knowledge.sources-tab": {
     "kind": "open",
-    "revealer": "connections.mcp-servers-tab"
+    "revealer": "knowledge.sources-tab"
+  },
+  "open:mcp.servers-view": {
+    "kind": "open",
+    "revealer": "mcp.servers-view"
   },
   "shell.nav-rail": {
     "kind": "state",
@@ -587,7 +601,7 @@ export const GUIDE_PLANS: Readonly<Record<string, UiGuidePlan>> = {
     "placements": [
       {
         "id": "any",
-        "route": "/artifacts",
+        "route": "/artifacts?scope=all",
         "steps": [
           {
             "id": "any:select:artifact_open",
@@ -618,7 +632,7 @@ export const GUIDE_PLANS: Readonly<Record<string, UiGuidePlan>> = {
     "placements": [
       {
         "id": "any",
-        "route": "/artifacts",
+        "route": "/artifacts?scope=all",
         "steps": [
           {
             "id": "any:select:artifact_open",
@@ -643,7 +657,7 @@ export const GUIDE_PLANS: Readonly<Record<string, UiGuidePlan>> = {
     "placements": [
       {
         "id": "any",
-        "route": "/artifacts",
+        "route": "/artifacts?scope=all",
         "steps": [
           {
             "id": "any:select:artifact_open",
@@ -668,7 +682,7 @@ export const GUIDE_PLANS: Readonly<Record<string, UiGuidePlan>> = {
     "placements": [
       {
         "id": "any",
-        "route": "/artifacts",
+        "route": "/artifacts?scope=all",
         "steps": [
           {
             "id": "any:select:artifact_open",
@@ -713,16 +727,17 @@ export const GUIDE_PLANS: Readonly<Record<string, UiGuidePlan>> = {
   },
   "artifacts.new": {
     "version": 2,
-    "label_key": "pages.artifactsPage.new_artifact",
+    "label_key": "pages.artifactsPage.quick_doc",
     "placements": [
       {
-        "id": "any",
+        "id": "desktop",
         "route": "/artifacts",
+        "viewport": "desktop",
         "steps": [
           {
-            "id": "any:artifacts.new",
+            "id": "desktop:artifacts.new",
             "location": "artifacts.new",
-            "label_key": "pages.artifactsPage.new_artifact"
+            "label_key": "pages.artifactsPage.quick_doc"
           }
         ]
       }
@@ -738,9 +753,33 @@ export const GUIDE_PLANS: Readonly<Record<string, UiGuidePlan>> = {
         "viewport": "desktop",
         "steps": [
           {
+            "id": "desktop:artifacts.add-menu",
+            "location": "artifacts.add-menu",
+            "label_key": "pages.artifactsPage.more_ways_to_add_an_artifact",
+            "scope": "menu:artifacts.add-menu"
+          },
+          {
             "id": "desktop:artifacts.new-folder",
             "location": "artifacts.new-folder",
             "label_key": "pages.artifactsPage.new_folder"
+          }
+        ]
+      }
+    ]
+  },
+  "artifacts.new-mobile": {
+    "version": 2,
+    "label_key": "pages.artifactsPage.new_artifact",
+    "placements": [
+      {
+        "id": "mobile",
+        "route": "/artifacts",
+        "viewport": "mobile",
+        "steps": [
+          {
+            "id": "mobile:artifacts.new-mobile",
+            "location": "artifacts.new-mobile",
+            "label_key": "pages.artifactsPage.new_artifact"
           }
         ]
       }
@@ -752,7 +791,7 @@ export const GUIDE_PLANS: Readonly<Record<string, UiGuidePlan>> = {
     "placements": [
       {
         "id": "any",
-        "route": "/artifacts",
+        "route": "/artifacts?scope=all",
         "steps": [
           {
             "id": "any:artifacts.starred",
@@ -1689,18 +1728,41 @@ export const GUIDE_PLANS: Readonly<Record<string, UiGuidePlan>> = {
       }
     ]
   },
-  "connections.mcp-servers-tab": {
+  "knowledge.add-source": {
     "version": 2,
-    "label_key": "pages.connectionsPage.mcp_servers",
+    "label_key": "pages.knowledge.sourcesList.add_source",
     "placements": [
       {
         "id": "any",
-        "route": "/capabilities?tab=mcp",
+        "route": "/capabilities?tab=knowledge",
         "steps": [
           {
-            "id": "any:connections.mcp-servers-tab",
-            "location": "connections.mcp-servers-tab",
-            "label_key": "pages.connectionsPage.mcp_servers"
+            "id": "any:knowledge.sources-tab",
+            "location": "knowledge.sources-tab",
+            "label_key": "pages.knowledge.index.sources_tab",
+            "scope": "open:knowledge.sources-tab"
+          },
+          {
+            "id": "any:knowledge.add-source",
+            "location": "knowledge.add-source",
+            "label_key": "pages.knowledge.sourcesList.add_source"
+          }
+        ]
+      }
+    ]
+  },
+  "knowledge.sources-tab": {
+    "version": 2,
+    "label_key": "pages.knowledge.index.sources_tab",
+    "placements": [
+      {
+        "id": "any",
+        "route": "/capabilities?tab=knowledge",
+        "steps": [
+          {
+            "id": "any:knowledge.sources-tab",
+            "location": "knowledge.sources-tab",
+            "label_key": "pages.knowledge.index.sources_tab"
           }
         ]
       }
@@ -1712,13 +1774,13 @@ export const GUIDE_PLANS: Readonly<Record<string, UiGuidePlan>> = {
     "placements": [
       {
         "id": "any",
-        "route": "/capabilities?tab=mcp",
+        "route": "/capabilities?tab=mcp-servers",
         "steps": [
           {
-            "id": "any:connections.mcp-servers-tab",
-            "location": "connections.mcp-servers-tab",
-            "label_key": "pages.connectionsPage.mcp_servers",
-            "scope": "open:connections.mcp-servers-tab"
+            "id": "any:mcp.servers-view",
+            "location": "mcp.servers-view",
+            "label_key": "pages.mcpPage.view_servers",
+            "scope": "open:mcp.servers-view"
           },
           {
             "id": "any:mcp.add-server",
@@ -1735,18 +1797,69 @@ export const GUIDE_PLANS: Readonly<Record<string, UiGuidePlan>> = {
     "placements": [
       {
         "id": "any",
-        "route": "/capabilities?tab=mcp",
+        "route": "/capabilities?tab=mcp-servers",
         "steps": [
           {
-            "id": "any:connections.mcp-servers-tab",
-            "location": "connections.mcp-servers-tab",
-            "label_key": "pages.connectionsPage.mcp_servers",
-            "scope": "open:connections.mcp-servers-tab"
+            "id": "any:mcp.servers-view",
+            "location": "mcp.servers-view",
+            "label_key": "pages.mcpPage.view_servers",
+            "scope": "open:mcp.servers-view"
           },
           {
             "id": "any:mcp.probe",
             "location": "mcp.probe",
             "label_key": "pages.overview.mcpTab.probe_mcp_servers"
+          }
+        ]
+      }
+    ]
+  },
+  "mcp.servers-view": {
+    "version": 2,
+    "label_key": "pages.mcpPage.view_servers",
+    "placements": [
+      {
+        "id": "any",
+        "route": "/capabilities?tab=mcp-servers",
+        "steps": [
+          {
+            "id": "any:mcp.servers-view",
+            "location": "mcp.servers-view",
+            "label_key": "pages.mcpPage.view_servers"
+          }
+        ]
+      }
+    ]
+  },
+  "mcp.share-switch": {
+    "version": 2,
+    "label_key": "pages.mcpManagement.share_switch_label",
+    "placements": [
+      {
+        "id": "any",
+        "route": "/capabilities?tab=mcp-servers",
+        "steps": [
+          {
+            "id": "any:mcp.share-switch",
+            "location": "mcp.share-switch",
+            "label_key": "pages.mcpManagement.share_switch_label"
+          }
+        ]
+      }
+    ]
+  },
+  "mcp.sharing-view": {
+    "version": 2,
+    "label_key": "pages.mcpPage.view_sharing",
+    "placements": [
+      {
+        "id": "any",
+        "route": "/capabilities?tab=mcp-servers",
+        "steps": [
+          {
+            "id": "any:mcp.sharing-view",
+            "location": "mcp.sharing-view",
+            "label_key": "pages.mcpPage.view_sharing"
           }
         ]
       }
@@ -2384,6 +2497,34 @@ export const GUIDE_PLANS: Readonly<Record<string, UiGuidePlan>> = {
       }
     ]
   },
+  "schedule.batch-actions": {
+    "version": 2,
+    "label_key": "pages.schedulePage.batchActions.actions_for_selected",
+    "placements": [
+      {
+        "id": "any",
+        "route": "/schedule",
+        "steps": [
+          {
+            "id": "any:select:one_job_checked",
+            "kind": "select",
+            "location": "schedule.job-list",
+            "label_key": "pages.schedulePage.jobs_table",
+            "selection": "one_job_checked",
+            "entity": "tickjob",
+            "requires": [
+              "schedule_list_view"
+            ]
+          },
+          {
+            "id": "any:schedule.batch-actions",
+            "location": "schedule.batch-actions",
+            "label_key": "pages.schedulePage.batchActions.actions_for_selected"
+          }
+        ]
+      }
+    ]
+  },
   "schedule.delete": {
     "version": 2,
     "label_key": "pages.schedulePage.delete",
@@ -2428,6 +2569,15 @@ export const GUIDE_PLANS: Readonly<Record<string, UiGuidePlan>> = {
             "label_key": "pages.schedulePage.jobs_table",
             "selection": "one_job_checked",
             "entity": "tickjob",
+            "requires": [
+              "schedule_list_view"
+            ]
+          },
+          {
+            "id": "any:schedule.batch-actions",
+            "location": "schedule.batch-actions",
+            "label_key": "pages.schedulePage.batchActions.actions_for_selected",
+            "scope": "menu:schedule.batch-actions",
             "requires": [
               "schedule_list_view"
             ]

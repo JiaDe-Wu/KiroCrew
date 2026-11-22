@@ -5,12 +5,32 @@ An autonomous ops first responder shipped as a **builtin app** (`origin: builtin
 investigates it in a chat session mirrored to Slack, matches it against a
 compounding knowledge ledger, and proposes an action. Read-only by default.
 
+**Adopted onto its own repository.** The wheel pins the app (`apps/adoption-pins.json`,
+[app-kit-platform.md § 33](app-kit-platform.md#33-former-built-in-adoption)) at
+`KiroCrewCaptain/kirocrew-app-ops-mission-control` with `minAppSdkLevel` 10, the level at
+which the agent's file tools fence an installed app's `credentialMasks`
+([app-kit-platform.md § 37](app-kit-platform.md#37-an-apps-credential-files-are-masked-by-its-own-manifest-seam-level-3)),
+so a host whose record is builtin-owned swaps it in place onto that tree at a restart,
+keeping `data/` (the ledger, the incident index and the settings), `.app_secret`, the
+approved grants, the app's crons and `enabled`; the rail keeps `/ops-mission-control` and
+the `Radio` glyph, and the wheel copy's `version` is the pinned one (D12). The adopted tree
+keeps the provider tokens in `<data dir>/secrets/secrets.json` behind its
+`"credentialMasks": ["secrets/"]` directory entry, which the OS sandbox and the agent's
+file tools both mask. On its first read with no store there it copies the data-home root
+`ops_mission_control_secrets.json` in and keeps that root file, rewritten on every save or
+revoke, as the copy a wheel copy reads after a downgrade, so the root file's rows below
+stay while the wheel copy ships. Its `app.json` declares the same `permissions` and the
+same `agentTools` as the wheel copy, plus that mask, which only narrows what an agent
+reaches, so E9 holds nothing back; its crons keep their names, schedules and enabled
+flags, and their prompts name the SOPs at the adopted skill's path. A fix to the app lands in that repository
+first; a change to the wheel copy needs its `App repo:` line.
+
 ## Repository boundary
 
 The whole app is meant to leave this repository intact: the package under
 `apps/builtins/ops_mission_control/` and the UI under `website/src/apps/ops-mission-control/`.
 Kiro Crew core does not import either. What the app needs from the core it imports from
-the core: the `webhooks` governance gate (`webhook_sources.source_refusal`), the
+the core: the `webhooks` governance gate (`webhook_sources.app_source_refusal`), the
 notification bus, the redactor, the grapheme-safe cut and the hidden-leaf staging. The
 app's tests of those pins live in its own `tests/` (`test_webhook_governance.py`,
 `test_notify_clip.py`, `test_github_issues_stderr_excerpts.py`,
@@ -22,21 +42,31 @@ app's tests of those pins live in its own `tests/` (`test_webhook_governance.py`
 core strings still naming it are a pinned list (`KNOWN_NAME_REFERENCES`) that may only
 shrink. Each row is deleted in the change that removes what it names:
 
-* **The `ops_mission_control_api` MCP tool.** Its descriptor, `TOOL_APPS` row, handler and
-  allowlist (`mcp_tools/apps.py`), its `MCP_CORE_SCHEMAS` validation row
-  (`validation_parts/`), its channel deny of `POST /rotation/arm` (`channel.py`), its title
-  (`data/mcp_tool_titles.json`) and the exact internal-secret admission of the routes it
-  reaches (`dashboard/server_internal_paths.py`). The built-in agent-tool seam
-  (`app-kit-platform.md`, section 30.1) carries only one POST route under the app proxy,
-  and this tool is a GET/POST dispatcher over `/api/apps/ops-mission-control`, so it stays
-  core until an app-contributed tool seam can carry it with the same name and permission
-  key. `apps.builtin_adoption_checks.core_named_apps` reads `TOOL_APPS`, so until then the
-  app is not adopted from its own repository.
-* **The `ops-mission-control` webhook source id** in `webhook_sources.py`: the core's
-  governance vocabulary, which a policy names and an app may not choose for itself.
+* **The `ops_mission_control_api` agent tool is the app's own.** `app.json` declares it
+  in its `agentTools` block (`app-kit-platform.md`, section 30.1) and the app serves it at
+  `POST /agent-tools` (see "The agent tool" under Security model), so the core lists it in
+  `kirocrew-core` and forwards each call without naming it. No core module holds its
+  descriptor, handler, allowlist, schema, internal-secret admission or channel deny. Its
+  title row in `data/mcp_tool_titles.json` stays until the app leaves, because the chat's
+  tool label and a remote session's whole-server grant read that table by name.
+  The core's hand-written `apps` MCP domain, whose `TOOL_APPS`
+  `apps.builtin_adoption_checks.core_named_apps` read, was deleted with this tool, its last.
+* **The webhook source is the app's own.** `app.json` declares
+  `permissions.webhookSource` (`app-kit-platform.md`, section 42), so the `webhooks`
+  scope governs the ingress under the app's name, `ops-mission-control`, the id existing
+  policies already name. No core constant names it, and adoption's E10 no longer
+  refuses the app on it.
 * **The sandbox leaf tables** (`sandbox_leaves.py`, `sandbox_aliases.py`,
   `security/paths_lists.py`) that hide the secret store, hold the autonomy ceiling
-  read-only and write-protect the rotation schedule and the incident index.
+  read-only and write-protect the rotation schedule and the incident index. The
+  manifest's `credentialMasks` (`app-kit-platform.md`, section 37) cannot carry the
+  secret store's rows: it masks only files under the app's own data directory, and the
+  store is `<data home>/ops_mission_control_secrets.json`, at the data-home root. The
+  rows leave when the store lives under `apps/ops-mission-control/data/` and the
+  manifest declares it there (#32681); the root name then stays masked as a retired leaf, as
+  `browser-cookies.txt` does, because a restored backup can bring it back. An adopted
+  record already keeps its store under `data/secrets/` (above), but it rewrites the root
+  file as the wheel copy's downgrade copy, so the rows stay until the wheel copy leaves.
 * **The `security_posture*.py` rows** that classify the app's files: the core's audit of
   the app's code.
 * **The packaged skill** `builtin_skills/ops-mission-control/` and its row in the closed
@@ -303,14 +333,16 @@ propose without checking" — showing only those two overstated the ledger's aut
 
 ### 2c. The sync loop, and where it is driven from
 
-The daily `ledger-hygiene` pass (`POST /ledger/hygiene`) is the only caller of the git
-transport and the vector index. Order is load-bearing: **pull → hygiene → index → push**.
+The daily `ledger-hygiene` pass (`POST /ledger/hygiene`) is the only caller that pushes
+the ledger and the only writer of the vector index; `run_cycle` also pulls the shared repo
+before each heartbeat (`_pull_shared_repo_safely`) so every instance refreshes
+`rotation.yaml`, and dispatch reads the index. Order is load-bearing: **pull → hygiene → index → push**.
 Deduping before the merge leaves freshly-arrived duplicates for tomorrow; indexing before
 hygiene embeds rows hygiene is about to prune; pushing before hygiene makes every instance
 re-derive the same dedupe locally so the repo never converges. Pinned by
 `test_stage_order_is_pull_hygiene_index_push`.
 
-When `memory.persistence_enabled` is false, the pass preserves that stage order
+When `memory.persistence_enabled` or `memory.writes_enabled` is false, the pass preserves that stage order
 but the index stage is a no-op decided before `VectorMemoryStore` construction.
 Pull, ledger hygiene, incident pruning, and push still run: they mutate the
 app's own durable state, while only the projection into shared episodic memory
@@ -422,7 +454,8 @@ Config keys (all non-secret, so plain `data/config.json`, same tier as the Slack
 A remote URL is **not** a credential — auth is the operator's own SSH key, credential
 helper or `gh` login — which is what makes it eligible for that file at all. The converse
 constrains the UI: `config.json` is served **unauthenticated**, the write path only
-length-caps the remote, and `redact_tokens` has no pattern for a PAT inside a URL. So the
+length-caps the remote and refuses an http(s) remote carrying userinfo
+(`remote_has_credentials`), and `redact_tokens` has no pattern for a PAT inside a URL. So the
 Settings card asks for an SSH remote, states plainly that there is no credential to enter,
 and strips a `userinfo@` component before *displaying* a remote — which is about not being
 a second place a token is shown, **not** a claim that the stored value was sanitised.
@@ -850,7 +883,8 @@ assert the clamped **value** rather than that the call returned something.
 
 `OpsProviderRegistry.gather_evidence` is the **only** caller of any adapter's
 `gather()`, and it redacts every `Evidence.body` through
-`redact_tokens(security.redact(...))`. That is what lets `Evidence`'s docstring
+`redact_tokens(redact_via_context(...))`, the platform redaction seam rather than
+`security.redact`. That is what lets `Evidence`'s docstring
 promise an adapter "cannot forget" — a second call site would silently bypass it, so
 `test_providers.py::test_redaction_is_the_only_path_out_of_an_adapter` pins the funnel
 by source inspection. This matters because evidence is largely **log content**, and
@@ -935,7 +969,8 @@ Two mechanisms, both in `registry`:
   provider `ok` is positive evidence rather than an inference).
 - **`poll_health()[src]["snapshot"]`** — whether that successful poll was a COMPLETE
   picture, i.e. whether absence from it is evidence at all. `ok` answers "did we look";
-  this answers "did we see everything", and for one source they differ. Read off
+  this answers "did we see everything", and for one source they differ. False too for a
+  poll the adapter returned as `TruncatedSignals` (more than the poll limit). Read off
   `SignalSource.is_snapshot`, defaulting `DEFAULT_IS_SNAPSHOT = True` so every polled
   provider API — and every companion adapter that does not set the flag — keeps its
   correct behaviour, and only a queue-draining source opts out.
@@ -1002,20 +1037,20 @@ which is exactly why the bucket is required: a UI counting `signals` under a col
 "Firing" would render "3 firing" above an empty queue with no explanation. `reconcile.md`
 Pass 1 step 5 states the rule for the agent side.
 
-`gather_evidence` passes every body through `security.redact` **and**
+`gather_evidence` passes every body through `redact_via_context` **and**
 `secrets.redact_tokens` centrally, so an adapter author cannot leak a credential
 into a model prompt by forgetting to redact.
 
-**The evidence TITLE gets the same passes, and did not.** `gather_evidence` redacted each
-`Evidence.body` at this chokepoint but copied `item.title` raw — and an evidence title is
+**The evidence TITLE gets the same passes.** `gather_evidence` redacts each
+`Evidence.title` beside its body at this chokepoint, because an evidence title is
 provider-controlled too (a CloudWatch alarm name, a Datadog monitor title), flowing into
 `ClaimedIncident.to_dict()`, i.e. the dashboard JSON and the model brief. The same title/body
 asymmetry the Slack sink and the brief each had in earlier rounds. Titles are short, so no
 headroom/budget dance — just both redactors.
 
-**The brief's own metadata needed the same floor and did not have it.**
+**The brief's own metadata gets the same floor.**
 `investigation_brief` prints the signal's `title`, `resource` and `url` alongside that
-redacted evidence, and rendered them raw. A signed webhook is accepted from anything able to
+redacted evidence. A signed webhook is accepted from anything able to
 POST JSON and a console link can carry a token in its query string, so provider metadata is
 exactly as untrusted as a fetched log line — and the brief goes into the agent's context, and
 from there into the transcript and any session artifact, so the metadata needs the same floor as
@@ -1204,15 +1239,7 @@ concurrent readers and writers can observe a cross it does not see. It uses no t
 on every platform. The "every writer holds the lock" structural test accepts delegation only
 when the wrapper does no read-modify-write of its own.
 
-Fencing the ceiling left it with **no write path at all**: `policy_store.set_rules` had zero
-callers, `PUT /settings` handled `mode` but not `autonomy_rules`, and `GET /rotation` returned
-only a rule *count*. So the app's headline `act` tier was unreachable — Settings said grants
-came from "patterns you have explicitly allowlisted with a rule", rendered an un-actionable
-empty state, and offered nothing to click; the manual said to edit `data/config.json`, which
-the keystone store does not read at all (and must not — see above). Every act-mode adopter
-silently got Propose behavior, with no error anywhere.
-
-The write path is `rotation.save_rules` → `policy_store.set_rules`, reached from the
+The write path is `rotation.validate_rules` → `policy_store.set_ceiling`, reached from the
 owner-only `PUT /settings` and nowhere else:
 
 - **Validation reuses `AutonomyRule.from_dict`** rather than restating the rules, because that
@@ -1254,7 +1281,7 @@ the authorization decision. The third is *who this instance is on the rotation*,
 | `schedule-file.strict_gating` | the same effect without needing anyone's login. Setting it false restores fail-open gating, so an *indeterminate* schedule reports `on_shift=True` — and an agent that can write `config.json` can also make the schedule indeterminate, since `rotation.yaml` lives in a repo it can edit. "Break the file, then disable strict gating" reproduces the forgery's result |
 
 Both live on the fenced floor. Fencing the READ alone is not enough: `PUT
-/provider/<id>/config` accepts exactly the keys an adapter declares in `config_fields` and
+/providers/<id>/config` accepts exactly the keys an adapter declares in `config_fields` and
 writes them to `config.json`, so `ScheduleFileRotationSource.config_fields` is **empty** —
 otherwise the generic provider route would be a second, non-keystone writer for an authorization
 input. Their sole writer is the owner-only `PUT /settings`
@@ -1267,9 +1294,9 @@ policy?" The off-shift refusal depends on these:
 |---|---|---|
 | 1 | `schedule-file.github_login` | claim to BE the on-call member (above) |
 | 2 | `schedule-file.strict_gating` | disable it and an indeterminate schedule permits |
-| 3 | `config_fields` advertising the login | a second, non-keystone writer via `PUT /provider/<id>/config` |
+| 3 | `config_fields` advertising the login | a second, non-keystone writer via `PUT /providers/<id>/config` |
 | 4 | `providers.<id>.enabled` | a vote that skipped any source where `configured()` is false would read the flag — so one flip would make the source abstain, nothing would answer, and the refusal would stop firing |
-| 5 | `pagerduty.user_id` | the same identity as #1, one adapter over — this app's OTHER rotation source |
+| 5 | `pagerduty.user_id`, `incidentio.user_id` | the same identity as #1, one adapter over — this app's OTHER rotation sources |
 | 6 | a source with no PRIVATE sync core | a vote that probed only `_on_shift_sync`/`resolve_now` — implementation details of the adapters this repo ships — would abstain when neither existed. `async on_shift()` IS the whole public `RotationSource` contract, so a correctly-written companion source reporting off shift would be counted as not answering, and a matching act-rule would execute a real provider write from an off-shift instance |
 | 7 | `pagerduty.schedule_ids` | the LAST agent-writable input this source consults. With `user_id` fenced, an empty schedule list that always reported `unknown` — a non-vote — would let clearing the list in `config.json` make PagerDuty stop answering and the refusal stop firing, with nothing about who is on call having changed |
 | 8 | `incidents/index.json` | not an input to the off-shift vote at all, but to WHICH SIGNAL is being authorized. `/incident/action` hands `incident.signal` (read from this file) to the gate, whose rules key on `source`/`resource`/`labels` — so an agent can pair a resource an operator's rule authorizes with a different provider target and have the gate approve one signal while the sink mutates another |
@@ -1285,7 +1312,8 @@ permits the action — the documented design, so a broken rotation cannot lock a
 but the agent cannot MANUFACTURE indeterminacy: PagerDuty reporting `on_shift=False` refuses
 the write whatever its `enabled` flag says.
 
-\#5 is fenced exactly like #1 (`policy_store.PAGERDUTY_USER_KEY`, dropped from `config_fields`,
+\#5 is fenced exactly like #1 (`policy_store.PAGERDUTY_USER_KEY` and
+`policy_store.INCIDENTIO_USER_KEY`, dropped from `config_fields`,
 written by `PUT /settings`). All three identities are reported back on `GET /rotation` under
 `identities` so Settings can render and edit them — the provider catalog does not carry them,
 and an operator who cannot see which identity is stored cannot tell a wrong one from an unset
@@ -1377,7 +1405,7 @@ that passes against the bug it names is worse than no test.
 
 `expire_stale_proposals` follows the same rule. Reading the index, testing each proposal and
 writing through `update_fields` as separate accesses would let the heartbeat read an expired
-draft, a concurrent `/incident/proposal` request revise or decide it, and the stale write stamp
+draft, a concurrent `/incident/propose` or `/incident/proposal/decide` request revise or decide it, and the stale write stamp
 `expired` over the newer state — reverting an operator's decision, or replacing a re-proposed
 draft with a dead one. The whole sweep therefore runs under one `_IndexLock`, re-reads each
 proposal from the locked index, and mutates in place via `dataclasses.replace` rather than
@@ -1400,7 +1428,7 @@ rather than rewriting the shared ledger from nothing.
 
 ### The keystone has a lock; every egress sink shares one seam
 
-**`policy_store` holds `_PolicyLock`.** All three writers (`set_mode`, `set_rules`, `put`) are
+**`policy_store` holds `_PolicyLock`.** Both writers (`set_ceiling`, which `set_mode` and `set_rules` wrap, and `put`) are
 read-modify-writes, and `atomic_write` REPLACES the file — so without a lock two concurrent
 settings PUTs would each write their own key onto a stale snapshot and the later one would
 silently revert the other. On this file that is a security defect rather than a lost-update
@@ -1529,7 +1557,9 @@ precisely what they asked not to happen.
 
 ### Autonomy gate (`backend/rotation.py`)
 
-`effective = min(app_mode, matching_rule_mode)` over `observe < propose < act`.
+`effective_mode(app_default, rule_mode)` (in `backend/models.py`) is
+`min(app_default, rule_mode)` over `observe < propose < act`, where `rule_mode` is
+the mode of the best matching rule.
 
 - Default `app_mode` is **`observe`** — nothing is written to any provider.
 - `act` requires **both** `app_mode == act` AND a user-authored rule whose
@@ -1551,14 +1581,14 @@ precisely what they asked not to happen.
   `actions: ["resovle"]` would filter down to nothing and the rule would then authorize ack,
   resolve, comment AND silence — one typo turning a narrow grant into the blanket one the bullet
   above refuses to let anyone express. A present-but-malformed `actions` (not a
-  list, empty, or holding any unknown verb) rejects the whole rule, and `save_rules`
+  list, empty, or holding any unknown verb) rejects the whole rule, and `validate_rules`
   surfaces that as a 400 naming the index so the operator fixes the typo instead of unknowingly
   running with more authority than they asked for. Omitting the key entirely still means every
   action — that is a choice made by omission, and is what the manual documents.
 - A rule can only NARROW the app ceiling, so it cannot escalate an instance the
   operator pinned to `observe`.
 - Every authorize decision — allow and deny — is SEL-audited as
-  `ops-mission-control.action_authorize`.
+  operation `action_authorize` (caller `core:ops-mission-control`).
 
 This deliberately diverges from a common shortcut: auto-resolving alert types believed
 to be always benign. A team that built those alerts itself can reason about which are
@@ -1596,9 +1626,9 @@ rather than a comment:
   necessary but not sufficient; the paths also converge on what happens after the write.
 - **The capability probe (`_sink_refuses`) FAILS CLOSED.** `supported_actions()` narrows which
   verbs a sink can perform — GitHub Issues supports only `{resolve, comment}`, so an authorized
-  `ack` there is an undefined `execute` call against a real repo. It first failed OPEN in three
-  ways — a missing method, a raising probe, and an EMPTY set all returned allow — which is that
-  exact undefined call reached three other ways. "Could not confirm support" is not "supported":
+  `ack` there is an undefined `execute` call against a real repo. A missing method, a raising
+  probe, and an EMPTY set all refuse, because allowing any of them would reach that exact
+  undefined call. "Could not confirm support" is not "supported":
   authorization says the operator permits the verb, not that this sink can perform it, so a
   broken probe against a production write refuses. `supported_actions` is part of the
   `ActionSink` protocol, so absence is a broken adapter, not a legacy one, and a raising probe
@@ -1806,9 +1836,8 @@ Two guards, both asserting the class rather than the known sites:
 Ambient credential chain only — profile, role, or instance role. The app never
 accepts, stores, or transmits an AWS access key. `boto3` is an **optional lazy
 import**: the module imports cleanly without it and the adapter reports
-unconfigured. Read-only permissions requested (`cloudwatch:DescribeAlarms`,
-`GetMetricStatistics`, `GetMetricData`, `logs:StartQuery`, `GetQueryResults`,
-`DescribeLogGroups`); no write permission.
+unconfigured. Read-only permissions used (`cloudwatch:DescribeAlarms`,
+`DescribeAlarmHistory`, `logs:StartQuery`, `GetQueryResults`); no write permission.
 
 ### Route gating
 
@@ -1894,7 +1923,7 @@ link", never to "a link somewhere else". Case is normalised first so an operator
 the field — the signal source's and the evidence adapter's via `_evidence_value` — because
 guarding one read leaves the same field open one namespace over.
 
-**A remote URL is refused, not stored, when it embeds a password.** A `ledger_sync_remote` of
+**A remote URL is refused, not stored, when it embeds userinfo.** A `ledger_sync_remote` of
 `https://user:ghp_xxx@github.com/org/repo.git` stored as-is would sit in a file served
 **without session auth**, and `redact_tokens` has no pattern for a PAT inside a URL; the
 frontend's `displayRemote()` strips userinfo for display only. `PUT /settings` rejects it (`remote_has_credentials`, 400) with a message telling the operator
@@ -1902,13 +1931,52 @@ to rotate the token and use a credential helper or SSH.
 
 Refused rather than silently stripped: the pasted token is compromised either way, and a
 remote quietly rewritten to an unauthenticated URL would fail to push later with no hint why.
-`_url_has_userinfo` parses with `urlsplit` and only flags a **password** on an http(s)
-remote, so the two legitimate `@`-bearing shapes keep working — scp-style
+`_url_has_userinfo` parses with `urlsplit` and flags **any** userinfo (a username alone
+included, the position GitHub's token remote puts a PAT in) on an http(s) remote, so the two legitimate `@`-bearing shapes keep working — scp-style
 `git@github.com:org/repo.git` (no `://`, so no userinfo) and `ssh://git@host/...` (a username
 authenticating by key, not a secret).
 
 `PUT /settings` refuses an unrecognized `mode` rather than falling back — a typo
 must not quietly change what the agent is allowed to do.
+
+### The agent tool (`POST /agent-tools`)
+
+`ops_mission_control_api` is the agent's only credentialed path to this surface, and it
+is this app's own (`app-kit-platform.md`, section 30.1): `app.json` declares it in
+`agentTools`, the core lists it in `kirocrew-core`, checks a call's arguments against the
+declaration, and posts it to the gateway's `/api/app-tools/call`, which hands it to the
+route registry. The built-in's other routes are mounted on the gateway router, which that
+handler never dispatches to, so `backend.hooks.routes` names `backend/agent_tool_hook.py`,
+which registers `POST /agent-tools` alone, behind `_require_enabled`.
+
+The route (`backend/http_routes/agent_tool.py`) decides everything the declaration's
+schema subset cannot:
+
+- only an exact `(method, path)` of `ALLOWED_CALLS` is dispatched: the SOP surface, never
+  `/incident/proposal/decide`, `/incident/propose`, `/proposals`, `/providers*`,
+  `/settings`, `/webhook` or bare `/incident`;
+- a query only on GET, of value-position characters only (`^[A-Za-z0-9_.=&%+,:-]*$`, at
+  most 512), so it can never rewrite the path; a body only on POST, at most 32,768
+  characters, and only a JSON object;
+- the decoded body goes through `routes._scrub_inbound` (`sanitize_json_values`, then
+  `redact_via_context` on every string, keys included) before a handler reads it, because
+  the schema saw `body_json` as one string in which an escaped `\u200b` is plain ASCII,
+  and a ledger entry persists and syncs to the team remote;
+- `POST /rotation/arm` arms this app's crons, which fire unattended after the caller's
+  turn, so a caller whose forwarded `X-Session-Key` is a channel agent's is refused with
+  403 `channel_agent_refused` and an `agent_tool` / `denied` audit row; every other call of
+  a channel agent stays reachable. That header is the one `kirocrew-core` sent to
+  `/api/app-tools/call`, so the hold is only as strong as the gateway's attestation of it
+  (`token_auth`'s `_verify_unix_peer` on the unix socket): loosening that check weakens
+  this hold too.
+
+An allowed call is answered by the handler the route of that `(method, path)` serves
+(`routes._AGENT_TOOL_HANDLERS`, read by name on every call), behind the same enable gate,
+through an `AgentCall` view of the forwarded request: aiohttp cannot clone a request whose
+body the gateway already read. So every route's validation, audit and response shape is
+the one a direct call gets, and the answer is relayed unchanged for the core to redact and
+cut at the declared 60,000 characters. No route of this app is admitted to internal-secret
+callers.
 
 ### The postmortem is a redaction sink
 
@@ -1918,13 +1986,13 @@ must not quietly change what the agent is allowed to do.
 the app's `secrets.redact_tokens` (provider-token shapes). Both are needed and it is
 worth naming why, because picking one looks sufficient: core alone leaves a bare-hex
 Datadog key and a prefix-less `Bearer` token in place, and the app pass alone leaves
-an AWS access key id. `registry.gather_evidence` composes them the same way, so the
+an AWS secret key. `registry.gather_evidence` composes them the same way, so the
 two paths provider text leaves this app sanitize to one standard.
 
 **The pre-push ledger scan follows the same rule.** `ledger_sync._credential_bearing_lines` is
 the last gate before bytes leave the machine for the team's shared git remote, and the asymmetry
 documented here for the postmortem applies verbatim: the core scan
-(`security.iter_credential_matches`) misses `ddapp_0123…` while `redact_tokens` misses
+(`security.iter_credential_matches`) misses a prefixed Datadog application key (`ddapp_…`) while `redact_tokens` misses
 `AKIAIOSFODNN7EXAMPLE`, so a scan using one of them would commit and push a legacy row (written
 by an older build, or by any path other than `POST /ledger`) carrying a provider token. The scan
 flags a line if EITHER detector does, and a structural test asserts both are called so a private
@@ -1939,7 +2007,7 @@ scanners over those is a verified no-op.
 
 **What this does and does not promise.** It masks credential *shapes*: recognized
 vendor key formats, the carrier forms (`Bearer …`, `token=…`, `DD-APPLICATION-KEY:
-…`), and exfiltration URLs. It does **not** understand meaning, so it will not remove
+…`), inside URLs too. It does **not** understand meaning, so it will not remove
 an internal hostname, a customer identifier, a stack trace naming private code paths,
 or a secret with no recognizable shape. The artifact is safe to share in the sense
 that a credential is very unlikely to ride out inside it; it is **not** a
@@ -1993,8 +2061,8 @@ discard every *other* queued delivery.
 Even the heartbeat cannot safely drain: `run_cycle` claims at most `max_claims` per cycle, so a
 burst larger than the cap would have its remainder destroyed by the very poll that delivered
 it. Tying consumption to "an incident owns this id" is what makes the cap safe.
-`maxlen` still bounds the spool, so a sender that permanently outruns the heartbeat drops
-oldest-first, and a read never triggers that.
+`maxlen` still bounds the spool, so a sender that permanently outruns the heartbeat is
+refused once it is full (see below), and a read never triggers that.
 `webhook.reset_spool()` exists for test isolation only and is named so it cannot be
 mistaken for a consumer.
 
@@ -2030,8 +2098,8 @@ implementations, hook what they share, not what one of them happens to call.
 `candidates`, so they are never claimed — and if only the `claimed` set were acked they would
 never leave the spool either. A sender that redelivers while an investigation is in flight
 (Alertmanager repeats every `group_interval`; a webhook script retries) would accumulate copies
-of a signal already being worked, and on a full 200-entry spool those would evict a NEW unclaimed
-alert. The rule: every place a signal becomes **or
+of a signal already being worked, and those copies would fill the 200-entry spool until a NEW alert
+was refused. The rule: every place a signal becomes **or
 already is** durable has to acknowledge it, not just the place that claims it. Safe by the same
 durability argument — an id in `owned` has an incident on disk, so dropping the spooled copy
 loses nothing, and once that incident goes terminal or stale the id leaves `owned` and the next
@@ -2039,11 +2107,12 @@ genuine delivery is claimable again.
 
 **Both places a claim becomes durable ack.** `dispatch.run_cycle` and `POST /incident/claim` —
 the board's manual claim — both do; otherwise a hand-claimed webhook signal would stay spooled
-forever, and on a full (200-entry) spool the next signed delivery would evict the OLDEST
-unclaimed entry to make room for a duplicate nobody needed, losing a real alert. The ack there is unconditional and needs no source check — `ack` on
+forever, and the duplicates would fill the 200-entry spool until the next signed delivery
+was refused, delaying a real alert behind copies nobody needed. The ack there is unconditional and needs no source check — `ack` on
 an id that is not spooled removes nothing, so a future push provider is covered for free.
 
-**Check order is load-bearing** (`webhook.enqueue`): enabled → secret → size →
+**Check order is load-bearing** (`webhook.enqueue`): governance source refusal
+(`app_source_refusal`) → enabled → secret → size →
 signature → parse. Nothing unauthenticated is ever handed to `json.loads`, and an
 oversized body is refused *before* it is hashed. `test_webhook.py` pins the order by
 asserting an unsigned malformed body is rejected for its **signature**, not its
@@ -2079,8 +2148,9 @@ in the adapter:
   ceiling (`_MAX_ALERT_PAGES`) refuses a cursor walk that never terminates rather than reporting
   a partial estate as complete.
 
-All five return `providers.base.TruncatedSignals` (a `list` subclass) when the source had more
-than a poll can carry, and `poll_all` marks the poll non-authoritative — the same
+Datadog, GitHub Issues, PagerDuty and incident.io return `providers.base.TruncatedSignals` (a
+`list` subclass) when the source had more than a poll can carry, CloudWatch returns its `limit + 1`
+list for the registry's post-slice check, and `poll_all` marks the poll non-authoritative — the same
 `snapshot=False` channel, honoured even when a client-side filter brought the surviving count back
 under the cap.
 
@@ -2154,7 +2224,7 @@ deliberately not made here**. Both are reachable today via any forwarder that ca
 
 **Rejection status codes are differentiated** (`_webhook_reject_status`): 401 for
 trust failures (not enabled / no secret / signature mismatch), 413 for an oversized
-body, 400 for payload faults (malformed JSON / non-object / no title). A single 401 for everything
+body, 400 for payload faults (malformed JSON / non-object / no title), 503 for a full spool. A single 401 for everything
 would tell a sender debugging a bad payload "Unauthorized", so they would re-check credentials
 that were fine, while a real signature failure would look identical to a typo. An *unrecognized* reason deliberately falls
 through to **401**, not 400 — a refusal we cannot classify should not be advertised
@@ -2204,19 +2274,21 @@ off-shift instance could never re-arm itself (`test_store_and_gate_arming.py` as
 `enabled: false`, and `POST /rotation/arm` arms *only* the `on_shift` tier — it cannot
 pause an `always` job and deliberately leaves `primary` alone (see "Arming is
 server-side"). So a cron on any other tier that ships disabled stays disabled **forever**.
-"It must not fire before a provider is configured" is answered by the step-0 cheap exit, not
-by shipping paused.
+"It must not fire before a provider is configured" is answered by each enabled cron's cheap
+exit, not by shipping paused.
 
 What ships enabled is therefore exactly the non-`on_shift` crons: `rotation-check` (`always`)
-and `ledger-hygiene` (`primary`), each with an explicit step-0 guard (`configured=true` → else
-`NO output`), so a fresh install still pays nothing. `ledger-hygiene` is the ONLY caller of the
+and `ledger-hygiene` (`primary`). `ledger-hygiene` carries an explicit step-0 guard
+(`configured=true` → else `NO output`). `rotation-check` has no early stop: it always POSTs
+`/rotation/arm` and stays silent on an empty `changed` list, because that route is the only
+thing that pauses `dispatch` and `reconcile` again once the last signal source is removed. `ledger-hygiene` is the ONLY caller of the
 git ledger sync, the vector-index import, and closed-incident pruning, so a paused one would
 leave all three dead in production. `reconcile` and `dispatch` are `on_shift` crons
 (`rotation.TIER_CRONS`): they ship paused (`enabled: false`) and `POST /rotation/arm` arms them,
 because `reconcile` POSTs `incident/transition` and edits the incident's Slack message, and on
 a team every armed instance would race to do the same. Two tests pin the rule generically —
-every non-`on_shift` cron must ship enabled, and every *enabled* cron must carry the cheap
-exit — rather than naming one job.
+every non-`on_shift` cron must ship enabled, and every *enabled* cron must carry a cheap
+exit (the `configured=true` stop or the arm route) — rather than naming one job.
 
 ### Rotation without a rotation service (`providers/schedule_file.py`)
 
@@ -2271,11 +2343,101 @@ everyone, which is precisely the failure a rotation exists to prevent. Fallbacks
 `test_the_always_on_default_does_not_mask_a_real_rotation` plus a companion test that the
 floor still arms a solo operator.
 
+### The on-call roster (`describe()["roster"]`)
+
+`GET /rotation` and `/state` carry a `roster` the board's on-call card renders. Two
+sources build it, in the same shape, each tagged with `source`:
+
+| `source` | Built by | Holds |
+|---|---|---|
+| `schedule-file` | `schedule_file.roster()` | the whole team from `rotation.yaml`, every shift in the file |
+| `incidentio` | `incidentio.roster()` | the `final` entries of every configured `schedule_ids` over the next 14 days |
+
+`rotation._roster_safely` picks one: a committed `rotation.yaml` wins, because it is the
+team's schedule and the one the shared ledger and leader election read. Otherwise the
+incident.io roster, which is `{}` unless the provider is on and the keystone holds
+`incidentio.user_id` — without an identity there is no "you" to build it around.
+
+The incident.io roster is **display only and never an authorization input**: the off-shift
+vote still comes from `_on_shift_sync` alone. It rides on the polled `/state`, so it is
+cached for 5 minutes (60 s after a failed read, or as long as a 429's `Retry-After` asks, if
+longer) keyed on the identity and the schedule list.
+Only one read builds it at a time: concurrent cache misses wait for that build and reuse it, so
+a burst of polls makes one vendor walk and a later-finishing failure cannot overwrite a fresh
+success. It walks each schedule's entries by passing `pagination_meta.after` back as
+`entry_window_start`, the endpoint's documented paging. `login` and `me` carry the
+incident.io user id, since display names are not unique, and `name` is what the card shows.
+
+Both the walk and what the cache keeps are bounded, because `schedule_ids` is agent-writable
+and the roster rides on a polled route. A read walks at most `_MAX_ROSTER_SCHEDULES` schedules
+(that capped, clamped list, with the configured count and the clamped identity, is the cache
+key), and pages stream through one at a time into a heap that keeps only the soonest
+`_MAX_ROSTER_WINDOWS` shifts. A member exists only for a kept shift, and ids and names are
+clamped to `_MAX_ROSTER_TEXT` before they are kept. The count left out, and any schedules not
+walked, are logged once per read. One deadline, `_ROSTER_WALK_DEADLINE_SECS` (8 s), is checked
+between requests across the whole walk, and each request has its own
+`_ROSTER_REQUEST_TIMEOUT_SECS` (5 s) per socket operation. That is a soft bound on how long a
+cache-miss board poll waits, not a guarantee: no enclosing timeout wraps `rotation.describe`.
+A read that still has a request to START once the deadline has passed, or that reaches the page
+cap, ends as the `cut_short` error, never as a partial roster (a request already in flight when
+the deadline passes may finish, and its read then succeeds normally); that
+code is kept apart from `unreachable` so the board names this app's own limit rather than
+sending the operator to check their key or the vendor's status. When a cap does leave
+shifts or schedules out, the roster says `partial: true` and the card says the list is partial.
+`me_on_roster` is decided from every entry the walk saw, kept or not, so a cap that drops this
+operator's own shift never reads as "you are on no schedule". The windows may be served from
+the cache, but `current` and `on_call_now` are recomputed on every read, so the card's badge
+moves at handover with the header rather than up to five minutes later.
+
+An identity with **no** `schedule_ids` is not `{}`: it is the state in which this source votes
+off shift on every check (see the fence above), so the roster comes back with members empty and
+an error naming it. The card renders for any incident.io roster, members or not, since its
+empty states (no `schedule_ids`, a failed read, a window with no shifts) are what it explains. Both incident.io roster errors
+travel as `error_code` (`no_schedule_ids`, `cut_short`, or `unreachable` with `error_status`)
+and the board translates them; the English `error` beside it is for logs. An `unreachable`
+with a 401 or 403 is shown as the key being refused, since that is an answer about the
+credential, not about connectivity. For incident.io,
+`me_on_roster` false means only "no shifts in the next two weeks", which a rotation longer than
+that produces on a correct setup, so the card states that fact and names the settings only as
+"if you expected one".
+
+An identity that names **nobody** fails the same way, silently. A real install held a display
+name in `incidentio.user_id`, and before that an id incident.io answered 404 for. Both match
+no entry, so the rotation read the operator as off shift with nothing saying why. So `PUT
+/settings` asks `GET /v2/users/{id}` (`incidentio.user_exists`) during validation, meaning a refusal writes no sibling field either. The lookup has its own
+short timeout (`_USER_CHECK_TIMEOUT_SECS`), since it runs inside the operator's save, and it
+runs whenever a key is stored, even with the provider switched off: an id saved then is the
+identity the rotation reads once it is switched back on. Only a
+definite 404 refuses (and an id that cannot be encoded, such as a lone surrogate from a
+hand-written JSON escape, is refused the same way rather than crashing the save), with `unknown_incidentio_user`. With no API key yet, or on any other failure, the save
+goes ahead: an outage must not lock the operator out of a field only they can write. A
+malformed stored key, which fails while the request is built, counts as "cannot say" too, and
+is logged by type only: the header-encoding error quotes the key.
+
+`pagerduty.user_id` has the same failure (a wrong id filters `/oncalls` to nothing) but no
+save-time check yet. A check that refused every id, because a vendor call was subtly wrong,
+would lock the operator out, so it waits until PagerDuty's `GET /users/{id}` has been confirmed
+on a live account to 404 only for an unknown user.
+
+A failed roster read shows a fixed, translated phrase with the HTTP status, and the vendor's
+error body goes to the log. The status is what an operator acts on; a raw error body in the
+card read as the app breaking.
+
+The card branches on `source`, never on which fields happen to be present. The `rotation.yaml`
+warnings (GitHub login, strict gating) appear only for `schedule-file`, incident.io's own
+remedy only for `incidentio`. Settings' on-call schedule card is handed only a
+`schedule-file` roster (or the source-less `{}`), because it seeds its GitHub-login field from
+`roster.me`. It is admitted by name so that a roster source added later is kept out without an
+edit there. Both sources get
+"Your next shift", read from `windows`.
+
+PagerDuty has no roster yet. `/oncalls` accepts `since`/`until`, so the same builder applies.
+
 ### Arming is server-side: `POST /rotation/arm`
 
 **The agent does not choose which crons to pause, and no longer holds `cron_pause` at
-all.** `rotation.apply_tiers(shift, cron_service)` computes the tier map and moves the
-app's jobs itself; the rotation-check cron just POSTs `/rotation/arm` and reports whether
+all.** `rotation.apply_tiers(shift, cron_service, watching=...)` computes the tier map and
+moves the app's jobs itself; the rotation-check cron just POSTs `/rotation/arm` and reports whether
 `changed` came back non-empty.
 
 This replaced an agent-driven loop, and the reason is worth keeping: off shift the armed
@@ -2363,9 +2525,9 @@ heartbeat's cost flat at a 2-minute cadence.
    second occurrence of a failure cheaper than the first; without it the ledger is
    decorative. `record_use` returns the UPDATED entry so a brief cannot report
    "used 0×" for a pattern the same incident just used.
-5b. **`webhook.ack({claimed ids})`** — the ONE place the push spool shrinks, and only for
-   ids that have an incident on disk. Anything the cap deferred, anything already
-   owned, and anything lost to a claim race stays spooled for a later cycle. See § Webhook ingress
+5b. **`webhook.ack({claimed ids} | owned)`** — where the heartbeat shrinks the push spool (the
+   board's manual claim is the other place), and only for ids that have an incident on disk.
+   Anything the cap deferred and anything lost to a claim race stays spooled for a later cycle. See § Webhook ingress
    for why draining on `poll` loses data.
 6. **`verify_pending_actions`** — for every incident whose post-action recheck has come
    due, re-read whether its signal is still firing, using the poll THIS cycle already
@@ -2505,13 +2667,13 @@ uses them.
 
 `slack_out._safe()` is the single chokepoint for everything outbound and applies
 `security.redact` **and** `secrets.redact_tokens`. Neither is a superset of the other:
-`redact` knows AWS keys and exfiltration URLs, `redact_tokens` knows the PROVIDER-specific
+`redact` knows AWS secret keys and credentials inside URLs, `redact_tokens` knows the PROVIDER-specific
 token shapes this app handles.
 
 A Datadog app-key shape and a PagerDuty `u+` token both pass through `redact` **completely
 unchanged** and are masked only by `redact_tokens`, so a single pass would republish a
 provider-authored alarm title carrying a key into the channel verbatim. A test using only an
-`AKIA` key, which `redact` *does* catch, would stay green either way.
+AWS secret key beside its key ID, which `redact` *does* catch, would stay green either way.
 
 One function rather than three call sites: three sites each remembering two passes is three
 chances to forget the second. A test asserts the only
@@ -2598,8 +2760,8 @@ a future "just add a token field" regression.
 The consequence is a real dependency rather than a hidden one: with Slack
 unconfigured on Kiro Crew itself, this channel is unavailable, and `status()`
 distinguishes the three cases (off / no channel / no host Slack) because each has a
-different fix. The channel ID **is** stored in plain app config — it is not a
-credential.
+different fix. The channel ID is stored in the operator-only policy store (`policy_store`), not the
+keystone — it is not a credential, but it is an outbound destination.
 
 ### Explicit client, no global
 
@@ -2697,7 +2859,7 @@ deep link: the page selects an incident from React state and reads no query para
 
 **Default off.** `notify_enabled` absent reads as False, so every existing install stays
 silent until an operator flips the toggle. Not a credential, so it lives in plain
-`config.json` alongside the Slack channel id.
+`config.json`.
 
 **Redacted at the producer, both passes**, matching `store.write_log`,
 `registry.gather_evidence`, and `slack_out._safe`. Core `security.redact` leaves `401 from https://api.datadoghq.com?api_key=<hex>`
@@ -2768,8 +2930,8 @@ Invariants:
 - **Headline ordering is load-bearing:** no coverage → work waiting on you → the
   ordinary case. "Nothing is watching" must outrank everything, because a board with no
   configured source looks calm and reporting "all quiet" would be actively misleading.
-- **Unproven patterns are visibly unproven.** `proven` reuses the ledger's own
-  `FAST_PATH_*` constants rather than restating "verified/high" — a digest that
+- **Unproven patterns are visibly unproven.** `proven` asks the ledger's own
+  `entry_unlocks_fast_path` rather than restating "verified/high" — a digest that
   disagreed with the engine about what counts as proven would tell a responder to trust
   the wrong entry.
 - **Escalated is read from the index, not the open set.** It is a terminal status, so
@@ -2792,8 +2954,14 @@ that tier. `rotation-check` must start live to arm it; otherwise a user can enab
 and configure CloudWatch while dispatch never starts. `ledger-hygiene` starts live and
 is primary-gated by its route instead of by cron arming.
 
-Safe to arm because its SOP's **step 0** exits with no output when no provider reports
-`configured: true`, so a fresh install pays nothing for a 5-minute poller. Both halves
+Safe to ship enabled because `POST /rotation/arm` keeps the `on_shift` tier paused while
+no signal source is configured, so a fresh install never arms `dispatch` (a model turn
+every 2 minutes). The built-in "Always on shift" rotation and "Observe only" action sink
+always report `configured: true`, so a `configured` check in `/state` cannot answer this;
+the route asks `registry.may_be_watching()`. That answers False only when every signal
+source says it is not set up: a `configured()` that raises, or an app config or secret
+store that exists but cannot be read, counts as maybe watching, so a transient fault never
+pauses a live shift. Both halves
 are pinned (`test_rotation_check_ships_enabled_or_nothing_ever_arms`,
 `test_rotation_check_exits_cheaply_when_unconfigured`) plus the Playwright cron check.
 
@@ -2832,8 +3000,10 @@ returns to paused after a disable→enable cycle.
 ├── config.json            # NON-SECRET only (served unauthenticated)
 ├── incidents/index.json   # dispatch index — {incident_id: Incident}
 ├── incidents/<id>.md      # postmortem, written when the incident CLOSES (0o600)
-└── ledger.jsonl           # append-only LedgerEntry stream
+├── ledger.jsonl           # append-only LedgerEntry stream
+└── rotation.yaml          # optional team schedule, git-synced with the ledger
 <crew_home>/ops_mission_control_secrets.json   # KEYSTONE (see contract 4)
+<crew_home>/ops_mission_control_policy.json    # operator-only policy store
 ```
 
 All writes go through `atomic_write`. File locking goes through
@@ -2922,6 +3092,13 @@ review time, not to simulate the platform.
 - `.../backend/secrets.py` — keystone token store, `SecretBackend` seam, redaction
 - `.../backend/registry.py` — ADD-only registry, fan-out
 - `.../backend/rotation.py` — autonomy gate, tier arming
+- `.../backend/policy_store.py` — the operator-only policy store (mode, act-rules,
+  outbound destinations, identities)
+- `.../backend/ledger_sync.py`, `.../backend/ledger_index.py` — the ledger's git exchange
+  and its vector index
+- `.../backend/slot_watch.py`, `.../backend/handover.py`, `.../backend/slack_out.py`,
+  `.../backend/companion.py` — derived status, the handover digest, the Slack pin board,
+  companion discovery
 - `.../backend/dispatch.py` — **the cycle**: poll → claim → ledger-match → sweep,
   plus `investigation_brief`
 - `.../backend/notify_out.py` — the local notification bus as an output channel: three
@@ -2930,8 +3107,9 @@ review time, not to simulate the platform.
   every full path, the `_require_enabled` gate, `_audit`, the `_safe_outbound` redaction floor
   (the registered sink for the ledger write), `_index_ledger_safely`, a handler for each of the
   nineteen routes whose projection calls a seam (the other six register the projection
-  itself), three signature-preserving adapters, and re-exports of every other name `routes.py`
-  defined. It must stay this plain module at this path: `app.json`, the package `__init__`, the
+  itself), three signature-preserving adapters, the agent tool's handler with its two seams
+  (`_scrub_inbound`, `_served_call` over `_AGENT_TOOL_HANDLERS`), and re-exports of every
+  other name `routes.py` defined. It must stay this plain module at this path: `app.json`, the package `__init__`, the
   security posture registry and the SOP→route scanner all address it.
 - `.../backend/http_routes/` — the handler bodies, one module per slice (none imports `routes`):
   - `_shared.py` — `_json_body`, `_require_bool`, `_store_read_refusal`, `_slack_client`, the
@@ -2951,7 +3129,13 @@ review time, not to simulate the platform.
   - `ledger.py` — `/ledger` read, write and delete, `/ledger/contradictions`,
     `/ledger/hygiene`;
   - `webhook.py` — the bounded, signed `/webhook` ingress: `_read_capped` and
-    `_webhook_reject_status`.
+    `_webhook_reject_status`;
+  - `agent_tool.py` — `/agent-tools`, the `ops_mission_control_api` agent tool: its
+    allowlist (`ALLOWED_CALLS`), the query and body rules, the channel-agent hold and the
+    `AgentCall` view an allowed call is answered through.
+- `.../backend/agent_tool_hook.py` — `backend.hooks.routes`: registers `POST /agent-tools`
+  alone with the route registry, which is where the gateway's `/api/app-tools/call` hands
+  an in-gateway app's tool call (the other routes stay on the gateway router).
 - `.../backend/providers/` — the four Protocols + public adapters; the package
   `__init__` also owns config read/merge (`merge_provider_config`, `set_top_level`)
 - `src/kiro_crew/builtin_skills/ops-mission-control/` — the agent skill AND the
@@ -2974,13 +3158,13 @@ review time, not to simulate the platform.
 
   A token recipe cannot fix this — the builtin security rules block agents from minting
   gateway tokens, by design. Agent access goes through the `ops_mission_control_api`
-  MCP tool instead: the MCP server process holds the gateway's internal secret and
-  forwards only a frozen (method, path) allowlist; the agent never sees a credential
-  (the `issue_radar_record_investigation` precedent). Each SOP names the tool and its
-  paths because a cron agent may read **only** its own SOP. Tests pin the three planes
-  to one surface: the allowlist in `validation_parts/app_schemas.py`, the schema rejecting off-surface
-  calls, and the gateway's mixed-internal path set admitting exactly the allowlisted
-  routes — see `apps/builtins/ops_mission_control/tests/test_agent_api_tool.py`.
+  agent tool instead: the `kirocrew-core` MCP server lists it from this app's manifest and
+  forwards each call to the gateway, which hands it to this app's `/agent-tools` route;
+  the agent never sees a credential. Each SOP names the tool and its paths because a cron
+  agent may read **only** its own SOP. Tests pin the planes to one surface: the
+  declaration's path enum equal to the route's allowlist, the route refusing off-surface
+  calls before any handler runs, and no route of this app admitted to internal-secret
+  callers — see `apps/builtins/ops_mission_control/tests/test_agent_api_tool.py`.
 
   **The SOP→route contract scanner matches the *path*, not a literal prefix.** Filtering lines
   on a literal `GATEWAY/api/apps/...` prefix would leave routes unguarded once the SOPs derive
@@ -3229,6 +3413,14 @@ line-anchored so a genuinely internal reference in that file is still caught.
 - `test_provider_secret_owner_gate.py` — the owner gate on `PUT` / `DELETE
   /providers/{id}/secret`: a non-owner subject and every app token are refused `403`
   `owner_only` before the body is read
+- `test_agent_api_tool.py` — the `ops_mission_control_api` agent tool: the declaration
+  (validated, read as first party from the shipped `app.json`, no core tool of the same
+  name, the title-table row, the path enum equal to the allowlist, the bounds), every
+  refusal landing before a handler runs, the inbound scrub reaching a ledger write, the
+  channel-agent hold and the read surface it leaves, every allowed call answering through
+  the tool as its direct route does, the gateway's own path (field engine,
+  `/api/app-tools/call`, the route registry loading `backend.hooks.routes` from the
+  shipped root), and no route of this app admitted to internal-secret callers
 
 Frontend: `website/src/apps/ops-mission-control/opsMissionControl.test.ts` (route registration, panel-parity
 assertions read from the .tsx source, and the pure helpers `describeSourceHealth` /

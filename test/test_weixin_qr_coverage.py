@@ -184,6 +184,19 @@ def test_a_confirmed_sign_in_that_cannot_be_saved_is_reported_and_ends_the_sessi
     assert (client.close.await_count, sessions) == (1, {})
 
 
+def test_a_sign_in_refused_by_a_pending_config_reaches_the_dashboard_chain(sessions, monkeypatch):
+    """Not a 500: the refusal propagates so the chain answers its 409 code."""
+    from kiro_crew.config.loader import PendingEditBlocksSave
+
+    monkeypatch.setattr(qr, "_stage_weixin_config", lambda **kw: (Path("config.json"), "{}"))
+    refused = PendingEditBlocksSave("config.json")
+    monkeypatch.setattr(qr, "_commit_credential_and_config", MagicMock(side_effect=refused))
+    client = _client({"status": "confirmed", **CREDS})
+    with pytest.raises(PendingEditBlocksSave):
+        _poll(sessions, client)
+    assert (client.close.await_count, sessions) == (1, {})
+
+
 def _config(creds: dict[str, str] | None = None, **weixin: Any) -> SimpleNamespace:
     """What ``KiroCrewConfig.load()`` returns: a weixin section and a credential store."""
     section = {"enabled": True, "account_id": "acct", "dm_policy": "open", "token": ""}
@@ -262,8 +275,8 @@ def _save(monkeypatch, tmp_path: Path, body: Any, config: str = "{}", state: Any
 @pytest.mark.parametrize(
     ("body", "reply"),
     [
-        (ValueError("not json"), {"error": "invalid JSON"}),
-        (["a list"], {"error": "body must be an object"}),
+        (ValueError("not json"), {"error": "invalid JSON", "code": "invalid_json"}),
+        (["a list"], {"error": "body must be an object", "code": "body_not_object"}),
         ({"enabled": "yes"}, {"error": "enabled must be a boolean"}),
         ({"dm_policy": "everyone"}, {"error": "invalid dm_policy"}),
         ({"allowed_user_ids": "u-1"}, {"error": "allowed_user_ids must be a list"}),

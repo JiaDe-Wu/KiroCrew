@@ -9,6 +9,7 @@ import AwsConsentGate from '../../components/AwsConsentGate'
 import { i18nT } from '../../i18n/t'
 import { Info } from 'lucide-react'
 import ErrorNotice from '../../components/ErrorNotice'
+import { useViewerIsNotOwner } from '../../hooks/sharedCrew/useSharedCrew'
 import SpeechProviderNotice from '../../components/SpeechProviderNotice'
 import { parseSpeechProviders, speechProviderNotice, speechProviderOptions } from '../../lib/speechProviders'
 import { languageOptionLabel } from '../../lib/sttProviders'
@@ -122,6 +123,9 @@ export function VoicePanel() {
   // (install one, or switch provider), so it is surfaced rather than left to a
   // failed synthesis. Only claimed once the probe has actually answered.
   const systemUnavailable = isSystem && systemVoicesQ.isSuccess && !systemVoicesQ.data.available
+  // The engine is installed on the Crew's computer, which a teammate cannot reach,
+  // so they get the same status without the install command.
+  const { notOwner } = useViewerIsNotOwner()
   // A failed probe would otherwise collapse to a picker offering only the OS
   // default, which reads as "this host has one voice" rather than as a failure.
   const systemVoicesFailed = isSystem && systemVoicesQ.isError
@@ -161,8 +165,6 @@ export function VoicePanel() {
     onError: (_err, _vars, ctx) => {
       if (ctx?.prev) {
         qc.setQueryData(['voiceConfig'], ctx.prev)
-        setLocalProfile(ctx.prev.aws_profile || '')
-        setLocalRegion(ctx.prev.region || '')
         window.dispatchEvent(new CustomEvent('voice-config-changed', { detail: ctx.prev }))
       }
       setSaveError(i18nT('pages.settings.voicePanel.failed_to_save_voice_config'))
@@ -186,11 +188,9 @@ export function VoicePanel() {
 
   return (
     <>
-      {/* askAgent ON: `onError` above has already reverted localProfile /
-          localRegion to the server value
-          by the time this banner shows, so the navigation cannot destroy an
-          unsaved edit — the fields hold exactly what is persisted. */}
-      <ErrorNotice message={saveError} onDismiss={() => setSaveError('')} className="mb-4 animate-rise" askAgent />
+      {/* No hand-off: a failed save leaves the profile or region draft in the
+          fields so it can be retried. */}
+      <ErrorNotice message={saveError} onDismiss={() => setSaveError('')} className="mb-4 animate-rise" />
 
       <SettingsSection title={i18nT('pages.settings.voicePanel.text_to_speech')}>
         <SettingsCard>
@@ -223,7 +223,9 @@ export function VoicePanel() {
                        user who installs espeak-ng would otherwise stare at this
                        line until a full reload. */
                     <div className="flex flex-wrap items-center gap-2 mb-2 text-[13px]" data-testid="system-engine-absent">
-                      <span className="flex items-center gap-1.5"><Info size={13} className="lucide-inline" /> {i18nT('pages.settings.voicePanel.this_host_has_no_built_in_speech_engine_install_es')}</span>
+                      <span className="flex items-center gap-1.5"><Info size={13} className="lucide-inline" /> {notOwner
+                        ? i18nT('pages.settings.voicePanel.no_engine_teammate')
+                        : i18nT('pages.settings.voicePanel.this_host_has_no_built_in_speech_engine_install_es')}</span>
                       {/* "Check again", not "Retry": nothing failed here. The engine is
                           absent, so this re-runs detection after the user installs one --
                           the two genuine fetch failures below keep "Retry". */}

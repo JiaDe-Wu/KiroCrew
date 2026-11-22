@@ -232,7 +232,7 @@ def test_workflow_routes_every_scope_without_changing_local_defaults(jobs):
     assert "ipv6_required" not in config["tool:pytest"]["addopts"]
     assert "real_venv" not in config["tool:pytest"]["addopts"]
     assert config["tool:pytest"]["testpaths"] == "test src/kiro_crew/apps/builtins"
-    for name, expected_count in (("backend-test", 4), ("backend-test-windows", 1)):
+    for name, expected_count in (("backend-test", 4), ("backend-test-windows", 4)):
         body = _step(jobs, name, "Run tests")["run"].replace("\\\n", " ")
         commands = re.findall(r"^\s*(?:python -m )?pytest .+$", body, re.MULTILINE)
         assert len(commands) == expected_count
@@ -301,7 +301,7 @@ def test_workflow_routes_every_scope_without_changing_local_defaults(jobs):
     assert (
         "backend-test-ipv6" in gate["needs"]
         and gate["if"]
-        == "${{ !cancelled() && (github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true') }}"
+        == "${{ !cancelled() && (github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true' || github.actor != 'github-merge-queue[bot]') }}"
     )
     guard = _step(jobs, "coverage-gate", "Require upstream")
     assert guard["env"]["IPV6"] == "${{ needs.backend-test-ipv6.result }}"

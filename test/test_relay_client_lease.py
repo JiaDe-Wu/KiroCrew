@@ -25,10 +25,13 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from relay_client_helpers import (
     OWNER,
+    TOKEN,
     FakeCrew,
     FakeRelay,
     RecordingSleep,
+    StaticHostTokenSource,
     TopRng,
+    drop_unanswered,
     fixture,
     make_client,
     ready_frame,
@@ -36,12 +39,15 @@ from relay_client_helpers import (
     valid_message,
 )
 
+from kiro_crew.atomic_write import read_bytes_with_retry
 from kiro_crew.platform_compat import IS_POSIX
 from kiro_crew.relay_client import lease as lease_module
+from kiro_crew.relay_client.client import RelayClient
 from kiro_crew.relay_client.lease import (
     AWS_JSON_CONTENT_TYPE,
     DEFAULT_DISPLAY_NAME,
     INSTANCE_ID_FILE,
+    RELEASE_TARGET,
     RENEW_TARGET,
     RETRY_AFTER_MAX_SECONDS,
     TAKEOVER_WAIT_JITTER,
@@ -61,6 +67,7 @@ from kiro_crew.relay_client.lease import (
 from kiro_crew.relay_client.provider import (
     RelaySettings,
     RelaySettingsError,
+    RelayTunnelProvider,
     lease_token_source,
     public_tunnel_provider,
 )
@@ -68,7 +75,6 @@ from kiro_crew.relay_client.token_source import (
     HostCredential,
     HostTokenRetryLater,
     HostTokenUnavailable,
-    StaticHostTokenSource,
     UnavailableHostTokenSource,
     token_claims,
 )
@@ -155,15 +161,19 @@ class StepClock:
 class FakeLeaseService:
     """The bearer service's awsJson 1.0 ``POST /`` on loopback, answering what the test queued.
 
-    A call that names another operation, or is not ``application/x-amz-json-1.0``,
-    is refused as an unknown operation, the way the real service does.
+    A ``ReleaseCrewInstanceLease`` call is kept in ``releases`` and answered with an
+    empty 200. A call that names another operation, or is not
+    ``application/x-amz-json-1.0``, is refused as an unknown operation, the way the
+    real service does.
     """
 
     def __init__(self, credentials: Optional[set] = None) -> None:
         self.credentials = set(credentials or {CREDENTIAL})
         self.answers: List[Tuple[int, Dict[str, Any], Dict[str, str]]] = []
         self.requests: List[Dict[str, Any]] = []
+        self.releases: List[Dict[str, Any]] = []
         self.on_refused_credential: Any = None
+        self.reachable = True  # False drops every call unanswered; the port stays held
         self._server: Optional[TestServer] = None
 
     @property
@@ -177,7 +187,7 @@ class FakeLeaseService:
 
     async def __aenter__(self) -> "FakeLeaseService":
         app = web.Application()
-        app.router.add_post("/", self._renew)
+        app.router.add_post("/", self._route)
         self._server = TestServer(app, host="127.0.0.1", port=0)
         await self._server.start_server()
         return self
@@ -186,17 +196,30 @@ class FakeLeaseService:
         if self._server is not None:
             await self._server.close()
 
+    async def _route(self, request: web.Request) -> web.Response:
+        if not self.reachable:
+            return drop_unanswered(request)
+        if request.headers.get("X-Amz-Target") == RELEASE_TARGET:
+            return await self._release(request)
+        return await self._renew(request)
+
+    async def _release(self, request: web.Request) -> web.Response:
+        self.releases.append(await self._recorded(request))
+        return web.json_response({}, content_type=AWS_JSON_CONTENT_TYPE)
+
+    @staticmethod
+    async def _recorded(request: web.Request) -> Dict[str, Any]:
+        return {
+            "auth": request.headers.get("Authorization", ""),
+            "target": request.headers.get("X-Amz-Target"),
+            "content_type": request.headers.get("Content-Type"),
+            "token_type": request.headers.get("TokenType"),
+            "body": json.loads(await request.read()),
+        }
+
     async def _renew(self, request: web.Request) -> web.Response:
         auth = request.headers.get("Authorization", "")
-        self.requests.append(
-            {
-                "auth": auth,
-                "target": request.headers.get("X-Amz-Target"),
-                "content_type": request.headers.get("Content-Type"),
-                "token_type": request.headers.get("TokenType"),
-                "body": json.loads(await request.read()),
-            }
-        )
+        self.requests.append(await self._recorded(request))
         if (
             request.headers.get("X-Amz-Target") != RENEW_TARGET
             or request.headers.get("Content-Type") != AWS_JSON_CONTENT_TYPE
@@ -374,9 +397,82 @@ async def test_relay_connected_is_what_the_client_reports_at_each_call(
     ]
 
 
+async def test_connected_count_is_what_the_client_reports_at_each_call(
+    lease: FakeLeaseService, tmp_path: Path, clock: StepClock
+) -> None:
+    lease.queue(200, answer(0))
+    lease.queue(200, answer(1))
+    source = make_source(lease, tmp_path, clock)
+    people = {"now": 0}
+    source.track_relay(lambda: True, lambda: people["now"])
+    try:
+        await source.current()
+        await clock.next_sleep()
+        people["now"] = 2
+        clock.elapse()
+        await calls(lease, 2)
+    finally:
+        await source.aclose()
+    assert [r["body"]["connectedCount"] for r in lease.requests] == [0, 2]
+
+
+def _count_raises() -> int:
+    raise RuntimeError("the count broke")
+
+
+@pytest.mark.parametrize("count", [_count_raises, lambda: -1, lambda: True, lambda: "3"])
+async def test_a_count_that_cannot_be_read_is_sent_as_zero_and_the_renewal_goes_on(
+    lease: FakeLeaseService, tmp_path: Path, clock: StepClock, count: Any
+) -> None:
+    lease.queue(200, answer(0))
+    source = make_source(lease, tmp_path, clock)
+    source.track_relay(lambda: True, count)
+    try:
+        credential = await source.current()
+    finally:
+        await source.aclose()
+    assert credential.token == answer(0)["hostToken"]
+    (request,) = lease.requests
+    assert request["body"]["connectedCount"] == 0
+
+
+async def test_the_client_counts_each_person_with_a_viewer_open_once() -> None:
+    teammate = fixture("frames/ws-upgrade")["valid"][1]["message"]["user"]
+    team = StaticHostTokenSource(HostCredential(TOKEN, crew_kind="team", owner_user_id=""))
+    async with FakeRelay() as relay, FakeCrew() as crew:
+        client, _, ingress = make_client(relay, crew, source=team)
+        await client.start()
+        try:
+            leg = await relay.next_leg()
+            await leg.handshake()
+            assert client.connected_people() == 0  # connected, nobody viewing
+            # The owner on two tabs, then a teammate on one.
+            for sid, user in ((1, OWNER), (3, OWNER), (5, teammate)):
+                await leg.send(valid_message("frames/ws-upgrade", id=sid, user=user))
+                frame = {"type": "ws-frame", "id": sid, "data": "opened"}
+                await leg.send(frame)
+                assert await leg.recv_type("ws-frame") == frame
+            assert client.connected_people() == 2
+            await leg.send(valid_message("frames/ws-close", 0, id=5))
+            await async_wait_until(lambda: client.connected_people() == 1)
+            # One of the owner's two tabs closing leaves the owner connected.
+            await leg.send(valid_message("frames/ws-close", 0, id=1))
+            await async_wait_until(lambda: 5 not in _streams(client) and 1 not in _streams(client))
+            assert client.connected_people() == 1
+            # Once the connection ends, nobody is connected through it.
+            await leg.close(1011)
+            await async_wait_until(lambda: client.connected_people() == 0)
+        finally:
+            await stop(client, ingress)
+
+
+def _streams(client: RelayClient) -> set[int]:
+    return {sid for conn in client._live for sid in conn._streams}
+
+
 async def test_the_client_counts_as_connected_only_from_ready_until_the_connection_ends() -> None:
-    # Contract section 4.2: relay.connected is true only from ready until that
-    # connection ends, never from the upgrade or the hello alone.
+    # Contract section 4.2: relay.connectionStatus is CONNECTED only from ready
+    # until that connection ends, never from the upgrade or the hello alone.
     async with FakeRelay() as relay, FakeCrew() as crew:
         client, _, ingress = make_client(relay, crew)
         await client.start()
@@ -531,22 +627,22 @@ async def test_failed_calls_back_off_on_the_reconnect_steps_then_reset(
 
 async def test_a_service_it_cannot_reach_is_retried_later(tmp_path: Path, clock: StepClock) -> None:
     async with FakeLeaseService() as gone:
-        url = gone.url
-    source = LeaseHostTokenSource(
-        lease_url=url,
-        credential=str(credential_file(tmp_path)),
-        crew_version="0.9.1.0",
-        home=tmp_path,
-        rng=TopRng(),
-        sleep=clock.sleep,
-        monotonic=clock.monotonic,
-    )
-    try:
-        with pytest.raises(HostTokenRetryLater, match="could not be reached"):
-            await source.current()
-        assert await clock.next_sleep() == 2.0
-    finally:
-        await source.aclose()
+        gone.reachable = False  # kept up, so no other listener can take its port and answer
+        source = LeaseHostTokenSource(
+            lease_url=gone.url,
+            credential=str(credential_file(tmp_path)),
+            crew_version="0.9.1.0",
+            home=tmp_path,
+            rng=TopRng(),
+            sleep=clock.sleep,
+            monotonic=clock.monotonic,
+        )
+        try:
+            with pytest.raises(HostTokenRetryLater, match="could not be reached"):
+                await source.current()
+            assert await clock.next_sleep() == 2.0
+        finally:
+            await source.aclose()
 
 
 @pytest.mark.parametrize(
@@ -580,7 +676,7 @@ async def test_a_definitive_refusal_stops_renewals(
 @pytest.mark.parametrize(
     "reason,why",
     [
-        ("RemoteAccessDisabled", "does not allow remote access"),
+        ("RemoteAccessDisabled", "remote access is turned off for this Crew's account"),
         ("CrewAccessNotGranted", "has no access to the Crew"),
         (None, "cannot host this Crew"),
     ],
@@ -717,10 +813,11 @@ async def test_any_http_401_is_a_sign_in_failure_whatever_its_body(
     source._read_credential = counting  # type: ignore[method-assign]
     try:
         assert (await source.current()).token == answer(0)["hostToken"]
+        # Counted before the stop, whose release reads it once more.
+        assert len(reads) == 2
     finally:
         await source.aclose()
     assert len(lease.requests) == 2
-    assert len(reads) == 2
 
 
 async def test_a_second_401_with_a_name_stops_until_restart(
@@ -816,7 +913,7 @@ def saved_version(home: Path) -> Optional[int]:
     path = home / LEASE_VERSION_PATH
     if not path.exists():
         return None
-    saved_for, _, version = path.read_text("ascii").partition(" ")
+    saved_for, _, version = read_bytes_with_retry(path).decode("ascii").partition(" ")
     assert saved_for == crew_instance_id(home)
     return int(version)
 
@@ -866,7 +963,9 @@ async def test_every_versioned_renewal_with_no_token_holds_until_the_next_one(
             clock.elapse()
             await calls(lease, 3)
             assert lease.requests[2]["body"]["leaseVersion"] == 8
-            await async_wait_until(lambda: saved_version(tmp_path) == 9)
+            # The client saves 9 on a thread: read off the loop, where a Windows read
+            # that meets its replace is retried.
+            await async_wait_until(lambda: saved_version(tmp_path) == 9, off_loop=True)
             await assert_retry_later(source.current())
             assert len(lease.requests) == 3
             assert not source.stopped_reason
@@ -1250,9 +1349,6 @@ async def test_the_lease_url_is_https_or_a_loopback_port_forward() -> None:
 def _cfg(**tunnel: Any) -> SimpleNamespace:
     values = {
         "relay_enabled": True,
-        "relay_host_url": "",
-        "relay_crew_domain": "",
-        "relay_move_grace_seconds": 1.0,
         "relay_lease_url": "",
         "relay_lease_credential": "",
     }
@@ -1260,12 +1356,32 @@ def _cfg(**tunnel: Any) -> SimpleNamespace:
     return SimpleNamespace(tunnel=SimpleNamespace(**values))
 
 
-async def test_the_lease_client_is_the_source_only_when_a_lease_service_is_set() -> None:
-    assert isinstance(public_tunnel_provider(_cfg())._tokens, UnavailableHostTokenSource)
+async def test_the_lease_client_is_the_source_unless_an_edition_names_the_relay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def no_lookup(profile_arn: Optional[str]) -> str:
+        raise AssertionError("building the provider resolved the built-in lease URL")
+
+    monkeypatch.setattr(lease_module, "built_in_lease_url", no_lookup)
+    # No lease URL: the lease client, on the built-in URL, which construction leaves
+    # unresolved (no I/O until the first call).
+    built_in = public_tunnel_provider(_cfg(lease_credential="secret://x"))._tokens
+    assert isinstance(built_in, LeaseHostTokenSource)
     provider = public_tunnel_provider(
         _cfg(lease_url="http://127.0.0.1:8790", lease_credential="/run/lease-credential")
     )
     assert isinstance(provider._tokens, LeaseHostTokenSource)
+    # An edition that names the relay itself brings its own source: none is built here.
+    for names in (
+        {"host_url": "wss://relay.example/v1/host", "crew_domain": "relay.example"},
+        {"host_url": "wss://relay.example/v1/host", "crew_domain": ""},
+        {"host_url": "", "crew_domain": "relay.example"},
+    ):
+        assert lease_token_source(RelaySettings(enabled=True, **names)) is None, names
+    assert isinstance(
+        RelayTunnelProvider(RelaySettings(enabled=True, host_url="", crew_domain=""))._tokens,
+        UnavailableHostTokenSource,
+    )
 
 
 async def test_lease_settings_the_client_must_not_use_are_refused_without_echo() -> None:
@@ -1273,14 +1389,100 @@ async def test_lease_settings_the_client_must_not_use_are_refused_without_echo()
         return RelaySettings.from_config(_cfg(**tunnel))
 
     settings(lease_url="https://lease.example.com", lease_credential="secret://x").validate()
-    # No lease service and no names: nothing names the relay, so it is refused.
-    with pytest.raises(RelaySettingsError, match="tunnel.relay_host_url"):
-        settings().validate()
+    # No lease URL: the built-in one, which still needs the credential.
+    settings(lease_credential="secret://x").validate()
+    settings(lease_credential="kiro-sign-in").validate()
+    # An empty credential is the sign-in only for a personal Crew (see the sign-in
+    # wiring tests, which pin the agent identity seam); a team Crew must name its key.
+    with pytest.raises(RelaySettingsError, match="tunnel.relay_lease_credential is not set"):
+        settings(lease_token_type="API_KEY").validate()
+    with pytest.raises(RelaySettingsError) as refused:
+        settings(lease_credential=CREDENTIAL).validate()
+    assert CREDENTIAL not in str(refused.value)
+    # An edition's names are checked as before: one alone is refused by name.
+    with pytest.raises(RelaySettingsError, match="relay Crew domain"):
+        RelaySettings(
+            enabled=True, host_url="wss://relay.example/v1/host", crew_domain=""
+        ).validate()
     with pytest.raises(RelaySettingsError, match="relay_lease_url"):
         settings(lease_url="http://lease.example.com", lease_credential="secret://x").validate()
     with pytest.raises(RelaySettingsError) as refused:
         settings(lease_url="https://lease.example.com", lease_credential=CREDENTIAL).validate()
     assert CREDENTIAL not in str(refused.value)
+
+
+# ── the built-in lease service ──
+
+_PROFILE = "arn:aws:codewhisperer:{}:123456789012:profile/EXAMPLE1234"
+
+
+@pytest.mark.parametrize(
+    ("profile_arn", "region"),
+    [
+        (None, "us-east-1"),
+        ("not-a-profile-arn", "us-east-1"),
+        (_PROFILE.format("us-east-1"), "us-east-1"),
+        (_PROFILE.format("eu-central-1"), "eu-central-1"),
+    ],
+    ids=["no-profile", "unreadable-profile", "us-east-1", "eu-central-1"],
+)
+async def test_the_built_in_lease_url_is_the_control_plane_for_the_profile_region(
+    profile_arn: Optional[str], region: str
+) -> None:
+    from kiro_crew.auth.login.control_plane import control_plane_url
+
+    assert control_plane_url("eu-central-1") != control_plane_url("us-east-1")
+    assert lease_module.built_in_lease_url(profile_arn) == control_plane_url(region)
+
+
+async def test_with_no_lease_url_each_call_goes_to_the_built_in_url_for_the_profile(
+    lease: FakeLeaseService, tmp_path: Path, clock: StepClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asked: List[Optional[str]] = []
+
+    def built_in(profile_arn: Optional[str]) -> str:
+        asked.append(profile_arn)
+        return lease.url
+
+    monkeypatch.setattr(lease_module, "built_in_lease_url", built_in)
+    arn = _PROFILE.format("eu-central-1")
+    lease.queue(200, answer(0))
+    source = LeaseHostTokenSource(
+        lease_url="",
+        credential=str(credential_file(tmp_path)),
+        crew_version="0.9.1.0",
+        home=tmp_path,
+        rng=TopRng(),
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+        profile_arn=lambda: arn,
+    )
+    assert asked == []
+    try:
+        await source.current()
+    finally:
+        await source.aclose()
+    assert asked and set(asked) == {arn}
+    (request,) = lease.requests
+    assert request["auth"] == f"Bearer {CREDENTIAL}"
+    assert request["body"]["profileArn"] == arn
+    assert len(lease.releases) == 1
+
+
+async def test_a_set_lease_url_wins_over_the_built_in_one(
+    lease: FakeLeaseService, tmp_path: Path, clock: StepClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def built_in(profile_arn: Optional[str]) -> str:
+        raise AssertionError("a set lease URL fell back to the built-in one")
+
+    monkeypatch.setattr(lease_module, "built_in_lease_url", built_in)
+    lease.queue(200, answer(0))
+    source = make_source(lease, tmp_path, clock)
+    try:
+        await source.current()
+    finally:
+        await source.aclose()
+    assert len(lease.requests) == 1 and len(lease.releases) == 1
 
 
 # ── the round trip ──
@@ -1362,10 +1564,10 @@ async def test_a_real_lease_service_never_points_the_host_token_at_a_plaintext_p
         sleep=clock.sleep,
         monotonic=clock.monotonic,
     )
-    posted: List[Dict[str, Any]] = []
+    posted: List[str] = []
 
-    async def fake_post(credential: str, body: Dict[str, Any]) -> Any:
-        posted.append(body)
+    async def fake_post(credential: str, body: Dict[str, Any], target: str) -> Any:
+        posted.append(target)
         return SimpleNamespace(
             status=200, payload=answer(0, hostUrl=host_url), date=None, error_type=None
         )
@@ -1376,7 +1578,7 @@ async def test_a_real_lease_service_never_points_the_host_token_at_a_plaintext_p
             await source.current()
     finally:
         await source.aclose()
-    assert len(posted) == 1
+    assert posted == [RENEW_TARGET, RELEASE_TARGET]
 
 
 async def test_times_are_epoch_seconds_or_iso_8601_with_a_zone() -> None:
@@ -1475,9 +1677,9 @@ def _count_lease_calls(source: LeaseHostTokenSource) -> List[int]:
     calls: List[int] = []
     post = source._post
 
-    async def counted(credential: str, body: dict):
+    async def counted(credential: str, body: dict, target: str):
         calls.append(1)
-        return await post(credential, body)
+        return await post(credential, body, target)
 
     source._post = counted  # type: ignore[method-assign]
     return calls
@@ -1489,10 +1691,10 @@ async def _connected_then_unreachable(lease: FakeLeaseService, relay: FakeRelay,
     await leg.handshake()
     await async_wait_until(client.relay_connected)
     # The token's own lifetime passes, the relay stops taking it, and the lease
-    # service goes away.
+    # service drops every call while it keeps its port, so nothing else can answer.
     clock.now += 600
     relay.tokens.clear()
-    await lease.__aexit__()
+    lease.reachable = False
     return leg
 
 
@@ -1666,3 +1868,132 @@ async def test_a_refused_credential_stop_names_both_settings_and_no_credential(
         assert "tunnel.relay_lease_token_type" in message
         assert "needs API_KEY" in message
         assert CREDENTIAL not in message
+
+
+# ── refusal messages: each names its cause and keeps today's timing ──
+
+
+@pytest.mark.parametrize(
+    "status,body,why",
+    [
+        (
+            400,
+            {
+                "__type": "ServiceQuotaExceededException",
+                "message": "Remote Crew limit reached",
+            },
+            "the account has reached its limit of remote Crews",
+        ),
+        (
+            *refusal("ThrottlingException")[:2],
+            "the relay is limiting requests; the host will try again",
+        ),
+    ],
+    ids=["quota", "throttling"],
+)
+async def test_a_quota_or_throttling_refusal_names_its_cause_on_the_backoff_steps(
+    lease: FakeLeaseService,
+    tmp_path: Path,
+    clock: StepClock,
+    status: int,
+    body: Dict[str, Any],
+    why: str,
+) -> None:
+    lease.queue(status, body)
+    lease.queue(200, answer(0))
+    source = make_source(lease, tmp_path, clock)
+    try:
+        with pytest.raises(HostTokenRetryLater) as later:
+            await source.current()
+        assert str(later.value).startswith(
+            f"the lease service refused the renewal ({body['__type']}): {why}"
+        )
+        assert f'The service said: "{body["message"]}"' in str(later.value)
+        assert CREDENTIAL not in str(later.value)
+        assert len(lease.requests) == 1
+        # Today's backoff path: the first reconnect step, then a normal renewal.
+        assert await clock.next_sleep() == 2.0
+        clock.elapse()
+        await calls(lease, 2)
+        assert (await source.current()).token == answer(0)["hostToken"]
+    finally:
+        await source.aclose()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {
+            "__type": "AccessDeniedException",
+            "message": "Access denied.",
+            "reason": "REMOTE_ACCESS_DISABLED",
+        },
+        {
+            "__type": "AccessDeniedException",
+            "message": "Remote Crews are not enabled for this account",
+        },
+    ],
+    ids=["remote-access-disabled", "no-reason"],
+)
+async def test_remote_access_turned_off_says_so_and_holds_15_minutes(
+    lease: FakeLeaseService, tmp_path: Path, clock: StepClock, body: Dict[str, Any]
+) -> None:
+    lease.queue(403, body)
+    lease.queue(200, answer(0))
+    source = make_source(lease, tmp_path, clock)
+    try:
+        with pytest.raises(HostTokenRetryLater) as later:
+            await source.current()
+        assert "remote access is turned off for this Crew's account or organization" in str(
+            later.value
+        )
+        assert f'The service said: "{body["message"]}"' in str(later.value)
+        assert CREDENTIAL not in str(later.value)
+        # Today's access-refusal hold.
+        assert len(lease.requests) == 1
+        assert await clock.next_sleep() == RETRY_AFTER_MAX_SECONDS == 900.0
+        clock.elapse()
+        await calls(lease, 2)
+        assert (await source.current()).token == answer(0)["hostToken"]
+    finally:
+        await source.aclose()
+
+
+async def test_a_refused_credential_stop_names_the_token_type_for_each_kind_of_credential(
+    lease: FakeLeaseService, tmp_path: Path, clock: StepClock
+) -> None:
+    lease.queue(401, {"__type": "UnauthorizedException"})
+    lease.queue(401, {"__type": "UnauthorizedException"})
+    source = make_source(lease, tmp_path, clock)
+    try:
+        with pytest.raises(HostTokenUnavailable) as stopped:
+            await source.current()
+        reason = source.stopped_reason
+    finally:
+        await source.aclose()
+    # Today's path: one re-read and retry, then a stop until restart.
+    assert len(lease.requests) == 2
+    for message in (str(stopped.value), reason):
+        assert "credential is current" in message
+        assert "a Shared Crew on a crew API key needs API_KEY" in message
+        assert "a token from an outside identity provider needs EXTERNAL_IDP" in message
+        assert "a Kiro sign-in leaves it empty" in message
+        assert CREDENTIAL not in message
+
+
+@pytest.mark.parametrize("reason", ["RemoteAccessDisabled", "REMOTE_ACCESS_DISABLED"])
+async def test_both_spellings_of_remote_access_disabled_resolve_to_one_entry(
+    lease: FakeLeaseService, tmp_path: Path, clock: StepClock, reason: str
+) -> None:
+    lease.queue(403, {"__type": "AccessDeniedException", "message": "Denied.", "reason": reason})
+    source = make_source(lease, tmp_path, clock)
+    try:
+        with pytest.raises(HostTokenRetryLater) as later:
+            await source.current()
+    finally:
+        await source.aclose()
+    # The entry's own text, not the no-reason text that also names remote access.
+    assert str(later.value).startswith(
+        f"the lease service refused this Crew (AccessDeniedException {reason}): "
+        "remote access is turned off for this Crew's account or organization"
+    )

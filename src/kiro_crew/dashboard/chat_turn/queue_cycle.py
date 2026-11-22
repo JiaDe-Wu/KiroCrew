@@ -1,7 +1,8 @@
 """The end of a dashboard turn's queue cycle: the per-exit record and its ordered tail, the
 hand-off to the next queued turn, the AutoNudge turn-end signal, and the pending synthesis turn
 with its re-check, and the outcome a turn records for that tail when it ends
-(``_turn_record_outcome``, with the session-switch lock's hand-back)."""
+(``_turn_record_outcome``, with the session-switch lock's hand-back and the tracked task that
+stamps the turn's consumed merge cards, ``_schedule_consumed_merge_context_stamp``)."""
 
 from __future__ import annotations
 
@@ -10,7 +11,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from kiro_crew.dashboard.chat_utils import SYNTHESIS_HELD, SYNTHESIS_UNKNOWN
 from kiro_crew.dashboard.slot_queue_repository import RESTORED_QUEUE_KEY, RESTORED_SEND_CHOSEN_KEY
-from kiro_crew.dashboard.state import SUBAGENT_SYNTHESIS_PROMPT
+from kiro_crew.dashboard.state import SUBAGENT_FINAL_COMPLETION_NOTE, SUBAGENT_SYNTHESIS_PROMPT
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
@@ -18,8 +19,10 @@ if TYPE_CHECKING:
         DashboardState,
         StartPriority,
         _ChatSlot,
+        _log_task_exception,
         _note_mate_wakes,
         _run_chat,
+        _run_clock,
         chat_done_payload,
         effective_session_key,
         generate_session_summary,
@@ -40,9 +43,48 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_turn.regenerate_swap import settle_regenerate
     from kiro_crew.dashboard.chat_turn.session_reset import _consume_pending_reset
     from kiro_crew.dashboard.chat_turn.steer_queue import _requeue_unconsumed_steers
+    from kiro_crew.dashboard.chat_turn.turn_context import (
+        _register_consumed_merge_contexts,
+        _restore_consumed_merge_contexts,
+        _stamp_and_reconcile_consumed_merge_contexts,
+    )
     from kiro_crew.dashboard.chat_turn.turn_locals import _ChatTurn
     from kiro_crew.dashboard.chat_turn.turn_marker import _gateway_shutdown_requested
     from kiro_crew.dashboard.chat_turn.turn_reply_seams import _turn_full_reply_text
+    from kiro_crew.dashboard.chat_turn.turn_stats import _merge_cards_reached_the_model
+
+
+# The durable ``consumed`` stamp is the record of a merge card's consumption, so
+# a failed write is retried rather than logged and abandoned: the in-memory guard
+# dies with this process, and a hold without the stamp re-queues the card's
+# context on the next restart. The retries run here, in the tracked task nothing
+# awaits -- the landing path takes one attempt and hands the rest over, rather
+# than holding a turn open across their backoff. Bounded, because a transcript
+# that refuses every write would otherwise retry forever.
+_MERGE_STAMP_ATTEMPTS = 3
+_MERGE_STAMP_RETRY_DELAY_SECS = 0.5
+
+
+def _schedule_consumed_merge_context_stamp(
+    state: DashboardState, identities: list[tuple[str, str]]
+) -> None:
+    """Stamp already-registered cards in a tracked task the finally does not await.
+
+    A state with no conversation log is NOT short-circuited here: the task's own
+    no-log branch reconciles the live twins and marks those guards, and skipping
+    it would leave guards that can never resolve sitting unstamped ahead of
+    genuine stamp-pending ones in the eviction order.
+    """
+    if not identities:
+        return
+    task = asyncio.create_task(
+        _stamp_and_reconcile_consumed_merge_contexts(
+            state, identities, attempts=_MERGE_STAMP_ATTEMPTS
+        )
+    )
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+    task.add_done_callback(_log_task_exception)
 
 
 async def _run_pending_synthesis(state: DashboardState, slot: _ChatSlot) -> None:
@@ -80,6 +122,7 @@ async def _run_pending_synthesis(state: DashboardState, slot: _ChatSlot) -> None
         slot._pending_synthesis = False
         slot._synthesis_rechecks = 0
         slot._synthesis_completion_turns = 0
+        slot._synthesis_final_turn_ran = False
         # Same successor boundary as the queue drain (see the finalize comment in
         # `_start_next_queued_turn`): this dispatch is reached from the previous
         # turn's tail without a `chat_done`, so the predecessor's streaming row
@@ -149,18 +192,22 @@ def _launch_synthesis(state: DashboardState, slot: _ChatSlot) -> None:
 
 
 def _drop_single_turn_synthesis(slot: _ChatSlot) -> bool:
-    """Consume a cleared arm whose whole batch reached the slot in one turn.
+    """Consume a cleared arm whose batch was already reported.
 
-    That turn (a lone sub-agent's completion, or a wave digest) already
-    reported every result, so the synthesis prompt would only restate it.
-    Exactly one counted turn drops it. Any other count fires, including 0:
+    One counted turn (a lone sub-agent's completion, or a wave digest)
+    reported every result. Two or more drop it only when the turn that took
+    the last result ended successfully on reply text after its last tool call
+    (``_synthesis_final_turn_ran``): that reply is the consolidated report,
+    so the synthesis prompt would only ask for it again. A count of 0 fires:
     an arm nothing counted is not judged.
     """
-    if slot._synthesis_completion_turns != 1:
+    turns = slot._synthesis_completion_turns
+    if turns != 1 and not (turns > 1 and slot._synthesis_final_turn_ran):
         return False
     slot._pending_synthesis = False
     slot._synthesis_rechecks = 0
     slot._synthesis_completion_turns = 0
+    slot._synthesis_final_turn_ran = False
     return True
 
 
@@ -312,7 +359,7 @@ async def _finish_queue_cycle(
             verdict == SYNTHESIS_CLEAR
             and not _drop_single_turn_synthesis(slot)
             and not teardown_hold_active(state, slot)
-            # Ultra Mode "Pause all" holds this session: the synthesis stays
+            # Conductor mode "Pause all" holds this session: the synthesis stays
             # armed, and the turn end after Resume all (or its Continue) fires it.
             and not crew_pause.holds_slot(slot)
         )
@@ -477,7 +524,27 @@ async def _send_chat_done(
     broadcast, so a coroutine never reaches the serializer."""
     if payload is None:
         payload = await chat_done_payload(state, slot, continuing=continuing, ends_turn=ends_turn)
+    _report_run_seconds(slot, payload)
     state.broadcast_ws("chat_done", payload)
+
+
+def _report_run_seconds(slot: _ChatSlot, payload: dict[str, Any]) -> None:
+    """Add ``run_seconds`` to the frame that ends a run, and start the next run clean.
+
+    A run is every turn from the first one the ``task`` setter stamped to the
+    completion that hands the floor back: a frame that ends a turn (it carries
+    ``turn``) and is not ``continuing``, or that pauses on a question. A
+    ``continuing`` frame, whose sub-agents, workflow, loop or queue still owe
+    work, and the deferred ``/compact`` acknowledgement, which ends no turn,
+    leave the stamp, so a long run that ends with a short turn is measured whole.
+    A run with no stamp, or whose stamp no turn passed the dispatch gates under,
+    reports no field, which the dashboard reads as unknown."""
+    if "turn" not in payload or (payload.get("continuing") and not payload.get("needs_input")):
+        return
+    started = slot._run_started_at
+    slot._run_started_at = None
+    if started is not None and slot._run_started_turns != slot._turns_started:
+        payload["run_seconds"] = _run_clock.seconds_since(started)
 
 
 async def _hand_off_queue(
@@ -496,8 +563,23 @@ async def _hand_off_queue(
     cancellable) and the cycle ends with its terminal ``chat_done``. The
     ``predecessor_*`` pair names the ending turn, so the drain marks its end
     unless the head is that turn's own recovery."""
+    from kiro_crew.tracing import work as trace_work
+
+    # Whatever comes next is not the work-ledger watch's turn, whether or not it bound.
+    trace_work.end_patrol_turn()
+    # Close steer admission for this turn before the hand-off's first await, held
+    # steers or not: a peer steer sent while the hand-off awaits takes the queue.
+    slot._deferred_steer_ended_gen = slot._turn_generation
+    # Steers still held for a tool boundary this turn never reached join the queue
+    # first, so the drain below starts the next turn on them in this same call.
+    if slot._deferred_steers:
+        from kiro_crew.dashboard import deferred_steer
+
+        await deferred_steer.requeue_all(state, slot)
     # Steers outrank queued messages, so they go to the head before the drain.
     _requeue_unconsumed_steers(state, slot)
+    slot._deferred_steer_delivered.clear()
+    slot._deferred_steer_injected.clear()
     if drain and slot._queue:
         # A user message drained at a turn's end ends an armed synthesis's
         # batch only when no child of it is still out (running, delivering,
@@ -600,7 +682,9 @@ class _TurnExit:
     the tail needs: its depth, whether a provider saw it, the local slash
     command it is running, and -- at the top of the ``finally``, before anything
     there can be cancelled -- its outcome. The guard runs :func:`_end_turn_tail`
-    from it unless the turn already did."""
+    from it unless the turn already did. The guard also names it on the slot
+    (``_preparing_turn``) for the turn's length, which is how a Stop finds a
+    runner still preparing its turn and the task to cancel."""
 
     __slots__ = (
         "actor",
@@ -610,6 +694,7 @@ class _TurnExit:
         "outcome",
         "reached_provider",
         "responsive_owner",
+        "runner",
         "stop_reason",
         "turn_id",
     )
@@ -627,6 +712,10 @@ class _TurnExit:
         self.responsive_owner: Any = None
         # The terminal event's stop reason; None while the turn reached none.
         self.stop_reason: str | None = None
+        # The task running the exit guard, the one a Stop cancels
+        # (``turn_stop._cancel_preparing_runner``). Not always ``slot.task``: a
+        # bounded turn runs the guard in an inner task under ``asyncio.shield``.
+        self.runner: asyncio.Task[Any] | None = None
 
 
 def _end_browser_live_turn(slot: _ChatSlot) -> None:
@@ -758,6 +847,7 @@ async def _end_turn_tail(
     if turn_exit.actor != AGENT_STARTED_ACTOR:
         _notify_autonudge_turn_end(slot, **(outcome.nudge_facts if outcome is not None else {}))
     if turn_exit.depth == 0:
+        slot._turn_wrote_text = False
         # A crewmate's worker reports back to the crewmate's thread on its own.
         _note_mate_wakes(
             state,
@@ -916,7 +1006,37 @@ async def _turn_record_outcome(turn: _ChatTurn) -> None:
     _turn_priority = turn._turn_priority
     _turn_tool_calls = turn._turn_tool_calls
     _turn_tool_identities = turn._turn_tool_identities
+    slot = turn.slot
+    state = turn.state
     turn_exit = turn.turn_exit
+    # Cards registered in the process guard whose durable stamp this phase still
+    # owes, started once the lock handback and outcome record below are done.
+    _pending_merge_stamp: list[tuple[str, str]] = []
+    if turn._drained_merge_contexts and not turn._merge_contexts_completed:
+        if not _merge_cards_reached_the_model(turn):
+            # The prompt never went out, kiro-cli did not keep it (a Stop,
+            # an empty-response re-queue), or the session the next turn
+            # runs on does not hold it: reset before the model finished
+            # answering, discarded, or replaced after a runtime death
+            # (``_native_session_lacks_the_prompt``). The next turn
+            # re-sends it.
+            _restore_consumed_merge_contexts(slot, turn._drained_merge_contexts)
+        else:
+            # The prompt was kept and the session the next turn runs on
+            # still holds it, but the turn left before the landing write (a
+            # backend error or an exception after output streamed), or a
+            # landed turn's stamp was cancelled or did not land. Register
+            # every card in the process guard synchronously -- that is the
+            # replay guard a twin reads while the stamp is in flight -- and
+            # leave the durable stamp to the tracked task started after the
+            # lock handback and outcome record below: this phase and the ones
+            # before it in _run_chat's finally await nothing ahead of them,
+            # because a cancel landing in such an await would skip them. A
+            # later full save removes the hold with row proof.
+            _pending_merge_stamp = _register_consumed_merge_contexts(
+                state, turn._drained_merge_contexts
+            )
+    slot._inflight_merge_contexts = []
     # First: hand back the session-switch lock if this turn exited between
     # its acquire and its post-registration release. Before anything that
     # can await, and before _restore_refusal_fallback (chat_turn/model_fallback.py) takes the
@@ -953,3 +1073,25 @@ async def _turn_record_outcome(turn: _ChatTurn) -> None:
         },
         quiet_end=turn._terminal_directive_applied and not _turn_full_reply_text(turn)[0].strip(),
     )
+    # Every turn end rewrites this, so it describes the newest turn: one that
+    # took the arming result and ended successfully on reply text written
+    # after its last tool call has written the consolidated report
+    # (``_drop_single_turn_synthesis``, read only after the fire gate's store
+    # read answers clear); a quiet end (``nothing_to_do``), a failed or refused
+    # turn, or a turn whose only text is narration before a tool call has none.
+    # ``turn.assistant_text`` is that trailing segment: every tool boundary
+    # flushes and resets it, and the end-of-turn flush leaves it in place.
+    slot._synthesis_final_turn_ran = (
+        turn._incoming_message.rstrip().endswith(SUBAGENT_FINAL_COMPLETION_NOTE)
+        and turn._turn_landed
+        and turn._stop_class.is_success
+        and isinstance(turn.assistant_text, str)
+        and bool(turn.assistant_text.strip())
+    )
+    # Third: the durable consumption stamp this turn still owes -- after the
+    # handback and the record above, so nothing this stamp does can cost
+    # them, and in a tracked task because this phase awaits nothing. Its
+    # retries are bounded; a card left unstamped re-delivers its context
+    # once on the next restart.
+    if _pending_merge_stamp:
+        _schedule_consumed_merge_context_stamp(state, _pending_merge_stamp)

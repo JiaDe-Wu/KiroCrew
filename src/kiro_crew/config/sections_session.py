@@ -13,6 +13,7 @@ from kiro_crew.config.fields import _meta
 from kiro_crew.config.sections_defaults import (
     DEFAULT_AUTOCOMPACT_PCT,
     DEFAULT_HARNESS_BACKGROUND_HOLD_SECS,
+    DEFAULT_MAX_PER_CREATOR,
     DEFAULT_POOL_SIZE,
     DEFAULT_RECONCILE_MAX_KILLS,
     DEFAULT_SEARCH_SCAN_WINDOW,
@@ -24,6 +25,16 @@ from kiro_crew.config.sections_defaults import (
 # Highest dock position a crew may hold. Far above any roster a person drags by
 # hand; it only bounds a hand-edited or hostile value.
 STAR_ORDER_MAX = 10_000
+
+# How many worker sessions one Bot may have open at once (``max_workers``). The
+# owner sets it on the Bot's settings page; no Bot tool writes it. 0, the
+# default, sets no limit of the Bot's own: the bound on parallel work comes from
+# the host's resources unless the owner chooses a number
+# (rfc-work-ledger-concurrency-cap.md section 7). The ceiling is the work
+# ledger's own open bound (``work_ledger_records.MAX_ITEMS_PER_CONDUCTOR``).
+BOT_MAX_WORKERS_DEFAULT = 0
+BOT_MAX_WORKERS_MIN = 0
+BOT_MAX_WORKERS_MAX = 32
 
 
 def _archive_retention_days(session_data: dict) -> int:
@@ -67,10 +78,11 @@ class SessionConfig:
             "still ends it. On the kiro-cli or KAS backend, a Kiro sign-out from the dashboard "
             "ends it at once, whatever account it signed in with. After any other switch or "
             "sign-out of the Kiro account it signed in with, the next dashboard chat turn ends "
-            "it, and so does the next agent cron run unless Kiro Crew then cannot tell which "
+            "it, and so does the next session start or reuse elsewhere, such as an agent cron "
+            "run, a channel reply or a task step, unless Kiro Crew then cannot tell which "
             "account is signed in, as with a social login. A session that "
             "is mid-turn then ends later instead, when its next turn starts or at a later "
-            "dashboard chat turn or agent cron run. At most 10 keys are kept.",
+            "dashboard chat turn or session start. At most 10 keys are kept.",
         ),
     )
     empty_response_auto_continue: bool = field(
@@ -107,11 +119,24 @@ class SessionConfig:
         metadata=_meta(
             "Conductor Context Cap",
             "Trim a goal conductor's chat on the KAS backend at the start of a "
-            "dashboard turn: a chat over 400K tokens, or over 200K tokens after 5 "
-            "minutes idle, starts that turn on a new session seeded with its "
-            "session-ledger snapshot and the newest messages as text. Older messages "
-            "and tool output stay in the chat's transcript. Read at each turn start, "
-            "so a change needs no restart.",
+            "dashboard turn, only once its prompt cache has expired: a chat over "
+            "200K tokens whose previous turn ended 5 minutes or more ago starts that "
+            "turn on a new session seeded with its session-ledger snapshot, a list "
+            "of its tool results and the newest messages as text. A chat whose cache "
+            "is still warm is never trimmed, at any size. Older messages and tool "
+            "output stay in the chat's transcript. Read at each turn start, so a "
+            "change needs no restart.",
+        ),
+    )
+    worker_context_cap: bool = field(
+        default=False,
+        metadata=_meta(
+            "Worker Context Cap",
+            "Trim a dispatched worker's chat (kirocrew-worker) on the KAS backend the "
+            "same way as the Conductor Context Cap, over 300K tokens and only once its "
+            "prompt cache has expired (previous turn ended 5 minutes or more ago). A "
+            "warm cache is never trimmed. Off by default. Read at each turn start, so "
+            "a change needs no restart.",
         ),
     )
     idle_compaction: bool = field(
@@ -236,6 +261,19 @@ class SessionConfig:
             "100..100000. Read at each search, so a change needs no restart.",
         ),
     )
+    semantic_search: bool = field(
+        default=False,
+        metadata=_meta(
+            "Session Search by Meaning",
+            "Build a chunk store of session text in the background so session "
+            "search can later find a conversation by describing it. Off by "
+            "default. While on, the session index worker cuts each quiet session "
+            "into chunks with the embedding model's tokenizer, and the gateway embeds "
+            "them with the local embedding model at background priority (nothing is "
+            "embedded with the ollama_http provider); incognito and temporary "
+            "sessions are never read. Search does not read the store.",
+        ),
+    )
     watchdog_rss_max_mb: int = field(
         default=DEFAULT_WATCHDOG_RSS_MAX_MB,
         metadata=_meta(
@@ -243,7 +281,23 @@ class SessionConfig:
             "Recycle a session when its process tree resident memory exceeds "
             "this many MiB (default 4096). 0 disables; the internal background "
             "runtime recycles at 1536 MiB, or at this value when it is lower. Busy sessions (turn in "
-            "flight) are never recycled.",
+            "flight) are never recycled. A process above the limit when the watchdog "
+            "takes its size, at its second reading of it, is left running and recycled "
+            "only once it doubles: so with many MCP servers or a long first turn. Not so "
+            "for a process read under the limit more than about twelve minutes before, or for a "
+            "chat recycled in the last 24 hours.",
+        ),
+    )
+    watchdog_end_leftovers_mid_turn: bool = field(
+        default=False,
+        metadata=_meta(
+            "End Leftover Processes During a Turn",
+            "When a session is over the Watchdog RSS Limit during a turn and the "
+            "memory is held by processes its commands left running outside the "
+            "agent's process tree (for example a job a timed-out shell command "
+            "started), end those processes at once instead of only reporting them. "
+            "Off by default: such a process can be work the agent started on purpose. "
+            "Linux only. Read every cleanup tick, so a change needs no restart.",
         ),
     )
     harness_background_hold_secs: int = field(
@@ -269,6 +323,18 @@ class SessionConfig:
             "home, since a runtime owned by another install has no record here and "
             "reads as unowned. 0 makes the arm observe-only: it still publishes the "
             "leak reading and audits each candidate it would have signalled.",
+        ),
+    )
+    max_per_creator: int = field(
+        default=DEFAULT_MAX_PER_CREATOR,
+        metadata=_meta(
+            "Sessions per Creator",
+            "How many live sessions one creator may hold: a Bot's own chat, a "
+            "conductor, or any session that opens other sessions (10-450). A "
+            "creator that holds this many cannot open another until it closes "
+            "one. The chats you open yourself do not count. All sessions together "
+            "still stop at 500. Read at each session create, so a change needs no "
+            "restart.",
         ),
     )
 
@@ -340,6 +406,18 @@ class KiroCrewAgentConfig:
             "decides as usual (its own crew pin if it runs as a Bot, else "
             "agent.reasoning_effort, else the model default). Set, one of the five "
             "standard levels. An explicit effort on the call wins.",
+        ),
+    )
+    max_workers: int = field(
+        default=BOT_MAX_WORKERS_DEFAULT,
+        metadata=_meta(
+            "Workers at once",
+            "How many of this Bot's own worker sessions (on its worker template) "
+            "may be open at once. A session_create, session_revive or "
+            "session_fork past it is refused with bot_worker_cap_reached until "
+            "one of them is closed. Set by the owner on the Bot's settings page; "
+            "the Bot cannot change it. 0 (the default) sets no limit; otherwise "
+            "1 to 32.",
         ),
     )
     acp_backend: str = field(
@@ -420,6 +498,23 @@ class KiroCrewAgentConfig:
             "dragging its row there. 1 is the top; 0 means not placed yet, which "
             "sorts after every placed crew. Cleared when the crew is unstarred. "
             "Purely a display preference, like starred.",
+        ),
+    )
+    # Preview, off by default: a crewmate must opt in before any Dashboard card
+    # button can send a turn. Absent or non-bool reads as off (see card_send),
+    # so this changes nothing until it is turned on and the page-to-host `send`
+    # behaves exactly as `act` (fill the composer) meanwhile.
+    dashboard_card_send: bool = field(
+        default=False,
+        metadata=_meta(
+            "Dashboard card send (preview)",
+            "Preview, off by default. When on, a button on this crewmate's "
+            "Dashboard tab may send its reply straight into the crewmate's own "
+            "thread with one click. Off (the default), such a button only puts "
+            "the reply in the chat box and the person presses send, which is what "
+            "every card did before. A card-sent turn is tagged '[Dashboard "
+            "card]', is never an approval, and is refused while the thread has an "
+            "open approval or question.",
         ),
     )
     # Per-agent watchdog window overrides. The global ``watchdog.tool_stall_*``
@@ -720,6 +815,11 @@ class ResolvedBindings:
     # Revision observed before resolution: "" means no protected record;
     # None means no observation was made. Only automatic publication uses it.
     selection_revision: str | None = None
+    # For a ``member`` record: the agent a NEW chat with its member runs now
+    # (``member_template_id``), "" for any other session. It differs from
+    # ``kiro_agent`` once the member is set to another agent than the record
+    # keeps, which the chat then tells its user; this turn never runs it.
+    new_chat_agent: str = ""
 
     def same_dispatch_binding(self, other: "ResolvedBindings") -> bool:
         """Whether two resolutions name the SAME dispatch target.
@@ -740,6 +840,7 @@ class ResolvedBindings:
         from ``memory_store_name`` plus global config shared by both sides).
         ``execution_context`` carries the admitted session's identity and mode;
         session selection checks those separately before comparing these targets.
+        ``new_chat_agent`` is what another chat would run, not this one's target.
         """
         return (
             self.kiro_agent == other.kiro_agent

@@ -4,7 +4,7 @@ The duplicate and silent paths, the dashboard tab and bell, the channel the job 
 scheduled from, and the Slack post with its uploads; the dedup anchor advances only
 on a confirmed delivery.
 
-Orchestrator fields read: ``_owner_id``, ``dashboard_state``, ``sessions``, ``slack``.
+Orchestrator fields read: ``dashboard_state``, ``sessions``, ``slack``.
 Orchestrator fields written: none.
 
 Composed by :mod:`kiro_crew.slack.gateway`, whose globals its functions run on;
@@ -54,9 +54,17 @@ async def _deliver_cron_agent_result(
     if rh != job.last_posted_hash and self.dashboard_state:
         # A changed result of a crewmate's scheduled turn reaches that crewmate's
         # thread as one of its worker reports; an identical one wakes nobody.
-        from kiro_crew.dashboard.mate_thread_wakes import note_cron_result
+        # The session's own MCP report rides along, so the report names a server
+        # of the crewmate's that this scheduled turn could not use.
+        from kiro_crew.dashboard.mate_thread_wakes import note_cron_result, provider_mcp_payload
 
-        await note_cron_result(self.dashboard_state, job, session_key, result_text)
+        await note_cron_result(
+            self.dashboard_state,
+            job,
+            session_key,
+            result_text,
+            mcp_report=provider_mcp_payload(client),
+        )
     if rh == job.last_posted_hash:
         job.consecutive_dupes += 1
         # Time-based reminder: re-post after 24h so persistent identical
@@ -65,7 +73,7 @@ async def _deliver_cron_agent_result(
             # NB: consecutive_dupes is captured here before the reset
             # at the post-delivery state update further below.
             result_text = (
-                f"⚠️ Cron '{job.name}' has produced the same result"
+                f"Warning: Cron '{job.name}' has produced the same result"
                 f" {job.consecutive_dupes} times in a row:\n\n{result_text}"
             )
         else:
@@ -77,14 +85,14 @@ async def _deliver_cron_agent_result(
             if self.dashboard_state:
                 redacted_for_dash, _ = redact_exfiltration_urls(result_text)
                 redacted_for_dash, _ = redact_credentials(redacted_for_dash)
-                title = f"🔇 Cron: {job.name} (dup #{job.consecutive_dupes})"
+                title = f"Cron: {job.name} (dup #{job.consecutive_dupes})"
                 title, _ = redact_exfiltration_urls(title)
                 title, _ = redact_credentials(title)
                 self.dashboard_state.notify(
                     "cron",
                     title,
                     redacted_for_dash,
-                    meta={"job_id": job.id},
+                    meta={"job_id": job.id, "result_ts": job.last_result_ts},
                 )
 
             sel().log_tool_invocation(
@@ -137,6 +145,9 @@ async def _deliver_cron_agent_result(
         return result_text
 
     if self.dashboard_state:
+        # The folder a tab closed mid-run was filed in, which a re-mint files it back in.
+        from kiro_crew.dashboard.cron_inject import stored_cron_folder
+
         # Inject into slot BEFORE notification so has_slot() is true for notify_meta.
         # hide_in_chat=True keeps the cron out of the active session list — the
         # result still reaches Slack/bell below, and the run stays visible in the
@@ -151,21 +162,16 @@ async def _deliver_cron_agent_result(
         # paths above only re-inject into an already-existing slot via has_slot(), so
         # they self-no-op when hide_in_chat is True.
         if job.persistent_session and not job.hide_in_chat:
-            history = (
-                await asyncio.to_thread(
-                    self.dashboard_state.conversation_log.read_messages,
-                    f"cron:{job.id}",
-                )
-                if self.dashboard_state.conversation_log
-                else []
-            )
             inject_cron_result_to_dashboard(
                 self.dashboard_state,
                 job,
                 result_text,
-                history=history,
+                history=await prefetch_cron_history(
+                    self.dashboard_state, job.id, fresh=job.on_tab_close == "fresh"
+                ),
                 context_reading=_ctx_reading,
                 turn_stats=_turn_stats,
+                stored_folder=await stored_cron_folder(self.dashboard_state, job.id),
             )
         run_tab = ""
         if job.new_chat_per_run and not job.persistent_session and not job.hide_in_chat:
@@ -182,9 +188,12 @@ async def _deliver_cron_agent_result(
                 if log is not None:
                     await asyncio.to_thread(log.update_metadata, session_key, {"cron_run": "tab"})
             except Exception:
+                from kiro_crew.terminal_safe import safe_terminal_line
+
+                # The name is agent-authored: one line, no controls, in the log.
                 logger.warning(
                     "Cron '%s': could not keep run transcript %s; no tab opened",
-                    job.name,
+                    safe_terminal_line(job.name),
                     session_key,
                     exc_info=True,
                 )
@@ -204,7 +213,12 @@ async def _deliver_cron_agent_result(
         redacted_for_dash, _ = redact_credentials(redacted_for_dash)
         safe_name, _ = redact_exfiltration_urls(job.name)
         safe_name, _ = redact_credentials(safe_name)
-        notify_meta: dict[str, str] = {"job_id": job.id}
+        notify_meta: dict[str, str | float] = {"job_id": job.id}
+        # `result_ts` names the stored result this note carries, so the dashboard
+        # can tell whether the job's current `last_result` is still that one. A
+        # 24h repeat reminder carries a rewritten text, so it names none.
+        if result_text == job.last_result:
+            notify_meta["result_ts"] = job.last_result_ts
         # Gate the slot linkage on not hide_in_chat for parity with the
         # three inject sites above. Without this, a job flipped to
         # hide_in_chat=True that still owns an older cron-{id} slot would
@@ -242,8 +256,9 @@ async def _deliver_cron_agent_result(
         try:
             channel_delivered = await self._deliver_cron_to_channel(
                 job.session_key,
-                f"⏰ Cron: {job.name}\n\n{result_text}",
+                f"Cron: {job.name}\n\n{result_text}",
                 actor_key=session_key,
+                pin=(job.channel_type, job.target_id),
             )
         except Exception:
             # The job SUCCEEDED. Letting a delivery error reach the
@@ -277,8 +292,9 @@ async def _deliver_cron_agent_result(
             # Retry only open_dm (transient Slack API errors).
             # Delivery (post_blocks/post_message) is NOT retried to avoid duplicates.
             channel = job.channel
-            if not channel and (job.created_by or self._owner_id):
-                channel = await self._open_dm_with_retry(job.created_by or self._owner_id, job.name)
+            dm_user = self._cron_dm_user(job)
+            if not channel and dm_user:
+                channel = await self._open_dm_with_retry(dm_user, job.name)
             if channel:
                 # ── Extract embedded local images and upload them
                 # natively (mirror the chat renderer's on_done seal).
@@ -407,7 +423,7 @@ async def _deliver_cron_agent_result(
                 self.dashboard_state.notify(
                     "cron",
                     f"Cron: {job.name}",
-                    f"⚠️ Job completed but Slack delivery failed: {exc_msg}",
+                    f"Warning: Job completed but Slack delivery failed: {exc_msg}",
                     meta={"job_id": job.id},
                 )
     return result_text

@@ -11,15 +11,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 
 from aiohttp import web
 
 from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
-from kiro_crew.dashboard.handlers.terminal_lifecycle import _kill_session, _sess_alive, _sess_pid
+from kiro_crew.dashboard.handlers.terminal_lifecycle import (
+    _kill_session,
+    _sess_alive,
+    _sess_pid,
+    _shell_to_evict,
+)
 from kiro_crew.dashboard.handlers.terminal_session import (
     _MAX_SESSION_ID_LEN,
     _MAX_SESSIONS,
+    _TERMINAL_MAX_SESSIONS,
     _get_config,
     _get_registry,
     _is_enabled,
@@ -62,7 +69,10 @@ async def api_terminal_create(request: web.Request) -> web.Response:
     cfg = _get_config(request)
     max_sessions = cfg.get("max_sessions", _MAX_SESSIONS)
 
-    if len(registry) >= max_sessions:
+    # The WebSocket open this id is for makes room at the cap by ending the
+    # longest-detached shell, so refuse only when it could not.
+    now = time.monotonic()
+    if len(registry) >= max_sessions and _shell_to_evict(registry, max_sessions, now) is None:
         _sel().log_api_access(
             caller=caller,
             operation="terminal.session.create",
@@ -71,7 +81,7 @@ async def api_terminal_create(request: web.Request) -> web.Response:
             resources=f"max_sessions={max_sessions}",
         )
         return web.json_response(
-            {"error": f"Max {max_sessions} sessions", "code": "terminal_max_sessions"},
+            {"error": f"Max {max_sessions} sessions", "code": _TERMINAL_MAX_SESSIONS},
             status=409,
         )
 
@@ -188,6 +198,20 @@ async def api_terminal_list(request: web.Request) -> web.Response:
             resources=str(request.remote),
         )
         return web.Response(status=401, text="Unauthorized")
+    from kiro_crew.shared_crew.teammate_access import is_shared_crew_teammate
+
+    if is_shared_crew_teammate(request):
+        # A Shared Crew teammate has the owner's dashboard except the Terminal.
+        # Answer the shell's probe with the disabled shape, so their tab hides the
+        # Terminal rather than showing one every route below refuses.
+        _sel().log_api_access(
+            caller=caller,
+            operation="terminal.session.list",
+            outcome="denied",
+            source="dashboard",
+            resources="shared_crew_teammate",
+        )
+        return web.json_response({"enabled": False, "sessions": []})
     owner_denied = await require_owner_dashboard_request(request, "terminal.session.list")
     if owner_denied is not None:
         return owner_denied

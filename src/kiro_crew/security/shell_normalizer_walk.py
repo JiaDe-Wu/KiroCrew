@@ -20,6 +20,8 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, NamedTuple
 
+from .call_views import once_per_call
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -242,51 +244,169 @@ def _ends_argv(token: str) -> bool:
     return "|" in token or ";" in token
 
 
-def _substitution_bodies(text: str) -> "list[str]":
-    """The body of each command substitution in *text*.
+_SUBSTITUTION_OPENERS = ("<(", ">(", "$(", "`")
 
-    ``$(...)`` is scanned with paren nesting so a nested substitution closing
-    first does not truncate the outer body; backticks are taken pairwise.  Only
-    the BODY is returned -- a bare ``kill`` must not be attributed a name that
-    merely appears in a LATER, unrelated command of the same line.
 
-    The nesting walk is QUOTE-AWARE, through the same
-    :func:`_matching_close_paren` span the git-publish boundary walk uses. A
-    private, quote-unaware copy of it truncates the body at a QUOTED ``)``, and
-    that loses the nested command entirely rather than merely mis-sizing the span:
-    ``git push origin my-feature > >(X=')' git push origin main)`` extracts the
-    body ``X='``, so the nested publish of a protected branch is never scanned
-    and ``is_denied`` returns None for a command bash executes. An UNPROVEN span
-    yields the whole remainder, which is the fail-closed direction -- scanning
-    text that is not really in the body can only add findings.
+def _only_single_quoted_openers(text: str) -> bool:
+    """True when every quote in *text* closes and every substitution opener in it sits
+    inside single quotes (``'...'`` or ``$'...'``), so bash opens no substitution."""
+    state = 0
+    for step in _iter_shell_chars(text):
+        state = step.state
+        if step.state == 1:  # inside '...' or $'...', the opening quote included
+            continue
+        for at in range(step.offset, step.offset + len(step.text)):
+            if text.startswith(_SUBSTITUTION_OPENERS, at):
+                return False
+    return state == 0
 
-    Quoting was not the whole of it. That span helper counted a ``)`` that shell
-    COMMAND GRAMMAR also puts there as an ordinary character, and two such
-    spellings were measured allowing a payload this module still refuses:
-    a ``#`` comment (``$(: # )`` closes on a later line) and a ``case`` pattern
-    (``$(case x in x) printf token;; esac)``). Both truncated the body before the
-    verb, so the value assembled from it was never recognised. The closer for the
-    BACKTICK form reads the same state machine now too, so the two spellings
-    cannot disagree.
+
+#: The message flags whose single-quoted value the program stores as text and never
+#: runs, per ``(first word, subcommand words)``.
+_MESSAGE_FLAGS: "dict[tuple[str, ...], tuple[str, ...]]" = {
+    ("git", "commit"): ("-m", "--message"),
+    ("git", "tag"): ("-m", "--message"),
+    **{
+        ("gh", group, verb): ("-b", "--body", "-t", "--title")
+        for group in ("pr", "issue")
+        for verb in ("create", "edit", "comment")
+    },
+}
+
+
+def _message_flag_command_shape(text: str) -> "tuple[str, ...] | None":
+    """The message flags of ONE simple ``git commit|tag`` or ``gh pr|issue
+    create|edit|comment`` command (first word literally ``git``/``gh``, no global
+    option before the subcommand, no active separator), or ``None`` if *text* is not
+    one.
+
+    The program stores a message flag's value and never runs it, so at THIS level
+    only bash's own quoting decides which backtick in the value bash runs: an escaped
+    or single-quoted backtick is literal, a bare one inside double quotes is a live
+    substitution. An interpreter argument (``ruby -e``, ``bash -c``) is re-evaluated
+    one level down, so it is NOT one of these and its value is read quote-blind."""
+    if any(step.active and step.char in ";&|(){}\n" for step in _iter_shell_chars(text)):
+        return None
+    words = _split_shell_words(text)
+    return _MESSAGE_FLAGS.get(tuple(words[:2])) or _MESSAGE_FLAGS.get(tuple(words[:3]))
+
+
+def _is_message_flag_command(text: str) -> bool:
+    """True when *text* is a message-flag command (see
+    :func:`_message_flag_command_shape`) and every word holding a substitution opener
+    is the value of a message flag (``-m V``, ``-mV``, ``--message V``,
+    ``--message=V``; ``--body``/``-b``/``--title``/``-t`` for gh), with that value
+    exactly one bare single-quoted word -- so bash opens no substitution at all."""
+    flags = _message_flag_command_shape(text)
+    if flags is None:
+        return False
+    words = _split_shell_words(text)
+    i = 3 if words[0] == "gh" else 2
+    while i < len(words):
+        word = words[i]
+        if word in flags:
+            i += 1  # the next word is the flag's value
+            word = words[i] if i < len(words) else ""
+        else:
+            for flag in flags:
+                prefix = flag + "=" if flag.startswith("--") else flag
+                if word.startswith(prefix):
+                    word = word[len(prefix) :]
+                    break
+            else:
+                if any(opener in word for opener in _SUBSTITUTION_OPENERS):
+                    return False
+        if any(opener in word for opener in _SUBSTITUTION_OPENERS) and not (
+            word.startswith("'") and word.endswith("'") and word.count("'") == 2
+        ):
+            return False
+        i += 1
+    return True
+
+
+def _substitution_bodies(text: str, *, raw_source: bool = False) -> "list[str]":
+    """Return substitution bodies, not the unrelated commands after their closers.
+
+    Shared closers track quotes, nesting, comments and case arms; an unproven span
+    yields the whole remainder. In *raw_source*, a message-flag command
+    (:func:`_is_message_flag_command`) whose every opener sits inside single quotes
+    has no bodies, as in bash. That holds only for text with no ``$`` anywhere,
+    no ``#``, ``<<``, backslash or control byte (a newline, or a sentinel a caller
+    masked in) and whose every quote closes. Any other text, including text with a
+    live opener anywhere, gets the quote-blind openers for the whole text.
+
+    In a message-flag command (:func:`_message_flag_command_shape`, under
+    *raw_source*) THE shell quote/escape machine decides which backtick is a live
+    opener, not a re-derived rule. An escaped backtick (``\\```) is never an opener:
+    it is a literal backtick unquoted and inside double quotes, and reading it as
+    one pairs it with the next LIVE backtick as its closer, which hides the real
+    substitution after it. A single-quoted backtick is a literal too,
+    but only when the value is PROVED inert (:func:`_is_message_flag_command`, every
+    opener in one bare single-quoted word); a glued or stray single quote is not
+    proved and keeps the conservative quote-blind reading. A PAYLOAD (an interpreter
+    argument, an ``sh -c`` or ``eval`` body) is not a message command at all, so it
+    is read quote-blind: a backtick there may be live once the inner reader sees it
+    again, and skipping it would hide a self-restart.
     """
+    if raw_source and not any(m in text for m in ("#", "<<", "$", "\\")):
+        if not any(ch < " " for ch in text) and _only_single_quoted_openers(text):
+            if _is_message_flag_command(text):
+                return []
+    # The quote-aware reading is used only where bash's quoting at THIS level fully
+    # decides liveness: no ``$`` (expansions, ``$'...'`` ANSI-C), ``#`` (comment) or
+    # ``<<`` (heredoc), each of which keeps the conservative quote-blind reading, as
+    # the top fast-path above requires. A backslash is fine -- the quote/escape
+    # machine models it, which is what lets a single-quoted value with a ``\``` in it
+    # still read as inert.
+    message_shaped = (
+        raw_source
+        and not any(m in text for m in ("#", "<<", "$"))
+        and _message_flag_command_shape(text) is not None
+    )
+    # Single-quoted backticks count as literal ONLY when the value is PROVED inert
+    # (``_is_message_flag_command``): every opener sits in one bare single-quoted
+    # message word. A glued or stray single quote (``-m '...''tail'``, ``-F ...``) is
+    # not proved, so it keeps the conservative quote-blind reading.
+    message_inert = message_shaped and _is_message_flag_command(text)
+    live_openers = (
+        {
+            step.offset
+            for step in _iter_shell_chars(text)
+            if step.char == "`"
+            and step.text == "`"  # unescaped: ``\``` is a literal backtick
+            and (step.state != 1 or not message_inert)  # single-quoted literal only if proved inert
+        }
+        if message_shaped
+        else None
+    )
     bodies: list[str] = []
+    quote_at: "dict[int, tuple[int, bool]] | None" = None
     i = 0
     while i < len(text):
         # PROCESS substitutions run their body as a command just as a command
         # substitution does -- ``cat <(kirocrew token)`` executes the inner command and
         # feeds its output through a pipe.  Same paren-nesting walk.
         if text.startswith(("<(", ">(", "$("), i):
-            end, proven = _matching_close_paren(text, i + 2)
+            quote_at = quote_at or _quote_states(text)
+            end, proven = _matching_close_paren(text, i + 2, quote_at[i + 2])
             bodies.append(text[i + 2 : end - 1] if proven else text[i + 2 :])
             i = end
             continue
-        if text[i] == "`":
+        if text[i] == "`" and (live_openers is None or i in live_openers):
             end, proven = _matching_close_backtick(text, i + 1)
-            bodies.append(text[i + 1 : end - 1] if proven else text[i + 1 :])
+            body = text[i + 1 : end - 1] if proven else text[i + 1 :]
+            if message_shaped:
+                # Inside backticks bash drops the backslash before ``\``, ``` and
+                # ``$`` before it runs the body, so ``\\`` + newline is a continuation.
+                body = _BACKTICK_BODY_ESCAPE_RE.sub(r"\1", body)
+            bodies.append(body)
             i = end
         else:
             i += 1
     return bodies
+
+
+_BACKTICK_BODY_ESCAPE_RE = re.compile(r"\\([\\`$])")
 
 
 # A shell removes ``backslash + newline`` while lexing (line continuation), so
@@ -295,6 +415,10 @@ def _substitution_bodies(text: str) -> "list[str]":
 # model the shell before tokenizing. Scoped to the floor's own tokenizer input
 # (NOT a catalog-wide rewrite of the matched text): it only shapes the argv the
 # self-protection predicates see, so it cannot over-block an unrelated rule.
+# This fold over-approximates on purpose: it drops the last ``\`` before any
+# newline, folding even an even backslash run bash would keep. That keeps the
+# self-restart views fail-closed, so a split ``kiro\<newline>crew restart`` in an
+# executable payload still reads as the restart it runs.
 _SHELL_LINE_CONTINUATION_RE = re.compile(r"\\\r?\n")
 
 
@@ -303,6 +427,7 @@ def _shell_join_continuations(text: str) -> str:
     return _SHELL_LINE_CONTINUATION_RE.sub("", text)
 
 
+@once_per_call()
 def _fold_line_continuations(text: str) -> str:
     """Remove ``\\<newline>`` exactly where a shell removes it -- quote-aware.
 
@@ -498,7 +623,9 @@ class _ShellChar(NamedTuple):
     trailing_escape: bool
 
 
-def _iter_shell_chars(text: str, state: int = 0, ansi: bool = False) -> "Iterator[_ShellChar]":
+def _iter_shell_chars(
+    text: str, state: int = 0, ansi: bool = False, start: int = 0
+) -> "Iterator[_ShellChar]":
     """THE shell quote/escape state machine. Every push-path reading of shell
     quoting walks through this one generator.
 
@@ -522,9 +649,10 @@ def _iter_shell_chars(text: str, state: int = 0, ansi: bool = False) -> "Iterato
     "still open" where bash closed hides a separator or a ``git`` word.
 
     *state* and *ansi* resume a walk, which is what lets a quoted word spanning
-    whitespace be read without desyncing.
+    whitespace be read without desyncing; *start* resumes it at that offset of
+    *text* without copying the rest, and every offset stays one of *text*'s own.
     """
-    i = 0
+    i = start
     n = len(text)
     dollar_run = 0  # consecutive LITERAL ``$`` immediately before this char
     while i < n:
@@ -811,7 +939,9 @@ def _arms_case_context(text: str, index: int, in_case_body: bool = False) -> boo
     return True  # chain too deep to decide -- arm, the long direction
 
 
-def _matching_close_paren(text: str, open_end: int) -> "tuple[int, bool]":
+def _matching_close_paren(
+    text: str, open_end: int, at: "tuple[int, bool] | None" = None
+) -> "tuple[int, bool]":
     """``(index just past the matching ``)``, proven)`` for a paren opened before
     *open_end*, walked QUOTE-AWARELY through :func:`_iter_shell_chars`.
 
@@ -858,26 +988,48 @@ def _matching_close_paren(text: str, open_end: int) -> "tuple[int, bool]":
     The ``${...}`` reading is kept only where it CLOSES the span later than the
     paren-only walk does. Where it cannot close it (text it does not model, such
     as a here-document), the paren-only span stands, so no span gets shorter.
+
+    *at* is the ``(state, ansi)`` a walk of *text* from offset 0 holds at
+    *open_end* (:func:`_quote_states`). Given it, the walk starts AT *open_end*
+    with that state rather than re-reading the text before it, so the paren-only walk
+    of a text with one span per line is linear; the steps from *open_end* on are the same.
     """
-    paren = _close_paren_walk(text, open_end, False)
-    spanned = _close_paren_walk(text, open_end, True)
-    return spanned if spanned[1] and spanned[0] > paren[0] else paren
+    end, proven, _reach = _matching_close_paren_reach(text, open_end, at)
+    return end, proven
 
 
-def _close_paren_walk(text: str, open_end: int, expansions: bool) -> "tuple[int, bool]":
+def _matching_close_paren_reach(
+    text: str, open_end: int, at: "tuple[int, bool] | None" = None
+) -> "tuple[int, bool, int | None]":
+    """:func:`_matching_close_paren`'s ``(end, proven)``, plus how far its walks read.
+
+    The third value is the furthest index any walk read (each stops just past its own
+    close), or None when a walk ran to the end of *text* unproven.
+    """
+    paren = _close_paren_walk(text, open_end, False, at)
+    if text.find("{", open_end, paren[0]) < 0:
+        # no ``${`` on the way, so the second walk takes the same steps
+        return paren[0], paren[1], paren[0] if paren[1] else None
+    spanned = _close_paren_walk(text, open_end, True, at)
+    best = spanned if spanned[1] and spanned[0] > paren[0] else paren
+    reach = max(paren[0], spanned[0]) if paren[1] and spanned[1] else None
+    return best[0], best[1], reach
+
+
+def _close_paren_walk(
+    text: str, open_end: int, expansions: bool, at: "tuple[int, bool] | None" = None
+) -> "tuple[int, bool]":
     """The walk behind :func:`_matching_close_paren`; *expansions* reads ``${...}``."""
     frames = ["("]  # innermost last: ``(`` is command text, ``{`` a ``${...}`` word
     cases = 0
     outer_cases: "list[int]" = []  # a ``${...}`` word starts outside any ``case``
-    pos = 0
-    state = 0
-    ansi = False
+    pos, (state, ansi) = (0, (0, False)) if at is None else (open_end, at)
     while pos <= len(text):
         jumped = False
         dollars = 0  # live ``$`` run just before this step: ``$${`` is the PID, then ``{``
         prev = ""  # the live character just before this step
-        for step in _iter_shell_chars(text[pos:], state, ansi):
-            off = pos + step.offset
+        for step in _iter_shell_chars(text, state, ansi, pos):
+            off = step.offset
             if off < open_end:
                 continue
             if not step.active:
@@ -937,6 +1089,18 @@ def _close_paren_walk(text: str, open_end: int, expansions: bool) -> "tuple[int,
         if not jumped:
             break
     return (len(text), False)
+
+
+def _quote_states(text: str) -> "dict[int, tuple[int, bool]]":
+    """``(state, ansi)`` a walk of *text* from offset 0 holds at each step boundary.
+
+    The end of every ``$(`` / ``<(`` / ``>(`` is one: neither of its two characters
+    is a backslash, so no escape pair can straddle it.
+    """
+    states = {0: (0, False)}
+    for step in _iter_shell_chars(text):
+        states[step.offset + len(step.text)] = (step.state, step.ansi)
+    return states
 
 
 def _matching_close_backtick(text: str, start: int) -> "tuple[int, bool]":

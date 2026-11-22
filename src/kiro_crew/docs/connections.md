@@ -7,7 +7,7 @@ session; a server nobody curated is added by hand on the same page and behaves t
 same way afterwards. The page also reports whether each one is actually answering,
 which is usually the question you came with.
 
-Open it from the sidebar: **Customize → Connections**. The older
+Open it from the sidebar: **Settings → Connections**. The older
 `/connections` address still works and redirects there.
 
 The gallery ships on. To remove every Connections surface from an install, set
@@ -17,18 +17,18 @@ the only place a sign-in is offered.
 
 ## The vendor catalogue
 
-`src/kiro_crew/connections/registry.json` holds **38** curated providers. A catalogue
+`src/kiro_crew/connections/registry.json` holds the curated providers. A catalogue
 entry is what lets Kiro Crew offer a one-click **Connect** instead of asking you for
 a URL: the entry carries the vendor's MCP endpoint, the scopes worth asking for, the
 revoke page to send you to later, and a baseline of the vendor's published OAuth
 metadata that a nightly job watches for drift.
 
-Of those, **14** render a card today. Two conditions decide which:
+Of those, the entries in the first two rows below render a card today:
 
 | Entry state | Card | Why |
 |---|---|---|
-| Launch gate passed | **Connect** | A human has walked the whole flow on this provider and recorded its revoke surface. Six entries: Notion, Linear, Atlassian, Stripe, Vercel, GitLab |
-| Needs an operator-registered OAuth app | **Configure OAuth app** | The vendor refuses runtime client registration, so the card is an instruction rather than an offer. One Google OAuth client can serve all six Google cards; paste it into each. Eight entries: GitHub, Asana, Gmail, Google Drive, Google Calendar, Google Sheets, Google Docs and Google Slides |
+| Launch gate passed | **Connect** | A human has walked the whole flow on this provider and recorded its revoke surface. Seven entries: Notion, Linear, Atlassian, Stripe, Vercel, GitLab, TickTick |
+| Needs an operator-registered OAuth app | **Set up <provider>** (e.g. **Set up GitHub**) | The vendor refuses runtime client registration, so the card is an instruction rather than an offer. One Google OAuth client can serve all six Google cards; paste it into each. Slack needs both its Client ID and its Client Secret, and its card connects only when Kiro Crew does the sign-in itself (the Crew-owned sign-in preview on, chats on Kiro Agent); otherwise the card links to that setting. Nine entries: GitHub, Asana, Gmail, Google Drive, Google Calendar, Google Sheets, Google Docs, Google Slides and Slack |
 | Launch gate not yet walked | hidden | The entry exists so the nightly metadata check covers it; nothing about it is claimed to you yet |
 | Vendor admits clients by allowlist or waitlist | hidden | No per-install app can satisfy it, which is a dead end rather than an instruction. Four entries: Figma, Canva, Dropbox, Square |
 
@@ -40,7 +40,10 @@ is the same fact as the hidden row above.
 A hidden entry is not a missing feature. If a vendor you want is in the catalogue but
 has no card, you can still add its MCP endpoint by hand as an ordinary remote server
 — you give up the curated scopes, the revoke link and the **Sign in** control, and
-you keep the tools.
+you keep the tools. A vendor that admits clients by allowlist or waitlist (the last
+row above) is the exception on the Kiro Agent harness: until it admits Kiro, a row at
+its url reads **Sign-in unavailable**, unless its `oauth` block names a public client
+of your own.
 
 ## Adding your own MCP server
 
@@ -74,8 +77,8 @@ if a server's tools are missing in chat, check its row here first.
 ### Remote servers that need a sign-in
 
 A remote server usually answers the first request with a `401`, and that is the whole
-trigger — there is no command to run. `kiro-cli` owns the OAuth exchange and runs it
-itself, so **start a session** and watch chat: a banner appears with a lock icon, the
+trigger — there is no command to run. The harness (`kiro-cli`, or the KAS engine)
+runs the OAuth exchange itself, so **start a session** and watch chat: a banner appears with a lock icon, the
 server's name, and an **Authorize** link. The authorization URL is never printed into
 the transcript as text, so a session that mentions nothing is not a silent failure —
 the banner is where it lives.
@@ -88,7 +91,10 @@ which reads exactly like a broken connection.
 Curated catalogue rows get a second route: a per-row **Sign in** control, and the
 provider's own card. Minting is deliberately fenced to catalogue providers, so a
 hand-added row — even one pointing at a vendor that *is* in the catalogue — is sent
-to chat instead. That is accurate routing, not a missing button.
+to chat instead. That is accurate routing, not a missing button. On the Kiro Agent
+harness, a row at the url of a vendor that admits clients by allowlist or waitlist
+reads **Sign-in unavailable** instead, unless its `oauth` block names a public client
+of your own (see [The vendor catalogue](#the-vendor-catalogue)).
 
 Two other ways to authorize a remote server:
 
@@ -96,7 +102,7 @@ Two other ways to authorize a remote server:
   on the entry and no browser flow happens at all. A `${VAR}` reference is resolved
   when the handshake is sent; an unresolved one stays literal, which then reads as a
   server asking for a sign-in.
-- **An operator-registered OAuth app**, for the two vendors that refuse runtime
+- **An operator-registered OAuth app**, for the vendors that refuse runtime
   registration. See [credentials](#credentials-and-what-kiro-crew-can-see) below.
 
 ### The tools appear in the next *cold* session
@@ -241,8 +247,21 @@ messaging-channel session asks only while `agent.approval_mode` is `"interactive
 
 ## Credentials, and what Kiro Crew can see
 
-`kiro-cli` owns the OAuth chain end to end. On a successful sign-in it writes two
-files into its own cache directory, keyed by a hash of the server's URL — one holding
+Who runs the OAuth chain depends on the backend and one preview:
+
+- **kiro-cli** runs it end to end on the Kiro CLI backend, and on KAS for any
+  server Kiro Crew does not sign in itself.
+- **The KAS engine** runs it on the KAS backend, and hands the result to Kiro
+  Crew to keep (below).
+- **The gateway itself** runs it for a Connections card while the **MCP sign-in
+  by Kiro Crew** preview (`dashboard.feature_previews.crew_oauth`, off by default)
+  is on and chats run on KAS: it opens the consent page, swaps the code for
+  tokens, keeps the pair in your Settings → Secrets vault, refreshes it before
+  it expires, and serves the access token to KAS chats. **Disconnect** revokes it
+  upstream and deletes the vault entry.
+
+On the Kiro CLI backend, a successful sign-in writes two
+files into kiro-cli's own cache directory, keyed by a hash of the server's URL — one holding
 the bearer and refresh token, one holding the client registration. Both survive a
 restart.
 
@@ -253,7 +272,8 @@ under `<data home>/kas/mcp-grants/`, apart from your Settings → Secrets vault.
 off, the engine holds the sign-in in memory and loses it when it exits.
 With this setting off, the badge ignores any entries left in the vault.
 
-**Kiro Crew checks whether those files exist and never opens them.** For the KAS
+**For kiro-cli and KAS grants, Kiro Crew checks whether those files exist and never
+opens them.** For the KAS
 vault it checks whether the server's entry name is listed; it opens no key file and
 decrypts nothing. That is what the "Signed in" badge reports: a sign-in happened, not
 that the token is still valid. It also means Kiro Crew can tell you neither the
@@ -265,14 +285,15 @@ grant.** The token files are keyed on the URL, not on the entry, so a later reco
 silently resumes the old grant. Use the card's **Disconnect**, or the vendor's own
 revoke page, when you mean to end access.
 
-For the two vendors needing an operator-registered app, the split is:
+For the vendors needing an operator-registered app (GitHub, Asana, the six Google
+cards and Slack), the split is:
 
 | Half | Where it goes |
 |---|---|
 | Client ID | `config.json`, under `connections.oauth_clients.<slug>.client_id` |
 | Client secret | the encrypted vault, as `CONNECTIONS_<SLUG>_CLIENT_SECRET` |
 
-Enter both under **Settings → OAuth Apps**, which also shows the exact redirect URI
+Enter both under **Settings → Connections**, which also shows the exact redirect URI
 to register in the vendor console. The panel is write-only for the secret: it never
 reads one back, so a screenshot of it leaks nothing. An environment pair
 (`KIROCREW_CONNECTIONS_<SLUG>_CLIENT_ID` and `_CLIENT_SECRET`) overrides both, for
@@ -283,6 +304,74 @@ Do not hand-write a client secret into a server entry instead. A secret there si
 plaintext in a file the agent can read. See [Secrets vault](secrets-vault.md) for what
 the vault refuses the agent, and [Blocked commands](blocked-commands.md) for what
 happens when the agent tries to read one anyway.
+
+## Atlassian organization admin checklist
+
+An Atlassian organization admin can limit which apps may sign in to Atlassian's
+MCP server and what they may do there. With those limits on, an Atlassian
+sign-in from Kiro Crew, or its tool calls, fail until the admin allows this
+install. This section is the list to hand that admin. It mixes two sources, and
+each part says which: what Kiro Crew does (from its source), and what Atlassian
+Administration offers (from Atlassian's docs, not walked by Kiro Crew on a real
+organization).
+
+**1. The redirect address (Kiro Crew).** The Atlassian card shows the address
+this install signs in with, under the warning triangle beside **Connect**. Copy
+it from there. Which address applies depends on what runs the sign-in:
+
+| What runs the sign-in | When | Redirect address | Domain entry the admin needs |
+|---|---|---|---|
+| Kiro Crew itself, local | The **MCP sign-in by Kiro Crew** feature preview (`dashboard.feature_previews.crew_oauth`, which also covers the Atlassian card) is on, chats run on a backend Kiro Crew bridges such as Kiro Agent, and `dashboard.url` is not a public HTTPS address | `http://127.0.0.1:48100/callback` | `http://127.0.0.1:*/**` covers it |
+| Kiro Crew itself, on a gateway with a public HTTPS `dashboard.url` | As above, with `dashboard.url` set to `https://<dashboard host>` | `https://<dashboard host>/api/connections/oauth/callback` | `https://<dashboard host>/**`, its own entry |
+| Kiro CLI or the KAS engine | Every other case | A loopback address whose port that runtime picks at each sign-in | `http://127.0.0.1:*/**` and `http://localhost:*/**` |
+
+**2. What to allow in Atlassian Administration (Atlassian's docs).** Everything
+below lives at [admin.atlassian.com](https://admin.atlassian.com): pick the
+organization, then **Connectors → Atlassian MCP server**.
+
+- **Domains.** The list of redirect patterns allowed to sign in. Atlassian
+  describes `http://localhost:*/**` and `http://127.0.0.1:*/**` as the entries
+  that let local clients finish an OAuth sign-in, which an admin may keep or
+  remove, and an **Allow Atlassian supported domains** switch an admin may turn
+  off. If the entry from the table is missing, the admin adds it with **Add
+  domain**. An `https://` address always needs its own entry; `http://` is
+  accepted only for `localhost` and `127.0.0.1`.
+- **Permissions.** Read, Write and Search, each allowed or blocked per app
+  (Jira, Confluence and others). Allow the ones the agent should use.
+- **Authentication.** OAuth 2.1 is the default and is what Kiro Crew uses. The
+  API token switch does not affect it.
+- **IP allowlist.** Managed elsewhere in Atlassian Administration, not on the MCP
+  server page. If the organization uses one, MCP requests must come from an
+  allowed address. Kiro Crew's requests to Atlassian leave from the machine that
+  runs the gateway, so that machine's public address is the one to allow.
+  Atlassian notes the consent page can still appear from a blocked address; the
+  tool calls then fail.
+
+**3. What the sign-in asks for (Kiro Crew).** When Kiro Crew runs the sign-in
+itself, it asks for every scope Atlassian's server advertises, because
+Atlassian's sign-in challenge names none and the catalogue recommends none. That
+is about 40 scopes today, each shaped `<verb>:<product>:agent-interface`, for
+example `read:jira:agent-interface`, `write:jira:agent-interface`,
+`delete:jira:agent-interface` and `manage:jira:agent-interface`, plus scopes for
+Confluence, Jira Service Management, Bitbucket, Loom, Talent, Assets and more,
+and `offline_access`. The live list is the `scopes_supported` field of
+[Atlassian's resource document](https://mcp.atlassian.com/.well-known/oauth-protected-resource/v2/mcp).
+When Kiro CLI or the KAS engine runs the sign-in, that runtime chooses
+the scopes. The scope verbs do not map one to one onto the Permissions tab: the
+tab has Read, Write and Search, while the scopes also say `delete` and `manage`,
+and Atlassian's docs do not say which permission governs those.
+
+**4. When Atlassian refuses.** If Atlassian sends the sign-in back refused with
+`access_denied`, the card says that either the consent was declined or the
+organization's admin does not allow the connection, because that answer means
+either. Whether an admin block arrives that way or on a page of Atlassian's own
+has not been checked on a real organization. The exact messages Atlassian shows,
+and what the admin changes for each, are in
+[Troubleshooting](troubleshooting.md#atlassian-says-access-denied-your-organization-admin).
+
+Atlassian's own pages: [Control Atlassian MCP server settings](https://support.atlassian.com/security-and-access-policies/docs/control-atlassian-rovo-mcp-server-settings/),
+[Configure Atlassian MCP server permissions](https://support.atlassian.com/security-and-access-policies/docs/configure-atlassian-mcp-server-permissions/)
+and [Available Atlassian MCP server domains](https://support.atlassian.com/security-and-access-policies/docs/available-atlassian-rovo-mcp-server-domains/).
 
 ## Health: what a row's badge means
 
@@ -359,7 +448,7 @@ search         →  atlassian_search, gitlab_search, neon_search, ticktick_searc
 whoami         →  figma_whoami, railway_whoami, sentry_whoami
 ```
 
-Renames are declared in the catalogue for eleven providers today — GitHub, Linear,
+Renames are declared in the catalogue for these providers today — GitHub, Linear,
 Vercel, GitLab, Atlassian, Neon, Todoist, TickTick, Sentry, Figma and Railway — and
 only for the tools that actually collide. A server that is not the catalogue provider
 gets no renames, whatever it calls itself.
@@ -394,6 +483,67 @@ claiming success.
 unreachable for several consecutive checks, so retrying the same call is unlikely to
 help. Say which server is quarantined and what its last error was, and offer the
 reset control — do not edit the user's MCP config to work around it.
+
+## Sharing MCP servers across chats
+
+Each chat normally starts its own copy of every stdio MCP server. **MCP
+Management**, at the top of **MCP Servers** above the server list,
+lets all your chats use one copy of a server instead, which saves memory when many
+chats are open. A shared copy runs outside each chat's sandbox, with your access, so
+share a server only if you added it yourself and its command is what you expect.
+
+**Turn on MCP server sharing** is the switch on the
+**Share MCP servers across chats** card at the top of the page
+(`mcp_gateway.enabled`). The card's diagram
+shows the difference: off, each chat runs its own copy of a server; on, all chats
+use one copy. A link can open the card directly at
+`/capabilities?tab=mcp-servers&view=sharing#mcp-sharing`. Turning it on asks first and lists every server it will
+share: the ones you turned on by hand, plus the shareable ones nobody chose for. It
+never turns on a server you turned off by hand, a server that hands out
+credentials, or one that waits for your OK. **Memory now** and **Memory with
+sharing** show what the MCP servers use, to the crew owner only. Chats that are
+already open keep their own copies until you reload them: the banner under the
+switch offers to reload them, and skips a chat that is busy.
+
+When servers wait for your OK, a card counts them. **Review and approve** opens
+them in a dialog, each with **Share across chats** (one copy runs it for all
+chats, outside their sandbox) and **Don't share** (it keeps running inside
+each chat). There is no
+approve-all.
+
+The **Sharing** view, beside **Servers** under the card, holds the rest. In
+**Per-server sharing**, each row has a switch in
+the **Share** column, named **Enable MCP sharing** (`mcp_gateway.stub_servers`,
+which [MCP Apps](mcp-apps.md) calls routing). Turning it on reads the command the
+server runs and approves exactly that launch; the row's **Details** shows it, with
+env names only, never a secret value. When a server's PATH changes, Details names
+the folders added and removed. A row's state is one of:
+
+| State | Meaning |
+|---|---|
+| **shared** | All new chats use one copy |
+| **direct** | Each chat starts its own copy. A row with Share on also reads **direct** while the switch at the top is off, when its env names a vault secret, or when it needs a setting each chat keeps |
+| **Can't share** | It has no stdio pipe, it hands out credentials, or its command cannot be approved here, such as when too many agents start it with different settings (the row names the limit and the way back) |
+| **Paused · command changed** | Its command or settings changed since you approved it, so it runs inside each chat until you press **Approve update** |
+| **Paused · not approved yet** | It was added in a config file and never approved here; **Share across chats** shares it |
+
+A paused row has no switch. It offers its approve button and **Don't share this
+server**, which takes the mark off and approves nothing. A row that cannot share
+but still carries a mark has **Remove** in place of a switch, which takes the mark
+off. **Enable all shareable** lists the servers it would share by name, and shares
+them only when you confirm.
+
+**Pre-install npm servers** installs each server started with `npx` (or
+`npm exec`) that has Share on and is not paused, ahead of time, so a chat starts it
+without a download or a registry lookup. A server whose version is not pinned to an
+exact number is checked for a newer one every
+`mcp_gateway.resolve_once_refresh_hours` (24 by default). **Update now** checks all
+of them immediately, pinned or not. A server that fails to pre-install starts the
+way it always did.
+
+**Sharing assessment** is read-only: what Kiro Crew observed about each server, and
+whether that argues for or against sharing it. Nothing on it changes anything; the
+switches are under **Per-server sharing**.
 
 ## Behind enterprise MCP governance
 

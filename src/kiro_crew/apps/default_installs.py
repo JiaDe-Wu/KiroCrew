@@ -127,12 +127,16 @@ def _applied_names() -> frozenset[str]:
     """
     import json
 
-    from kiro_crew.config.loader import KiroCrewConfig, config_path, read_config_text
+    from kiro_crew.config.loader import KiroCrewConfig, config_path, read_endorsed_config_text
 
     names: set[str] = set()
     path = config_path()
-    if path.is_file():
-        raw = json.loads(read_config_text(path))
+    try:
+        # Read as the load reads it, so a deleted file serves its endorsed copy.
+        raw = json.loads(read_endorsed_config_text(path))
+    except FileNotFoundError:
+        raw = None  # neither the file nor an endorsed copy
+    if raw is not None:
         agent_raw = raw.get("agent") if isinstance(raw, dict) else None
         if isinstance(agent_raw, dict):
             names.update(_list(agent_raw, _APPLIED_KEY))
@@ -266,7 +270,9 @@ async def _install_transaction(
         _suspend_app_for_session_approval_reconsent,
     )
 
-    result = await install_from_registry(name, resolved_entry=entry, start_disabled=True)
+    result = await install_from_registry(
+        name, resolved_entry=entry, start_disabled=True, via="default"
+    )
     if not result.get("ok"):
         return result
     if result.get("needsClientInstall"):

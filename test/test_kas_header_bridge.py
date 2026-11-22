@@ -11,6 +11,8 @@ HTTP requests and must appear in nothing that crosses the wire.
 
 from __future__ import annotations
 
+import errno
+import http.client
 import io
 import json
 import os
@@ -20,6 +22,7 @@ import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from kas_agents_helpers import _spec
@@ -154,6 +157,7 @@ class _FakeRemote(BaseHTTPRequestHandler):
 
     seen: list[dict]
     sse = False
+    tool_result: dict | None = None
 
     def log_message(self, *_a):  # quiet
         pass
@@ -183,7 +187,7 @@ class _FakeRemote(BaseHTTPRequestHandler):
         result = (
             {"protocolVersion": "2025-06-18"}
             if body["method"] == "initialize"
-            else {"text": "authorized"}
+            else self.tool_result or {"text": "authorized"}
         )
         payload = json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": result}).encode()
         if self.sse:
@@ -335,6 +339,38 @@ class TestBridge:
         assert all(r["headers"].get("mcp-protocol-version") == "2025-06-18" for r in posts)
         assert handler.seen[-1]["body"] is None, "close ends the server's session"
 
+    @pytest.mark.parametrize("sse", [False, True])
+    def test_a_structured_only_result_reaches_the_engine_as_text(self, remote, sse):
+        # Airtable's hosted server answers ``content: []`` with the payload only
+        # in ``structuredContent``; the engine reads only ``content``.
+        handler, base = remote
+        handler.sse = sse
+        handler.tool_result = {"content": [], "structuredContent": {"bases": ["Ü"]}}
+        bridge, out, _err = _bridge(base + "/mcp")
+        bridge.send(_msg(id=2, method="tools/call", params={}))
+        (reply,) = _lines(out)
+        assert reply["result"]["content"] == [{"type": "text", "text": '{"bases":["Ü"]}'}]
+        assert reply["result"]["structuredContent"] == {"bases": ["Ü"]}, "kept for outputSchema"
+
+    def test_every_request_names_the_bridge_not_the_python_library(self, remote):
+        # Bot filters (Atlassian Rovo's among them) answer urllib's default
+        # "Python-urllib/x.y" with 403, which reads as a bad auth header.
+        handler, base = remote
+        bridge, _out, _err = _bridge(base + "/mcp")
+        bridge.send(_msg(id=1, method="initialize", params={}))
+        bridge.close()
+        agents = [r["headers"].get("user-agent", "") for r in handler.seen]
+        assert len(agents) == 2, "the POST and the closing DELETE"
+        assert all(a.startswith("kirocrew-mcp-bridge/") for a in agents), agents
+
+    def test_a_configured_user_agent_is_kept(self, remote):
+        handler, base = remote
+        bridge, _out, _err = _bridge(
+            base + "/mcp", {"Authorization": CANARY, "user-agent": "mine/2"}
+        )
+        bridge.send(_msg(id=1, method="tools/list"))
+        assert handler.seen[0]["headers"]["user-agent"] == "mine/2"
+
     def test_a_rejection_answers_the_request_without_the_header(self, remote):
         _handler, base = remote
         bridge, out, err = _bridge(base + "/mcp", {"Authorization": "Bearer wrong-value"})
@@ -350,10 +386,29 @@ class TestBridge:
         assert [r["path"] for r in handler.seen] == ["/moved"], "the header went nowhere else"
         assert "redirect" in _lines(out)[0]["error"]["message"]
 
-    def test_an_unreachable_server_answers_the_request(self):
-        bridge, out, _err = _bridge(f"http://127.0.0.1:{_closed_port()}/mcp")
+    def test_an_unreachable_server_answers_the_request_with_the_cause(self):
+        bridge, out, err = _bridge(f"http://127.0.0.1:{_closed_port()}/mcp")
         bridge.send(_msg(id=4, method="tools/list"))
-        assert "could not be reached" in _lines(out)[0]["error"]["message"]
+        message = "kirocrew: MCP server 'jira' could not be reached (connection refused)"
+        assert _lines(out)[0]["error"]["message"] == message
+        assert err.getvalue() == message + "\n", "no [Errno ...] socket text"
+
+    def test_an_answer_the_network_cuts_off_is_reported_with_the_cause(self):
+        class _TimedOut(io.BytesIO):
+            status, headers = 200, http.client.HTTPMessage()
+
+            def read(self, *_args):
+                raise TimeoutError(errno.ETIMEDOUT, "Connection timed out")
+
+        out, err = io.BytesIO(), io.StringIO()
+        opener = SimpleNamespace(open=lambda _request, timeout: _TimedOut())
+        bridge = Bridge(
+            "https://example.test/mcp", {}, server="jira", out=out, err=err, opener=opener
+        )
+        bridge.send(_msg(id=6, method="tools/list"))
+        message = "kirocrew: MCP server 'jira' stopped answering (timed out)"
+        assert _lines(out)[0]["error"]["message"] == message
+        assert err.getvalue() == message + "\n", "no [Errno ...] socket text"
 
     @pytest.mark.parametrize(
         ("answer", "reason"),

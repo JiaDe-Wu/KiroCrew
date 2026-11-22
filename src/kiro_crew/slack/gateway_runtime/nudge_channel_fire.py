@@ -54,13 +54,12 @@ if TYPE_CHECKING:
         logger,
         nudge_cycle_header,
         provider_last_turn_usage,
-        redact_credentials,
-        redact_exfiltration_urls,
         render_for_slack,
         run_in_embed_pool,
         save_conversation_turn_off_loop,
         session_store_for_turn,
         stream_and_collect,
+        terminal_wake_line,
         turn_ceiling,
     )
 
@@ -196,9 +195,17 @@ async def _fire_slack_inner_nudge(
         _fired_generation = loop.config_generation
         msg_body = await compose_nudge_body(_fired_message, _fired_sentinel, loop.slot_key)
         tagged = f"{nudge_cycle_header(loop)}\n{msg_body}"
+        # The watched pull request ended: this is the owed final turn, and its
+        # result goes first so the agent reports rather than waits.
+        if _terminal_line := terminal_wake_line(loop):
+            tagged = f"{_terminal_line}\n\n{tagged}"
+        # Skill triggers read the loop's own message, not the cycle header or
+        # the ledger snapshot Kiro Crew puts before it.
+        trigger_text: str | None = _fired_message
     else:
         tagged = wake_message
         _fired_generation = loop.config_generation
+        trigger_text = None
     # Fail closed: an unattended turn MUST run under the HookManager
     # PreToolUse governance gate (mirrors cron's default approval path).
     # Without ctx_builder there are no hooks to enforce the gate — skip.
@@ -250,6 +257,7 @@ async def _fire_slack_inner_nudge(
             provider_type=_provider,
             context_provider=client,
             resumed=_resumed,
+            skill_trigger_text=trigger_text,
         )
         _completion_hook = self._monitor_completion_hook(loop)
         if wake_message is not None and _completion_hook is None:
@@ -301,6 +309,10 @@ async def _fire_slack_inner_nudge(
                 ),
                 timeout=_NUDGE_TURN_TIMEOUT,
             )
+            # A directive tool result the reply quotes is protocol, not reply text.
+            from kiro_crew.session_directive import strip_quoted_markers
+
+            response = strip_quoted_markers(response or "")
             if _directives.terminal_applied:
                 # A plain wake has no human-steer path. Its accepted quiet end
                 # is the reply, not any text the provider streams around it.
@@ -349,6 +361,8 @@ async def _fire_slack_inner_nudge(
                 # other channel constructors.
                 audit_session_key=key,
                 audit_agent=_get_agent_for_session(key) or "kirocrew",
+                hook_agent=_get_agent_for_session(key) or "",
+                is_new_session=is_new,
             )
             response = await asyncio.wait_for(
                 driver.run(full_msg),
@@ -481,15 +495,11 @@ async def _fire_slack_inner_nudge(
     # Persist for dashboard replay (mirrors subagent Slack injection).
     if self.conv_log and not (is_thread_temporary(key) or is_thread_incognito(key)):
         try:
-            safe_nudge, _ = redact_exfiltration_urls(tagged)
-            safe_nudge, _ = redact_credentials(safe_nudge)
-            safe_response, _ = redact_exfiltration_urls(response or "")
-            safe_response, _ = redact_credentials(safe_response)
             await save_conversation_turn_off_loop(
                 self.conv_log,
                 key,
-                safe_nudge,
-                safe_response,
+                tagged,
+                response or "",
                 source_thread=key,
                 source_user="autonudge",
                 agent=_get_agent_for_session(key),
@@ -615,6 +625,10 @@ async def _fire_dm_nudge(
         fired_message = loop.message
         msg_body = await compose_nudge_body(fired_message, loop.stop_sentinel_path, loop.slot_key)
         tagged = f"{nudge_cycle_header(loop)}\n{msg_body}"
+        # The watched pull request ended: this is the owed final turn, and its
+        # result goes first so the agent reports rather than waits.
+        if _terminal_line := terminal_wake_line(loop):
+            tagged = f"{_terminal_line}\n\n{tagged}"
         # Skill triggers read the loop's own message, not the cycle header or the
         # ledger snapshot Kiro Crew put before it, as on the Slack thread path.
         trigger_text: str | None = fired_message

@@ -154,9 +154,19 @@ def test_real_resolver_shell_emits_large_and_hosted_fallback(
 
 
 @pytest.mark.parametrize(
-    "resolved", ["", "windows-latest", "codebuild-windows instance-size:large"]
+    "resolved,expected",
+    [
+        ("", "windows-latest"),
+        ("windows-latest", "windows-latest"),
+        ("kirocrew-windows-4-core", "kirocrew-windows-4-core"),
+        # Admitted: the label is this job's own attempt's, never the resolver's.
+        (
+            "codebuild-kirocrew-gha-windows-100-1 instance-size:large",
+            "codebuild-kirocrew-gha-windows-100-2 instance-size:large",
+        ),
+    ],
 )
-def test_all_windows_consumers_keep_output_fallback_and_matrix_names(jobs, resolved):
+def test_all_windows_consumers_keep_output_fallback_and_matrix_names(jobs, resolved, expected):
     consumers = {
         name
         for name, job in jobs.items()
@@ -176,8 +186,10 @@ def test_all_windows_consumers_keep_output_fallback_and_matrix_names(jobs, resol
                 "matrix.os": "windows-latest",
                 "needs.changes.outputs.windows_runner": resolved,
                 "needs.changes.outputs.linux_runner_large": "linux-large",
+                "github.run_id": "100",
+                "github.run_attempt": "2",
             }
-            assert _expression(jobs[name]["runs-on"], context) == (resolved or "windows-latest")
+            assert _expression(jobs[name]["runs-on"], context) == expected
 
 
 def test_shard_selection_and_checks_stay_intact(jobs):
@@ -198,14 +210,17 @@ def test_shard_selection_and_checks_stay_intact(jobs):
     )
     assert "continue-on-error" not in job
     step = next(s for s in job["steps"] if s.get("name", "").startswith("Run tests (Windows shard"))
+    # The full-suite arm, the last invocation (the leaf and reduced arms are held
+    # by test_ci_file_shards.py).
     command = re.sub(
-        r"\s+", " ", step["run"].split("python -m pytest", 1)[1].replace("\\\n", " ")
+        r"\s+", " ", step["run"].rsplit("python -m pytest", 1)[1].replace("\\\n", " ")
     ).strip()
     assert command == (
-        "-p scripts.ci_pytest_progress -p scripts.ci_file_shards "
+        "-p scripts.ci_pytest_progress -p scripts.ci_file_shards -p scripts.ci_main_red_skip "
         '--ci-progress-dir "$RUNNER_TEMP/pytest-progress" '
-        '-q -n auto --timeout=180 --no-cov --max-worker-restart=0 -m "not ipv6_required and not real_venv" '
-        '--file-shards "$SHARD_COUNT" --file-shard ${{ matrix.group }}'
+        '-q -n "$WORKERS" --timeout=180 --no-cov --max-worker-restart=0 -m "not ipv6_required and not real_venv" '
+        '--file-shards "$SHARD_COUNT" --file-shard ${{ matrix.group }} '
+        "--file-shard-pins scripts/ci_file_shard_pins_windows.txt"
     )
     assert step["shell"] == "bash"
     upload = next(s for s in job["steps"] if s.get("name") == "Upload Windows pytest progress")
@@ -303,6 +318,8 @@ def test_boot_matrix_maps_only_runner_and_retains_os_fallback(jobs, os_name, ava
         "matrix.os": os_name,
         "needs.changes.outputs.linux_runner_large": "linux-large" if available else "",
         "needs.changes.outputs.windows_runner": "windows-large" if available else "",
+        "github.run_id": "100",
+        "github.run_attempt": "2",
     }
     expected = (
         {

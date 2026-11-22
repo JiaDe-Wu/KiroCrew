@@ -162,6 +162,12 @@ def _person(value: Any) -> str:
     return str(user.get("displayName") or user.get("name") or user.get("slug") or "")
 
 
+def _account(value: Any) -> str:
+    """The stable account key of *value*; two accounts can share a display name."""
+    user = projection._as_dict(value)
+    return str(user.get("name") or user.get("slug") or "")
+
+
 class _Client:
     """One fetch's view of one instance: the base URL and an open session."""
 
@@ -366,6 +372,7 @@ def _comment_rows(client: _Client, activities: Any, partial: list[str]) -> list[
     if page.get("isLastPage", True) is False:
         projection._mark_partial(partial, "review discussions")
     rows: list[dict[str, Any]] = []
+    verdicts: dict[str, list[dict[str, Any]]] = {}
 
     def add_comment(
         comment: dict[str, Any], thread: str, anchor: dict[str, Any], depth: int
@@ -408,6 +415,12 @@ def _comment_rows(client: _Client, activities: Any, partial: list[str]) -> list[
                     projection._as_dict(activity.get("commentAnchor")),
                     0,
                 )
+        elif action == "UNAPPROVED":
+            # A withdrawal leaves the reviewer with no verdict, so their earlier
+            # review rows are dropped. Keyed by account, not display name.
+            account = _account(activity.get("user"))
+            for row in verdicts.pop(account, []) if account else []:
+                rows.remove(row)
         elif action in _REVIEW_STATES:
             if len(rows) >= _MAX_COMMENTS:
                 projection._mark_partial(partial, "review discussions")
@@ -428,6 +441,7 @@ def _comment_rows(client: _Client, activities: Any, partial: list[str]) -> list[
                     "resolved": False,
                 }
             )
+            verdicts.setdefault(_account(activity.get("user")), []).append(rows[-1])
     return rows
 
 
@@ -452,6 +466,7 @@ async def _fetch_pull_request(ref: SourceRef) -> dict[str, Any]:
     async def work(client: _Client) -> dict[str, Any]:
         pr = await client.pull_request()
         partial: list[str] = []
+        failed: list[str] = []
         head = _head_sha(pr)
         commits, changes, diff, activities, builds = await asyncio.gather(
             client.get(
@@ -484,7 +499,7 @@ async def _fetch_pull_request(ref: SourceRef) -> dict[str, Any]:
             if isinstance(value, BaseException):
                 if isinstance(value, SourceProviderNotConfigured):
                     raise value
-                projection._mark_partial(partial, section)
+                projection._mark_failed(partial, failed, section)
         commit_page = projection._or_empty(commits)
         if projection._as_dict(commit_page).get("isLastPage", True) is False:
             projection._mark_partial(partial, "commits")
@@ -523,6 +538,7 @@ async def _fetch_pull_request(ref: SourceRef) -> dict[str, Any]:
             "comments": _comment_rows(client, projection._or_empty(activities), partial),
             "files": files,
             "partialSections": partial,
+            "failedSections": failed,
         }
 
     return await _with_client(ref, work)

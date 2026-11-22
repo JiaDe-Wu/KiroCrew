@@ -63,6 +63,11 @@ export interface ChatPaneProps {
    *  in split view the grid sets it on the focused pane only, since the
    *  single-chat composer is not mounted there. */
   pushToTalk?: boolean
+  /** ⌘F / Ctrl+F opens Find in chat for this pane, the Sessions chat's find
+   *  bar over this transcript. Only the one pane a page's chat key belongs to
+   *  sets it (a Bot's chat on the Bots page): the key listens on the whole
+   *  document, and the Sessions chat answers it itself. False closes the bar. */
+  findInChat?: boolean
   /** Suppress the "Session ready. Type a message to start." hint on an empty
    *  transcript. A host that is showing its own verdict about this thread
    *  above the pane (the Members page's "Couldn't reconnect" notice) sets it,
@@ -83,6 +88,11 @@ export interface ChatPaneProps {
    *  the pane shows every attachment but cannot open one. Capability by
    *  omission, like `openSideChat`. */
   onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
+  /** Open a directory a reply names in the host's side panel. Without it a
+   *  folder chip falls back to the OS file manager, which a remote or
+   *  headless gateway answers by copying the path. Capability by omission,
+   *  like `onFileOpen`. */
+  onFolderOpen?: (path: string) => void
   /** Reveal the Crew (Workers) tab from a Crew Mode dispatch-notice row. The
    *  host's single reveal (`handleOpenCrewTab`), threaded down so a split pane
    *  uses the SAME path as the single-chat surface — it closes Find and rebinds

@@ -7,7 +7,7 @@
  * press "Download" and "Restart & Update". Rather than add a test-only
  * auto-consent hook to shipped code, this drives the REAL renderer over the
  * Chrome DevTools Protocol and calls the SAME preload-exposed API a click
- * calls (window.updateAPI.download / .install). The code path under test is
+ * calls (window.updateAPI.download / .install / .relaunch). The code path under test is
  * therefore identical to the one users hit.
  *
  * Requires: the app launched with --remote-debugging-port=<port>, a local feed
@@ -19,7 +19,7 @@
  *   node scripts/ota-drive.js --cdp 9222 --expect 1.0.1 [--timeout 180]
  *
  * Exit 0 only if the updater reached the "downloaded" state and install was
- * dispatched. Verifying the BUNDLE actually swapped is the caller's job (read
+ * armed and the quit that installs it was dispatched. Verifying the BUNDLE actually swapped is the caller's job (read
  * CFBundleShortVersionString afterwards) -- this script deliberately does not
  * conflate "install dispatched" with "install succeeded".
  */
@@ -50,12 +50,19 @@ function getJson(path) {
   });
 }
 
-/** Find the renderer target that actually has the update bridge attached. */
+// The local dashboard's origin. update:relaunch answers only a sender on it
+// (ipc-registrar.js assertLocalDashboard), which is where a real Restart now
+// click comes from; the loading.html shell is file:// (origin "null") and is
+// refused, so driving it would never quit the app.
+const LOCAL_DASHBOARD = /^http:\/\/(localhost|127\.0\.0\.1):\d+\//;
+
+/** Find the local dashboard renderer that has the update bridge attached. */
 async function findUpdateTarget(deadline) {
   while (Date.now() < deadline) {
     let targets = [];
     try { targets = await getJson("/json/list"); } catch { /* devtools not up yet */ }
-    for (const t of targets.filter((x) => x.type === "page" && x.webSocketDebuggerUrl)) {
+    const pages = targets.filter((x) => x.type === "page" && x.webSocketDebuggerUrl && LOCAL_DASHBOARD.test(x.url));
+    for (const t of pages) {
       const probe = await evaluate(t.webSocketDebuggerUrl, "typeof window.updateAPI").catch(() => null);
       if (probe && probe.value === "object") {
         log(`found renderer with updateAPI: ${t.url.slice(0, 80)}`);
@@ -64,7 +71,7 @@ async function findUpdateTarget(deadline) {
     }
     await sleep(1000);
   }
-  throw new Error("no renderer exposing window.updateAPI appeared before the timeout");
+  throw new Error("no local dashboard renderer exposing window.updateAPI appeared before the timeout");
 }
 
 /** One-shot CDP Runtime.evaluate over a fresh socket (keeps state simple). */
@@ -114,13 +121,14 @@ async function waitForState(wsUrl, wanted, deadline) {
     const states = JSON.parse(r.value || "[]");
     const names = states.map((s) => s.state).join(",");
     if (names !== last) { log(`states: ${names || "(none)"}`); last = names; }
-    const hit = states.find((s) => s.state === wanted);
+    const wants = Array.isArray(wanted) ? wanted : [wanted];
+    const hit = states.find((s) => wants.includes(s.state));
     if (hit) return hit;
     const err = states.find((s) => s.state === "error");
     if (err) throw new Error(`updater reported error: ${err.message}`);
     await sleep(2000);
   }
-  throw new Error(`state "${wanted}" not reached before the timeout`);
+  throw new Error(`state "${[].concat(wanted).join('" or "')}" not reached before the timeout`);
 }
 
 (async () => {
@@ -162,23 +170,42 @@ async function waitForState(wsUrl, wanted, deadline) {
 
   log("triggering a check (the launch-delay check may already have run)");
   await evaluate(ws, "window.updateAPI.check()");
-  const found = await waitForState(ws, "found", deadline);
-  log(`DISCOVERY ok -> found ${found.version} (no download yet: consent gate held)`);
+  // The dashboard renders after the gateway boots, and with auto-download on
+  // the launch check may have staged the build by then: the state it reports
+  // on a check is then "downloaded", never "found".
+  const found = await waitForState(ws, ["found", "downloaded"], deadline);
+  log(`DISCOVERY ok -> ${found.state} ${found.version}`);
   if (EXPECT && found.version !== EXPECT) {
     throw new Error(`expected to find ${EXPECT}, feed offered ${found.version}`);
   }
 
-  log("granting consent -> updateAPI.download()");
-  await evaluate(ws, "window.updateAPI.download()");
+  if (found.state === "found") {
+    log("granting consent -> updateAPI.download()");
+    await evaluate(ws, "window.updateAPI.download()");
+  }
   const downloaded = await waitForState(ws, "downloaded", deadline);
   log(`DOWNLOAD ok -> staged ${downloaded.version}`);
 
-  log("dispatching install -> updateAPI.install() (app will quit + swap)");
-  await evaluate(ws, "window.updateAPI.install()").catch((e) => {
+  // install() only ARMS: an update is applied on the app's own quit, never while
+  // it runs. So arm it, then quit the way the Restart now button does
+  // (updateAPI.relaunch(): a plain quit whose quit-time install swaps the bundle
+  // and brings the app back). That keeps the real quit-time install under test.
+  log("arming the install -> updateAPI.install() (nothing quits yet)");
+  await evaluate(ws, "window.updateAPI.install()");
+
+  log("quitting the way Restart now does -> updateAPI.relaunch() (the quit installs, then the app returns)");
+  const relaunched = await evaluate(ws, "window.updateAPI.relaunch()").catch((e) => {
     // The app quits mid-call, so a dropped socket here is expected/normal.
-    log(`install dispatched (socket closed as the app quit: ${e.message})`);
+    log(`quit dispatched (socket closed as the app quit: ${e.message})`);
+    return null;
   });
-  log("OK: discovery -> consent -> download -> install dispatched");
+  // A refused relaunch answers {ok: false} and the app keeps running, so the
+  // swap is never attempted. That is a failure, never "quit dispatched".
+  const answer = relaunched && relaunched.value;
+  if (answer && answer.ok === false) {
+    throw new Error(`updateAPI.relaunch() was refused: ${answer.error || "no reason given"}`);
+  }
+  log("OK: discovery -> consent -> download -> armed -> quit dispatched");
   process.exit(0);
 })().catch((e) => {
   console.error("[ota-drive] FAIL:", e.message);

@@ -153,7 +153,7 @@ def _retry_at_in_text(haystack: str, now: float | None) -> float | None:
     if match is None:
         return None
     base = time.time() if now is None else now
-    return base + float(int(match.group(1)))
+    return _http.delay_retry_at(match.group(1), base)
 
 
 def classify_raw_error(error: object, *, scope: str = SCOPE_DEFAULT) -> DependencySignal | None:
@@ -186,7 +186,7 @@ def classify(exc: BaseException, scope: str = "") -> DependencySignal | None:
     if not is_acp_error(exc):
         return None
     effective_scope = scope_for(exc, scope)
-    if getattr(exc, "auth_required", False):
+    if getattr(exc, "auth_required", False) or getattr(exc, "sign_in_needed", False):
         return DependencySignal(
             kind=KIND_AUTH_FAILED,
             dependency_scope=effective_scope,

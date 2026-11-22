@@ -3,8 +3,8 @@
  *
  * `settingsRegistry.gen.ts` is codegen'd from the static settings tree, so it lists
  * every entry the build ships whether or not the running gateway offers it. The
- * Decisions (Jev) toggle is governed by `capabilities.decisions`: under a pin
- * `FeaturePreviewsSection` renders no card, and an unfiltered corpus would then hand
+ * Decisions toggle is governed by `capabilities.decisions`: under a pin
+ * the card draws only the administrator's notice, and an unfiltered corpus would then hand
  * the user a search result that navigates to a section where the row is absent —
  * which reads as a broken page rather than a feature the fleet withdrew.
  *
@@ -23,28 +23,40 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router-dom'
 import { Provider } from 'react-redux'
 
-import { api } from '../../api/client'
+import { api, ApiError } from '../../api/client'
 import { createTestStore } from '../../test/helpers'
 import { updateInfoQuery } from '../../api/updateInfoQuery'
 import { useUpdateSubscription } from '../../hooks/useUpdateSubscription'
 import { sseStatus } from '../../store/dashboardSlice'
 import type { ResourceProvider } from './types'
-import { PREVIEW_EXPLORE, setPreviewFlag } from '../../utils/previewFlags'
+import { PREVIEW_DASHBOARD_STALE_FIELDS, PREVIEW_EXPLORE, setPreviewFlag } from '../../utils/previewFlags'
 
 import { createSettingsProvider, useSettingsProvider } from './providers/settingsProvider'
 import { SETTINGS_REGISTRY } from './settingsRegistry.gen'
 import {
   APP_AUTO_DOWNLOAD_SETTING_ID,
+  AUTO_CONNECT_CREWS_SETTING_ID,
   DECISIONS_SETTING_ID,
   DECISIONS_SETTING_IDS,
+  ENABLE_REMOTE_CREWS_SETTING_ID,
   FEATURE_TIPS_SETTING_ID,
   GATEWAY_AUTO_UPDATE_SETTING_ID,
+  REOPEN_LAST_PAGE_SETTING_ID,
+  SLACK_TOOLS_SWITCH_KEY,
   settingEntryOffered,
+  TERMINAL_CTRL_COPY_PASTE_SETTING_ID,
   type SettingsSearchGovernance,
 } from './settingsSearchCore'
 import { extractFromSource } from '../../../scripts/settingsExtract'
+import { turnOffCrewModeAsLts } from '../../test/crewModeOff'
 import { KIRO_SIGN_IN_SETTING_ID } from './kiroSignInSettingId'
 import type { SettingEntry } from './settingsTypes'
+
+const platform = vi.hoisted(() => ({ mac: false }))
+vi.mock('../../utils/platform', async importOriginal => ({
+  ...(await importOriginal<typeof import('../../utils/platform')>()),
+  get isMac() { return platform.mac },
+}))
 
 const decisionsEntry = (): SettingEntry => {
   const entry = SETTINGS_REGISTRY.find(e => e.id === DECISIONS_SETTING_ID)
@@ -64,10 +76,15 @@ const tipsEntry = (): SettingEntry => {
   return entry
 }
 
+/** Display > View's Channels switch, drawn only while Channels is on. */
+const CHANNELS_SETTING_ID = 'display.show-channels'
+
 /** Every id some governance answer can withhold. */
 const GOVERNED_IDS = new Set([
   ...DECISIONS_SETTING_IDS, FEATURE_TIPS_SETTING_ID, GATEWAY_AUTO_UPDATE_SETTING_ID, APP_AUTO_DOWNLOAD_SETTING_ID,
-  KIRO_SIGN_IN_SETTING_ID,
+  KIRO_SIGN_IN_SETTING_ID, ENABLE_REMOTE_CREWS_SETTING_ID, AUTO_CONNECT_CREWS_SETTING_ID, CHANNELS_SETTING_ID,
+  REOPEN_LAST_PAGE_SETTING_ID,
+  TERMINAL_CTRL_COPY_PASTE_SETTING_ID,
 ])
 
 /** Any OTHER entry, as the control: the predicate must gate one card, not the corpus. */
@@ -113,6 +130,36 @@ describe('settingEntryOffered', () => {
     expect(settingEntryOffered(tipsEntry(), ON)).toBe(true)
   })
 
+  it('offers Reopen where I left off only in the installed app, where DisplayPanel draws it', () => {
+    const entry = entryById(REOPEN_LAST_PAGE_SETTING_ID)
+    const standalone = (on: boolean) => vi.spyOn(window, 'matchMedia').mockImplementation(
+      (query: string) => ({ matches: on && query === '(display-mode: standalone)', media: query } as unknown as MediaQueryList),
+    )
+    standalone(false)
+    expect(settingEntryOffered(entry, ON)).toBe(false)
+    standalone(true)
+    expect(settingEntryOffered(entry, ON)).toBe(true)
+    vi.restoreAllMocks()
+  })
+
+  it('offers Start New Chats in conductor mode with no preview on, and not in an LTS build', () => {
+    const entry = SETTINGS_REGISTRY.find(e => e.configKey === 'dashboard.new_chat_crew_mode')
+    if (!entry) throw new Error('dashboard.new_chat_crew_mode missing from the registry')
+    expect(settingEntryOffered(entry, ON)).toBe(true)
+    turnOffCrewModeAsLts()
+    expect(settingEntryOffered(entry, ON)).toBe(false)
+  })
+
+  it('offers the stale-wake switch only while the stale-fields mark draws it', () => {
+    const entry = SETTINGS_REGISTRY.find(e => e.labelKey === 'pages.developer.featurePreviewsTab.dashboard_stale_wake')
+    if (!entry) throw new Error('the stale-wake switch is missing from the registry')
+    localStorage.removeItem(PREVIEW_DASHBOARD_STALE_FIELDS)
+    expect(settingEntryOffered(entry, ON)).toBe(false)
+    setPreviewFlag(PREVIEW_DASHBOARD_STALE_FIELDS, true)
+    expect(settingEntryOffered(entry, ON)).toBe(true)
+    localStorage.removeItem(PREVIEW_DASHBOARD_STALE_FIELDS)
+  })
+
   it('the two governed answers do not leak into each other', () => {
     expect(settingEntryOffered(tipsEntry(), OFF)).toBe(true)
     expect(settingEntryOffered(decisionsEntry(), TIPS_OFF)).toBe(true)
@@ -138,6 +185,34 @@ describe('settingEntryOffered', () => {
     expect(settingEntryOffered(otherEntry(), { ...ON, kiroSignInOffered: false })).toBe(true)
   })
 
+  it('offers the Channels switch only once Channels is known to be on', () => {
+    const channels = entryById(CHANNELS_SETTING_ID)
+    expect(channels.configKey).toBe('dashboard.channels_enabled')
+    expect(settingEntryOffered(channels, ON)).toBe(false)
+    expect(settingEntryOffered(channels, { ...ON, channelsOn: false })).toBe(false)
+    expect(settingEntryOffered(channels, { ...ON, channelsOn: true })).toBe(true)
+    expect(settingEntryOffered(otherEntry(), { ...ON, channelsOn: false })).toBe(true)
+  })
+
+  it('withholds the Slack tools switch only once Settings > Slack is known not to draw it', () => {
+    const slackTools = SETTINGS_REGISTRY.find(e => e.configKey === SLACK_TOOLS_SWITCH_KEY)!
+    expect(slackTools).toBeDefined()
+    expect(settingEntryOffered(slackTools, ON)).toBe(true)
+    expect(settingEntryOffered(slackTools, { ...ON, slackToolsShown: true })).toBe(true)
+    expect(settingEntryOffered(slackTools, { ...ON, slackToolsShown: false })).toBe(false)
+    expect(settingEntryOffered(otherEntry(), { ...ON, slackToolsShown: false })).toBe(true)
+  })
+
+  it('offers Remote Control only while Remote Crew draws its card (Bug Bash row 60)', () => {
+    // The card is drawn only while the setting is on or the relay runs; a hit
+    // that opens the page without it lands on nothing to highlight.
+    const card = entryById('instances.remote-control')
+    expect(settingEntryOffered(card, ON)).toBe(false)
+    expect(settingEntryOffered(card, { ...ON, remoteControlShown: false })).toBe(false)
+    expect(settingEntryOffered(card, { ...ON, remoteControlShown: true })).toBe(true)
+    expect(settingEntryOffered(otherEntry(), { ...ON, remoteControlShown: false })).toBe(true)
+  })
+
   it('offers Display > Explore only while the Explore preview is on', () => {
     const explore = SETTINGS_REGISTRY.find(e => e.configKey === 'dashboard.milestones_enabled')!
     expect(explore).toBeDefined()
@@ -150,6 +225,19 @@ describe('settingEntryOffered', () => {
     } finally {
       setPreviewFlag(PREVIEW_EXPLORE, false)
     }
+  })
+})
+
+describe('the terminal Ctrl+C / Ctrl+V switch follows the platform DisplayPanel draws it on', () => {
+  afterEach(() => { platform.mac = false })
+
+  it('withholds it on macOS and offers it elsewhere', () => {
+    const entry = entryById(TERMINAL_CTRL_COPY_PASTE_SETTING_ID)
+    platform.mac = true
+    expect(settingEntryOffered(entry, ON)).toBe(false)
+    expect(settingEntryOffered(otherEntry(), ON)).toBe(true)
+    platform.mac = false
+    expect(settingEntryOffered(entry, ON)).toBe(true)
   })
 })
 
@@ -473,44 +561,136 @@ describe('DECISIONS_SETTING_IDS covers the whole card', () => {
   })
 })
 
-describe('the Kiro sign-in entry follows the selected harness', () => {
+describe('the Kiro sign-in entry follows whether the build offers Kiro sign-in', () => {
   afterEach(() => {
     vi.restoreAllMocks()
   })
 
-  // The search reads the harness from the cache the shell's boot read fills, so
-  // each case seeds that cache (or leaves it empty) instead of serving a fetch.
-  const renderWithConfig = async (cached: unknown) => {
-    const config = vi.spyOn(api, 'kirocrewConfig')
+  // The search reads the build's harness choices from the `['config-schema']`
+  // cache the Settings page fills, so each case seeds that cache (or leaves it
+  // empty) beside the harness config.
+  const renderWithSchema = async (choices: string[] | undefined, acp_backend = 'kas') => {
     vi.spyOn(api, 'dashboardConfig').mockResolvedValue({ decisions_enabled: true } as never)
     vi.spyOn(api, 'tipsStatus').mockResolvedValue({ enabled_config: true } as never)
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    if (cached !== undefined) client.setQueryData(['kirocrewConfig'], cached)
+    client.setQueryData(['kirocrewConfig'], { agent: { acp_backend } })
+    if (choices !== undefined) {
+      client.setQueryData(['config-schema'], new Map([
+        ['agent.acp_backend', { path: 'agent.acp_backend', type: 'enum', enum: choices }],
+      ]))
+    }
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(Provider, { store: createTestStore() },
         createElement(QueryClientProvider, { client }, createElement(MemoryRouter, null, children)))
     const hook = renderHook(() => useSettingsProvider(), { wrapper })
     await waitFor(() => expect(client.getQueryState(['tipsStatus'])?.status).not.toBe('pending'))
-    // Cache only: opening a search never issues a request of its own.
-    expect(config).not.toHaveBeenCalled()
     return hook
   }
-  const harness = (acp_backend: string) => ({ agent: { acp_backend } })
   const offersSignIn = (provider: ResourceProvider) =>
     (provider.search('sign out') as { id?: string }[]).some(r => (r.id ?? '').endsWith(KIRO_SIGN_IN_SETTING_ID))
 
-  it.each(['kas', ''])('offers it on the KAS harness (acp_backend=%j)', async backend => {
-    const { result } = await renderWithConfig(harness(backend))
+  it.each(['kas', 'kiro', 'claude'])('offers it on the %s harness when the build offers KAS', async backend => {
+    const { result } = await renderWithSchema(['kas', 'kiro', 'claude'], backend)
     await waitFor(() => expect(offersSignIn(result.current)).toBe(true))
   })
 
-  it.each(['kiro', 'claude'])('withholds it on the %s harness, whose account the card does not sign out', async backend => {
-    const { result } = await renderWithConfig(harness(backend))
+  it('withholds it on a build whose harness choices do not list KAS', async () => {
+    const { result } = await renderWithSchema(['kiro', 'claude'])
     await waitFor(() => expect(offersSignIn(result.current)).toBe(false))
   })
 
-  it('offers it while the harness is unknown (no answer in the cache)', async () => {
-    const { result } = await renderWithConfig(undefined)
+  it('offers it while the build is unknown (no schema in the cache)', async () => {
+    const { result } = await renderWithSchema(undefined)
     expect(offersSignIn(result.current)).toBe(true)
+  })
+})
+
+describe('the Slack tools switch follows what Settings > Slack draws', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  // Settings > Slack draws the switch only while the server says Connections offers
+  // the Slack card (`slack_mcp_card`) or the switch is already on. The search reads
+  // that answer from the cache the Slack page's own `['slack-config']` read fills,
+  // so each case seeds that cache (or leaves it empty) instead of serving a fetch.
+  const renderWithSlackConfig = async (cached: unknown) => {
+    const slack = vi.spyOn(api, 'getSlackConfig')
+    vi.spyOn(api, 'dashboardConfig').mockResolvedValue({ decisions_enabled: true } as never)
+    vi.spyOn(api, 'tipsStatus').mockResolvedValue({ enabled_config: true } as never)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    if (cached !== undefined) client.setQueryData(['slack-config'], cached)
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(Provider, { store: createTestStore() },
+        createElement(QueryClientProvider, { client }, createElement(MemoryRouter, null, children)))
+    const hook = renderHook(() => useSettingsProvider(), { wrapper })
+    await waitFor(() => expect(client.getQueryState(['tipsStatus'])?.status).not.toBe('pending'))
+    // Cache only: opening a search never asks the gateway for the Slack config.
+    expect(slack).not.toHaveBeenCalled()
+    return hook
+  }
+  const offersSlackTools = (provider: ResourceProvider) =>
+    (provider.search('Slack tools for your agents') as { id?: string }[])
+      .some(r => (r.id ?? '').endsWith('channels.slack-tools-for-your-agents-slack'))
+
+  it.each([
+    ['Connections offers the Slack card', { slack_mcp_card: true, slack_mcp: false }, true],
+    ['there is no card but the switch is on', { slack_mcp_card: false, slack_mcp: true }, true],
+    ['there is no card and the switch is off', { slack_mcp_card: false, slack_mcp: false }, false],
+    ['the server reports neither field', {}, false],
+  ])('when %s', async (_label, cached, offered) => {
+    const { result } = await renderWithSlackConfig(cached)
+    await waitFor(() => expect(offersSlackTools(result.current)).toBe(offered))
+  })
+
+  it('offers it while the Slack page has not been read (no answer in the cache)', async () => {
+    const { result } = await renderWithSlackConfig(undefined)
+    expect(offersSlackTools(result.current)).toBe(true)
+  })
+})
+
+describe('the Instances rows follow whether remote crews are on', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  // RemoteCrewPanel draws the enable card only while `['instances']` fails with
+  // `instances_disabled`, and the auto-connect switch only once it succeeds. The search
+  // reads that answer from the cache the shell's tab bar fills.
+  const renderWithInstances = async (seed: (client: QueryClient) => Promise<unknown> | void) => {
+    const list = vi.spyOn(api, 'listInstances')
+    vi.spyOn(api, 'dashboardConfig').mockResolvedValue({ decisions_enabled: true } as never)
+    vi.spyOn(api, 'tipsStatus').mockResolvedValue({ enabled_config: true } as never)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    await seed(client)
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(Provider, { store: createTestStore() },
+        createElement(QueryClientProvider, { client }, createElement(MemoryRouter, null, children)))
+    const { result } = renderHook(() => useSettingsProvider(), { wrapper })
+    await waitFor(() => expect(client.getQueryState(['tipsStatus'])?.status).not.toBe('pending'))
+    expect(list).not.toHaveBeenCalled()
+    const offers = (query: string, id: string) =>
+      (result.current.search(query) as { id?: string }[]).some(r => (r.id ?? '').endsWith(id))
+    return {
+      enable: offers('enable remote crew management', ENABLE_REMOTE_CREWS_SETTING_ID),
+      autoConnect: offers('auto-connect crews', AUTO_CONNECT_CREWS_SETTING_ID),
+    }
+  }
+  const disabled = new ApiError(403, 'Instances feature is disabled',
+    JSON.stringify({ error: 'Instances feature is disabled', code: 'instances_disabled' }))
+
+  it('offers only the auto-connect switch while remote crews are on', async () => {
+    const rows = await renderWithInstances(client => { client.setQueryData(['instances'], { instances: [], active: true }) })
+    expect(rows).toEqual({ enable: false, autoConnect: true })
+  })
+
+  it('offers only the enable card while remote crews are off', async () => {
+    const rows = await renderWithInstances(client =>
+      client.prefetchQuery({ queryKey: ['instances'], queryFn: () => Promise.reject(disabled) }))
+    expect(rows).toEqual({ enable: true, autoConnect: false })
+  })
+
+  it('offers both while the answer is unknown', async () => {
+    expect(await renderWithInstances(() => {})).toEqual({ enable: true, autoConnect: true })
   })
 })

@@ -25,12 +25,13 @@ from __future__ import annotations
 
 import importlib.util
 import os
-import shutil
 import subprocess
 from pathlib import Path
 
+import git_repo_templates
 import pytest
 from git_maintenance_helpers import git_maintenance_off_entries
+from git_repo_templates import RepoTemplates, copy_repo
 
 from kiro_crew.platform.update_governance import _GIT_LOCATION_VARS, git_command_env
 
@@ -46,6 +47,8 @@ SPEC.loader.exec_module(scope)
 #: Config a ``git -c ...`` that ran the suite (a pre-push hook) exports to its children.
 #: git reads it after ``GIT_CONFIG_COUNT``, so it would override any pin set there.
 _GIT_COMMAND_LINE_CONFIG = ("GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT")
+
+repo_templates = git_repo_templates.repo_templates  # the fixture, bound for this module
 
 
 def _fixture_git_env() -> dict[str, str]:
@@ -122,13 +125,14 @@ def _repo_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
     Six git subprocesses (~2-3s) would otherwise be paid on every one of the 23
     tests in this module. Session scope is safe here because the template is
-    never handed to a test, only copied from via ``shutil.copytree`` -- so a
+    never handed to a test, only copied from via ``copy_repo`` -- so a
     test that adds a commit, merges, or moves a branch cannot reach another's
     copy.
     """
     template = tmp_path_factory.mktemp("ratchet-scope-seed") / "repo"
     template.mkdir()
     _build_repo_with_diverged_feature(template)
+    _git(template, "reset", "--hard", "HEAD")  # the ORIG_HEAD and reflog line a copy starts with
     return template
 
 
@@ -149,12 +153,12 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _repo_template: Path) 
     # builder strips.
     for var in (*_GIT_LOCATION_VARS, *_GIT_COMMAND_LINE_CONFIG):
         monkeypatch.delenv(var, raising=False)
-    fixture_repo = tmp_path / "repo"
-    shutil.copytree(_repo_template, fixture_repo)
-    # A copied checkout reads as "unstaged changes" on Windows (fresh inode/ctime
-    # invalidate the index stat cache); nothing in the template is uncommitted, so
-    # this changes no content and only re-stats the index.
-    _git(fixture_repo, "reset", "--hard", "HEAD")
+    # A CI run's own base branch must not leak into the synthetic repository.
+    for var in ("GITHUB_BASE_REF", "GITHUB_REF_NAME"):
+        monkeypatch.delenv(var, raising=False)
+    # ``copy_repo`` gives the copied index the copied files' stat data: a plain
+    # copy reads as "unstaged changes" (fresh inode and ctime).
+    fixture_repo = copy_repo(_repo_template, tmp_path / "repo")
     # The module runs git with cwd=ROOT; retarget it at the synthetic repo.
     monkeypatch.setattr(scope, "ROOT", fixture_repo)
     return fixture_repo
@@ -219,6 +223,76 @@ class TestMergeShapes:
 
         assert label == "main...HEAD"
         assert paths == {"feature.py"}
+
+    @pytest.mark.parametrize("merge_ref", [False, True], ids=["three-dot", "merge-ref"])
+    def test_a_non_ascii_path_comes_back_by_its_real_name(
+        self, repo: Path, merge_ref: bool
+    ) -> None:
+        # Line output C-quotes this name as "f\303\251e.py", which names no
+        # file, so a gate scoped by it would check nothing.
+        _set_origin_main(repo)
+        _git(repo, "checkout", "feature")
+        _commit_file(repo, "fée.py", "a change with a non-ASCII name")
+        if merge_ref:
+            _git(repo, "checkout", "--detach", "main")
+            _git(repo, "merge", "--no-ff", "-m", "merge ref", "feature")
+
+        paths, _ = scope.changed_paths()
+
+        assert paths == {"feature.py", "fée.py"}
+
+
+class TestReleaseBase:
+    """A backport PR is scoped against the release branch it targets."""
+
+    @staticmethod
+    def _backport_merge_ref(repo: Path) -> None:
+        # release/1.2 is cut at the commit `feature` branched from, gains a
+        # release-only commit, and the PR merge ref merges `feature` into it.
+        # main has moved on with mainline.txt, so main cannot reach HEAD^1.
+        _set_origin_main(repo)
+        _git(repo, "branch", "release/1.2", "feature~1")
+        _git(repo, "checkout", "release/1.2")
+        _commit_file(repo, "release_only.txt", "a fix already on the release branch")
+        _git(repo, "update-ref", "refs/remotes/origin/release/1.2", "release/1.2")
+        _git(repo, "checkout", "--detach", "release/1.2")
+        _git(repo, "merge", "--no-ff", "-m", "merge ref", "feature")
+
+    def test_a_pr_into_a_release_branch_scopes_to_the_change_only(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._backport_merge_ref(repo)
+        monkeypatch.setenv("GITHUB_BASE_REF", "release/1.2")
+
+        paths, label = scope.changed_paths()
+
+        assert label == "merge HEAD^1..HEAD"
+        assert paths == {"feature.py"}
+
+    def test_without_the_base_the_probe_falls_back_to_main(self, repo: Path) -> None:
+        # The shape before the release branch was probed: HEAD^1 is not on
+        # main, so the scope widens to everything since the cut.
+        self._backport_merge_ref(repo)
+
+        paths, label = scope.changed_paths()
+
+        assert label == "origin/main...HEAD"
+        assert paths == {"feature.py", "release_only.txt"}
+
+    def test_a_push_names_its_branch_through_ref_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("GITHUB_BASE_REF", raising=False)
+        monkeypatch.setenv("GITHUB_EVENT_NAME", "push")
+        monkeypatch.setenv("GITHUB_REF_NAME", "release/1.2")
+        assert scope._base_branch_refs() == (
+            "origin/release/1.2",
+            "release/1.2",
+            "origin/main",
+            "main",
+        )
+        monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+        assert scope._base_branch_refs() == ("origin/main", "main")
 
 
 class TestWholeTreeOverride:
@@ -795,29 +869,46 @@ class _RepoHelper:
         return self.root / name
 
 
+def _build_change_repo(root: Path) -> None:
+    """``main`` holds ``a.txt``; ``change``, checked out, adds ``b.txt`` in one commit."""
+    repo = _RepoHelper(root)
+    (root / "a.txt").write_text("one\n", encoding="utf-8")
+    repo.git("init", "-q")
+    repo.git("checkout", "-q", "-b", "main")
+    repo.git("add", "-A")
+    repo.git("commit", "-q", "-m", "base")
+    repo.git("checkout", "-q", "-b", "change")
+    (root / "b.txt").write_text("two\n", encoding="utf-8")
+    repo.git("add", "-A")
+    repo.git("commit", "-q", "-m", "add b.txt")
+
+
+def _build_three_file_repo(root: Path) -> None:
+    """``main`` holds three files; ``change`` is checked out at the same commit."""
+    repo = _RepoHelper(root)
+    (root / "a.txt").write_text("one\n", encoding="utf-8")
+    (root / "b.txt").write_text("two\n", encoding="utf-8")
+    (root / "to_delete.txt").write_text("gone\n", encoding="utf-8")
+    repo.git("init", "-q")
+    repo.git("checkout", "-q", "-b", "main")
+    repo.git("add", "-A")
+    repo.git("commit", "-q", "-m", "base")
+    repo.git("checkout", "-q", "-b", "change")
+
+
 class TestChangeMergeBase:
     """The change-shaped base resolver, for a per-file comparison that must handle a
     forked ``origin`` and a shallow CI checkout.
     """
 
     @pytest.fixture
-    def repo(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _RepoHelper:
+    def repo(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repo_templates: RepoTemplates
+    ) -> _RepoHelper:
         _drop_ambient_git_location(monkeypatch)
         monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
         monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-        root = tmp_path / "repo"
-        root.mkdir()
-        repo = _RepoHelper(root)
-        (root / "a.txt").write_text("one\n", encoding="utf-8")
-        repo.git("init", "-q")
-        repo.git("checkout", "-q", "-b", "main")
-        repo.git("add", "-A")
-        repo.git("commit", "-q", "-m", "base")
-        repo.git("checkout", "-q", "-b", "change")
-        (root / "b.txt").write_text("two\n", encoding="utf-8")
-        repo.git("add", "-A")
-        repo.git("commit", "-q", "-m", "add b.txt")
-        return repo
+        return _RepoHelper(repo_templates.copy(_build_change_repo, tmp_path / "repo"))
 
     def test_the_fixture_ignores_ambient_git_state(self, request, monkeypatch, tmp_path) -> None:
         assert_fixture_ignores_ambient_git(request, monkeypatch, tmp_path, "repo")
@@ -885,22 +976,13 @@ class TestChangeFilesAndShowAt:
     changes against *base*, and ``show_at`` reads a file's bytes at that base."""
 
     @pytest.fixture
-    def repo(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _RepoHelper:
+    def repo(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repo_templates: RepoTemplates
+    ) -> _RepoHelper:
         _drop_ambient_git_location(monkeypatch)
         monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
         monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-        root = tmp_path / "repo"
-        root.mkdir()
-        repo = _RepoHelper(root)
-        (root / "a.txt").write_text("one\n", encoding="utf-8")
-        (root / "b.txt").write_text("two\n", encoding="utf-8")
-        (root / "to_delete.txt").write_text("gone\n", encoding="utf-8")
-        repo.git("init", "-q")
-        repo.git("checkout", "-q", "-b", "main")
-        repo.git("add", "-A")
-        repo.git("commit", "-q", "-m", "base")
-        repo.git("checkout", "-q", "-b", "change")
-        return repo
+        return _RepoHelper(repo_templates.copy(_build_three_file_repo, tmp_path / "repo"))
 
     def test_the_fixture_ignores_ambient_git_state(self, request, monkeypatch, tmp_path) -> None:
         assert_fixture_ignores_ambient_git(request, monkeypatch, tmp_path, "repo")

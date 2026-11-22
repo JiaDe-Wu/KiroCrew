@@ -595,6 +595,7 @@ def _launch_tools(
     delegate: bool = False,
     spawn_error: BaseException | None = None,
     retrying=None,
+    scoped: bool = True,
 ):
     from kiro_crew.acp.launch import LaunchTools
 
@@ -658,7 +659,7 @@ def _launch_tools(
         wrap_argv_async=_wrap_async,
         wrap_argv=lambda *a, **k: None,
         wrapped_by_crew_sandbox=lambda argv: argv[:1] == ["sandbox"],
-        cgroup_scope_argv=lambda argv: ["scope", *argv],
+        cgroup_scope_argv=(lambda argv: ["scope", *argv]) if scoped else (lambda argv: argv),
         augmented_path=lambda path: f"{path}:/augmented",
         scrub_agent_subprocess_env=_scrub,
         apply_pod_home_remap=_pod_remap,
@@ -728,9 +729,49 @@ def test_the_tail_hands_the_plan_mask_and_the_scratch_window_to_the_sandbox(
     assert host._sandbox_cleanup == "/run/launcher.sh"
     assert host._sandbox_wrapped_by_crew is True
     assert host._sandbox_hidden_dirs == ("/srv/creds/.aws",)
+    # The verdict the child's env was built with, for the servers it starts later.
+    assert host._ssh_auth_sock_forwarded is True
     # The cgroup scope is OUTERMOST, around the sandboxed command.
     assert rec.factory_argv == ["scope", "sandbox", "/opt/bin/host", "acp"]
     assert launched.scope_unit == ""
+
+
+def test_a_forward_the_wrap_dropped_is_the_one_the_tail_records_and_scrubs_with(
+    monkeypatch, tmp_path
+) -> None:
+    """The wrap re-judges the forward on the tier it applies; its verdict wins.
+
+    The tail judged the forward on (``_forward`` answers True), then the wrap
+    dropped it (a floor raised between the two reads). A record of the tail's own
+    verdict would let a server the engine starts later be handed the socket the
+    engine's wrap took away, and the parent-side scrub would keep it for a
+    passthrough wrap that relies on that scrub.
+    """
+    _launch_env(monkeypatch)
+    # The withheld-socket notice is not under test; with no socket it never runs.
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    host = _FakeHost(tmp_path)
+    rec = _Recording()
+    scrubbed_with: list[bool] = []
+
+    async def _dropping_wrap(argv, **kwargs):
+        # Reports the drop to a caller that hands it a list, as ``wrap_argv`` does.
+        kwargs.get("forward_ssh_auth_sock_out", []).append(False)
+        return ["sandbox", *argv], None
+
+    def _scrub(env, *, forward_ssh_auth_sock=False):
+        scrubbed_with.append(forward_ssh_auth_sock)
+        return env
+
+    tools = dataclasses.replace(
+        _launch_tools(rec, scratch=_Scratch(None)),
+        wrap_argv_async=_dropping_wrap,
+        scrub_agent_subprocess_env=_scrub,
+    )
+    _run_launch(host, _request(), tools)
+
+    assert host._ssh_auth_sock_forwarded is False
+    assert scrubbed_with == [False]
 
 
 def test_the_child_environment_is_built_in_one_fixed_order(monkeypatch, tmp_path) -> None:
@@ -910,6 +951,30 @@ def test_the_driver_names_the_scope_and_the_launch_reports_it(monkeypatch, tmp_p
     )
     assert rec.factory_argv[:2] == ["named", "scope"]
     assert launched.scope_unit == "kirocrew-x.scope"
+
+
+def test_only_a_session_host_without_a_cgroup_scope_is_an_oom_target(monkeypatch, tmp_path) -> None:
+    """No scope means no memory.max over the tree, so the host OOM killer must
+    prefer it to the gateway; a scoped tree keeps the unbiased profile."""
+    from kiro_crew.sandbox import (
+        RLIMIT_PROFILE_SESSION_HOST,
+        RLIMIT_PROFILE_UNBOUNDED_SESSION_HOST,
+    )
+
+    _launch_env(monkeypatch)
+    profiles = {}
+    for scoped in (True, False):
+        rec = _Recording()
+        _run_launch(
+            _FakeHost(tmp_path),
+            _request(),
+            _launch_tools(rec, scratch=_Scratch(None), scoped=scoped),
+        )
+        profiles[scoped] = rec.factory_kwargs["profile"]
+    assert profiles == {
+        True: RLIMIT_PROFILE_SESSION_HOST,
+        False: RLIMIT_PROFILE_UNBOUNDED_SESSION_HOST,
+    }
 
 
 def test_only_a_driver_that_brings_a_retry_retries_the_spawn(monkeypatch, tmp_path) -> None:

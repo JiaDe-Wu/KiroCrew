@@ -26,6 +26,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from kiro_crew.dashboard.handlers.knowledge import ingest_file
 from kiro_crew.knowledge.ingestion import IngestionPipeline
+from kiro_crew.knowledge.readers import FileReader
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.testing.wait import async_wait_until
 
@@ -147,6 +148,41 @@ async def test_valid_docx_ingests(mock_sel):
     status, body = await _post(
         app, _minimal_zip_bytes(), "doc.docx",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    assert status == 200, body
+    assert body["source_id"] == "sid1"
+
+
+@pytest.mark.asyncio
+async def test_unsupported_format_is_refused_before_a_source_exists(mock_sel, monkeypatch):
+    """A format with a reader but outside ``FileReader.SUPPORTED`` is refused up
+    front with its reason, not answered 'processing' and then failed with an
+    empty error."""
+    monkeypatch.setattr(FileReader, "SUPPORTED", FileReader.SUPPORTED - {".pptx"})
+    app, ingest_spy = _make_app()
+    status, body = await _post(
+        app, _minimal_zip_bytes(), "deck.pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+    assert status == 400, body
+    assert body == {"error": "Unsupported file type: .pptx", "code": "unsupported_file_type"}
+    ingest_spy.assert_not_called()
+    assert app["state"].knowledge_store._rows == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["deck.pptx", "sheet.xlsx"])
+async def test_office_decks_and_workbooks_ingest(mock_sel, name):
+    app, _ = _make_app()
+    status, body = await _post(app, _minimal_zip_bytes(), name, "application/octet-stream")
+    assert status == 200, body
+    assert body["source_id"] == "sid1"
+
+
+@pytest.mark.asyncio
+async def test_an_unlisted_text_format_still_ingests(mock_sel):
+    """Only a dispatched reader outside the allowlist is refused: an unlisted
+    extension with no reader of its own still reads as text."""
+    app, _ = _make_app()
+    status, body = await _post(app, b"[tool]\nname = 'x'\n", "config.toml", "text/plain")
     assert status == 200, body
     assert body["source_id"] == "sid1"
 

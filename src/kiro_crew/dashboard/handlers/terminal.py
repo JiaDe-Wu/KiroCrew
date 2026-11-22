@@ -29,12 +29,13 @@ import subprocess
 import sys as _sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 from aiohttp import web
 
 from kiro_crew import _facade_mirror, platform_compat
-from kiro_crew.dashboard import terminal_commands
+from kiro_crew.dashboard import terminal_commands, ws_heartbeat
 from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 from kiro_crew.dashboard.handlers.files import _PathProbeBusy, _run_path_probe
 from kiro_crew.dashboard.handlers.terminal_complete import (
@@ -54,6 +55,7 @@ from kiro_crew.dashboard.handlers.terminal_lifecycle import (
     _sess_alive,
     _sess_pid,
     _take_shell_to_evict,
+    apply_terminal_enabled,
 )
 from kiro_crew.dashboard.handlers.terminal_placement import (
     _CHAT_NOT_LOADED,
@@ -68,12 +70,14 @@ from kiro_crew.dashboard.handlers.terminal_placement import (
 from kiro_crew.dashboard.handlers.terminal_session import (
     _MAX_SESSION_ID_LEN,
     _MAX_SESSIONS,
+    _TERMINAL_MAX_SESSIONS,
     _completion_cfg,
     _completion_disabled,
     _get_config,
     _get_registry,
     _is_enabled,
     _sel,
+    _terminal_enabled,
     _TerminalSession,
 )
 from kiro_crew.dashboard.handlers.terminal_shell import (
@@ -83,6 +87,7 @@ from kiro_crew.dashboard.handlers.terminal_shell import (
     _resolve_shell,
 )
 from kiro_crew.dashboard.handlers.terminal_transport import (
+    _TAKEOVER_READY_TIMEOUT_S,
     _close_terminal_ws_bounded,
     _record_and_forward_terminal_output,
     _release_terminal_ws_identity,
@@ -393,14 +398,19 @@ def _bash_ready_env(token: str) -> dict[str, str]:
     The snippet is single-shot and self-removing: it emits only while the token
     variable is still set, unsets that token so neither a later prompt nor a
     child shell repeats the sequence, and withdraws itself from
-    ``PROMPT_COMMAND`` only when that variable is still exactly the scalar that
-    was exported. Both halves of that last test matter: a profile that APPENDED
-    (``PROMPT_COMMAND="$PROMPT_COMMAND; history -a"``) no longer matches, and one
-    that appended as an ARRAY (``PROMPT_COMMAND+=("history -a")``, Bash 5.1+)
-    leaves the exported text as element zero — which the scalar expansion alone
-    would match, so unsetting there would take the user's own element with it.
-    ``${PROMPT_COMMAND[1]+x}`` distinguishes the two without Bash 5.1 syntax the
-    ``/bin/bash`` on macOS (3.2) cannot parse.
+    ``PROMPT_COMMAND`` only while element zero is still exactly the value that
+    was exported. A profile that APPENDED to the scalar
+    (``PROMPT_COMMAND="$PROMPT_COMMAND; history -a"``) does not match it, so the
+    hook stays. A profile that appended as an ARRAY
+    (``PROMPT_COMMAND+=("history -a")``, Bash 5.1+) leaves the exported text as
+    element zero. systemd's ``/etc/profile.d`` OSC-context script does this on
+    every login shell of a systemd host, so it is the common case there, not a
+    corner. Unsetting the variable there would take the profile's own elements
+    with it, so the hook drops ONLY element zero: replaced by the inherited
+    command when there is one, else removed with the rest shifted down, which
+    is the array the profile would have built with no hook in front.
+    ``${PROMPT_COMMAND[1]+x}`` tells the two shapes apart without Bash 5.1
+    syntax the ``/bin/bash`` on macOS (3.2) cannot parse.
 
     A profile that ASSIGNS ``PROMPT_COMMAND`` outright drops the hook, and with
     it the marker: that session's barrier never opens, and the client's own
@@ -433,11 +443,11 @@ def _bash_ready_env(token: str) -> dict[str, str]:
         f"builtin printf '\\033]697;KiroCrewReady;%s\\007' "
         f'"${{{_READY_TOKEN_VAR}}}"; '
         f"builtin unset {_READY_TOKEN_VAR}; "
-        f'if [[ "${{PROMPT_COMMAND-}}" == "${{{_READY_HOOK_VAR}-}}" '
-        f'&& -z "${{PROMPT_COMMAND[1]+x}}" ]]; then '
+        f'if [[ "${{PROMPT_COMMAND-}}" == "${{{_READY_HOOK_VAR}-}}" ]]; then '
         f'if [[ -n "${{{_READY_PREV_VAR}+x}}" ]]; then '
         f'PROMPT_COMMAND="${{{_READY_PREV_VAR}}}"; '
-        f"else builtin unset PROMPT_COMMAND; fi; fi; "
+        f'elif [[ -z "${{PROMPT_COMMAND[1]+x}}" ]]; then builtin unset PROMPT_COMMAND; '
+        f'else PROMPT_COMMAND=("${{PROMPT_COMMAND[@]:1}}"); fi; fi; '
         f"builtin unset {_READY_HOOK_VAR} {_READY_PREV_VAR}; fi"
     )
     inherited = os.environ.get("PROMPT_COMMAND") or ""
@@ -644,7 +654,14 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
     # At the cap, the longest-detached shell gives up its slot in the same step;
     # it ends only once this open goes ahead, and returns to its slot otherwise.
     evicted = None if existing else _take_shell_to_evict(registry, max_sessions, time.monotonic())
-    if not existing and len(registry) >= max_sessions:
+    at_cap = not existing and len(registry) >= max_sessions
+
+    # Reserve a placeholder so concurrent requests see the slot as taken
+    placeholder = not existing and not at_cap
+    if placeholder:
+        registry[session_id] = None
+
+    if at_cap:
         _sel().log_api_access(
             caller=caller,
             operation="terminal.ws.open",
@@ -652,15 +669,20 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             source="dashboard",
             resources=f"max_sessions={max_sessions}",
         )
-        return web.Response(status=409, text=f"Max {max_sessions} terminal sessions")
-
-    # Reserve a placeholder so concurrent requests see the slot as taken
-    placeholder = not existing
-    if placeholder:
-        registry[session_id] = None
+        # A browser cannot read a refused handshake's body, so the dashboard
+        # would redial and end on a bare "disconnected". Accept and send the
+        # coded refusal instead; no slot was reserved.
+        refusal_ws = web.WebSocketResponse(heartbeat=30, timeout=300)
+        await refusal_ws.prepare(request)
+        await _close_terminal_ws_bounded(
+            refusal_ws,
+            error_message=f"Max {max_sessions} terminal sessions",
+            error_code=_TERMINAL_MAX_SESSIONS,
+        )
+        return refusal_ws
 
     try:
-        ws = web.WebSocketResponse(heartbeat=30, timeout=300)
+        ws = ws_heartbeat.LagTolerantWebSocketResponse(heartbeat=30, timeout=300)
         cwd = ""
         if placeholder:
             try:
@@ -991,6 +1013,13 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
         if evicted is not None and not _restore_evicted_shell(registry, evicted):
             await _end_evicted_shell(request.app, evicted, max_sessions)
 
+    # A switch-off applied while this open awaited skipped its reservation: read the
+    # switch again now that the shell is published, so this read or the applier ends it.
+    cfg = _get_config(request)
+    if registry.get(session_id) is sess and not _terminal_enabled(cfg):
+        await apply_terminal_enabled(registry, cfg)
+        return ws
+
     # The placement check above ran before this shell was published, and a bind
     # in between skipped the then-unpublished reservation: read it again now
     # that the shell is visible, so either this read or the bind's retire sees it.
@@ -1004,6 +1033,22 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             )
             return ws
 
+    if not existing:
+        # A fresh session has no saved output. Mark the live boundary before
+        # starting its PTY reader, independently of the shell's readiness hook.
+        try:
+            async with sess.send_lock:
+                if sess.ws is ws and not ws.closed:
+                    await asyncio.wait_for(
+                        ws.send_str(json.dumps({"type": "replayed"})),
+                        timeout=_TAKEOVER_READY_TIMEOUT_S,
+                    )
+        except (ConnectionResetError, RuntimeError, OSError, asyncio.TimeoutError):
+            # Keep draining the PTY for a reconnect, but send no live bytes to
+            # a socket that does not have its replay boundary.
+            _release_terminal_ws_identity(sess, ws)
+            await _close_terminal_ws_bounded(ws)
+
     # --- Read loop: PTY → WebSocket ---
     notification_bus: NotificationBus | None = getattr(
         request.app.get("state"), "notification_bus", None
@@ -1011,6 +1056,10 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
 
     async def read_pty():
         reader_ended = False
+        # The shell's own thread, never the default executor: an idle shell parks
+        # this read for as long as it lives, so enough open tabs would hold every
+        # default worker and stop each to_thread caller in the gateway.
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mc-pty-reader")
         try:
             loop = asyncio.get_running_loop()
             if sess.winpty is not None:
@@ -1018,7 +1067,7 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             else:
                 reader = lambda: os.read(sess.master_fd, 4096)  # noqa: E731  # wokeignore:rule=master
             while True:
-                data = await loop.run_in_executor(None, reader)
+                data = await loop.run_in_executor(pool, reader)
                 if not data:
                     reader_ended = True
                     break
@@ -1027,6 +1076,9 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             # EIO: the child exited, or a teardown closed the fd under us.
             # _handle_pty_reader_end tells those apart.
             reader_ended = True
+        finally:
+            # A read still parked frees its thread when the shell ends.
+            pool.shutdown(wait=False)
         if reader_ended:
             await _handle_pty_reader_end(registry, sess, bus=notification_bus)
 
@@ -1548,7 +1600,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _orphan_timeout_s,
         _record_orphan_reap,
         _shell_failure_note,
+        _shell_to_evict,
         _sweep_terminals,
+        end_shells_if_policy_refuses,
         reap_orphaned_terminals,
     )
     from kiro_crew.dashboard.handlers.terminal_placement import (  # noqa: F401
@@ -1562,18 +1616,23 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.dashboard.handlers.terminal_session import (  # noqa: F401
         _ConptyBackend,
         _enabled_cache,
+        _policy_refuses_terminal,
         _read_terminal_config,
     )
     from kiro_crew.dashboard.handlers.terminal_transport import (  # noqa: F401
+        _CSI_QUERIES,
         _OWNER_CONTROL_SEND_TIMEOUT_S,
         _SCROLLBACK_MAX,
         _STALE_OWNER_ERROR_CODE,
         _STALE_OWNER_ERROR_MESSAGE,
         _TAKEOVER_CATCH_UP_ROUNDS,
-        _TAKEOVER_READY_TIMEOUT_S,
         _TAKEOVER_REPLAY_SEND_TIMEOUT_S,
         _TERMINAL_WS_CLEANUP_TIMEOUT_S,
         _consume_ready_marker,
+        _csi_query_end,
+        _is_colour_query,
+        _string_end,
+        _strip_terminal_queries,
         _write_all,
     )
 

@@ -14,6 +14,7 @@ from kiro_crew.crew_log.entry_types import (
     CUSTOM_FOLD_NAME,
     DASHBOARD_FOLD_NAME,
     GOAL_FOLD_NAME,
+    OBJECTS_FOLD_NAME,
     PANEL_FOLD_NAME,
     WAITING_FOLD_NAME,
 )
@@ -92,16 +93,21 @@ def fold_slot_checkpoint(name: str, unit_ids: Sequence[str], *, slot: str = "") 
     if slot and fold_spec.bind_slot is not None:
         fold_spec.bind_slot(state, slot)
     reached = 0
-    for unit_id in unit_ids:
-        handle = open_session_log(unit_id)
-        if handle is None:
-            continue
-        grown = advance(
-            Checkpoint(name=name, last_seq=0, state=state),
-            handle.iter_from(1, known=KNOWN_TYPES),
-        )
-        state = grown.state
-        reached = grown.last_seq
+    from kiro_crew.crew_log import read_budget
+
+    # A cold fold pass, counted as one (see ``read_budget.fold_scope``); a pass never raises.
+    with read_budget.fold_scope(slot, name):
+        read_budget.note_origin("cold")
+        for unit_id in unit_ids:
+            handle = open_session_log(unit_id)
+            if handle is None:
+                continue
+            grown = advance(
+                Checkpoint(name=name, last_seq=0, state=state),
+                handle.iter_from(1, known=KNOWN_TYPES),
+            )
+            state = grown.state
+            reached = grown.last_seq
     return Checkpoint(name=name, last_seq=reached, state=state)
 
 
@@ -148,13 +154,30 @@ def read_slot_state(
     if name == WORKERS_FOLD_NAME:
         raise ValueError("the workers fold has no single state; read its projection")
     units = list(_slot_units_for_fold(slot, name))
+    own = len(units)
     known = set(units)
     for extra in also_slots:
         for unit_id in _supplemental_units(extra, name):
             if unit_id not in known:
                 known.add(unit_id)
                 units.append(unit_id)
-    return fold_slot_warm_revised(require_name(name), units, slot=slot, cold=cold)
+    if len(units) == own:
+        return fold_slot_warm_revised(require_name(name), units, slot=slot, cold=cold)
+    # A LONGER list than every other reader of this cell builds. Folded in a throwaway
+    # cell -- no warm memo, no savepoint -- because the shared cell is keyed by slot and
+    # fold, not by list: a pass over these units would leave the cell holding a list the
+    # next ordinary read cannot continue, and would persist its savepoint beside the
+    # list's newest unit, which is another slot's unit, over that slot's own file. The
+    # value is the same either way: a warm cell answers what a cold fold answers.
+    # shortcut: a full fold of every listed unit; it is the operator's rebuild, the only
+    # caller, which walks every slot anyway. Upgrade with the child-process backfill.
+    if not cold:
+        from kiro_crew.crew_log.projection_slot_memo import SlotFoldNotReady
+
+        raise SlotFoldNotReady(slot, name)
+    # Revision 0, below every cell's: a consumer that keeps the highest revision per
+    # (key, fold) must never prefer this one-off value over the shared cell's.
+    return fold_slot_checkpoint(require_name(name), units, slot=slot), 0
 
 
 #: Per ``(data home, crewmate slot)``, the part revisions the last ``workers`` read
@@ -456,10 +479,10 @@ def _slot_units_for_fold(slot: str, name: str) -> "tuple[str, ...]":
         # wrote and the write path accepted -- silently, because both are well-formed.
         # The custom fold keeps the latest record per TYPE and is the same case.
         return units_in_succession(slot)
-    if name in (GOAL_FOLD_NAME, WAITING_FOLD_NAME):
+    if name in (GOAL_FOLD_NAME, WAITING_FOLD_NAME, OBJECTS_FOLD_NAME):
         # The same reason again: each keeps the NEWEST snapshot whole, so a retired
         # session sorted last by its header clock would bring back an old goal or a
-        # question already answered.
+        # question already answered. ``objects`` keeps the newest read per subject.
         return units_in_succession(slot)
     return session_units_for_slot(slot)
 
@@ -515,16 +538,21 @@ def fold_tree_checkpoint(name: str, root: str) -> Checkpoint:
         fold_spec.bind_slot(state, root)
     state["omitted"] = state.get("omitted", 0) + dropped
     reached = 0
-    for unit_id in units:
-        handle = open_session_log(unit_id)
-        if handle is None:
-            continue
-        grown = advance(
-            Checkpoint(name=name, last_seq=0, state=state),
-            handle.iter_from(1, known=KNOWN_TYPES),
-        )
-        state = grown.state
-        reached = grown.last_seq
+    from kiro_crew.crew_log import read_budget
+
+    # A cold fold pass, counted as one (see ``read_budget.fold_scope``); a pass never raises.
+    with read_budget.fold_scope(root, name):
+        read_budget.note_origin("cold")
+        for unit_id in units:
+            handle = open_session_log(unit_id)
+            if handle is None:
+                continue
+            grown = advance(
+                Checkpoint(name=name, last_seq=0, state=state),
+                handle.iter_from(1, known=KNOWN_TYPES),
+            )
+            state = grown.state
+            reached = grown.last_seq
     return Checkpoint(name=name, last_seq=reached, state=state)
 
 

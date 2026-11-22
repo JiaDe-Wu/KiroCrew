@@ -178,6 +178,63 @@ class TestRunLaunch:
         # Persisted terminal state is visible to a fresh reader.
         assert lj.LaunchJobStore(root=s.root).get(job.id).status == lj.DONE
 
+    def test_a_fallback_network_is_on_the_provision_step_before_the_stack(
+        self, tmp_path, monkeypatch
+    ):
+        # The dashboard card names the VPC the launcher picked by itself while the
+        # stack is created, through the real engine's provision.
+        from kiro_crew.cloud import launch_engine as le
+
+        s = _store(tmp_path)
+        job = s.create(profile="dev", region="us-east-2", size_key="balanced")
+        mid_deploy = {}
+
+        def fake_deploy(**kw):
+            kw["on_network_fallback"]("No default VPC in us-east-2, so ...")
+            mid_deploy["detail"] = s.get(job.id).step(lj.STEP_PROVISION).detail
+            return SimpleNamespace(instance_id="i-0abc")
+
+        monkeypatch.setattr(le.ec2, "deploy", fake_deploy)
+        monkeypatch.setattr(le.sizes, "get_tier", lambda k: SimpleNamespace(key=k))
+        eng = le.RealLaunchEngine()
+        eng.preflight = lambda profile, region: None
+        eng.begin_signin = lambda **kw: FakeHandle(already=True)
+        eng.register = lambda **kw: None
+
+        out = lj.run_launch(job, s, eng)
+
+        # The sub-step the engine reports first sits on its own line below it.
+        assert mid_deploy["detail"] == "No default VPC in us-east-2, so ...\n" + le.SUBSTEP_CREATING
+        assert out.status == lj.DONE
+
+    def test_the_fallback_and_the_sub_step_share_the_provision_detail(self, tmp_path):
+        s = _store(tmp_path)
+        job = s.create(profile="dev", region="us-east-2", size_key="balanced")
+        mid = []
+
+        class ProgressEngine(FakeEngine):
+            def provision(
+                self, *, tag, size_key, profile, region, on_network_fallback, on_progress
+            ):
+                on_network_fallback("No default VPC in us-east-2, so ...")
+                on_progress("Creating the instance…")
+                mid.append(s.get(job.id).step(lj.STEP_PROVISION))
+                on_progress("Installing Kiro Crew on the instance…")
+                mid.append(s.get(job.id).step(lj.STEP_PROVISION))
+                return "i-0abc123456789def0"
+
+        out = lj.run_launch(job, s, ProgressEngine())
+
+        assert [(st.state, st.detail) for st in mid] == [
+            (lj.STEP_ACTIVE, "No default VPC in us-east-2, so ...\nCreating the instance…"),
+            (
+                lj.STEP_ACTIVE,
+                "No default VPC in us-east-2, so ...\nInstalling Kiro Crew on the instance…",
+            ),
+        ]
+        assert out.step(lj.STEP_PROVISION).detail == "i-0abc123456789def0"
+        assert out.status == lj.DONE
+
     def test_verified_identity_mismatch_registers_then_fails_not_done(self, tmp_path):
         """A refused sign-in (the box holds a session for a DIFFERENT identity
         than the pinned target -- ordinary on a re-launch onto a reused stack) is
@@ -275,6 +332,55 @@ class TestRunLaunch:
         # back (best-effort) so a transient post-deploy error can't orphan it.
         assert ("teardown", out.tag) in eng.calls
         assert "was removed" in out.error
+
+    @pytest.mark.parametrize(
+        ("exists", "confirms", "says", "never_says"),
+        [
+            (False, True, "was never created, so it is not billing", "was removed"),
+            (True, True, "was removed so it stops billing", "never created"),
+            (False, False, "did NOT confirm", "not billing"),
+            (RuntimeError("Throttling"), True, "was removed so it stops billing", "never created"),
+        ],
+    )
+    def test_a_failed_provision_says_whether_a_stack_existed(
+        self, tmp_path, exists, confirms, says, never_says
+    ):
+        """A refusal before CloudFormation (a denied CreateChangeSet, a subnet with no
+        egress) created no stack, so the card must not report one removed. The delete
+        runs whatever the lookup said, so an unconfirmed one keeps its billing warning."""
+
+        class ProbingEngine(FakeEngine):
+            def resource_exists(self, *, tag, profile, region):
+                self.calls.append(("resource_exists", tag))
+                if isinstance(exists, Exception):
+                    raise exists
+                return exists
+
+        s = _store(tmp_path)
+        job = s.create(profile="dev", region="us-east-1", size_key="balanced")
+        eng = ProbingEngine(
+            provision_exc=RuntimeError("AccessDenied: cloudformation:CreateChangeSet"),
+            teardown_confirms=confirms,
+        )
+        out = lj.run_launch(job, s, eng)
+
+        assert out.status == lj.FAILED
+        assert [c[0] for c in eng.calls if c[0] in ("resource_exists", "teardown")] == [
+            "resource_exists",
+            "teardown",
+        ]
+        assert says in out.error
+        assert never_says not in out.error
+
+    def test_the_ec2_engine_answers_existence_from_the_stack_lookup(self, monkeypatch):
+        from kiro_crew.cloud import launch_engine as le
+
+        stacks = {"kc-1": {"StackStatus": "ROLLBACK_COMPLETE"}}
+        monkeypatch.setattr(le.ec2, "find_stack", lambda tag, profile, region: stacks.get(tag))
+        eng = le.RealLaunchEngine()
+
+        assert eng.resource_exists(tag="kc-1", profile="", region="us-east-1") is True
+        assert eng.resource_exists(tag="kc-2", profile="", region="us-east-1") is False
 
     def test_a_failure_after_provisioning_does_not_tear_down_the_crew(self, tmp_path):
         # Once provisioning succeeded the crew exists; a later-step failure (register)
@@ -393,7 +499,7 @@ class TestRunLaunch:
             ),
         )
         out = lj.run_launch(job, s, eng)
-        assert "Added to Your crews" not in out.step(lj.STEP_CONNECT).detail
+        assert "Added to My Crews" not in out.step(lj.STEP_CONNECT).detail
 
     def test_a_refused_signin_still_outranks_a_registration_failure(self, tmp_path):
         """Two things went wrong and only one is reported as the job's status. The
@@ -502,7 +608,7 @@ class TestFilePermissions:
     def test_a_pre_existing_wide_open_store_dir_is_tightened(self, tmp_path):
         s = _store(tmp_path)
         s.root.mkdir(parents=True)
-        s.root.chmod(0o755)  # what an earlier build would have left
+        s.root.chmod(0o755)  # a legacy install's mode
         s.save(s.create(profile="dev", region="us-east-1", size_key="balanced"))
         assert s.root.stat().st_mode & 0o777 == 0o700
 
@@ -702,11 +808,20 @@ class TestRealEngineRegistration:
     def test_a_successful_registration_returns_quietly(self, monkeypatch):
         from kiro_crew.cloud import launch_engine as le
 
-        monkeypatch.setattr(le.connect_mod, "register_instance", lambda *a, **k: "inst-7")
+        registry: dict = {}
+
+        def _register(instance_id, **kwargs):
+            registry[instance_id] = kwargs
+            return "inst-7"
+
+        monkeypatch.setattr(le.connect_mod, "register_instance", _register)
 
         le.RealLaunchEngine().register(
             instance_id="i-0abc", tag="kc-3f9a", profile="", region="us-east-1"
         )
+        assert registry == {
+            "i-0abc": {"name": "Kiro Crew Cloud (kc-3f9a)", "profile": "", "region": "us-east-1"}
+        }
 
 
 class TestCancelRollsBackTheStack:
@@ -732,6 +847,45 @@ class TestCancelRollsBackTheStack:
         assert out.status == lj.CANCELLED
         assert ("teardown", out.tag) in eng.calls
         assert out.step(lj.STEP_PROVISION).detail == f"Removed {out.tag} after cancellation."
+        assert out.step(lj.STEP_PROVISION).state == lj.STEP_DONE
+
+    def test_the_saved_job_says_the_removal_is_running_until_it_confirms(self, tmp_path):
+        """The job is saved ``cancelled`` before the minutes-long delete. A reader of
+        that file must see the removal step still running, or the dashboard stops
+        polling and never learns whether the instance stopped billing."""
+        entered, release = threading.Event(), threading.Event()
+
+        class BlockingTeardown(FakeEngine):
+            def teardown(self, *, tag, profile, region):
+                entered.set()
+                assert release.wait(10), "the test never released the teardown"
+                return True
+
+        s = _store(tmp_path)
+        job = s.create(profile="dev", region="us-east-1", size_key="balanced")
+        cancel = threading.Event()
+        eng = BlockingTeardown(
+            handle=FakeHandle(url="u", code="c", on_wait=lambda ev: cancel.set())
+        )
+        worker = threading.Thread(
+            target=lj.run_launch, args=(job, s, eng), kwargs={"cancel": cancel}
+        )
+        worker.start()
+        try:
+            assert entered.wait(10), "the rollback never reached the teardown"
+            during = _store(tmp_path).get(job.id)
+            assert during.status == lj.CANCELLED
+            assert during.step(lj.STEP_PROVISION).state == lj.STEP_ACTIVE
+            assert during.step(lj.STEP_PROVISION).detail == f"Removing {job.tag}…"
+        finally:
+            release.set()
+            worker.join(10)
+        assert not worker.is_alive()
+
+        after = _store(tmp_path).get(job.id)
+        assert after.status == lj.CANCELLED
+        assert after.step(lj.STEP_PROVISION).state == lj.STEP_DONE
+        assert after.step(lj.STEP_PROVISION).detail == f"Removed {job.tag} after cancellation."
 
     def test_an_unconfirmed_delete_is_not_reported_as_removed(self, tmp_path):
         """`destroy(wait=False)` only means the request was accepted. A stack that
@@ -745,6 +899,7 @@ class TestCancelRollsBackTheStack:
         assert out.tag in (out.error or "")
         assert "did NOT confirm" in (out.error or "")
         assert "billing" in (out.error or "")
+        assert out.step(lj.STEP_PROVISION).state == lj.STEP_FAILED
 
     def test_a_failed_rollback_names_the_stack_so_the_user_can_remove_it(self, tmp_path):
         out, _ = self._cancel_at_signin(tmp_path, teardown_exc=RuntimeError("access denied"))
@@ -752,6 +907,28 @@ class TestCancelRollsBackTheStack:
         assert out.status == lj.CANCELLED
         assert out.tag in (out.error or ""), "the user must be told what to delete"
         assert "billing" in (out.error or "")
+        assert out.step(lj.STEP_PROVISION).state == lj.STEP_FAILED
+
+    def test_a_provision_that_fails_after_a_cancel_is_a_cancel(self, tmp_path):
+        """The engine may retry a refused launch in another zone; it is handed the
+        cancel, and its failure once the owner cancelled rolls back as a cancel."""
+        s = _store(tmp_path)
+        job = s.create(profile="dev", region="us-east-1", size_key="balanced")
+        cancel = threading.Event()
+        seen: list = []
+
+        class RetryingEngine(FakeEngine):
+            def provision(self, *, tag, size_key, profile, region, cancelled):
+                seen.append(cancelled)
+                cancel.set()  # the owner cancels while the deploy runs
+                raise RuntimeError("no capacity in any zone")
+
+        eng = RetryingEngine()
+        out = lj.run_launch(job, s, eng, cancel=cancel)
+
+        assert seen == [cancel.is_set]
+        assert out.status == lj.CANCELLED
+        assert ("teardown", out.tag) in eng.calls
 
     def test_a_cancel_before_provisioning_deletes_nothing(self, tmp_path):
         s = _store(tmp_path)
@@ -834,6 +1011,41 @@ class TestOrphanReaping:
         assert s.reap_orphans() == []
         still = s.get(job.id)
         assert still is not None and still.status == lj.RUNNING
+
+    def _cancelled_mid_removal(self, tmp_path, *, error=""):
+        s = _store(tmp_path)
+        job = s.create(profile="dev", region="us-east-1", size_key="balanced")
+        job.status = lj.CANCELLED
+        job.step(lj.STEP_PROVISION).state = lj.STEP_ACTIVE
+        job.step(lj.STEP_PROVISION).detail = f"Removing {job.tag}…"
+        job.error = error
+        s.save(job)
+        return s, job
+
+    def test_a_removal_cut_short_by_a_restart_is_failed_not_left_spinning(self, tmp_path):
+        """A cancelled job whose removal step is still active lost its rollback with
+        the old process. Left alone, the dashboard would poll a spinner forever and
+        never say the instance may still be billing."""
+        _, job = self._cancelled_mid_removal(tmp_path, error="Earlier note.")
+
+        reaped = _store(tmp_path).reap_orphans()
+
+        assert reaped == [job.id]
+        after = _store(tmp_path).get(job.id)
+        assert after.status == lj.CANCELLED
+        assert after.step(lj.STEP_PROVISION).state == lj.STEP_FAILED
+        assert after.error.startswith("Earlier note. Interrupted")
+        assert "restarted" in after.error
+        assert "billing" in after.error
+        assert job.tag in after.error
+
+    def test_a_removal_this_process_is_running_is_left_alone(self, tmp_path):
+        s, job = self._cancelled_mid_removal(tmp_path)
+
+        assert s.reap_orphans() == []
+        still = s.get(job.id)
+        assert still.step(lj.STEP_PROVISION).state == lj.STEP_ACTIVE
+        assert still.error == ""
 
     def test_terminal_jobs_are_untouched(self, tmp_path):
         s = _store(tmp_path)

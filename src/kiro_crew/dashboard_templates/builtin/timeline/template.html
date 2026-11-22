@@ -193,7 +193,7 @@
         situ_need: 'needs a person', situ_done: 'accepted', situ_bad: 'rejected',
         situ_gone: 'abandoned', situ_mute: 'open, no report yet',
         scope: '{n} agent row(s) over {s}, {lo} to {hi} UTC',
-        empty_no_board: 'No board has reached this Bot\u2019s record yet.',
+        empty_no_board: 'No board has reached this bot\u2019s record yet.',
         undraw_same_instant: 'Every task starts and ends in the same instant, so no bar has a width.',
         undraw_no_stamp: 'No task carries a start stamp, so no row can be placed on a clock.',
         in_record: '{r} agent row(s) and {u} task(s) are in the record.',
@@ -358,7 +358,11 @@
       if (state === 'rejected') return 'bad';
       if (state === 'abandoned') return 'gone';
       var status = text(task.status);
-      if (status === 'blocked' || status === 'question') return 'need';
+      // The fold's `awaits_person`, when sent: a report naming a person that no
+      // decide or steer answered. An answered question reads by its age instead.
+      var asks = typeof task.awaits_person === 'boolean' ? task.awaits_person :
+        (status === 'blocked' || status === 'question');
+      if (asks) return 'need';
       var last = stamp(task.last_report_at);
       if (last === null) return 'mute';
       var quiet = now - last;

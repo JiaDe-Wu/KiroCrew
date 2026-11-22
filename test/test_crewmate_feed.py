@@ -23,6 +23,7 @@ from kiro_crew.crew_log import projection as crew_log
 from kiro_crew.crew_log import schema as lg
 from kiro_crew.dashboard import crewmate_feed
 from kiro_crew.history import HUMAN_TURN_META_KEY
+from kiro_crew.testing.synthetic_credentials import github_classic
 from kiro_crew.testing.wait import async_wait_until
 
 ASK = "Open a PR for the docs fix? [OPTIONS: Open the PR | Not yet]"
@@ -190,6 +191,233 @@ def test_a_card_press_empties_the_waiting_list_with_no_typed_reply(appended, mon
     _cards(monkeypatch, [{"status": "applied", "finished_at": 1792348900.0}])
     assert crewmate_feed.record_waiting(state, slot) is True
     assert appended[-1][2] == {"items": [], "total": 0}
+
+
+class _Handle:
+    def __init__(self, delay: float, fn: Any, args: tuple[Any, ...]) -> None:
+        self.delay, self.fn, self.args = delay, fn, args
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+class _Loop:
+    def __init__(self) -> None:
+        self.armed: list[_Handle] = []
+
+    def call_later(self, delay: float, fn: Any, *args: Any) -> _Handle:
+        handle = _Handle(delay, fn, args)
+        self.armed.append(handle)
+        return handle
+
+
+def test_a_card_that_expires_is_read_off_the_waiting_list_with_no_growth(appended, monkeypatch):
+    # An expiry writes nothing to the thread's log, so the feed arms its own read
+    # for the moment the soonest open card runs out.
+    now = 1792348860.0
+    monkeypatch.setattr(crewmate_feed, "_expiry_timers", {}, raising=False)
+    monkeypatch.setattr(
+        crewmate_feed,
+        "time",
+        type("_Clock", (), {"time": staticmethod(lambda: now)}),
+        raising=False,
+    )
+    slot = _Slot([])
+    state = _State(slot)
+    loop = _Loop()
+    state.serving_loop = loop  # type: ignore[attr-defined]
+    _cards(
+        monkeypatch,
+        [
+            {
+                "status": "pending",
+                "title": "Set the milestones",
+                "created_at": now,
+                "expires_at": now + 7200,
+            },
+            {
+                "status": "failed",
+                "title": "Save tools",
+                "created_at": now,
+                "expires_at": now + 3600,
+            },
+            {"status": "applied", "title": "Done", "expires_at": now + 60},
+        ],
+    )
+    assert crewmate_feed.record_waiting(state, slot) is True
+    assert len(loop.armed) == 1
+    armed = loop.armed[0]
+    assert armed.fn is crewmate_feed._retired
+    assert armed.args == (SLOT,)
+    assert armed.delay == pytest.approx(3600 + crewmate_feed._SETTLE_SECONDS)
+    # The read the timer starts finds both cards expired: the list empties, and with
+    # nothing left open no timer is armed again.
+    _cards(
+        monkeypatch,
+        [{"status": "expired", "title": "Set the milestones", "finished_at": now + 7200}],
+    )
+    assert crewmate_feed.record_waiting(state, slot) is True
+    assert appended[-1][2] == {"items": [], "total": 0}
+    assert armed.cancelled
+    assert len(loop.armed) == 1
+    assert crewmate_feed._expiry_timers == {}
+
+
+def test_an_expiry_whose_append_is_rejected_is_read_again(monkeypatch):
+    # A rejected append grows no log, so the feed's own timer is what retries it.
+    now = 1792348860.0
+    monkeypatch.setattr(crewmate_feed, "_expiry_timers", {}, raising=False)
+    monkeypatch.setattr(
+        crewmate_feed,
+        "time",
+        type("_Clock", (), {"time": staticmethod(lambda: now)}),
+        raising=False,
+    )
+    outcomes = iter([True, False, True])
+    seen: list[dict] = []
+
+    def write(_sid: str, data: dict, *, on_settled: Any = None) -> None:
+        seen.append(data)
+        on_settled(next(outcomes))
+
+    monkeypatch.setattr(emit, "on_waiting_changed", write)
+    monkeypatch.setattr(crewmate_feed, "_session_of", lambda slot: "s-atlas")
+    slot = _Slot([])
+    state = _State(slot)
+    loop = _Loop()
+    state.serving_loop = loop  # type: ignore[attr-defined]
+    _cards(
+        monkeypatch, [{"status": "pending", "title": "Set the milestones", "expires_at": now + 60}]
+    )
+    assert crewmate_feed.record_waiting(state, slot) is True
+    _cards(monkeypatch, [{"status": "expired", "title": "Set the milestones"}])
+    assert crewmate_feed.record_waiting(state, slot) is True  # rejected
+    assert len(loop.armed) == 2
+    assert loop.armed[1].delay == crewmate_feed._EXPIRY_RETRY_SECONDS
+    assert crewmate_feed.record_waiting(state, slot) is True  # appended again, committed
+    assert seen[-1] == {"items": [], "total": 0}
+    assert len(loop.armed) == 2
+    assert crewmate_feed._expiry_timers == {}
+
+
+def test_a_card_past_its_expiry_but_still_open_is_read_again_after_the_retry_delay(
+    appended, monkeypatch
+):
+    # A step in flight holds an expired card open; reading again every settle
+    # interval until it reports would spin the loop.
+    now = 1792348860.0
+    monkeypatch.setattr(crewmate_feed, "_expiry_timers", {}, raising=False)
+    monkeypatch.setattr(
+        crewmate_feed,
+        "time",
+        type("_Clock", (), {"time": staticmethod(lambda: now)}),
+        raising=False,
+    )
+    slot = _Slot([])
+    state = _State(slot)
+    loop = _Loop()
+    state.serving_loop = loop  # type: ignore[attr-defined]
+    _cards(monkeypatch, [{"status": "failed", "title": "Save tools", "expires_at": now - 5}])
+    crewmate_feed.record_waiting(state, slot)
+    assert len(loop.armed) == 1
+    assert loop.armed[0].delay == crewmate_feed._EXPIRY_RETRY_SECONDS
+
+
+class _ServingLoop(_Loop):
+    """Records timers like :class:`_Loop`; runs tasks on the real running loop."""
+
+    def create_task(self, coro: Any) -> "asyncio.Task[None]":
+        return asyncio.get_running_loop().create_task(coro)
+
+
+def _restarted(monkeypatch, now: float, cards: list[dict[str, Any]]) -> tuple[_State, _ServingLoop]:
+    """A gateway just started: its Bot thread idle, no live client, one unit on disk."""
+    import kiro_crew.constants as constants
+    from kiro_crew.crew_log import projection_readers as readers
+    from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS
+
+    monkeypatch.setattr(crewmate_feed, "_expiry_timers", {}, raising=False)
+    monkeypatch.setattr(
+        crewmate_feed,
+        "time",
+        type("_Clock", (), {"time": staticmethod(lambda: now)}),
+        raising=False,
+    )
+    # The settle timer is real; the test runs the settle itself, so the timer never fires.
+    monkeypatch.setattr(crewmate_feed, "_SETTLE_SECONDS", FALLBACK_TIMEOUT_SECS)
+    monkeypatch.setattr(constants, "crew_log_enabled", lambda: True)
+    monkeypatch.setattr(crewmate_feed, "_registered", True)
+    monkeypatch.setattr(crewmate_feed, "_state_ref", None)
+    monkeypatch.setattr(crewmate_feed, "_session_of", lambda slot: "")
+    monkeypatch.setattr(readers, "newest_unit_in_succession", {SLOT: "s-atlas"}.get)
+    _cards(monkeypatch, cards)
+    state = _State(_Slot([]))
+    state.slot_list_rebuilding = False  # type: ignore[attr-defined]
+    loop = _ServingLoop()
+    state.serving_loop = loop  # type: ignore[attr-defined]
+    return state, loop
+
+
+async def _settle_now() -> None:
+    """Run the pending settle at once, and every task it starts."""
+    assert crewmate_feed._timer is not None
+    crewmate_feed._timer.cancel()
+    crewmate_feed._settle()
+    await _drain()
+
+
+def _waiting(appended: list[tuple[str, str, dict]]) -> list[tuple[str, list[str]]]:
+    return [
+        (sid, [i["kind"] for i in data["items"]])
+        for kind, sid, data in appended
+        if kind == "waiting"
+    ]
+
+
+CARD = {"status": "pending", "title": "Set the milestones", "created_at": 1792348860.0}
+
+
+def test_a_card_that_expires_after_a_restart_leaves_an_idle_threads_list(appended, monkeypatch):
+    # A restart drops every expiry timer, and a thread idle since has no live client
+    # to name its session: start-up learns its newest unit and reads its list again.
+    now = 1792348860.0
+    state, loop = _restarted(monkeypatch, now, [{**CARD, "expires_at": now + 600}])
+
+    async def go() -> None:
+        crewmate_feed.start(state)
+        await _drain()
+        await _settle_now()
+        assert len(loop.armed) == 1
+        armed = loop.armed[0]
+        assert (armed.fn, armed.args) == (crewmate_feed._retired, (SLOT,))
+        assert armed.delay == pytest.approx(600 + crewmate_feed._SETTLE_SECONDS)
+        # The card runs out; the read the timer starts logs into that unit.
+        _cards(monkeypatch, [{**CARD, "status": "expired", "finished_at": now + 600}])
+        armed.fn(*armed.args)
+        await _settle_now()
+
+    asyncio.run(go())
+    assert _waiting(appended) == [("s-atlas", ["card"]), ("s-atlas", [])]
+
+
+def test_a_card_that_expired_while_the_gateway_was_down_leaves_an_idle_threads_list(
+    appended, monkeypatch
+):
+    # The store reads the card as expired at start-up, so no timer is due: the
+    # start-up read itself records the list without it.
+    now = 1792348860.0
+    expired = {**CARD, "status": "expired", "finished_at": now - 60}
+    state, loop = _restarted(monkeypatch, now, [expired])
+
+    async def go() -> None:
+        crewmate_feed.start(state)
+        await _drain()
+        await _settle_now()
+
+    asyncio.run(go())
+    assert _waiting(appended) == [("s-atlas", [])]
+    assert loop.armed == []
 
 
 def test_a_goal_write_reaches_the_feed_and_is_recorded_once(appended, monkeypatch):
@@ -718,7 +946,7 @@ def test_the_goal_fold_takes_the_snapshots_own_totals():
 
 
 def test_a_goal_snapshot_redacts_a_credential_in_goal_and_milestone_text():
-    token = "ghp_" + "a" * 36
+    token = github_classic(seed=305)
     rec = {
         "goals": [{"text": f"Rotate {token}"}],
         "key_results": [

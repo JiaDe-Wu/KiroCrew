@@ -27,6 +27,7 @@ from aws_control_app_helpers import (  # noqa: F401 -- fixtures are used by name
     _registered,
     _request,
 )
+from redaction_structured_cases import github_classic
 
 from kiro_crew import aws_consent
 from kiro_crew.apps.builtins.aws_control.backend import accounts as accounts_mod
@@ -172,10 +173,12 @@ class TestAggregation:
     def test_snapshot_is_cached_until_refresh(self):
         registry = _registry([_entry("a")])
         calls = 0
+        use_cache_values: list[bool] = []
 
-        async def probe(profile: str, region: str, **_kw) -> aws_consent.Identity:
+        async def probe(profile: str, region: str, **kw) -> aws_consent.Identity:
             nonlocal calls
             calls += 1
+            use_cache_values.append(kw.get("use_cache", True))
             return _identity(True, account="1")
 
         with (
@@ -188,8 +191,10 @@ class TestAggregation:
             asyncio.run(accounts_mod.list_accounts())
             asyncio.run(accounts_mod.list_accounts())
             assert calls == 1  # served from the snapshot
+            assert use_cache_values == [True]
             asyncio.run(accounts_mod.list_accounts(refresh=True))
             assert calls == 2  # refresh bypasses it
+            assert use_cache_values == [True, False]
 
 
 # Reconnect classification + plan
@@ -555,7 +560,7 @@ class TestConsentTargetTracksTheOperation:
         from kiro_crew.dashboard.handlers import aws_consent as consent_handlers
         from kiro_crew.deploy import profiles as deploy_profiles
 
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        secret = github_classic(seed=131)
         snapshot = _snapshot_of(
             _registry([_entry(secret, account=self.ACCOUNT)], default=secret),
             {secret: _identity(False, detail="ExpiredToken")},

@@ -79,6 +79,7 @@ def _stub_provider(**attrs):
         # runtime kwargs mirror; the base class answers None and so does this double.
         "tool_search_settings": None,
         "work_scratch_dir": None,
+        "harness_pin": "",
     }
     base.update(attrs)
     return SimpleNamespace(**base)
@@ -294,6 +295,9 @@ class TestAdoptProvider:
 
 
 class _StreamingProvider:
+    # ``LLMProvider``'s default: no spawn tier to compare.
+    sandbox_mode = None
+
     def __init__(self, events=("a", "b"), sid="sid-9"):
         self._events = events
         self._sid = sid

@@ -20,7 +20,7 @@
  */
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { Code2, GitBranch, Loader2, RotateCcw, Server, ShieldAlert, Terminal } from 'lucide-react'
+import { Code2, EyeOff, GitBranch, Globe, KeyRound, Loader2, MessagesSquare, Monitor, Plug, RotateCcw, Server, ShieldAlert, Terminal, Webhook } from 'lucide-react'
 
 import { api } from '../../api/client'
 import { isNotFoundError } from '../../api/apiError'
@@ -28,10 +28,17 @@ import Modal from '../Modal'
 import ErrorNotice from '../ErrorNotice'
 import { Badge, Btn } from '../ui'
 import SessionApprovalModes from './SessionApprovalModes'
+import { chatLaunchLine, chatLaunchScopeLine, type ChatLaunchDeclaration } from './chatLaunch'
+import TrustAppDesktopBox from './TrustAppDesktopBox'
+import type { DesktopRequest } from './desktopRequest'
 import { i18nT } from '../../i18n/t'
 import { findReport, isGatewayConnected, subscribeGatewayConnected } from '../../utils/errorReport'
 import { safeHref } from '../../utils/safeHref'
 import { sourceLabel, type RegistryApp } from './types'
+import { desktopCapabilityLine, knownDesktopCapabilities } from './desktopCapabilities'
+import { browserVerbLine, knownBrowserVerbs } from './browserVerbs'
+import { usePreviewFlag } from '../../hooks/usePreviewFlag'
+import { PREVIEW_APP_BROWSER_SDK } from '../../utils/previewFlags'
 
 /** Machine-readable code the enable and registry-install paths return when trust is missing. */
 export const APP_EXECUTION_DENIED = 'app_execution_denied'
@@ -45,6 +52,14 @@ export const SESSION_APPROVAL_CONSENT_REQUIRED = 'session_approval_consent_requi
  * than on the sentence beside it.
  */
 export const DESKTOP_BUILD_STEP_UNSUPPORTED = 'desktop_build_step_unsupported'
+/**
+ * Machine-readable code of a registry update refused because the app's grant
+ * covers only the copy installed from a local folder. Granting through this
+ * dialog's normal path would record that local grant again, so the refusal
+ * carries the repository the update installs (`trustRepository`) and the update
+ * route takes it back as consent to switch the grant (`switchesLocalSource`).
+ */
+export const APP_TRUST_LOCAL_ONLY = 'app_trust_local_only'
 
 /**
  * The subset of an app row the consent modal needs: identity for the grant,
@@ -55,6 +70,37 @@ export type TrustAppTarget = Pick<RegistryApp, 'name' | '_registry' | 'origin'> 
   displayName?: string
   trustRepository?: string
   sessionApproval?: boolean
+  /** The app declares `permissions.workerAutoApprove`: its own background sessions may auto-approve. */
+  workerAutoApprove?: boolean
+  /** The app declares `permissions.chatSlots`: it runs chat sessions of its own. */
+  chatSlots?: boolean
+  /** The app declares `permissions.hiddenSessions`: its own chats stay out of the session lists. */
+  hiddenSessions?: boolean
+  /** The app declares `permissions.chatLaunch`: the person's chats its page may open. */
+  chatLaunch?: ChatLaunchDeclaration
+  /** The `permissions.reachableByUserSessions` verbs: what your chats may do to the sessions it runs. */
+  reachableByUserSessions?: string[]
+  /** The windows and shortcuts its manifest `desktop` block asks the desktop shell for. */
+  desktop?: DesktopRequest
+  /** The `permissions.desktopCapabilities`: what its desktop windows may ask the desktop app for. */
+  desktopCapabilities?: string[]
+  /** The `permissions.browser` verbs: what it may do on its own slots' browser tabs. Install approves none. */
+  browser?: string[]
+  /** The `permissions.kiroOperations` names: the Kiro operations the gateway calls for it as you. */
+  kiroOperations?: string[]
+  /** The app declares `permissions.webhookSource`: it takes inbound webhooks under its own name. */
+  webhookSource?: boolean
+  /**
+   * The manifest's `permissions.api` entries. The dialog lists the ones outside
+   * the app's own namespace (`hostApiPaths`): the Kiro Crew endpoints it calls.
+   */
+  api?: string[]
+  /**
+   * True when the manifest widens `sessionApproval` to the owner's member
+   * threads (`permissions.memberThreads`). Shown only inside the session
+   * approval box: the scope grants nothing on its own.
+   */
+  memberThreads?: boolean
   /**
    * True when confirming re-runs the registry INSTALL rather than the enable.
    * An install lands the app switched off (enabling is its own step), so the
@@ -70,6 +116,13 @@ export type TrustAppTarget = Pick<RegistryApp, 'name' | '_registry' | 'origin'> 
    * update uses its own `update_*` Cancel and failure sentences.
    */
   replacesInstalled?: boolean
+  /**
+   * True when the app's grant covers only its local-folder copy and confirming
+   * runs the update that moves it to `trustRepository`. The retry itself carries
+   * the consent proof and the server writes the grant, putting the local one
+   * back if the update fails, so confirm writes no trust of its own here.
+   */
+  switchesLocalSource?: boolean
   /**
    * `community` when the registry that LISTED this app is a community one
    * (`registryTierFor`): a negative claim, the listing was not vetted, which is
@@ -169,6 +222,27 @@ function errorCode(e: unknown): string | null {
  */
 export function isTrustDeniedError(e: unknown): boolean {
   return errorCode(e) === APP_EXECUTION_DENIED
+}
+
+/**
+ * The repository an `app_trust_local_only` refusal names, or `''` for any other
+ * failure. Read like `errorCode`: a direct property on a resolved stream result,
+ * or the JSON body of a rejected `/update` call. A value that is not already
+ * credential-free is dropped, the same validation `useTrustGate().open` applies.
+ */
+export function localOnlyTrustRepository(e: unknown): string {
+  if (errorCode(e) !== APP_TRUST_LOCAL_ONLY || !e || typeof e !== 'object') return ''
+  let repository: unknown = (e as { trustRepository?: unknown }).trustRepository
+  const body = (e as { body?: unknown }).body
+  if (repository === undefined && typeof body === 'string' && body.trim().startsWith('{')) {
+    try {
+      repository = (JSON.parse(body) as { trustRepository?: unknown }).trustRepository
+    } catch {
+      repository = undefined
+    }
+  }
+  if (typeof repository !== 'string' || !repository) return ''
+  return credentialFreeRepository(repository) === repository ? repository : ''
 }
 
 /** True when enable must continue from the detail disclosure surface. */
@@ -314,7 +388,10 @@ export function useTrustGate(retryEnable: (name: string) => Promise<void>) {
     // closure, and the catch below has to know whether a grant stands.
     let grantLanded = grantStood
     try {
-      if (!grantStood) {
+      // A local-source switch writes its grant inside the retried update and
+      // undoes it there on failure, so there is no grant here to land, stand or
+      // roll back: a failure leaves the not-saved state.
+      if (!grantStood && !gate.app.switchesLocalSource) {
         await api.trustApp(gate.app.name, gate.app.trustRepository)
         grantLanded = true
         setGranted(true)
@@ -410,6 +487,36 @@ export function useTrustGate(retryEnable: (name: string) => Promise<void>) {
 // Repository text still reaches this dialog from a remote source, so its
 // provenance link goes through the shared scheme allowlist.
 export { safeHref }
+
+/**
+ * The `permissions.api` entries that reach past the app's own namespace: the Kiro
+ * Crew endpoints the app calls. `/apps/<name>/...` (its own backend) and
+ * `/api/apps/<name>/...` (its own routes) are left out, because the gateway's
+ * app-token check admits them without any declaration (`_app_owns_path`), so
+ * listing them would name nothing the user is asked to allow. Blank and
+ * non-string entries grant nothing and are dropped; a repeat is shown once.
+ */
+export function hostApiPaths(name: string, api: unknown): string[] {
+  if (!Array.isArray(api)) return []
+  const own = [`/apps/${name}`, `/api/apps/${name}`]
+  const owned = (entry: string) => own.some(base => entry === base || entry.startsWith(base + '/'))
+  const entries = api
+    .filter((entry): entry is string => typeof entry === 'string')
+    .map(entry => entry.trim())
+    .filter(entry => entry && !owned(entry))
+  return [...new Set(entries)]
+}
+
+/**
+ * Whether a listed host path names the chat endpoints (`/api/chat` or a path below
+ * it, plain or `=` exact), so the box can say in plain words what that reach is.
+ */
+export function callsChat(paths: string[]): boolean {
+  return paths.some(entry => {
+    const path = entry.startsWith('=') ? entry.slice(1) : entry
+    return path === '/api/chat' || path.startsWith('/api/chat/')
+  })
+}
 
 /**
  * The three capabilities a trust grant confers, each paired with its icon.
@@ -572,6 +679,16 @@ export default function TrustAppModal({
   onConfirm: () => void
 }) {
   const name = app ? (app.displayName || app.name) : ''
+  // Only the verbs the gateway knows; anything else in a manifest grants nothing.
+  const hostApi = app ? hostApiPaths(app.name, app.api) : []
+  const reachVerbs = (Array.isArray(app?.reachableByUserSessions) ? app.reachableByUserSessions : [])
+    .filter(verb => verb === 'read' || verb === 'send')
+  const desktopCaps = knownDesktopCapabilities(app?.desktopCapabilities)
+  const browserVerbs = knownBrowserVerbs(app?.browser)
+  const kiroOperations = Array.isArray(app?.kiroOperations) ? app.kiroOperations.filter(op => typeof op === 'string') : []
+  const browserPreview = usePreviewFlag(PREVIEW_APP_BROWSER_SDK)
+  // The badge's own rule (`sourceLabel`): a listing tag outranks the origin.
+  const localInstall = !app?._registry && app?.origin === 'local'
   const state = terminalState({ failed, granted, detail, detailCode })
   const path = trustPath(app)
   // A first install only: an Update re-runs the install over an app that is
@@ -609,6 +726,9 @@ export default function TrustAppModal({
     <Modal
       open={!!app}
       onClose={onCancel}
+      // Cancel is off while the grant and its install run; Escape, the backdrop
+      // and the X must be too, or the dialog a late failure renders in is gone.
+      dismissDisabled={pending}
       maxWidth={560}
       guideTrustRoot
       title={i18nT('components.appstore.trustAppModal.title', { app: name })}
@@ -643,7 +763,9 @@ export default function TrustAppModal({
                     // No new trust is asked here, so no trust (shield) icon either.
                     ? <><RotateCcw size={14} /> {i18nT('components.appstore.trustAppModal.confirm_retry_granted')}</>
                     : <><ShieldAlert size={14} /> {i18nT('components.appstore.trustAppModal.confirm_after_failure')}</>
-                  : <><ShieldAlert size={14} /> {path === 'update'
+                  : <><ShieldAlert size={14} /> {app?.switchesLocalSource
+                      ? i18nT('components.appstore.trustAppModal.confirm_switch_local_source')
+                      : path === 'update'
                       ? i18nT('components.appstore.trustAppModal.confirm_update')
                       : path === 'install'
                         ? i18nT('components.appstore.trustAppModal.confirm_install')
@@ -658,6 +780,20 @@ export default function TrustAppModal({
           <p className="text-muted leading-relaxed">
             {i18nT('components.appstore.trustAppModal.scope', { app: name })}
           </p>
+          {/* The take-back line sits at the top on every path: on a phone the
+              bottom of the dialog is a scroll away, and this line is what
+              makes the consent safe to give. */}
+          <p className="text-muted leading-relaxed">
+            {i18nT('components.appstore.trustAppModal.revocable')}
+          </p>
+          {/* The switch changes where the app comes from: the local-folder copy
+              is replaced by the repository's, and its trust follows the
+              repository. Above the list so a phone shows it without scrolling. */}
+          {path === 'update' && app.switchesLocalSource && !permanentRefusal && (
+            <p className="text-text leading-relaxed">
+              {i18nT('components.appstore.trustAppModal.local_source_switch', { app: name })}
+            </p>
+          )}
           <p className="text-text leading-relaxed">
             {i18nT('components.appstore.trustAppModal.intro', { app: name })}
           </p>
@@ -694,12 +830,172 @@ export default function TrustAppModal({
               <p className="text-text leading-relaxed">
                 {i18nT('components.appstore.trustAppModal.session_approval_desc')}
               </p>
+              {app.memberThreads && (
+                <p className="text-text leading-relaxed">
+                  {i18nT('components.appstore.trustAppModal.session_approval_member_threads')}
+                </p>
+              )}
               <SessionApprovalModes label={i18nT('components.appstore.trustAppModal.session_approval_modes')} />
+            </div>
+          )}
+          {/* Its own box for the same reason: a manifest-declared request, not part of
+              the ceiling above, and the one that lets work run with nobody approving. */}
+          {app.workerAutoApprove && (
+            <div className="flex flex-col gap-1.5 rounded-lg border border-warn/30 bg-warn-subtle px-3.5 py-3">
+              <div className="flex items-center gap-2 font-semibold text-warn">
+                <ShieldAlert size={14} className="shrink-0" />
+                <span>{i18nT('components.appstore.trustAppModal.worker_auto_approve_heading')}</span>
+              </div>
+              <p className="text-text leading-relaxed">
+                {i18nT('components.appstore.trustAppModal.worker_auto_approve_desc')}
+              </p>
+            </div>
+          )}
+          {/* A manifest-declared request too: the app opens and drives chats of its
+              own, which a person sees in the sidebar under it. */}
+          {app.chatSlots && (
+            <div className="flex flex-col gap-1.5 rounded-lg border border-border bg-[color-mix(in_srgb,var(--card)_88%,transparent)] px-3.5 py-3" data-testid="trust-chat-slots">
+              <div className="flex items-center gap-2 font-semibold text-text">
+                <MessagesSquare size={14} className="shrink-0" />
+                <span>{i18nT('components.appstore.trustAppModal.chat_slots_heading')}</span>
+              </div>
+              <p className="text-text leading-relaxed">
+                {i18nT('components.appstore.trustAppModal.chat_slots_desc')}
+              </p>
+            </div>
+          )}
+          {app.hiddenSessions && (
+            <div className="flex flex-col gap-1.5 rounded-lg border border-border bg-[color-mix(in_srgb,var(--card)_88%,transparent)] px-3.5 py-3" data-testid="trust-hidden-sessions">
+              <div className="flex items-center gap-2 font-semibold text-text">
+                <EyeOff size={14} className="shrink-0" />
+                <span>{i18nT('components.appstore.trustAppModal.hidden_sessions_heading')}</span>
+              </div>
+              <p className="text-text leading-relaxed">
+                {i18nT('components.appstore.trustAppModal.hidden_sessions_desc')}
+              </p>
+            </div>
+          )}
+          {/* The person's own chats its page may open: which agents, which folder,
+              under which key prefix and with which memory modes. */}
+          {app.chatLaunch && (
+            <div className="flex flex-col gap-1.5 rounded-lg border border-border bg-[color-mix(in_srgb,var(--card)_88%,transparent)] px-3.5 py-3" data-testid="trust-chat-launch">
+              <div className="flex items-center gap-2 font-semibold text-text">
+                <MessagesSquare size={14} className="shrink-0" />
+                <span>{i18nT('components.appstore.trustAppModal.chat_launch_heading')}</span>
+              </div>
+              <p className="text-text leading-relaxed">
+                {chatLaunchLine(app.chatLaunch, 'trust')}
+              </p>
+              <p className="text-muted leading-relaxed">
+                {chatLaunchScopeLine(app.chatLaunch)}
+              </p>
+            </div>
+          )}
+          {/* The other direction from session approval: the owner's chats reaching the
+              app's sessions, not the app reaching the owner's chats. */}
+          {reachVerbs.length > 0 && (
+            <div className="flex flex-col gap-1.5 rounded-lg border border-border bg-[color-mix(in_srgb,var(--card)_88%,transparent)] px-3.5 py-3">
+              <div className="flex items-center gap-2 font-semibold text-text">
+                <MessagesSquare size={14} className="shrink-0" />
+                <span>{i18nT('components.appstore.trustAppModal.user_session_reach_heading')}</span>
+              </div>
+              {reachVerbs.includes('read') && (
+                <p className="text-text leading-relaxed">{i18nT('components.appstore.trustAppModal.user_session_reach_read')}</p>
+              )}
+              {reachVerbs.includes('send') && (
+                <p className="text-text leading-relaxed">{i18nT('components.appstore.trustAppModal.user_session_reach_send')}</p>
+              )}
+              <p className="text-muted leading-relaxed">{i18nT('components.appstore.trustAppModal.user_session_reach_note')}</p>
+            </div>
+          )}
+          {/* Shown with the grants because the windows run the app's own code on the
+              desktop, over every other program, while the app is on. */}
+          <TrustAppDesktopBox request={app.desktop} />
+          {desktopCaps.length > 0 && (
+            <div className="flex flex-col gap-1.5 rounded-lg border border-border bg-[color-mix(in_srgb,var(--card)_88%,transparent)] px-3.5 py-3" data-testid="trust-desktop-capabilities">
+              <div className="flex items-center gap-2 font-semibold text-text">
+                <Monitor size={14} className="shrink-0" />
+                <span>{i18nT('components.appstore.trustAppModal.desktop_capabilities_heading')}</span>
+              </div>
+              {desktopCaps.map(cap => (
+                <p key={cap} className="text-text leading-relaxed">{desktopCapabilityLine(cap)}</p>
+              ))}
+              <p className="text-muted leading-relaxed">{i18nT('components.appstore.trustAppModal.desktop_capabilities_note')}</p>
+            </div>
+          )}
+          {/* `permissions.browser` (rfc-app-sdk-browser.md): listed so the owner knows what the app
+              will ask for. Installing approves none of it; the app's page does. */}
+          {browserVerbs.length > 0 && (
+            <div className="flex flex-col gap-1.5 rounded-lg border border-border bg-[color-mix(in_srgb,var(--card)_88%,transparent)] px-3.5 py-3" data-testid="trust-browser-verbs">
+              <div className="flex items-center gap-2 font-semibold text-text">
+                <Globe size={14} className="shrink-0" />
+                <span>{i18nT('components.appstore.trustAppModal.browser_heading')}</span>
+              </div>
+              {browserVerbs.map(verb => (
+                <p key={verb} className="text-text leading-relaxed">{browserVerbLine(verb)}</p>
+              ))}
+              <p className="text-muted leading-relaxed">{i18nT('components.appstore.trustAppModal.browser_note')}</p>
+              {!browserPreview && (
+                <p className="text-muted leading-relaxed" data-testid="trust-browser-preview-off">{i18nT('components.appstore.trustAppModal.browser_preview_off')}</p>
+              )}
+            </div>
+          )}
+          {/* `permissions.kiroOperations`: listed so the owner knows what the app will ask for. Installing approves none of it; the app's page does. */}
+          {kiroOperations.length > 0 && (
+            <div className="flex flex-col gap-1.5 rounded-lg border border-border bg-[color-mix(in_srgb,var(--card)_88%,transparent)] px-3.5 py-3" data-testid="trust-kiro-operations">
+              <div className="flex items-center gap-2 font-semibold text-text">
+                <KeyRound size={14} className="shrink-0" />
+                <span>{i18nT('components.appstore.trustAppModal.kiro_operations_heading')}</span>
+              </div>
+              <div className="flex flex-wrap gap-1">
+                {kiroOperations.map(op => (
+                  <code key={op} className="max-w-full break-all bg-bg-elevated border border-border px-1.5 py-0.5 rounded text-[11px] text-text">{op}</code>
+                ))}
+              </div>
+              <p className="text-muted leading-relaxed">{i18nT('components.appstore.trustAppModal.kiro_operations_note')}</p>
+            </div>
+          )}
+          {/* The Kiro Crew endpoints the manifest declares beyond the app's own
+              namespace, listed as declared: the reach a page or backend of this
+              app has into the host's API. */}
+          {hostApi.length > 0 && (
+            <div
+              data-testid="trust-app-host-api"
+              className="flex flex-col gap-1.5 rounded-lg border border-border bg-[color-mix(in_srgb,var(--card)_88%,transparent)] px-3.5 py-3"
+            >
+              <div className="flex items-center gap-2 font-semibold text-text">
+                <Plug size={14} className="shrink-0" />
+                <span>{i18nT('components.appstore.trustAppModal.host_api_heading')}</span>
+              </div>
+              {callsChat(hostApi) && (
+                <p className="text-text leading-relaxed">{i18nT('components.appstore.trustAppModal.host_api_chat')}</p>
+              )}
+              <p className="text-muted leading-relaxed">{i18nT('components.appstore.trustAppModal.host_api_paths')}</p>
+              <ul className="flex flex-wrap gap-1">
+                {hostApi.map(path => (
+                  <li key={path}>
+                    <code className="bg-bg-elevated border border-border px-1.5 py-0.5 rounded text-[11px] text-text break-all">{path}</code>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {app.webhookSource && (
+            <div className="flex flex-col gap-1.5 rounded-lg border border-border bg-[color-mix(in_srgb,var(--card)_88%,transparent)] px-3.5 py-3">
+              <div className="flex items-center gap-2 font-semibold text-text">
+                <Webhook size={14} className="shrink-0" />
+                <span>{i18nT('components.appstore.trustAppModal.webhook_source_heading')}</span>
+              </div>
+              <p className="text-text leading-relaxed">
+                {i18nT('components.appstore.trustAppModal.webhook_source_desc', { source: app.name })}
+              </p>
             </div>
           )}
           <div className="flex flex-wrap items-center gap-2 text-muted">
             <GitBranch size={14} className="shrink-0" />
-            <span className="shrink-0">{i18nT('components.appstore.trustAppModal.source')}</span>
+            <span className="shrink-0">
+              {localInstall ? i18nT('appStoreSources.source') : i18nT('components.appstore.trustAppModal.source')}
+            </span>
             {app.trustRepository && (
               /* Provenance is shown as a LINK only when the URL is one the user can
                  safely be handed: the clone target is remote content, and
@@ -728,9 +1024,12 @@ export default function TrustAppModal({
             )}
             <Badge variant="muted">{sourceLabel(app)}</Badge>
           </div>
-          {/* The registry badge above reads as an endorsement. It is not one. */}
+          {/* The registry badge above reads as an endorsement. It is not one. A
+              local install has no listing, so its line claims none. */}
           <p className="text-muted leading-relaxed">
-            {i18nT('components.appstore.trustAppModal.not_reviewed')}
+            {localInstall
+              ? i18nT('components.appstore.trustAppModal.not_reviewed_local')
+              : i18nT('components.appstore.trustAppModal.not_reviewed')}
           </p>
           {/* A community registry's listing was not vetted by the team. Below the
               not-an-endorsement line, so that line stays next to the badge it
@@ -787,9 +1086,6 @@ export default function TrustAppModal({
             </p>
           )}
           <p className="text-muted leading-relaxed">{copy.exit}</p>
-          <p className="text-muted leading-relaxed">
-            {i18nT('components.appstore.trustAppModal.revocable')}
-          </p>
           {/* Two failure strings, because the two cases need different advice: if
               the grant landed and only the enable failed, the user has state to
               clean up; if nothing was written, telling them to go check Settings

@@ -10,7 +10,8 @@ export const LOCATIONS = {
   // The desktop top bar's Search Everywhere trigger: the only way into the
   // command palette besides ⌘K. While an app claims the quick-search slot the
   // same button opens that app's launcher under another label, hence the
-  // condition. The phone nav drawer's Search row is shell.menu-search below;
+  // condition. The Show search in the top bar display setting can hide it,
+  // hence the gate. The phone nav drawer's Search row is shell.menu-search below;
   // the phone Sessions drawer's rail button names itself from a variable and
   // is not registered.
   'shell.search': {
@@ -34,6 +35,7 @@ export const LOCATIONS = {
       requires: [
         { kind: 'viewport', value: 'desktop' },
         { kind: 'condition', id: 'search_bar_unclaimed' },
+        { kind: 'condition', id: 'topbar_search_shown' },
       ],
     }],
   },
@@ -166,20 +168,6 @@ export const LOCATIONS = {
         requires: [{ kind: 'condition', id: 'phone_connect_available' }],
       },
     ],
-  },
-  // Phone nav drawer only: the desktop opens the same account modal from the
-  // top bar's readout capsule, which the phone does not render.
-  'shell.kiro-account': {
-    kind: 'button',
-    label: { from: 'attr', attr: 'label' },
-    terms: {
-      en: ['account balance', 'credits', 'my account', 'sign in status', 'usage'],
-      'zh-CN': ['账户余额', '额度', '我的账户', '登录状态', '用量'],
-    },
-    placements: [{
-      surface: 'shell', parent: 'shell.mobile-menu', entry: 'menu',
-      requires: [{ kind: 'condition', id: 'kiro_account_entry' }],
-    }],
   },
   // The community row's "Report issue" link, which opens the diagnostics flow.
   // The label is the short visible text; the long accessible name ("Report a

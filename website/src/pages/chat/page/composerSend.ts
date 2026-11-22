@@ -12,7 +12,7 @@ import { expandAll as expandPasteTokens, carryPastes, mergeCarriedDraft, type Pa
 import { mergeSessionRefs, type SessionRef } from '../../../utils/sessionRefs'
 import type { PickedFileTokens } from './composerFileMentions'
 import { queuedSendStash } from '../../../hooks/useQueuedMessageActions'
-import { syncSlotRunningFromServer, capturePendingAskId, createSlot, appendMessage, selectComposerBusy, startLocalTurn, endLocalTurn, appendSlotMessage, setSlotRunning, selectSendConfirmed, selectSlotRunEpoch, markSendUnconfirmed, confirmOptimisticSend, resolveOptimisticSteer, recordSendAttempt, ageFolderSuggestion } from '../../../store/chatSlice'
+import { syncSlotRunningFromServer, capturePendingAskId, createSlot, appendMessage, selectComposerBusy, startLocalTurn, endLocalTurn, appendSlotMessage, setSlotRunning, selectPendingTurn, selectSendConfirmed, selectSlotRunEpoch, selectSlotStreamState, markSendUnconfirmed, confirmOptimisticSend, resolveOptimisticSteer, recordSendAttempt, ageFolderSuggestion } from '../../../store/chatSlice'
 import { confirmedDelivered } from '../../../utils/sendDelivery'
 import { warnDeliveryUnconfirmed } from '../../../utils/deliveryWarning'
 import { announceIfRemovedSendDelivered } from '../../../components/useDeliveryWarningStrip'
@@ -20,12 +20,14 @@ import { mintSendId, sendTurn } from '../../../chat-core/transport/sendTurn'
 import { prependQuote, type MessageQuote } from '../../../chat-core/composer/messageQuote'
 import { isEmptyTurn, buildOutgoingTurn } from '../../../chat-core/composer/outgoingTurn'
 import { storeSentPastes } from '../../../chat-core/composer/composerPastes'
+import { clearDictated, markDictated, takeDictated, wantsDictationNote } from '../../../chat-core/composer/dictationProvenance'
 import { addNotification } from '../../../store/notificationsSlice'
 import { isInterceptedSlashCommand, interceptSlashCommand } from '../ChatInput'
 import { loadChatConfig } from '../ChatSettings'
 import { api } from '../../../api/client'
 import { resolveAskAfterSend } from '../../../lib/resolveAskAfterSend'
 import { uniqueNotificationTs } from './notificationTs'
+import { CHANNEL_CHALLENGE_ORIGIN, takeChallengeSend } from '../../../utils/channelChallengeSend'
 import { PREFILL_STORAGE_KEY } from '../../../utils/navIntent'
 import { isComposerSendHeld } from '../../../utils/composerSendHolds'
 import type { ComposerHandle } from '../../../chat-core/composer/Composer'
@@ -108,6 +110,9 @@ export interface SentTurnRestore {
   quote: MessageQuote | null
   slotTokens?: Record<string, string[]>
   knowledge?: readonly KnowledgeResult[]
+  /** The text held dictated words (`dictationProvenance`), so the restore puts
+   *  the mark back and the re-send adds the note once. */
+  dictated?: boolean
 }
 
 /** Two sends' payloads as one, so a single restore puts both back. The stage holds one quote, so
@@ -125,6 +130,7 @@ export function mergeSentTurns(earlier: SentTurnRestore, later: SentTurnRestore)
     quote: earlier.quote ?? later.quote,
     slotTokens: earlier.slotTokens || later.slotTokens ? tokens : undefined,
     knowledge: [...(earlier.knowledge ?? []), ...(later.knowledge ?? []).filter(i => !knowledgeIds.has(i.id))],
+    ...(earlier.dictated || later.dictated ? { dictated: true } : {}),
   }
 }
 
@@ -236,6 +242,7 @@ export function useComposerSend({
     // exemption (same treatment as appendSessionRefLinks).
     // The quote: back on the stage when live and free, else in the text.
     const textBack = messageQuote.recoverInto(mergeCarriedDraft(keepText, carried), sent.quote, onScreenNow && composerMountedRef.current)
+    if (sent.dictated) markDictated(slot)
     setDraft(drafts.current, slot, textBack)
     setPasteDraft(pasteDrafts.current, slot, pastesBack)
     setSessionRefDraft(sessionRefDrafts.current, slot, refsBack)
@@ -263,7 +270,23 @@ export function useComposerSend({
   // delivery (ArtifactPanel's submit-to-chat batch marks comments sent on it).
   // `sendNow`: the deliberate Send now after this tab lost a send race. It is
   // a new submission at the current revision and never steers.
-  const send = useCallback(async (optionText?: string, targetSlot?: string, steerNow?: boolean | 'auto', isolated = false, sendNow = false): Promise<boolean> => {
+  // `onUndelivered` is for an isolated caller that reports a failed send itself
+  // (the follow-up card shows it on its item), so the page-level "copy it to try
+  // again" notice would only give it a second, conflicting recovery instruction.
+  // It is told whether the server refused the send or the answer was lost
+  // (`indeterminate`: the turn may be running, so a retry could run it twice).
+  // A refusal also carries the server's framed reason (a Shared Crew limit, or
+  // the receipt's reason), since the suppressed page notice was where it showed.
+  // `reportConfirmed` is the stricter verdict: it is called with true only when
+  // the server provably holds the message (a `dispatched` or `queued` receipt,
+  // or a correlated echo), never for a `response-late` or `unknown` receipt the
+  // boolean above counts as delivered. The composer's prompt stash deletes a
+  // restored draft's only durable copy on it, so a guess must not reach it.
+  // `ownFiles` is for an isolated send that carries its own uploaded files (a
+  // discussion card's pictures): only these paths go with it, never what the
+  // composer has staged. Ignored on a composer send.
+  const send = useCallback(async (optionText?: string, targetSlot?: string, steerNow?: boolean | 'auto', isolated = false, sendNow = false, onUndelivered?: (kind: 'refused' | 'indeterminate', reason?: string) => void, reportConfirmed?: (confirmed: boolean) => void, ownFiles: readonly string[] = []): Promise<boolean> => {
+    const ownsFailureReport = !!onUndelivered
     // Defense-in-depth: ChatInput already gates Send/Optimize buttons and
     // the keyboard Enter shortcut on `connected`, but a future caller (a
     // programmatic dispatch from a hotkey, a follow-up option click, an
@@ -294,6 +317,7 @@ export function useComposerSend({
     // App launches own only their explicit text, not the composer's staged data.
     const widgetOrigin = !isolated && !!widgetPrefillRef.current && raw.includes(widgetPrefillRef.current)
     if (!isolated) widgetPrefillRef.current = null
+    const challengeOrigin = takeChallengeSend()
     // A staged quote alone is a sendable message (the quote IS the text).
     const sentQuote: MessageQuote | null = isolated || optionText ? null : messageQuote.consume('').quote
     if (isEmptyTurn(isolated ? { text: raw } : { text: raw, quote: sentQuote, files: pendingFilesRef.current, sessionRefs: pendingSessionsRef.current })) return false
@@ -347,8 +371,12 @@ export function useComposerSend({
     // collaborator's send accepted while this one is on its way is still unseen.
     const baseAtPress = baseRevisionFor(entrySendSlot)
     // An app's supplied text is not the human's answer to a pending card.
-    // Null captures keep all composer-owned completion effects inert.
-    const askAtSend = isolated ? null : capturePendingAskId(store.getState().chat.pendingQuestions, entrySendSlot)
+    // Null captures keep all composer-owned completion effects inert. An
+    // isolated send that reports its own failure is a person's press (a
+    // discussion card's Start, a follow-up Start): like a typed send it
+    // releases a blocking question, or a queued send waits behind the parked
+    // turn until the question expires.
+    const askAtSend = isolated && !ownsFailureReport ? null : capturePendingAskId(store.getState().chat.pendingQuestions, entrySendSlot)
     // Entry-time capture of the folder-suggestion card, ONLY when it was
     // actually on screen for this send: the card renders solely in this page's
     // composer band for the ACTIVE slot, so a targeted send into another slot —
@@ -399,6 +427,9 @@ export function useComposerSend({
           if (composerMountedRef.current && composerSlotRef.current === uiSlot) {
             if (inputRef.current.trim() === raw && pasteBlocksRef.current === slashPastes) { setInput(''); setPasteBlocks([]) }
           } else if (uiSlot && (drafts.current[uiSlot] ?? '').trim() === raw) {
+            // The parked draft held the command's words, and no composer commit
+            // will see it emptied, so its dictation mark goes with it here.
+            clearDictated(uiSlot)
             delete drafts.current[uiSlot]; delete pasteDrafts.current[uiSlot]
             saveDrafts()
           }
@@ -447,11 +478,23 @@ export function useComposerSend({
     // referenced transcript -- the live paste tokens expanded on the wire only,
     // the knowledge block, and the quoted message opening both texts. An app
     // launch (`isolated`) sends its own text verbatim, folder tokens included.
+    // Whether the composer text this send takes holds dictated words. Only a
+    // composer send takes it: an option answer or an app launch sends its own
+    // text and leaves the composer, and its provenance, where they are. Every
+    // recovery path below that hands the text back puts the record back too.
+    const wasDictated = !isolated && !optionText && takeDictated(uiSlot)
+    const dictationNote = wantsDictationNote(wasDictated)
+    // An isolated send with its own files builds them in the composer's order
+    // and keeps its folder tokens verbatim. Not `typedOnly`: the raw text alone
+    // cannot put those files back, so a queued cancel takes the parser path.
     const turn = isolated
-      ? { wire: raw, bubble: raw, inlined: raw, meta: {}, pastes: [], storedPaste: undefined, typedOnly: true }
-      : buildOutgoingTurn({ text: raw, files: sentFiles, pastes: activePastes, sessionRefs: sentSessionRefs, knowledge: knowledgeBlock, quote: sentQuote, project: currentProjectRef.current || '' }, 'send')
+      ? (ownFiles.length
+          ? { ...buildOutgoingTurn({ text: raw, files: [...ownFiles], keepFolderTokens: true, project: currentProjectRef.current || '' }, 'send'), typedOnly: false }
+          : { wire: raw, bubble: raw, inlined: raw, meta: {}, pastes: [], storedPaste: undefined, typedOnly: true })
+      : buildOutgoingTurn({ text: raw, files: sentFiles, pastes: activePastes, sessionRefs: sentSessionRefs, knowledge: knowledgeBlock, quote: sentQuote, project: currentProjectRef.current || '', dictationNote }, 'send')
     if (!isolated) knowledgeFetchRef.current.clearPending()
-    storeSentPastes(turn.storedPaste)
+    const sendId = mintSendId()
+    storeSentPastes(turn.storedPaste, sendId)
 
     if (!isolated) setPrefillHint(false)
     // The alias sub-map this send is about to drop, kept as a frozen snapshot
@@ -520,6 +563,23 @@ export function useComposerSend({
         if (draft) { setFileDraft(fileDrafts.current, uiSlot, draft.filter(p => !sent.has(p))); saveDrafts() }
       }
     }
+    if (!isolated && challengeOrigin) {
+      // A channel challenge link seeds its prompt into the composer (and the
+      // prefill hand-off) for the window before connect, then auto-sends it as
+      // optionText, which skips the full clear above. Take back only the seed:
+      // text the person changed meanwhile is not the seed and stays. The
+      // slot-restore effect may have queued the seed's fill in this same commit,
+      // so the live check runs as an updater, after that fill. A failed send
+      // hands the text back through `restoreSentTurn`, like a typed send. This
+      // runs beside the staged-file prune above, not instead of it: a link that
+      // reopens a session sends that session's staged files too.
+      if (composerMountedRef.current && composerSlotRef.current === uiSlot) setInput(prev => (prev.trim() === raw ? '' : prev))
+      if (uiSlot && (drafts.current[uiSlot] ?? '').trim() === raw) { delete drafts.current[uiSlot]; saveDrafts() }
+      try {
+        const seed = JSON.parse(sessionStorage.getItem(PREFILL_STORAGE_KEY) ?? 'null') as { slotKey?: unknown; prompt?: unknown } | null
+        if (seed && seed.slotKey === uiSlot && typeof seed.prompt === 'string' && seed.prompt.trim() === raw) sessionStorage.removeItem(PREFILL_STORAGE_KEY)
+      } catch { /* sessionStorage unavailable or the seed unreadable */ }
+    }
     // Target the slot the user is actually looking at (uiSlot, from the ref),
     // not the stale closure `activeSlot`. See the uiSlot note above.
     let slot = targetSlot ?? uiSlot
@@ -560,7 +620,7 @@ export function useComposerSend({
           // page-level copyable notice, which survives slot switches, instead
           // of a draft or a user row that would age pending approvals.
           const failure = i18nT('pages.chatPage.send_failed_with_error', { error: createFailReason(e) })
-          setActionError({ message: i18nT('appChatLaunch.unsent', { error: failure, message: raw }), title: i18nT('pages.chatPage.could_not_start_a_new_session'), preserveOnSwitch: true })
+          if (!ownsFailureReport) setActionError({ message: i18nT('appChatLaunch.unsent', { error: failure, message: raw }), title: i18nT('pages.chatPage.could_not_start_a_new_session'), preserveOnSwitch: true })
           return false
         }
         // Recover the payload WITHOUT clobbering anything newer. Two traps make a
@@ -706,6 +766,7 @@ export function useComposerSend({
         // this one merge serves both the on-screen and parked-draft arms.
         if (uiSlot && sentSlotTokens) mergeSlotTokens(uiSlot, sentSlotTokens)
         if (uiSlot) {
+          if (wasDictated) markDictated(uiSlot)
           setDraft(drafts.current, uiSlot, restoredText)
           setPasteDraft(pasteDrafts.current, uiSlot, restoredPastes)
           setFileDraft(fileDrafts.current, uiSlot, restoredFiles)
@@ -730,11 +791,11 @@ export function useComposerSend({
     // turn's wire order.
     const meta: Record<string, unknown> = { ...turn.meta }
     if (widgetOrigin) meta.origin = 'widget'
+    if (challengeOrigin) meta.origin = CHANNEL_CHALLENGE_ORIGIN
     // A client-generated correlation ID so the server echo can be matched
     // to this exact optimistic bubble without relying on content equality.
     // The server preserves meta fields on the user row it appends, so the
     // echo carries both this sendId AND the server-minted `mid` (#2845).
-    const sendId = mintSendId()
     meta.sendId = sendId
     const metaPayload = meta
     // A busy snapshot may be stale. The server's user event supplies the
@@ -752,20 +813,36 @@ export function useComposerSend({
       if (slot && slot !== store.getState().chat.activeSlot) dispatch(appendSlotMessage({ slot, message: bubble }))
       else dispatch(appendMessage(bubble))
       // The composer is already empty, so this record is the prompt's only
-      // copy if the bubble later leaves the transcript; ↑ reads it.
-      if (slot && !isolated) dispatch(recordSendAttempt({ slot, text: turn.bubble, sendId, pastes: turn.pastes }))
+      // copy if the bubble later leaves the transcript; ↑ reads it. An isolated
+      // send that owns its failure report (a follow-up Start) records too: its
+      // prompt is the new session's first message, and when the POST is lost
+      // the switch into that session drops the unconfirmed bubble, so ↑ there
+      // is the only way back to it. Other isolated sends (app launches) keep
+      // their payload out of the person's ↑ history.
+      if (slot && (!isolated || ownsFailureReport)) dispatch(recordSendAttempt({ slot, text: turn.bubble, sendId, pastes: turn.pastes }))
     }
     if (!isolated) window.dispatchEvent(new Event('voice-stop'))
     sendingRef.current = false
     // Settings -> Chat can turn the send-time jump off (#25754).
-    if (loadChatConfig().scrollOnSend) setTimeout(() => scrollBottom(), SCROLL_AFTER_RENDER_MS)
+    // Only the transcript of the session that sent: an isolated send to another
+    // session (a follow-up Start) must not scroll the one on screen.
+    if (loadChatConfig().scrollOnSend) setTimeout(() => { if (!slot || store.getState().chat.activeSlot === slot) scrollBottom() }, SCROLL_AFTER_RENDER_MS)
     if (slot) dispatch(startLocalTurn(slot))
     const sendEpoch = slot ? selectSlotRunEpoch(store.getState(), slot) : 0
+    // Only this unconfirmed send owns the optimistic running flag. Once a live
+    // frame or a slots broadcast has taken the turn over (the epoch moved or
+    // the mark cleared), or the slot is streaming at all (a send queued behind
+    // a running turn), the turn is the server's: a failed POST must not idle it.
+    const endOwnLocalTurn = () => {
+      if (!slot) return
+      const state = store.getState()
+      if (selectPendingTurn(state, slot) && selectSlotRunEpoch(state, slot) === sendEpoch && selectSlotStreamState(state, slot) === 'idle') dispatch(endLocalTurn(slot))
+    }
     const restoreComposerAfterFailedSend = () => {
       // App payloads remain in the page-level error notice for copying; the
       // composer was never consumed and must not gain the app's text or chips.
       if (!slot || isolated) return
-      restoreSentTurn(slot, { inlined: turn.inlined, pastes: activePastes, sessionRefs: sentSessionRefs, quote: sentQuote, slotTokens: sentSlotTokens })
+      restoreSentTurn(slot, { inlined: turn.inlined, pastes: activePastes, sessionRefs: sentSessionRefs, quote: sentQuote, slotTokens: sentSlotTokens, ...(wasDictated ? { dictated: true } : {}) })
     }
     // A send carries the revision it is based on (first submit wins); one
     // pressed before this tab learned it waits for the session's read, bounded.
@@ -806,12 +883,12 @@ export function useComposerSend({
     // routes to the slot's own list, the active one included).
     const failLocalTurn = (message: ChatMessage) => {
       if (isolated) {
-        if (slot) dispatch(endLocalTurn(slot))
-        setActionError({ message: i18nT('appChatLaunch.unsent', { error: message.content, message: raw }), preserveOnSwitch: true })
+        endOwnLocalTurn()
+        if (!ownsFailureReport) setActionError({ message: i18nT('appChatLaunch.unsent', { error: message.content, message: raw }), preserveOnSwitch: true })
         return
       }
       if (slot) {
-        dispatch(endLocalTurn(slot))
+        endOwnLocalTurn()
         dispatch(appendSlotMessage({ slot, message }))
       } else {
         dispatch(setSlotRunning(false))
@@ -819,11 +896,15 @@ export function useComposerSend({
       }
     }
     if (receipt.status === 'transport-error') {
-      if (slot && selectSendConfirmed(store.getState(), slot, sendId)) return true
+      if (slot && selectSendConfirmed(store.getState(), slot, sendId)) { reportConfirmed?.(true); return true }
       // Cause-stating and naming the restore ("...and try again"), the shared
       // core copy the other surfaces use, instead of a bare "Connection error".
       failLocalTurn({ role: 'error', content: i18nT('pages.chatPage.send_failed_connection'), cls: '' })
       restoreComposerAfterFailedSend()
+      // The caller treats this as maybe-delivered, so the bubble keeps a visible
+      // pending-delivery line instead of reading as sent.
+      if (onUndelivered && slot) dispatch(markSendUnconfirmed({ slot, sendId }))
+      onUndelivered?.('indeterminate')
       return false
     }
     if (receipt.status === 'response-late') {
@@ -832,7 +913,15 @@ export function useComposerSend({
       // `optimistic` flag. A correlated echo is stronger evidence than the
       // missing response -- a channel-linked slot can deliver one -- and then
       // there is nothing to warn about.
-      if (slot && selectSendConfirmed(store.getState(), slot, sendId)) return true
+      if (slot && selectSendConfirmed(store.getState(), slot, sendId)) { reportConfirmed?.(true); return true }
+      // A caller that owns the failure report gets the same maybe-delivered
+      // verdict as a lost receipt, and no "resend manually" notice, which would
+      // invite running its prompt a second time.
+      if (onUndelivered) {
+        if (slot) dispatch(markSendUnconfirmed({ slot, sendId }))
+        onUndelivered('indeterminate')
+        return false
+      }
       // An unconfirmed STEER is not counted as delivered: the steer receipt
       // policy hands its text back (applySteerReceipt), so a caller that
       // persists on this verdict (a comment batch) keeps its payload.
@@ -850,7 +939,7 @@ export function useComposerSend({
       // slot like the failure rows: the user can switch sessions inside the
       // deadline window.
       dispatch(markSendUnconfirmed({ slot, sendId }))
-      if (!isolated) warnDeliveryUnconfirmed<SentTurnRestore>(slot, { sendId, surface: 'page', epoch: sendEpoch, sent: { inlined: turn.inlined, pastes: activePastes, sessionRefs: sentSessionRefs, quote: sentQuote, slotTokens: sentSlotTokens, knowledge: knowledgeBlock?.items } })
+      if (!isolated) warnDeliveryUnconfirmed<SentTurnRestore>(slot, { sendId, surface: 'page', epoch: sendEpoch, sent: { inlined: turn.inlined, pastes: activePastes, sessionRefs: sentSessionRefs, quote: sentQuote, slotTokens: sentSlotTokens, knowledge: knowledgeBlock?.items, ...(wasDictated ? { dictated: true } : {}) } })
       dispatch(appendSlotMessage({ slot, message: { role: 'notice', content: '\u26A0\uFE0F ' + i18nT(isolated ? 'pages.chatPage.delivery_unconfirmed_resend_manually' : 'pages.chatPage.delivery_unconfirmed_pending'), cls: '', meta: { deliveryNoticeFor: sendId } } }))
       return lateVerdict
     }
@@ -882,7 +971,7 @@ export function useComposerSend({
       // and are bounded by how many sends a single tab queues in one
       // session.
       if (typeof body.queue_id === 'string' && body.queue_id) {
-        queuedSendStash.set(body.queue_id, { raw, files: stagedFilesAtSend, sent: turn.wire, aliases: sentSlotTokens, ...(sentQuote ? { quote: sentQuote } : {}) })
+        queuedSendStash.set(body.queue_id, { raw, files: stagedFilesAtSend, sent: turn.wire, aliases: sentSlotTokens, ...(sentQuote ? { quote: sentQuote } : {}), ...(wasDictated ? { dictated: true } : {}) })
       }
     }
     if (receipt.status === 'refused' && slot && !isolated && isSendRaceConflict(receipt.body)) {
@@ -893,9 +982,7 @@ export function useComposerSend({
       // reads differently on purpose.
       setSendRaceNotice(slot, receipt.body)
       dispatch(resolveOptimisticSteer({ slot, sendId, outcome: 'queued' }))
-      // Only this unconfirmed send owns the optimistic running flag.
-      const state = store.getState()
-      if (state.chat.pendingTurnSlot === slot && selectSlotRunEpoch(state, slot) === sendEpoch) dispatch(endLocalTurn(slot))
+      endOwnLocalTurn()
       restoreComposerAfterFailedSend()
       return false
     }
@@ -905,9 +992,7 @@ export function useComposerSend({
       // composer locks with their name until the lease ends. Not an error row.
       noteComposerLocked(receipt.body)
       dispatch(resolveOptimisticSteer({ slot, sendId, outcome: 'queued' }))
-      // Only this unconfirmed send owns the optimistic running flag.
-      const state = store.getState()
-      if (state.chat.pendingTurnSlot === slot && selectSlotRunEpoch(state, slot) === sendEpoch) dispatch(endLocalTurn(slot))
+      endOwnLocalTurn()
       restoreComposerAfterFailedSend()
       return false
     }
@@ -919,17 +1004,21 @@ export function useComposerSend({
       // A Shared Crew limit names whose limit it is and what to do next; the
       // draft is restored below either way.
       const limitCopy = refusalMessage(receipt.body as { code?: unknown; capacity?: CapacityResponse })
+      const refusalReason = limitCopy
+        ?? (receipt.reason ? i18nT('pages.chatPage.send_failed_with_error', { error: receipt.reason }) : undefined)
       failLocalTurn({
         role: 'error',
-        content: limitCopy
-          ?? (receipt.reason
-            ? i18nT('pages.chatPage.send_failed_with_error', { error: receipt.reason })
-            : i18nT('pages.chatPage.send_failed')),
+        content: refusalReason ?? i18nT('pages.chatPage.send_failed'),
         cls: '',
       })
+      // An isolated send that reports its own failure adds no error row here,
+      // so its bubble would stand alone in the transcript looking delivered.
+      // Nothing of it was accepted, so it goes, as a race-lost send's does.
+      if (isolated && ownsFailureReport && slot) dispatch(resolveOptimisticSteer({ slot, sendId, outcome: 'queued' }))
       // The server explicitly accepted neither (`ok` nor `queued`), so nothing
       // was sent — recovering the composer cannot duplicate a delivered turn.
       restoreComposerAfterFailedSend()
+      onUndelivered?.('refused', refusalReason)
     }
     if (slot && confirmedDelivered(body)) {
       // The response remains a delivery receipt (#4131), even if the correlated
@@ -967,6 +1056,8 @@ export function useComposerSend({
     // not parse) may have started a turn, so it counts as delivered for the
     // same reason the composer above does not restore on it — a retry it
     // invited could duplicate a delivered turn.
+    reportConfirmed?.(receipt.status === 'dispatched' || receipt.status === 'queued'
+      || (!!slot && selectSendConfirmed(store.getState(), slot, sendId)))
     return receipt.status !== 'refused'
     // `send` is deliberately kept stable: it reads volatile values (agent,
     // model, project, mode, colorTheme, activeSlot) through refs so it does not
@@ -982,7 +1073,16 @@ export function useComposerSend({
     // array for no behavior change (the ref is always current regardless).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSlot, dispatch, connected, forkUnavailable, messageQuote.consume, messageQuote.restage, setPendingAgent, setPendingModel])
+
+  // The composer's send verdict for the prompt stash: true only when the
+  // server confirmed it holds the message. A `response-late` or `unknown`
+  // receipt resolves false, so a restored draft keeps its stash entry.
+  const composerSend = useCallback(async (): Promise<boolean> => {
+    let confirmed = false
+    const delivered = await send(undefined, undefined, undefined, false, false, undefined, (ok) => { confirmed = ok })
+    return delivered && confirmed
+  }, [send])
   return {
-    send, restoreSentTurn,
+    send, restoreSentTurn, composerSend,
   }
 }

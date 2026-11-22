@@ -19,7 +19,7 @@ the ring buffer bounds lines, not their length.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 #: Published in place of a tail the redactor flagged in either spelling.
 STDERR_WITHHELD = "stderr withheld: redacted content"
@@ -31,15 +31,26 @@ STDERR_TAIL_MAX_CHARS = 2000
 
 
 def safe_stderr_tail(
-    lines: Iterable[str], sep: str, *, max_chars: int = STDERR_TAIL_MAX_CHARS
+    lines: Iterable[str],
+    sep: str,
+    *,
+    max_chars: int = STDERR_TAIL_MAX_CHARS,
+    redact: Callable[[str], str] | None = None,
 ) -> str:
     """*lines* joined with *sep*, or :data:`STDERR_WITHHELD`, or ``""``.
 
     ``""`` when there is nothing to publish. Both spellings are checked whole and
     the bound is applied only to a tail that passed, so a secret straddling the
     cut is judged before the cut can leave an unrecognisable fragment of it.
+    *redact* is the credential judge, ``security.redact`` when omitted, and a URL the
+    exfiltration scan flags withholds the tail as well (``security.refuses``).
     """
-    from kiro_crew.security import redact
+    from kiro_crew.security import refuses
+
+    if redact is None:
+        from kiro_crew.security import redact as default_redact
+
+        redact = default_redact
 
     kept = [line for line in lines if isinstance(line, str)]
     if not kept:
@@ -55,6 +66,6 @@ def safe_stderr_tail(
     # Both spellings are judged WHOLE, before any cut: a cut can start the window
     # mid-secret, leaving a fragment with neither its prefix nor its full run,
     # which no pattern recognises.
-    if redact(joined) != joined or redact(rejoined) != rejoined:
+    if refuses(joined, redact) or refuses(rejoined, redact):
         return STDERR_WITHHELD
     return joined[-max_chars:]

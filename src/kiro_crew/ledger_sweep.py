@@ -331,11 +331,12 @@ def _damaged_session_age(directory: Path, now: datetime) -> float:
     The record has no stamp to read. The directory's mtime sees every atomic
     replace; the state file's mtime sees an in-place write that damaged it. The
     smaller age wins, so a store touched either way inside the window is kept.
+    A state file that is missing has no mtime and adds no reading, so the
+    directory alone ages a store that has none.
     """
-    return min(
-        _age_days(None, directory, now),
-        _age_days(None, directory / sl._STATE_FILE, now),
-    )
+    readings = [_mtime(directory / sl._STATE_FILE), _mtime(directory)]
+    ages = [_age_of(moment, now) for moment in readings if moment is not None]
+    return min(ages) if ages else 0.0
 
 
 def _session_age_days(state: dict[str, Any], directory: Path, now: datetime) -> float:
@@ -887,20 +888,20 @@ def run_command(*, purge: bool, older_than_days: float | None, purge_unreadable:
     # once. Infinity is refused alongside it -- it is not a window, and taking it
     # as "collect nothing" would make a typo look like a working command.
     if not math.isfinite(window) or window < 0:
-        print("  ❌ --older-than-days must be a finite number of days, and not negative")
+        print("  Error: --older-than-days must be a finite number of days, and not negative")
         sys.exit(2)
     # ``--purge-unreadable`` is a modifier of ``--purge``. Run alone it would be
     # the hazard this command exists to remove: a modifier parsed without its
     # mode, a dry run that exits 0 and reads like a purge that found nothing.
     if purge_unreadable and not purge:
-        print("  ❌ --purge-unreadable only works with --purge", file=sys.stderr)
+        print("  Error: --purge-unreadable only works with --purge", file=sys.stderr)
         sys.exit(2)
     header = "Ledger Sweep" + ("" if purge else " (dry run — nothing is deleted)")
     print(f"{header}\n")
     try:
         report = scan(older_than_days=window)
     except OSError as exc:
-        print(f"  ❌ could not read the ledger stores: {exc}")
+        print(f"  Error: could not read the ledger stores: {exc}")
         sys.exit(1)
     result = _purge(report, include_unreadable=purge_unreadable) if purge else None
     for line in render(report, purged=result):
@@ -921,7 +922,7 @@ def run_command(*, purge: bool, older_than_days: float | None, purge_unreadable:
         for candidate in result.failed:
             key = _safe(candidate.key) if candidate.key else "(no breadcrumb)"
             print(
-                f"  ❌ could not delete {candidate.kind} {_safe(candidate.store)}  key={key}",
+                f"  Error: could not delete {candidate.kind} {_safe(candidate.store)}  key={key}",
                 file=sys.stderr,
             )
         sys.exit(1)

@@ -65,7 +65,7 @@ import os
 import posixpath  # noqa: F401 - read by functions rebound from push_guard_commit.py
 import re
 import shlex
-import shutil
+import shutil  # noqa: F401 - read by functions rebound from push_guard_commit.py
 import signal
 import subprocess
 import sys
@@ -237,28 +237,6 @@ def child_env(probe=True, extra=None):
     return env
 
 
-# What cmd.exe expands inside an argument when it runs a .cmd/.bat file
-# (preflight.run refuses the same set).
-_CMD_META = '^&|<>%!"\r\n'
-
-
-def _which(name):
-    """An executable from PATH's absolute entries only, or None.
-
-    A bare name is searched in the current directory first on Windows (and a
-    relative PATH entry resolves against it everywhere), and that directory is
-    the checkout under guard.  Naming each directory makes shutil.which look
-    there alone, with PATHEXT still applied.  Shared with sweep_check.py, which
-    runs git and gh the same way.
-    """
-    for entry in os.environ.get("PATH", "").split(os.pathsep):
-        if entry and os.path.isabs(entry):
-            found = shutil.which(os.path.join(entry, name))
-            if found:
-                return found
-    return None
-
-
 def _which_git():
     """git from PATH's absolute entries only."""
     return _which("git")
@@ -331,6 +309,7 @@ def _stop(proc):
             except subprocess.TimeoutExpired:
                 pass
     else:
+        _free_waitpid_lock(proc)
         try:
             proc.terminate()
             proc.wait(timeout=_KILL_GRACE_S)
@@ -342,6 +321,22 @@ def _stop(proc):
     except OSError:
         pass
     proc.wait()
+
+
+def _free_waitpid_lock(proc):
+    """Release the waitpid lock an interrupted Popen.wait left taken.
+
+    POSIX Popen.wait(timeout) takes its lock with acquire(False) and only then
+    enters the try that releases it, so a SIGHUP/SIGTERM/SIGINT handler raising
+    between the two leaves it taken, and every later wait on ``proc`` (the one
+    below, after the kill) blocks forever.  The guard waits on a child from one
+    thread only, so a lock still taken here is that leak.
+    shortcut: reads Popen's private ``_waitpid_lock``; drop this once CPython
+    releases it on an asynchronous exception.
+    """
+    lock = getattr(proc, "_waitpid_lock", None)
+    if lock is not None and lock.locked():
+        lock.release()
 
 
 def _wait(proc, timeout, stall, out, errf):
@@ -1206,6 +1201,12 @@ def _load_owner(stem):
     """
     package = __name__.rpartition(".")[0]
     return _load_sibling(stem + ".py", package + "." + stem if package else stem)
+
+
+# The absolute-PATH lookup and the cmd.exe metacharacter set, defined in _tool_argv.py.
+_tool_argv = _load_owner("_tool_argv")
+_which = _tool_argv.which
+_CMD_META = _tool_argv.CMD_META
 
 
 def _sweep_check(base, git_dir):

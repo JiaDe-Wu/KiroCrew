@@ -33,6 +33,10 @@ _STALL_CURRENT_SECS = 24 * 3600
 #: gateway costs a short pause, never a hung diagnostic.
 _ADAPTIVE_READ_TIMEOUT_SECS = 2
 
+#: How much of a refusal's body the controller read parses for its code. An auth
+#: refusal is a small JSON object; reading more than this is never needed.
+_ADAPTIVE_ERROR_BODY_BYTES = 4096
+
 #: The loopback host the controller read dials. The local credential is
 #: resolved for this same host, so it pairs with the listener actually reached.
 _LOOPBACK_HOST = "127.0.0.1"
@@ -343,7 +347,19 @@ def _gateway_adaptive_state() -> tuple[int, dict[str, Any] | None, str]:
     except _GatewayPeerRefused:
         return port, None, "the answering process is not proven to be this install's gateway"
     except urllib.error.HTTPError as exc:
-        return port, None, f"the gateway refused the read (HTTP {exc.code})"
+        # The auth layer refuses with a bare "Forbidden" and a code; the code names
+        # the cause (a credential from another instance, most often), so say that.
+        import http.client
+
+        from kiro_crew.auth_refusal_text import auth_refusal_text
+
+        why = f"the gateway refused the read (HTTP {exc.code})"
+        try:
+            body = json.loads(exc.read(_ADAPTIVE_ERROR_BODY_BYTES))
+        except (OSError, ValueError, http.client.HTTPException):
+            body = None
+        explained = auth_refusal_text(body.get("code")) if isinstance(body, dict) else None
+        return port, None, f"{why}: {explained}" if explained else why
     except (urllib.error.URLError, OSError) as exc:
         # Only a bare read timeout (the connection was accepted and the gateway
         # then stalled -- a loop thread starved of the GIL) means it is up but
@@ -509,7 +525,8 @@ def _doctor_cron_health(issues: list[str]) -> None:
 
 def _doctor_crash_dumps(issues: list[str]) -> None:
     """Render the ``Loop-stall Crash Dumps`` section: the newest dump with stacks,
-    where the loop wedged, and who it was working for."""
+    where the loop wedged, who it was working for, and the gateways that died
+    with neither stacks nor a clean shutdown."""
     print("\nLoop-stall Crash Dumps")
     try:
         dumps_dir = cli_doctor.get_dumps_dir()
@@ -517,23 +534,16 @@ def _doctor_crash_dumps(issues: list[str]) -> None:
         if _latest is not None:
             _age_s = cli_doctor.dump_age_seconds(_latest)
             # Every gateway start pre-creates its own dump file, so a dump WITH
-            # stacks that a later local session's header file sits after was
-            # written by a session another one has already replaced without
-            # wedging. That is a past incident: counting it as something to fix
-            # makes `doctor` report a fault for a week after one stall, on a
-            # gateway that has been healthy the whole time — and the real
-            # finding in that run gets read as one more line of the same noise.
+            # stacks followed by a later session's header file came from a
+            # session since replaced without wedging: a past stall. Counting it
+            # would make `doctor` report a fault for a week after one stall and
+            # bury the real finding in noise.
             #
-            # Ordering alone is not enough to conclude it, though. Under the
-            # shipped `Restart=always` unit a wedged gateway is replaced within
-            # seconds, so the successor supersedes the stall almost at once and
-            # a gateway wedging hourly would downgrade every stall forever —
-            # under-reporting exactly the chronic case an operator needs. Two
-            # further terms keep that case visible: a stall inside
-            # `_STALL_CURRENT_SECS` is still current news whatever restarted
-            # since, and two or more stalls on record is a gateway wedging
-            # repeatedly, which no amount of successful restarting makes
-            # historical.
+            # Ordering alone is not enough. Under the shipped `Restart=always`
+            # unit a wedged gateway is replaced in seconds, so an hourly wedge
+            # would always look past. Two terms keep that chronic case visible:
+            # a stall inside `_STALL_CURRENT_SECS` is still current, and two or
+            # more stalls on record mean a gateway that keeps wedging.
             #
             # The stacks are printed either way, because they are what anyone
             # investigating that stall needs; only the issue verdict changes.
@@ -545,8 +555,17 @@ def _doctor_crash_dumps(issues: list[str]) -> None:
             )
             if _age_s < 7 * 86400:  # Less than 7 days old
                 _age_h = _age_s / 3600
-                _icon = "ℹ️ " if _superseded else "⚠️ "
-                print(f"  last dump:   {_icon} {_latest.name} ({_age_h:.1f}h ago)")
+                # The name is when that gateway STARTED (the file is opened at
+                # startup); when the alarm fired is the file's last write.
+                _attribution = cli_doctor.attribute_dump(_latest, cli_doctor.config_dir())
+                # A host-wide pause is a fault of the host, not of the gateway:
+                # shown, never counted as an issue to fix here.
+                _host_pause = _attribution.host_pause_secs is not None
+                _icon = "ℹ️ " if _superseded or _host_pause else "⚠️ "
+                print(
+                    f"  last dump:   {_icon} {_latest.name} "
+                    f"(fired {cli_doctor.dump_fired_at(_latest)}, {_age_h:.1f}h ago)"
+                )
                 if _superseded:
                     print(
                         "               a later gateway session started after it and did "
@@ -564,7 +583,6 @@ def _doctor_crash_dumps(issues: list[str]) -> None:
                 # stack and the cron in-flight markers on disk -- no gateway
                 # needed -- and phrased as evidence plus the one action it
                 # supports, or the statement that it supports none.
-                _attribution = cli_doctor.attribute_dump(_latest, cli_doctor.config_dir())
                 print("  attribution:")
                 for _line in cli_doctor.describe(_attribution):
                     print(f"    {_line}")
@@ -574,13 +592,13 @@ def _doctor_crash_dumps(issues: list[str]) -> None:
                     _paused_job = cli_doctor.job_pause_state_from_disk(_attribution.job.job_id)
                     if _paused_job is not None:
                         print(f"    job is currently {_paused_job}")
-                    if not _superseded:
+                    if not _superseded and not _host_pause:
                         issues.append(
                             "loop-stall dump attributed to cron job "
                             f"{render._safe_display(_attribution.job.name)} "
                             f"({render._safe_display(_attribution.job.job_id)})"
                         )
-                if not _superseded:
+                if not _superseded and not _host_pause:
                     issues.append(f"recent loop-stall crash dump ({_age_h:.0f}h ago)")
             else:
                 print(
@@ -588,6 +606,49 @@ def _doctor_crash_dumps(issues: list[str]) -> None:
                 )
         else:
             print("  dumps:       ✅ no crash dumps found (healthy)")
+        # Gateways that ended with neither a stall dump nor an orderly shutdown.
+        # A hard kill is an ordinary way to end one, so the row informs and never
+        # adds an issue.
+        _unclean = cli_doctor.unexplained_exits(dumps_dir)
+        if _unclean:
+            _newest_h = cli_doctor.dump_age_seconds(_unclean[-1]) / 3600
+            print(
+                f"  unclean:     ℹ️  {len(_unclean)} earlier gateway session(s) ended "
+                "without a clean shutdown and left no stacks"
+            )
+            print(
+                f"               newest last written {_newest_h:.1f}h ago: "
+                f"{render._safe_display(_unclean[-1].name)}"
+            )
         print(f"  dump dir:    {dumps_dir}")
     except Exception as exc:
         print(f"  crash dumps: ⚠️  check failed ({exc})")
+
+
+def _doctor_session_tree_checkpoint(issues: list[str]) -> None:
+    """Render the ``Session Tree Checkpoint`` section: whether the last save of the
+    checkpoint was refused or failed, which leaves the next start replaying the crew log
+    from an older one. Reads the marker the projection leaves beside the checkpoint, so
+    it needs no running gateway."""
+    from kiro_crew.crew_log.session_tree_projection import checkpoint_refusal
+
+    print("\nSession Tree Checkpoint")
+    try:
+        refusal = checkpoint_refusal()
+        if refusal is None:
+            print("  checkpoint:  ✅ the last save landed, or none has been refused")
+            return
+        reason = refusal.get("reason")
+        if reason == "over_ceiling":
+            what = (
+                f"the tree is {refusal.get('bytes')} bytes, "
+                f"past the {refusal.get('ceiling')}-byte ceiling"
+            )
+        else:
+            what = "the write failed; the gateway log has the error"
+        print(f"  checkpoint:  ⚠  not being saved: {render._safe_display(what)}")
+        print("               The next start replays the crew log from the last checkpoint that")
+        print("               was written, or rebuilds the session tree from scratch.")
+        issues.append("session tree checkpoint is not being saved")
+    except Exception as exc:
+        print(f"  checkpoint:  ⚠  check failed ({exc})")

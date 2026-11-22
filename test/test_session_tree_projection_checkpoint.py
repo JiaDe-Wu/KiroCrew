@@ -57,9 +57,8 @@ def _payload(**overrides: Any) -> dict[str, Any]:
         "root": stp._current_root(),
         "records": [{"sid": "s-1", "slot": "slot-a", "at": 7}],
         "edges": [{"slot": "slot-b", "at": 3, "sid": "s-2", "seq": 1, "parent": "slot-a"}],
-        "scans": {"s-1": [1, 2, 3, 4]},
         "spawned": [{"slot": "slot-c", "at": 4, "sid": "s-1", "seq": 2, "parent": "slot-a"}],
-        "spawn_scans": {"s-1": [5, 6, 7, 8]},
+        "marks": {"s-1": [1, 2, 3, 4, 6, 7, 0, 8, 9, 1]},
     }
     payload.update(overrides)
     return payload
@@ -145,9 +144,9 @@ def test_a_flush_round_trips_through_the_load(submitted: list[tuple[Any, ...]]) 
     assert proj.flush_checkpoint() is True
     loaded = stp._load_checkpoint()
     assert loaded is not None
-    records, edges, scans, spawned, spawn_scans = loaded
+    records, edges, spawned, marks = loaded
     assert records == {"s-1": _record("s-1", parent="slot-root")}
-    assert (edges, scans, spawned, spawn_scans) == ({}, {}, {}, {})
+    assert (edges, spawned, marks) == ({}, {}, {})
 
 
 def test_an_empty_clean_projection_has_nothing_to_flush(submitted: list[tuple[Any, ...]]) -> None:
@@ -163,15 +162,18 @@ def test_a_well_formed_checkpoint_loads_every_half(submitted: list[tuple[Any, ..
     _write(_payload())
     loaded = stp._load_checkpoint()
     assert loaded is not None
-    records, edges, scans, spawned, spawn_scans = loaded
+    records, edges, spawned, marks = loaded
     assert set(records) == {"s-1"}
     assert set(edges) == {("slot-b", "s-2")}
-    assert scans == {"s-1": (1, 2, 3, 4)}
     assert set(spawned) == {("slot-c", "s-1")}
-    assert spawn_scans == {"s-1": (5, 6, 7, 8)}
+    assert marks == {"s-1": (1, 2, 3, 4, 6, 7, 0, 8, 9, 1)}
 
 
-@pytest.mark.parametrize("text", ["{not json", "[]"], ids=["unparseable", "not-an-object"])
+@pytest.mark.parametrize(
+    "text",
+    ["{not json", "[]", "[" * 20000 + "]" * 20000],
+    ids=["unparseable", "not-an-object", "nested-past-the-stack-limit"],
+)
 def test_a_checkpoint_that_is_not_a_json_object_loads_as_none(
     submitted: list[tuple[Any, ...]], text: str
 ) -> None:
@@ -187,9 +189,8 @@ def test_a_checkpoint_that_is_not_a_json_object_loads_as_none(
         {"root": None},
         {"records": {}},
         {"edges": None},
-        {"scans": []},
         {"spawned": None},
-        {"spawn_scans": []},
+        {"marks": []},
     ],
     ids=[
         "older-version",
@@ -197,9 +198,8 @@ def test_a_checkpoint_that_is_not_a_json_object_loads_as_none(
         "no-root",
         "records-not-a-list",
         "edges-missing",
-        "scans-not-a-map",
         "spawned-missing",
-        "spawn-scans-not-a-map",
+        "marks-not-a-map",
     ],
 )
 def test_a_checkpoint_it_cannot_prove_loads_as_none(
@@ -223,20 +223,83 @@ def test_an_oversized_checkpoint_is_discarded_unread(
     submitted: list[tuple[Any, ...]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _write(_payload())
-    monkeypatch.setattr(stp, "MAX_CHECKPOINT_BYTES", 8)
+    monkeypatch.setattr(stp, "MAX_SESSION_TREE_CHECKPOINT_BYTES", 8)
     assert stp._load_checkpoint() is None
 
 
 def test_a_save_past_the_ceiling_writes_nothing(
     submitted: list[tuple[Any, ...]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(stp, "MAX_CHECKPOINT_BYTES", 8)
+    monkeypatch.setattr(stp, "MAX_SESSION_TREE_CHECKPOINT_BYTES", 8)
     assert stp._save_checkpoint(_payload()) is False
     assert not stp._checkpoint_path().exists()
 
 
 def test_a_save_that_raises_reports_it_did_not_land(submitted: list[tuple[Any, ...]]) -> None:
     assert stp._save_checkpoint({"unserialisable": object()}) is False
+
+
+def test_the_ceiling_is_its_own_and_above_the_crew_log_payload_ceiling() -> None:
+    from kiro_crew.crew_log.checkpoint import MAX_CHECKPOINT_BYTES
+
+    assert stp.MAX_SESSION_TREE_CHECKPOINT_BYTES > MAX_CHECKPOINT_BYTES
+
+
+def test_a_checkpoint_past_two_mib_is_written_and_read_back(
+    submitted: list[tuple[Any, ...]],
+) -> None:
+    """The 2 MiB crew-log payload ceiling accepts a large session tree."""
+    from kiro_crew.crew_log.checkpoint import MAX_CHECKPOINT_BYTES
+
+    rows = [{"sid": f"s-{i:05d}", "slot": f"slot-{i:05d}", "at": i} for i in range(50000)]
+    payload = _payload(records=rows)
+    assert len(json.dumps(payload, separators=(",", ":")).encode()) > MAX_CHECKPOINT_BYTES
+
+    assert stp._save_checkpoint(payload) is True
+    assert stp._checkpoint_path().stat().st_size > MAX_CHECKPOINT_BYTES
+    loaded = stp._load_checkpoint()
+    assert loaded is not None
+    assert len(loaded[0]) == 50000
+
+
+def test_a_refused_save_leaves_a_finding_and_the_next_save_clears_it(
+    submitted: list[tuple[Any, ...]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert stp.checkpoint_refusal() is None
+    with monkeypatch.context() as small:
+        small.setattr(stp, "MAX_SESSION_TREE_CHECKPOINT_BYTES", 8)
+        assert stp._save_checkpoint(_payload()) is False
+    finding = stp.checkpoint_refusal()
+    assert finding is not None
+    assert finding["reason"] == "over_ceiling"
+    assert finding["ceiling"] == 8
+    assert finding["bytes"] > 8
+    assert stp._save_checkpoint(_payload()) is True
+    assert stp.checkpoint_refusal() is None
+
+
+def test_a_failed_write_is_logged_loud_and_leaves_a_finding(
+    submitted: list[tuple[Any, ...]], caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger="kiro_crew.crew_log.session_tree_projection"):
+        assert stp._save_checkpoint({"unserialisable": object()}) is False
+    assert "could not be written" in caplog.text
+    finding = stp.checkpoint_refusal()
+    assert finding is not None
+    assert finding["reason"] == "write_failed"
+
+
+def test_a_refused_save_through_the_debounced_write_leaves_the_finding(
+    submitted: list[tuple[Any, ...]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(stp, "CHECKPOINT_DEBOUNCE_SECS", 0)
+    monkeypatch.setattr(stp, "MAX_SESSION_TREE_CHECKPOINT_BYTES", 8)
+    proj = SessionTreeProjection()
+    proj.apply(_record("s-1"))
+    proj._debounced_write(stp._checkpoint_path(), proj._cancel_epoch, stp._current_root())
+    finding = stp.checkpoint_refusal()
+    assert finding is not None and finding["reason"] == "over_ceiling"
+    assert proj._dirty is True, "a refused write must leave the state owing one"
 
 
 # --------------------------------------------------------------------------- #
@@ -300,16 +363,22 @@ def test_a_decision_row_round_trips_and_a_release_omits_its_parent() -> None:
     assert stp._edge_from_json(stp._edge_to_json(release)) == release
 
 
-def test_a_scan_row_that_does_not_parse_costs_only_its_unit() -> None:
+def test_a_mark_row_that_does_not_parse_costs_only_its_unit() -> None:
     rows = {
-        "kept": [1, 2, 3, 4],
-        "": [1, 2, 3, 4],
-        "short": [1, 2, 3],
+        "kept": [1, 2, 3, 4, 6, 7, 0, 8, 9, 1],
+        "no-cuts": [1, 2, 3, 4, -1, 7, 0, 8, 9, 1],
+        "": [1, 2, 3, 4, 6, 7, 0, 8, 9, 1],
+        "short": [1, 2, 3, 4, 6, 7],
         "not-a-list": "1,2,3,4",
-        "a-bool": [1, 2, 3, True],
-        "a-str": [1, 2, "3", 4],
+        "a-bool": [1, 2, 3, 4, True, 7, 0, 8, 9, 1],
+        "a-str": [1, 2, "3", 4, 6, 7, 0, 8, 9, 1],
+        "negative": [1, 2, 3, 4, -6, 7, 0, 8, 9, 1],
+        "negative-offset": [1, 2, 3, -4, 6, 7, 0, 8, 9, 1],
     }
-    assert stp._scans_from_json(rows) == {"kept": (1, 2, 3, 4)}
+    assert stp._marks_from_json(rows) == {
+        "kept": (1, 2, 3, 4, 6, 7, 0, 8, 9, 1),
+        "no-cuts": (1, 2, 3, 4, -1, 7, 0, 8, 9, 1),
+    }
 
 
 def test_every_door_refuses_an_over_long_string() -> None:
@@ -318,3 +387,29 @@ def test_every_door_refuses_an_over_long_string() -> None:
     edge = EdgeRecord(slot="a", parent_slot="p" * (stp.MAX_SHORT_STRING + 1), at=1, sid="s")
     assert stp._edge_within_bounds(edge) is False
     assert stp._edge_within_bounds(EdgeRecord(slot="a", parent_slot=None, at=1, sid="s")) is True
+
+
+# --------------------------------------------------------------------------- #
+# ``kirocrew doctor`` reports a checkpoint that is not being saved
+# --------------------------------------------------------------------------- #
+
+
+def test_doctor_reports_a_checkpoint_that_is_not_being_saved(
+    submitted: list[tuple[Any, ...]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from kiro_crew.doctor_checks import workload
+
+    issues: list[str] = []
+    workload._doctor_session_tree_checkpoint(issues)
+    assert "✅" in capsys.readouterr().out
+    assert issues == []
+
+    monkeypatch.setattr(stp, "MAX_SESSION_TREE_CHECKPOINT_BYTES", 8)
+    assert stp._save_checkpoint(_payload()) is False
+    workload._doctor_session_tree_checkpoint(issues)
+    out = capsys.readouterr().out
+    assert "not being saved" in out
+    assert "past the 8-byte ceiling" in out
+    assert issues == ["session tree checkpoint is not being saved"]

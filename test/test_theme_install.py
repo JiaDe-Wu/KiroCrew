@@ -42,6 +42,7 @@ import pytest
 from theme_install_helpers import _VALID_MP3, _VALID_VARS, _make_theme, _make_tiered, _write
 
 from conftest import requires_symlinks
+from kiro_crew import platform_compat
 from kiro_crew.dashboard.handlers.themes import (
     _atomic_write_theme_json,
     _clone_github,
@@ -356,6 +357,20 @@ class TestValidateThemeDir:
         assert summary is None
         assert err is not None and "symlink" in err.lower()
 
+    @pytest.mark.parametrize(
+        ("linked", "error"),
+        [("", "theme path is not a directory"), ("styles", "symlinks are not allowed: styles")],
+    )
+    def test_a_junction_is_refused_like_a_symlink(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, linked: str, error: str
+    ) -> None:
+        """A Windows junction is a directory that is not a symlink; the guards refuse it."""
+        d = _make_theme(tmp_path, styled=True)
+        junction = d / linked  # "" names the pack root itself
+        monkeypatch.setattr(platform_compat, "_ISJUNCTION", lambda p: Path(p) == junction)
+        assert junction.is_dir() and not junction.is_symlink()
+        assert _validate_theme_dir(d) == (None, error)
+
     def test_bad_css_value_rejected(self, tmp_path: Path) -> None:
         bad = {
             "dark": {"--bg": "red; }", "--text": "#fff", "--accent": "#00f"},
@@ -540,7 +555,7 @@ class TestCopyInstalledTheme:
         assert (dst / "styles" / "variables.json").is_file()
 
     def test_symlinked_file_rejected(self, tmp_path: Path) -> None:
-        # TOCTOU (Codex HIGH): a file swapped for a symlink after validation must
+        # TOCTOU: a file swapped for a symlink after validation must
         # be REFUSED by the copy loop, never dereferenced+served. The old
         # copytree(symlinks=False) would have copied the target's bytes.
         secret = tmp_path / "secret.txt"
@@ -1043,6 +1058,16 @@ class TestValidateThemeDirL1:
         descriptor = _theme_asset_descriptor(d, manifest, 1)
         assert descriptor["branding"] == {"welcome": f"branding/welcome.{ext}"}
 
+    @pytest.mark.parametrize("ext", ["svg", "png"])
+    def test_splash_image_accepted_and_described(self, tmp_path: Path, ext: str) -> None:
+        image = b"<svg xmlns='http://www.w3.org/2000/svg'/>" if ext == "svg" else _PNG_1PX
+        d = _make_tiered(tmp_path, level=1, extra={f"branding/splash.{ext}": image})
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert err is None, err
+        manifest = json.loads((d / "theme.json").read_text("utf-8"))
+        descriptor = _theme_asset_descriptor(d, manifest, 1)
+        assert descriptor["branding"] == {"splash": f"branding/splash.{ext}"}
+
 
 class TestValidateThemeDirL2:
     def test_valid_l2(self, tmp_path: Path) -> None:
@@ -1101,6 +1126,98 @@ class TestValidateThemeDirL2:
         assert err is not None and "valid audio" in err
 
 
+_L1_CSS = ".chat-bubble { border-radius: 8px; }"
+
+
+class TestWideEncodedPackText:
+    """A pack text file saved as UTF-16/UTF-32 is refused naming file and encoding.
+
+    Pure byte checks, so the same on every platform; Windows PowerShell 5.1's
+    ``>`` is what writes UTF-16LE with a mark in the field.
+    """
+
+    @pytest.mark.parametrize(
+        ("level", "rel", "text"),
+        [
+            (2, "persona.md", _VALID_PERSONA),
+            (1, "styles/overrides.css", _L1_CSS),
+            (2, "overlays/scanner.html", "<div>x</div>"),
+            (2, "topbar/dark.html", "<div>x</div>"),
+        ],
+        ids=["persona", "overrides", "overlay", "topbar"],
+    )
+    @pytest.mark.parametrize(
+        ("encoding", "family"),
+        [
+            ("utf-16", "UTF-16"),
+            ("utf-16-be", "UTF-16"),
+            ("utf-16-le", "UTF-16"),
+            ("utf-32", "UTF-32"),
+        ],
+        ids=["utf16-bom", "utf16-be-bom", "utf16-no-bom", "utf32-bom"],
+    )
+    def test_refused_naming_file_and_encoding(
+        self, tmp_path: Path, level: int, rel: str, text: str, encoding: str, family: str
+    ) -> None:
+        data = text.encode(encoding)
+        if encoding == "utf-16-be":
+            data = b"\xfe\xff" + data
+        summary, err = _validate_theme_dir(
+            _make_tiered(tmp_path, level=level, extra={rel: data}), installing=True
+        )
+        assert summary is None
+        assert err == f"{rel}: it is saved as {family}; re-save it as UTF-8"
+
+    @pytest.mark.parametrize("bom", [b"", b"\xef\xbb\xbf"])
+    def test_utf8_with_or_without_bom_still_installs(self, tmp_path: Path, bom: bytes) -> None:
+        extra: dict[str, object] = {
+            "persona.md": bom + _VALID_PERSONA.encode("utf-8"),
+            "styles/overrides.css": bom + _L1_CSS.encode("utf-8"),
+            "overlays/scanner.html": bom + b"<div>x</div>",
+        }
+        summary, err = _validate_theme_dir(
+            _make_tiered(tmp_path, level=2, extra=extra), installing=True
+        )
+        assert err is None, err
+        assert summary is not None
+
+    def test_crlf_persona_is_measured_with_newlines_normalised(self, tmp_path: Path) -> None:
+        """Notepad's CRLF must not push a persona that fits the cap over it."""
+        tail = "x\n" * 900
+        persona = _VALID_PERSONA + "\n" + tail
+        assert len(persona) <= 2000 < len(persona.replace("\n", "\r\n"))
+        extra: dict[str, object] = {"persona.md": persona.replace("\n", "\r\n").encode("utf-8")}
+        pack = _make_tiered(tmp_path, level=2, extra=extra)
+        for installing in (True, False):
+            summary, err = _validate_theme_dir(pack, installing=installing)
+            assert err is None, err
+            assert summary is not None
+
+    def test_an_installed_pack_with_wide_encoded_css_and_html_keeps_loading(
+        self, tmp_path: Path
+    ) -> None:
+        """The re-read of an installed pack (theme-detail route) is not install-gated."""
+        extra: dict[str, object] = {
+            "styles/overrides.css": _L1_CSS.encode("utf-16"),
+            "overlays/scanner.html": "<div>x</div>".encode("utf-16"),
+            "topbar/dark.html": "<div>x</div>".encode("utf-16"),
+        }
+        pack = _make_tiered(tmp_path, level=2, extra=extra)
+        summary, err = _validate_theme_dir(pack)
+        assert err is None, err
+        assert summary is not None
+
+    def test_descriptor_omits_persona_info_for_a_wide_encoded_persona(
+        self, tmp_path: Path
+    ) -> None:
+        pack = _make_full_l2(tmp_path)
+        (pack / "persona.md").write_bytes(_VALID_PERSONA.encode("utf-16"))
+        manifest = json.loads((pack / "theme.json").read_text(encoding="utf-8"))
+        desc = _theme_asset_descriptor(pack, manifest, manifest["level"])
+        assert desc.get("hasPersona") is True
+        assert desc.get("personaInfo") is None
+
+
 class TestLevelBounds:
     def test_l2_asset_in_l1_theme_rejected(self, tmp_path: Path) -> None:
         # An L1 theme carrying an overlays/ dir trips the directory level gate.
@@ -1151,7 +1268,15 @@ class TestPureContentHelpers:
         assert _classify_theme_file(rel) == (category, min_level)
 
     @pytest.mark.parametrize(
-        "rel", ["evil.txt", "styles/x.js", "branding/logo.gif", "branding/welcome.jpg", "random/x"]
+        "rel",
+        [
+            "evil.txt",
+            "styles/x.js",
+            "branding/logo.gif",
+            "branding/welcome.jpg",
+            "branding/splash.gif",
+            "random/x",
+        ],
     )
     def test_classify_unknown(self, rel: str) -> None:
         assert _classify_theme_file(rel) == (None, 0)

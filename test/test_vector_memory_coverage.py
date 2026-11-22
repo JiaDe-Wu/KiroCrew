@@ -224,7 +224,11 @@ class TestRetireStaleEpisodicTextFallback:
 
 
 class TestSqliteVectorSearchEdges:
-    def test_rows_with_a_different_width_are_skipped(self, tmp_path: Path) -> None:
+    def test_rows_with_a_different_width_are_skipped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # One fake vector for every text trips FAISS's near-duplicate check.
+        monkeypatch.setattr(vm, "_HAS_FAISS", False)
         store = _store(tmp_path)
         store.embed_fn = _fixed_embed()
         assert store.write_episodic("A memory embedded at the store's native width")
@@ -236,7 +240,11 @@ class TestSqliteVectorSearchEdges:
         store.db.commit()
         assert store.search_episodic(query_embedding=[0.5] * _DIM, limit=5) == []
 
-    def test_tag_filter_excludes_non_matching_rows(self, tmp_path: Path) -> None:
+    def test_tag_filter_excludes_non_matching_rows(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # One fake vector for every text trips FAISS's near-duplicate check.
+        monkeypatch.setattr(vm, "_HAS_FAISS", False)
         store = _store(tmp_path)
         store.embed_fn = _fixed_embed()
         assert store.write_episodic("A note that belongs to the ops rotation", tags=["ops"])
@@ -268,7 +276,11 @@ class TestEpisodicContext:
         assert "release train ships every Thursday" in context
         assert context.startswith("[Episodic Memory")
 
-    def test_cap_truncates_the_result_list(self, tmp_path: Path) -> None:
+    def test_cap_truncates_the_result_list(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # One fake vector for every text trips FAISS's near-duplicate check.
+        monkeypatch.setattr(vm, "_HAS_FAISS", False)
         store = _store(tmp_path)
         store.embed_fn = _fixed_embed()
         for i in range(3):
@@ -523,13 +535,14 @@ class TestLessonDedup:
         assert store.write_lesson("Rotate the signing key whenever a maintainer departs")
         assert len(store.get_lessons()) == 2
 
-    def test_a_space_change_mid_scan_drops_the_lazy_backfills(self, tmp_path: Path) -> None:
-        """Lazy backfills embedded before a model swap must not be committed.
+    def test_a_space_change_during_a_write_leaves_stored_lessons_unembedded(
+        self, tmp_path: Path
+    ) -> None:
+        """A model swap landing during a write must not leave a vector behind.
 
-        The dedup scan embeds legacy lessons inline, so a swap can land between
-        two entries. The blob from before the swap belongs to the old vector
-        space and has to be left NULL for the post-activation sweep instead of
-        being written behind reconcile's back.
+        The write embeds only its own rule. Stored legacy lessons stay NULL for the
+        post-activation sweep, and the submitted rule's vector, embedded before the
+        swap, is dropped rather than committed into the old space.
         """
         store = _store(tmp_path)
         assert store.write_lesson("Prefer allowlists over denylists for network egress")
@@ -539,22 +552,18 @@ class TestLessonDedup:
 
         calls: list[str] = []
 
-        def _swap_on_the_last_backfill(text: str) -> list[float] | None:
+        def _swap_after_the_embed(text: str) -> list[float] | None:
             calls.append(text)
-            # 1 = the new rule, 2 = first lazy backfill, 3 = second lazy backfill.
-            if len(calls) == 3:
-                store.begin_space_change()
-            # Distinct one-hot vectors so nothing trips the >0.85 semantic dedup.
+            store.begin_space_change()
             vec = [0.0] * _DIM
-            vec[len(calls) % _DIM] = 1.0
+            vec[0] = 1.0
             return vec
 
-        store.embed_fn = _swap_on_the_last_backfill
+        store.embed_fn = _swap_after_the_embed
         assert store.write_lesson("Verify the changelog headings render on mobile widths")
 
-        assert len(calls) == 3
-        # Neither legacy lesson kept a vector from the superseded space.
-        assert all(_raw_semantic_embedding(store, k) is None for k in keys)
+        assert calls == ["Verify the changelog headings render on mobile widths"]
+        assert all(_raw_semantic_embedding(store, e["key"]) is None for e in store.get_lessons())
 
 
 class TestFaissAbsent:
@@ -667,7 +676,11 @@ class TestEpisodicPromotion:
         assert store.promote_episodic_patterns() == 0
 
     @pytest.mark.skipif(not vm._HAS_NUMPY, reason="clustering needs numpy")
-    def test_a_repeated_pattern_becomes_a_semantic_fact(self, tmp_path: Path) -> None:
+    def test_a_repeated_pattern_becomes_a_semantic_fact(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # One fake vector for every text trips FAISS's near-duplicate check.
+        monkeypatch.setattr(vm, "_HAS_FAISS", False)
         store = _store(tmp_path)
         store.embed_fn = _fixed_embed()
         for i in range(5):
@@ -683,7 +696,11 @@ class TestEpisodicPromotion:
         assert _episodic_texts(store) == []
 
     @pytest.mark.skipif(not vm._HAS_NUMPY, reason="clustering needs numpy")
-    def test_a_cluster_with_no_inferrable_key_is_left_alone(self, tmp_path: Path) -> None:
+    def test_a_cluster_with_no_inferrable_key_is_left_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # One fake vector for every text trips FAISS's near-duplicate check.
+        monkeypatch.setattr(vm, "_HAS_FAISS", False)
         store = _store(tmp_path)
         store.embed_fn = _fixed_embed()
         for i in range(5):
@@ -695,7 +712,11 @@ class TestEpisodicPromotion:
         assert len(_episodic_texts(store)) == 5
 
     @pytest.mark.skipif(not vm._HAS_NUMPY, reason="clustering needs numpy")
-    def test_a_cluster_below_the_threshold_is_left_alone(self, tmp_path: Path) -> None:
+    def test_a_cluster_below_the_threshold_is_left_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # One fake vector for every text trips FAISS's near-duplicate check.
+        monkeypatch.setattr(vm, "_HAS_FAISS", False)
         store = _store(tmp_path)
         store.embed_fn = _fixed_embed()
         for i in range(2):

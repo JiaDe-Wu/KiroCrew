@@ -66,6 +66,7 @@ from kiro_crew.dashboard.handlers import get_update_info
 from kiro_crew.dashboard.token_auth import LINK_WINDOW_SECS, MAX_SESSION_TTL_SECS, parse_duration
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.hooks import safe_read_file
+from kiro_crew.http_proxy import resolve_proxy
 from kiro_crew.mcp_discovery import list_servers
 from kiro_crew.messaging.commands import note_user_stop
 from kiro_crew.messaging.dispatch import admit_inbound_callback
@@ -111,10 +112,15 @@ from kiro_crew.slack.blocks import (
 from kiro_crew.slack.channel_policy import SlackChannelRefused
 from kiro_crew.slack.code_channels import install as install_code_channels
 from kiro_crew.slack.code_channels import lifecycle as code_channel_lifecycle
+from kiro_crew.slack.code_channels.actions import EVENT as CODE_CHANNEL_ACTION_EVENT
+from kiro_crew.slack.code_channels.actions import dispatch as dispatch_code_channel_action
+from kiro_crew.slack.code_channels.binding import no_reactions as code_channel_no_reactions
+from kiro_crew.slack.code_channels.creation import PERSON_SUBTYPES
 from kiro_crew.slack.code_channels.routing import Gate as CodeChannelGate
 from kiro_crew.slack.code_channels.routing import dispatch as code_channel_dispatch
 from kiro_crew.slack.code_channels.routing import inbound_gate as code_channel_gate
 from kiro_crew.slack.code_channels.routing import is_bound_code_channel
+from kiro_crew.slack.code_channels.shared_refusal import shared_message_dropped, shared_stop_refused
 from kiro_crew.slack.code_channels.store import store as code_channel_store
 from kiro_crew.slack.enterprise import trusted_bot_admission, validated_self_user_id
 from kiro_crew.slack.files import (
@@ -134,6 +140,8 @@ from kiro_crew.slack.handler import (
     handle_message,
     is_allowed_user,
     is_owner,
+    is_shared_listed,
+    is_shared_user,
     is_yolo_mode,
     set_allowed_users,
     set_dashboard_state,
@@ -145,6 +153,7 @@ from kiro_crew.slack.handler import (
     slack_cfg,
 )
 from kiro_crew.slack.interactions import dispatch as dispatch_interactive
+from kiro_crew.slack.linked_thread_images import set_inbound_files as set_linked_thread_files
 from kiro_crew.slack.sessions_view import (
     _HOME_TAB_SESSIONS_PER_KIND,
     _SESSION_KIND_DASHBOARD,
@@ -154,6 +163,8 @@ from kiro_crew.slack.sessions_view import (
     _message_surface_limit,
     sessions_include_ended,
 )
+from kiro_crew.slack.shared_access import install as install_shared_access
+from kiro_crew.slack.shared_access import prime_shared_user
 
 # The proxy-selecting subclass under the SDK client's name, which is this
 # module's patch surface for the Socket Mode client.
@@ -219,11 +230,17 @@ def _wire_slack_code_capability_probe(
         listeners.append(_on_message)
 
 
-async def init_socket_mode(orch: GatewayOrchestrator, seen: SeenCache) -> None:
+async def init_socket_mode(
+    orch: GatewayOrchestrator, seen: SeenCache, *, declared_yolo: bool = True
+) -> None:
     """Wire up the Socket Mode client and attach the event listener.
 
     Does nothing when Slack is disabled (missing tokens or no allowed
     users).  Mutates ``orch._socket_client`` in place.
+
+    ``declared_yolo=False`` skips the start-up YOLO grant: an in-place Slack
+    reconnect rebuilds the socket and must keep the approval state the owner
+    set since start-up (a ``!yolo off`` stays off).
 
     Awaited on the gateway loop, never offloaded whole: constructing
     ``WSSocketModeClient`` requires a current event loop in the constructing
@@ -255,7 +272,7 @@ async def init_socket_mode(orch: GatewayOrchestrator, seen: SeenCache) -> None:
     set_tracking_channels(orch._tracking_channels)
     set_open_channels(orch._open_channels)
     set_owner_id(orch._owner_id)
-    if orch._cfg.agent.dangerously_skip_permissions:
+    if declared_yolo and orch._cfg.agent.dangerously_skip_permissions:
         # grant_declared_yolo walks the profiles dir — blocking, so off-loop.
         await asyncio.to_thread(set_yolo_mode, True)
     set_orch_cfg(orch._cfg)
@@ -290,6 +307,8 @@ async def init_socket_mode(orch: GatewayOrchestrator, seen: SeenCache) -> None:
         return
 
     web_client = AsyncWebClient(token=orch._bot_token)
+    # slack.shared_access checks each listed id with this client (users.info).
+    install_shared_access(web_client)
     orch._socket_client = WSSocketModeClient(
         app_token=orch._app_token,
         web_client=web_client,
@@ -306,6 +325,7 @@ async def init_socket_mode(orch: GatewayOrchestrator, seen: SeenCache) -> None:
             orch.sessions,
             channel_type="slack",
             route=None,
+            human_input=False,
         ):
             logger.info("slack envelope left unacknowledged during update restart")
             return
@@ -345,6 +365,7 @@ async def init_socket_mode(orch: GatewayOrchestrator, seen: SeenCache) -> None:
         if event_type == "app_home_opened":
             user = event.get("user")
             if event.get("tab") == "home" and user:
+                # Owner-only: the Home tab lists sessions and settings.
                 if is_allowed_user(user):
                     sel().log_api_access(
                         caller=user,
@@ -352,9 +373,10 @@ async def init_socket_mode(orch: GatewayOrchestrator, seen: SeenCache) -> None:
                         outcome="allowed",
                         source="slack",
                     )
-                    task = asyncio.ensure_future(_publish_home_tab(orch, user))
-                    _background_tasks.add(task)
-                    task.add_done_callback(_background_tasks.discard)
+                    if _home_tab_builtin_enabled(orch):
+                        task = asyncio.ensure_future(_publish_home_tab(orch, user))
+                        _background_tasks.add(task)
+                        task.add_done_callback(_background_tasks.discard)
                 else:
                     sel().log_api_access(
                         caller=user,
@@ -373,6 +395,11 @@ async def init_socket_mode(orch: GatewayOrchestrator, seen: SeenCache) -> None:
         # ── Code channels: archive, unarchive, rename ──
         if event_type in code_channel_lifecycle.LIFECYCLE_EVENTS:
             code_channel_lifecycle.dispatch(req.payload or {}, event)
+            return
+
+        # ── Code channels: a context-bar action item was clicked ──
+        if event_type == CODE_CHANNEL_ACTION_EVENT:
+            dispatch_code_channel_action(orch, req.payload or {}, event)
             return
 
         # ── Messages and mentions ──
@@ -418,7 +445,7 @@ async def init_socket_mode(orch: GatewayOrchestrator, seen: SeenCache) -> None:
                 error=_deny_error,
             )
             return
-        if _subtype and _subtype != "file_share":
+        if _subtype and _subtype not in PERSON_SUBTYPES:
             if not (_from_trusted_bot and _subtype == "bot_message"):
                 return
 
@@ -499,6 +526,9 @@ async def _route_message(
     msg_ts = event.get("ts", "")
     team_id = event.get("team", "")
     files = event.get("files", [])
+    # Read before the first await: a reconnect clears ``orch.slack`` for its
+    # window, and the code-channel gate and dispatch below use this client.
+    _route_slack = orch.slack
 
     # A native Slack forward carries the real body in ``attachments``
     # (``is_share`` / ``is_msg_unfurl``), not in top-level ``text``; a note typed
@@ -617,7 +647,13 @@ async def _route_message(
     _turn_capped = from_trusted_bot and _trusted_bot_turns.count(_thread_key) >= max(
         1, slack_cfg(orch).slack.trusted_bot_turn_limit
     )
-    _owner_authorized = is_allowed_user(sender_id)
+    # A shared user (slack.shared_access) is checked with Slack before the gate
+    # reads it, so a newly listed person is admitted on their first message.
+    await prime_shared_user(sender_id, orch)
+    _owner_authorized = is_allowed_user(sender_id) or is_shared_user(sender_id)
+    # From the list, not the confirmation: a confirmation ageing out between these
+    # reads must not leave a shared user's queued message untagged.
+    _shared_sender = is_shared_listed(sender_id)
     _trusted_bot_admitted = (
         from_trusted_bot
         and not _turn_capped
@@ -630,7 +666,9 @@ async def _route_message(
             operation="slack.message",
             outcome="allowed",
             source="slack",
-            resources="" if _owner_authorized else "trusted_bot",
+            resources=(
+                "shared_access" if _shared_sender else ("" if _owner_authorized else "trusted_bot")
+            ),
         )
     else:
         logger.warning("Ignoring message from unauthorized user %s", sender_id)
@@ -842,7 +880,7 @@ async def _route_message(
             )
             return
         # The channel itself: channels.posture.slack.allowed_channel_ids. In an
-        # enterprise build no channel is admitted until the policy names the list.
+        # LTS build no channel is admitted until the policy names the list.
         # A pure ``!stop`` stays exempt for the reason above.
         from kiro_crew.slack.channel_policy import channel_refusal
 
@@ -866,14 +904,71 @@ async def _route_message(
     # and a message addressed only to other people are dropped, and the sender
     # is authorized against the channel's ORIGIN conversation (the gate audits
     # every decision). Everywhere else this is PASS and nothing below changes.
+    # Code channels stay the owner's: a shared user is refused in a bound one and
+    # cannot open one (the dispatch below is skipped for them).
+    if _shared_sender and await shared_message_dropped(sender_id, channel):
+        return
+
+    # A code channel has no held queue: a message read with no client waits for
+    # the reconnect running now and takes its client, and one in a bound code
+    # channel that still has none is reported instead of dropped.
+    if _route_slack is None:
+        from kiro_crew.slack.reconnect import (
+            client_lost_to_reconnect,
+            reconnect_in_progress,
+            wait_for_reconnect,
+        )
+
+        if reconnect_in_progress(orch):
+            await wait_for_reconnect(orch)
+        _route_slack = orch.slack
+        # Only an admitted sender's words go into the owner's notice; anyone
+        # else's message goes on to the gate, which refuses it.
+        if (
+            _route_slack is None
+            and _user_authorized
+            and client_lost_to_reconnect(orch)
+            and is_bound_code_channel(orch, channel)
+        ):
+            # Once per message: Slack delivers a mention twice, and a message
+            # already handled needs no notice.
+            if seen.check(msg_ts) or seen.check_and_add(f"undelivered:{msg_ts}"):
+                return
+            from kiro_crew.slack.code_channels.routing import (
+                stop_from_channel,
+                strip_leading_mention,
+            )
+
+            # Read like the gate reads it: a leading mention is stripped
+            # whichever delivery (message or app_mention) arrives first.
+            if strip_leading_mention(_gate_text).strip().lower() == "!stop":
+                # A stop is local and needs no client: the Stop button's own
+                # sender and origin rules apply, in a thread too.
+                await stop_from_channel(orch, event, sender_id)
+            else:
+                notify_slack_undelivered(
+                    orch,
+                    thread_ts or msg_ts,
+                    msg_ts,
+                    dict(
+                        channel=channel,
+                        spool_text=_gate_text,
+                        spool_attachments=len(files) if files else 0,
+                        spool_voice_memos=(
+                            sum(1 for f in files if is_voice_memo(f)) if files else 0
+                        ),
+                    ),
+                )
+            return
     _code_channel = await code_channel_gate(
         orch,
         event,
         text=text,
         address_text=address_text if own_text is None else own_text,
         sender_id=sender_id,
-        authorized=_user_authorized,
+        authorized=_user_authorized and not _shared_sender,
         from_trusted_bot=from_trusted_bot,
+        slack=_route_slack,
     )
     if _code_channel.gate is CodeChannelGate.DROP:
         return
@@ -978,13 +1073,51 @@ async def _route_message(
     # message captured above before transcription and ingestion.
     _spool_text = _gate_text
     _spool_attachments = len(files) if files else 0
+    # Slack's own name for each file, which the restart notice lists so the user
+    # knows what to resend; a file Slack gives no name is still counted.
+    _spool_attachment_names = tuple(f.get("name") or "" for f in files) if files else ()
+    # Named by the undelivered notice when a held message is given up on.
+    _spool_voice_memos = sum(1 for f in files if is_voice_memo(f)) if files else 0
 
     # ── Transcribe audio files (voice memos) ──
     # Placed after dedup + auth to avoid expensive work on duplicate events
     # or unauthorized users.
     _attachment_temp_paths: list[str] = []
     _had_voice_input = False
-    if files and orch.slack and _user_authorized:
+    _files_lost_to_reconnect = False
+    if files and orch.slack is None and _user_authorized:
+        # A reconnect clears the client for its window, and this route may
+        # have awaited the sender lookup while it ran. The message is already
+        # marked seen, so the attachments wait for the attempt and are fetched
+        # with the client it publishes instead of being skipped.
+        from kiro_crew.slack.reconnect import (
+            client_lost_to_reconnect,
+            reconnect_in_progress,
+            wait_for_reconnect,
+        )
+
+        _files_lost_to_reconnect = reconnect_in_progress(orch) or client_lost_to_reconnect(orch)
+        await wait_for_reconnect(orch)
+    # Read once: voice and file ingestion fetch with this client even if a
+    # later reconnect clears orch.slack while they await.
+    _ingest_slack = orch.slack
+    if _files_lost_to_reconnect and _ingest_slack is None:
+        # The reconnect failed, so no client can fetch the files. Delivering
+        # the caption alone would drop them silently, and the message is
+        # already marked seen, so nothing retries it: tell the owner instead.
+        notify_slack_undelivered(
+            orch,
+            thread_ts or msg_ts,
+            msg_ts,
+            dict(
+                channel=channel,
+                spool_text=_spool_text,
+                spool_attachments=_spool_attachments,
+                spool_voice_memos=_spool_voice_memos,
+            ),
+        )
+        return
+    if files and _ingest_slack and _user_authorized:
         memos = [f for f in files if is_voice_memo(f)]
         if memos:
             transcripts: list[str] = []
@@ -999,7 +1132,7 @@ async def _route_message(
             stt_ok = await asyncio.to_thread(stt_available)
             if stt_ok:
                 transcripts = await _transcribe_with_reaction(
-                    orch.slack,
+                    _ingest_slack,
                     channel,
                     msg_ts,
                     orch,
@@ -1015,10 +1148,10 @@ async def _route_message(
             text = _voice_memo_context(text, len(memos), len(transcripts), available=stt_ok)
 
         # ── Process non-audio files (images, text, opaque files, etc.) ──
-        attachment_paths, text_blocks = await process_slack_files(orch, files)
+        attachment_paths, text_blocks = await process_slack_files(orch, files, slack=_ingest_slack)
         _attachment_temp_paths = attachment_paths
 
-        # Image paths are inlined by ACP; opaque paths remain available to agent tools.
+        # Image paths are inlined by ACP; opaque and whole-text paths stay for agent tools.
         if attachment_paths:
             paths_text = "\n".join(attachment_paths)
             # Same layout as append_attachment_context: a fence the user left
@@ -1066,7 +1199,7 @@ async def _route_message(
 
     # ── !stop: intercept BEFORE handle_message to bypass session semaphore ──
     if clean_text.strip().lower() == "!stop":
-        if not (is_owner(sender_id) or is_allowed_user(sender_id)):
+        if not (is_owner(sender_id) or is_allowed_user(sender_id) or is_shared_user(sender_id)):
             sel().log_api_access(
                 caller=sender_id,
                 operation="slack.stop_command",
@@ -1090,9 +1223,7 @@ async def _route_message(
             if orch.slack:
                 await _post_stop_notice(orch, channel, "Nothing running.", thread_ts or msg_ts)
             return
-        _flat_stop_key = flat_dm_session_key(
-            channel, thread_ts, enabled=_dm_single_session_enabled(orch, channel)
-        )
+        _flat_stop_key = _dm_stop_flat_key(orch, channel, thread_ts)
         # A dashboard-linked thread wins over the flat key. When !stop is typed
         # inside a DM thread that a dashboard send-to-Slack owns, the running
         # turn lives under THAT owner (keyed by thread_ts in the thread index),
@@ -1121,6 +1252,9 @@ async def _route_message(
             # therefore acks where the !stop was typed -- inside its thread if it
             # had one, at channel root otherwise -- the same split the turn uses.
             stop_post_ts = thread_ts if _flat_stop_key else session_key
+        # A shared user stops nothing in a code channel's session (key checked once final).
+        if await shared_stop_refused(orch, sender_id, session_key, thread_ts or msg_ts, channel):
+            return
         # Recorded BEFORE the liveness checks: a turn between its abandoned
         # attempt and its compaction replay has no session at this moment, and
         # an interaction-originated turn has no registered task either; the
@@ -1305,9 +1439,10 @@ async def _route_message(
                         # entries go back to their stash for the same reason.
                         _held[0].clear()
                         await hand_queue_to_successor(orch.sessions, session_key, queued_at_press)
-                    elif outcome == "hard":
+                    elif outcome == "hard" and not is_shared_listed(sender_id):
                         # An escalated stop reset the session: the queue goes for
-                        # everybody, with every detached entry's files.
+                        # everybody, with every detached entry's files. A shared
+                        # user's (slack.shared_access) drops only their own, below.
                         orch.sessions.clear_queue(session_key, only=queued_at_press)
                         for _item in pending_at_press:
                             unlink_queued_temp_paths(_item[2])
@@ -1399,7 +1534,9 @@ async def _route_message(
     #    open a code channel for a mention, or a reply in a thread the bot
     #    already answers, that asks for multi-step work. False (always, with
     #    slack.code_channels off) continues the normal path. ──
-    if await code_channel_dispatch(
+    #    It posts, binds and routes with the client the route read the message
+    #    with, not ``orch.slack``, which a reconnect clears for its window.
+    if not _shared_sender and await code_channel_dispatch(
         orch,
         _code_channel,
         event=event,
@@ -1407,8 +1544,12 @@ async def _route_message(
         sender_id=sender_id,
         was_mention=_was_mention,
         attachment_paths=_attachment_temp_paths,
+        slack=_ingest_slack if _ingest_slack is not None else _route_slack,
     ):
         return
+    # A linked dashboard chat's turn reads these after this task deletes them;
+    # route_linked_thread stores the pictures in its session first.
+    set_linked_thread_files(_attachment_temp_paths)
 
     # ── Queue check: if session is busy, enqueue instead of blocking ──
     # Keyed on the SAME session the turn will run under. A single-session DM keys
@@ -1440,7 +1581,10 @@ async def _route_message(
             from_trusted_bot=from_trusted_bot,
             spool_text=_spool_text,
             spool_attachments=_spool_attachments,
-            **_queue_tags(sender_id, channel),
+            spool_attachment_names=_spool_attachment_names,
+            spool_voice_memos=_spool_voice_memos,
+            had_voice_input=_had_voice_input,
+            **_queue_tags(sender_id, channel, shared=_shared_sender),
         )
         if not _queued:
             # Session object not created yet — stash on orch._pending_queue,
@@ -1461,14 +1605,17 @@ async def _route_message(
                         from_trusted_bot=from_trusted_bot,
                         spool_text=_spool_text,
                         spool_attachments=_spool_attachments,
-                        **_queue_tags(sender_id, channel),
+                        spool_attachment_names=_spool_attachment_names,
+                        spool_voice_memos=_spool_voice_memos,
+                        had_voice_input=_had_voice_input,
+                        **_queue_tags(sender_id, channel, shared=_shared_sender),
                     ),
                 )
             )
         logger.info(
             "Message %s queued for busy session %s (session_obj=%s)", msg_ts, session_key, _queued
         )
-        if orch.slack:
+        if orch.slack and not code_channel_no_reactions(channel):
             try:
                 await orch.slack.add_reaction(channel, msg_ts, "hourglass_flowing_sand")
             except Exception:
@@ -1491,10 +1638,13 @@ async def _route_message(
         from_trusted_bot=from_trusted_bot,
         spool_text=_spool_text,
         spool_attachments=_spool_attachments,
-        **_queue_tags(sender_id, channel),
+        spool_attachment_names=_spool_attachment_names,
+        spool_voice_memos=_spool_voice_memos,
+        had_voice_input=_had_voice_input,
+        **_queue_tags(sender_id, channel, shared=_shared_sender),
     ):
         logger.info("Message %s queued for busy session %s", msg_ts, session_key)
-        if orch.slack:
+        if orch.slack and not code_channel_no_reactions(channel):
             try:
                 await orch.slack.add_reaction(channel, msg_ts, "hourglass_flowing_sand")
             except Exception:
@@ -1502,6 +1652,39 @@ async def _route_message(
         # See the force=True branch above: cleanup is deferred to
         # _dispatch_queued so every queued attachment path remains valid.
         return
+
+    # A reconnect clears orch.slack for its whole window, and this route may
+    # have awaited voice or file work while it ran. While that window is open
+    # with no client published, the message waits in the pre-session queue
+    # (cleanup deferred, as above) and the held drain starts it on the next
+    # published client. Otherwise the client is read once here, in the same
+    # step as the dispatch below.
+    if hold_if_slack_down(orch, session_key):
+        orch._pending_queue.setdefault(session_key, []).append(
+            (
+                msg_ts,
+                clean_text,
+                dict(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    sender_id=sender_id,
+                    team_id=team_id,
+                    agent_override=agent_override,
+                    user_display_name=_sender_display,
+                    image_temp_paths=list(_attachment_temp_paths),
+                    from_trusted_bot=from_trusted_bot,
+                    spool_text=_spool_text,
+                    spool_attachments=_spool_attachments,
+                    spool_attachment_names=_spool_attachment_names,
+                    spool_voice_memos=_spool_voice_memos,
+                    had_voice_input=_had_voice_input,
+                    **_queue_tags(sender_id, channel, shared=_shared_sender),
+                ),
+            )
+        )
+        logger.info("Message %s held for session %s until Slack reconnects", msg_ts, session_key)
+        return
+    _slack = orch.slack
 
     # ── New transport path: route to the messaging abstraction ──
     # When messaging.use_transport is True, drive the turn through
@@ -1525,7 +1708,7 @@ async def _route_message(
     if _use_transport:
         t = asyncio.create_task(
             handle_message_transport(
-                orch.slack,  # type: ignore[arg-type]
+                _slack,  # type: ignore[arg-type]
                 orch.sessions,  # type: ignore[arg-type]
                 channel,
                 clean_text,
@@ -1573,6 +1756,8 @@ async def _route_message(
                 start_priority=person_priority(not from_trusted_bot),
                 spool_text=_spool_text,
                 spool_attachments=_spool_attachments,
+                spool_attachment_names=_spool_attachment_names,
+                had_voice_input=_had_voice_input,
             )
         )
         _track_router_task(orch, session_key, t, thread_ts)
@@ -1586,7 +1771,11 @@ async def _route_message(
             # Mirrors native _on_done so messages queued while this session was
             # busy aren't stranded when the transport path is the active route.
             try:
-                if not _key_busy(orch, session_key) and orch.sessions:
+                if (
+                    not _key_busy(orch, session_key)
+                    and orch.sessions
+                    and not hold_if_slack_down(orch, session_key)
+                ):
                     _next = orch.sessions.dequeue(session_key)
                     # Fall back to orchestrator-level pending queue (pre-session).
                     if not _next:
@@ -1598,7 +1787,9 @@ async def _route_message(
                     if _next:
                         _q_ts, _q_text, _q_kw = _next
                         _q_t = asyncio.ensure_future(
-                            _dispatch_queued(orch, session_key, _q_ts, _q_text, _q_kw)
+                            _dispatch_queued(
+                                orch, session_key, _q_ts, _q_text, _q_kw, slack=orch.slack
+                            )
                         )
                         _track_router_task(orch, session_key, _q_t, _q_kw.get("thread_ts"))
                         orch._handler_tasks.add(_q_t)
@@ -1613,7 +1804,7 @@ async def _route_message(
     try:
         t = asyncio.create_task(
             handle_message(
-                orch.slack,  # type: ignore[arg-type]
+                _slack,  # type: ignore[arg-type]
                 orch.sessions,  # type: ignore[arg-type]
                 channel,
                 clean_text,
@@ -1635,6 +1826,7 @@ async def _route_message(
                 had_voice_input=_had_voice_input,
                 spool_text=_spool_text,
                 spool_attachments=_spool_attachments,
+                spool_attachment_names=_spool_attachment_names,
                 start_priority=person_priority(not from_trusted_bot),
             )
         )
@@ -1652,7 +1844,11 @@ async def _route_message(
         _cleanup_attachment_temps()
         # Drain queue: only if no other task took over this session
         try:
-            if not _key_busy(orch, session_key) and orch.sessions:
+            if (
+                not _key_busy(orch, session_key)
+                and orch.sessions
+                and not hold_if_slack_down(orch, session_key)
+            ):
                 _next = orch.sessions.dequeue(session_key)
                 # Fall back to orchestrator-level pending queue (pre-session messages)
                 if not _next:
@@ -1664,7 +1860,7 @@ async def _route_message(
                 if _next:
                     _q_ts, _q_text, _q_kw = _next
                     _q_t = asyncio.ensure_future(
-                        _dispatch_queued(orch, session_key, _q_ts, _q_text, _q_kw)
+                        _dispatch_queued(orch, session_key, _q_ts, _q_text, _q_kw, slack=orch.slack)
                     )
                     _track_router_task(orch, session_key, _q_t, _q_kw.get("thread_ts"))
                     orch._handler_tasks.add(_q_t)
@@ -1690,15 +1886,18 @@ from kiro_crew.slack.events_block_text import _extract_trusted_bot_attachment_te
 from kiro_crew.slack.events_block_text import _forwarded_messages  # noqa: E402
 from kiro_crew.slack.events_block_text import _has_share_attachments  # noqa: E402
 from kiro_crew.slack.events_block_text import _string_field  # noqa: E402
+from kiro_crew.slack.events_home_tab import _home_tab_builtin_enabled  # noqa: E402
 from kiro_crew.slack.events_home_tab import _publish_home_tab  # noqa: E402
 from kiro_crew.slack.events_inbound import SeenCache  # noqa: E402
 from kiro_crew.slack.events_inbound import _background_tasks  # noqa: E402
 from kiro_crew.slack.events_inbound import _dm_single_session_enabled  # noqa: E402
+from kiro_crew.slack.events_inbound import _dm_stop_flat_key  # noqa: E402
 from kiro_crew.slack.events_inbound import _handle_message_deleted  # noqa: E402
 from kiro_crew.slack.events_inbound import _maybe_prompt_owner  # noqa: E402
 from kiro_crew.slack.events_inbound import _thread_follow_admits  # noqa: E402
 from kiro_crew.slack.events_inbound import _trusted_bot_turns  # noqa: E402
 from kiro_crew.slack.events_queue import _CHANNEL  # noqa: E402
+from kiro_crew.slack.events_queue import _configured_approval_mode  # noqa: E402
 from kiro_crew.slack.events_queue import _dispatch_queued  # noqa: E402
 from kiro_crew.slack.events_queue import _drain_slack_queue  # noqa: E402
 from kiro_crew.slack.events_queue import _entry_owner  # noqa: E402
@@ -1709,6 +1908,8 @@ from kiro_crew.slack.events_queue import _settle_stop_hold  # noqa: E402
 from kiro_crew.slack.events_queue import _StopHold  # noqa: E402
 from kiro_crew.slack.events_queue import _stops_in_flight  # noqa: E402
 from kiro_crew.slack.events_queue import _track_router_task  # noqa: E402
+from kiro_crew.slack.events_queue import hold_if_slack_down  # noqa: E402
+from kiro_crew.slack.events_queue import notify_slack_undelivered  # noqa: E402
 from kiro_crew.slack.events_slash import _handle_restart  # noqa: E402
 from kiro_crew.slack.events_slash import _handle_slash  # noqa: E402
 from kiro_crew.slack.events_slash import _safe_log  # noqa: E402
@@ -1743,15 +1944,24 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.slack.events_block_text import _render_rich_text_element  # noqa: F401
     from kiro_crew.slack.events_block_text import _table_row_fragments  # noqa: F401
     from kiro_crew.slack.events_block_text import _until_full  # noqa: F401
+    from kiro_crew.slack.events_queue import _NOTICE_PREVIEW_CHARS  # noqa: F401
+    from kiro_crew.slack.events_queue import _SLACK_MARKUP  # noqa: F401
     from kiro_crew.slack.events_queue import _bg_tasks  # noqa: F401
+    from kiro_crew.slack.events_queue import _held_while_slack_down  # noqa: F401
+    from kiro_crew.slack.events_queue import _notice_channel  # noqa: F401
+    from kiro_crew.slack.events_queue import _notice_subject  # noqa: F401
     from kiro_crew.slack.events_queue import _on_tracked_done  # noqa: F401
     from kiro_crew.slack.events_queue import _router_task_threads  # noqa: F401
     from kiro_crew.slack.events_queue import _spawn_tracked  # noqa: F401
     from kiro_crew.slack.events_queue import router_task_thread  # noqa: F401
+    from kiro_crew.slack.events_queue import _take_queued  # noqa: F401
+    from kiro_crew.slack.events_queue import _unmark  # noqa: F401
+    from kiro_crew.slack.events_queue import give_up_held_slack_work  # noqa: F401
+    from kiro_crew.slack.events_queue import resume_held_slack_drains  # noqa: F401
     from kiro_crew.slack.events_queue import slack_stop_in_flight  # noqa: F401
     from kiro_crew.slack.events_slash import SLASH_REGISTRY  # noqa: F401
     from kiro_crew.slack.events_slash import SlashHandler  # noqa: F401
-    from kiro_crew.slack.events_slash import _MANIFEST_COMMAND_RE  # noqa: F401
+    from kiro_crew.slack.events_slash import _RESTART_SESSION_CLOSE_SECS  # noqa: F401
     from kiro_crew.slack.events_slash import _build_help_text  # noqa: F401
     from kiro_crew.slack.events_slash import _get_agent_names  # noqa: F401
     from kiro_crew.slack.events_slash import _handle_agent  # noqa: F401
@@ -1780,4 +1990,8 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.slack.format import count_forwarded_files  # noqa: F401
     from kiro_crew.slack.format import forwarded_files_from_slack  # noqa: F401
     from kiro_crew.cron import job_zone_name  # noqa: F401
+    from kiro_crew.slack.code_channels.commands import (  # noqa: F401
+        handle_slash as code_channel_slash,
+    )
+    from kiro_crew.restart_session_close import close_sessions_for_restart  # noqa: F401
 # isort: on

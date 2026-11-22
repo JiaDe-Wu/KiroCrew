@@ -22,6 +22,7 @@ from acp_runtime_helpers import (
 
 from kiro_crew.acp.runtime import AcpSessionHandle
 from kiro_crew.acp.types import JSONRPC_METHOD_NOT_FOUND, METHOD_SESSION_UPDATE, JsonRpcMessage
+from kiro_crew.testing.synthetic_credentials import SAMPLE_AWS_SECRET
 from kiro_crew.testing.wait import await_until
 
 
@@ -439,6 +440,7 @@ def test_handle_update_malformed_cost_is_noop(cost):
         (10**400, 10000),  # bignum: math.isfinite itself raises OverflowError
         ([5000], {"n": 1}),
         (True, True),
+        (-5000, 10000),  # a negative count would read as a negative context_pct
     ],
 )
 def test_handle_update_malformed_usage_is_noop(used, size):
@@ -502,6 +504,53 @@ async def test_dispatch_metadata_credits():
         assert handle.last_prompt_stats.context_pct == 12.5
         complete = [e for e in events if e.kind == EVENT_COMPLETE]
         assert complete and complete[-1].usage.credits == pytest.approx(1.23)
+    finally:
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_turn_bills_the_metering_frame_behind_its_answer():
+    """kiro-cli answers a cancelled prompt BEFORE the metadata frame that bills
+    it (live probe, kiro-cli 3.1.0): the stopped turn's EVENT_COMPLETE carries
+    those credits instead of a footer with none."""
+    from kiro_crew.acp.types import EVENT_COMPLETE, METHOD_METADATA
+    from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS
+
+    rt, reader, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    task = await _start_reader(rt)
+    try:
+        events: list = []
+
+        async def drive():
+            async for ev in handle.prompt("hi", timeout=FALLBACK_TIMEOUT_SECS):
+                events.append(ev)
+
+        driver = asyncio.ensure_future(drive())
+        req_id = (await _await_routed(rt, "sA"))["sA"]
+        # Queued together, in kiro-cli's order, so the read after the answer
+        # finds the frame already there and no clock decides the outcome.
+        q["sA"].put_nowait(
+            JsonRpcMessage.from_dict({"id": req_id, "result": {"stopReason": "cancelled"}})
+        )
+        q["sA"].put_nowait(
+            JsonRpcMessage.from_dict(
+                {
+                    "method": METHOD_METADATA,
+                    "params": {
+                        "sessionId": "sA",
+                        "contextUsagePercentage": 7.5,
+                        "meteringUsage": [{"unit": "credit", "value": 0.26}],
+                    },
+                }
+            )
+        )
+        await await_until(driver, what="the driver finishing its turn")
+        complete = [e for e in events if e.kind == EVENT_COMPLETE]
+        assert [e.stop_reason for e in complete] == ["cancelled"]
+        assert complete[0].usage.credits == pytest.approx(0.26)
+        assert handle._between_turn_credits == 0.0
     finally:
         await _stop_reader(task)
 
@@ -747,7 +796,7 @@ async def test_dispatch_subagent_activity_text_is_redacted():
                         "sessionId": "sub-3",
                         "update": {
                             "sessionUpdate": "agent_message_chunk",
-                            "text": "leaked AKIAIOSFODNN7EXAMPLE key",
+                            "text": f"leaked aws_secret_access_key={SAMPLE_AWS_SECRET} key",
                         },
                     },
                 }
@@ -757,7 +806,7 @@ async def test_dispatch_subagent_activity_text_is_redacted():
         await await_until(driver, what="the driver finishing its turn")
         sa = [e for e in events if e.kind == EVENT_SUBAGENT_ACTIVITY]
         assert len(sa) == 1
-        assert "AKIAIOSFODNN7EXAMPLE" not in sa[0].text
+        assert SAMPLE_AWS_SECRET not in sa[0].text
         assert "[REDACTED: credential]" in sa[0].text
     finally:
         await _stop_reader(task)

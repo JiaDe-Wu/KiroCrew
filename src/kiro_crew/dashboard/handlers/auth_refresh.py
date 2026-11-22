@@ -30,6 +30,8 @@ from kiro_crew.dashboard.refresh_tokens import (
     generate_refresh_token,
     refresh_cookie_name,
     refresh_token_boot,
+    refresh_token_embed_forward_port,
+    refresh_token_embed_parent_port,
     refresh_token_owner_minted,
     refresh_token_peer_key,
     refresh_token_requires_peer,
@@ -349,10 +351,12 @@ async def api_auth_me(request: web.Request) -> web.Response:
     query token is silently replaced by that cookie; a caller exchanging a
     pasted token needs the difference, and 200 does not carry it.
 
-    ``owner_ok`` reports whether that caller also clears the owner gate. A token
+    ``owner_ok`` reports whether that caller is this machine's owner. A token
     minted before the owner was configured is perfectly valid, so it can be
     accepted and still be denied everywhere the gate fronts; the two fields
-    answer different questions and a caller recovering a session needs both.
+    answer different questions and a caller recovering a session needs both. A
+    Shared Crew teammate clears the owner gate too, yet reads ``False`` here: the
+    host's own first-run state is not theirs to answer.
     """
     user_id = request.get("user", "")
     if not user_id:
@@ -398,19 +402,21 @@ async def api_auth_me(request: web.Request) -> web.Response:
         if valid:
             refresh_exp = exp
 
-    # Whether this caller clears the owner gate, from the predicate the
-    # owner-gated routes themselves use -- not a second copy of the rule. A
-    # pre-owner token is a VALID token (validity is signature, expiry and nonce;
-    # the owner decision happens later), so ``token_accepted`` alone says a
-    # pasted token authenticated while the owner gate keeps denying it. Imported
+    # Whether this caller is the machine owner, from the predicate the owner gate
+    # itself is built on -- not a second copy of the rule. A pre-owner token is a
+    # VALID token (validity is signature, expiry and nonce; the owner decision
+    # happens later), so ``token_accepted`` alone says a pasted token
+    # authenticated while the owner gate keeps denying it. Imported
     # inside the function because this module sits on the auth path and its
     # owner is a 7900-line handler module; the name is the one
     # ``aws_control`` and ``meetings`` already gate on.
     owner_ok = False
     try:
-        from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+        from kiro_crew.dashboard.handlers.source_providers import (
+            is_host_owner_dashboard_request,
+        )
 
-        owner_ok = bool(is_owner_dashboard_request(request))
+        owner_ok = bool(is_host_owner_dashboard_request(request))
     except Exception:  # pragma: no cover - defensive
         # The predicate reads ``request.app["state"]``; an app without it cannot
         # answer, and unknown must read as not-authorized so a caller waiting on
@@ -431,7 +437,7 @@ async def api_auth_me(request: web.Request) -> web.Response:
             # session still answers 200 on its cookie. A bare boolean about a
             # credential the caller itself supplied, so it discloses nothing.
             "token_accepted": bool(request.get("auth_from_query_token", False)),
-            # Whether that caller also clears the owner gate. Neither field
+            # Whether that caller is the machine owner. Neither field
             # carries a token, a subject or an expiry -- both are one bit about
             # the request the caller just made.
             "owner_ok": owner_ok,
@@ -594,6 +600,25 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
     # within the multi-tab grace window, treat as theft and revoke.
     if state.is_consumed(jti):
         cached = state.grace_replacement(chain_id, jti, client_ip, now=now)
+        if not cached:
+            # A duplicate that lands while this jti's own rotation is still being written
+            # is the benign race, not reuse: the replacement is installed only once the
+            # write lands. Wait for that write on a worker, then read the grace entry
+            # again. A rotation that failed or outlasted the wait leaves none, and the
+            # duplicate is told to retry instead of revoking a chain nobody stole.
+            pending = await asyncio.to_thread(
+                state.await_pending_rotation, chain_id, jti, client_ip
+            )
+            cached = state.grace_replacement(chain_id, jti, client_ip, now=now)
+            if not cached and (pending or not state.is_consumed(jti)):
+                _audit(user_id, "refresh_token_use", "rotation_in_flight", chain_id)
+                return web.json_response(
+                    {
+                        "error": "This token's rotation did not complete. Retry the refresh.",
+                        "code": "refresh_state_unavailable",
+                    },
+                    status=503,
+                )
         if cached:
             # Multi-tab race: re-serve the same replacement pair.
             try:
@@ -678,6 +703,15 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
     carried_owner_mint = refresh_token_owner_minted(refresh_token)
     if carried_owner_mint:
         _carried_claims["owner_mint"] = "1"
+    # The embedding parent's port, for the CSP frame-ancestors of a framed remote
+    # pane. Dropped here, the pane went blank on its first load after a refresh.
+    carried_embed_parent_port = refresh_token_embed_parent_port(refresh_token)
+    if carried_embed_parent_port:
+        _carried_claims["embed_parent_port"] = carried_embed_parent_port
+    # The pane's own forward port, which binds its app web origin record.
+    carried_embed_forward_port = refresh_token_embed_forward_port(refresh_token)
+    if carried_embed_forward_port:
+        _carried_claims["embed_forward_port"] = carried_embed_forward_port
     # The key the checks above proved this request satisfies. Taken from the
     # presented credential rather than re-derived from the resolved peer, for the
     # same reason ``carried_boot`` is: the rotated pair then says what the
@@ -708,6 +742,8 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
         require_peer=require_peer,
         peer_key=bound_peer_key,
         owner_mint=carried_owner_mint,
+        embed_parent_port=carried_embed_parent_port,
+        embed_forward_port=carried_embed_forward_port,
     )
 
     public_payload = {
@@ -911,7 +947,9 @@ async def api_auth_logout(request: web.Request) -> web.Response:
             # rest of its TTL: exactly the replay this revocation exists to stop. The HMAC
             # and every claim were verified BEFORE that early return, so the chain id here
             # is authentic and revoking it cannot be driven by a forged token.
-            degraded = _get_state().degraded_reason()
+            # Decided from the validation's own answer, not a second read of the store: an
+            # unreadable file can read again in between, and that must not skip the revoke.
+            degraded = _reason.startswith("refresh state unavailable")
             if degraded and chain_id:
                 revocation_persisted = await asyncio.to_thread(
                     _get_state().revoke_chain,
@@ -938,8 +976,12 @@ async def api_auth_logout(request: web.Request) -> web.Response:
     # to_thread because revoke writes the denylist file (atomic-rename, 0600).
     access_cookie = request.cookies.get(f"mc_token_{cookie_port}", "")
     if access_cookie:
-        revoked = await asyncio.to_thread(revoke_access_cookie, access_cookie)
-        _audit(user_id or "", "access_cookie_revoked", "ok" if revoked else "noop")
+        try:
+            revoked = await asyncio.to_thread(revoke_access_cookie, access_cookie)
+            _audit(user_id or "", "access_cookie_revoked", "ok" if revoked else "noop")
+        except OSError:
+            revocation_persisted = False
+            _audit(user_id or "", "access_cookie_revoked", "not_persisted")
 
     # Always clear both cookies on the response, even when no refresh
     # cookie was present — the caller's intent is "log me out", and
@@ -957,7 +999,7 @@ async def api_auth_logout(request: web.Request) -> web.Response:
             {
                 "logged_out": False,
                 "error": "This session's cookies are cleared, but the revocation record "
-                "could not be stored, so the refresh token is not guaranteed dead after a "
+                "could not be stored, so this session is not guaranteed dead after a "
                 "gateway restart. Repair the gateway's storage, then log out again.",
                 "code": "refresh_state_unavailable",
             },

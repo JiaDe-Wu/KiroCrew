@@ -22,6 +22,8 @@ let resolveTeams: (v: { teams: { id: string; name: string; members: string[] }[]
 vi.mock('../../api/client', () => ({
   api: {
     members: vi.fn(),
+    // The owner check behind Import from file (`useViewerIsNotOwner`): the owner.
+    viewerOwnerOk: vi.fn(() => Promise.resolve(true)),
     teams: {
       list: vi.fn(() => new Promise((resolve) => { resolveTeams = resolve })),
     },
@@ -186,6 +188,6 @@ describe('MembersPage first paint', () => {
     })
     await waitFor(() => expect(snapshot().groups).toBeGreaterThan(0))
     expect(snapshot().rows.sort()).toEqual(['pilot', 'radar', 'scribe'])
-    expect(screen.getByTestId('member-count')).toHaveTextContent('3 Bots')
+    expect(screen.getByTestId('member-count')).toHaveTextContent('3 bots')
   })
 })

@@ -43,6 +43,13 @@
  * message, this extension notifies an envelope naming the steer's sequence number,
  * which the host reads as "consumed". A steer still on disk when the run settles is
  * retired, never delivered later: the host queues it as the next turn.
+ *
+ * And it reports a failed model call. pi-acp forwards none of one: a run whose model
+ * call failed ends `end_turn` with no text, an empty reply. So this extension records
+ * the failure at `turn_end` and, when the run settles still failed and not aborted,
+ * notifies one nonce-bound envelope naming pi's provider, model and error, which the
+ * host fails the turn on. Recorded per turn, so a failure pi retried successfully
+ * reports nothing.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -86,6 +93,9 @@ const STEER_KEY_ENV = "KIROCREW_PI_STEER_KEY";
 
 /** Marker a steer file and its consumed notification carry, beside the session nonce. */
 const STEER_MARKER = "kiro-crew-steer";
+
+/** Marker of the failed-model-call notification, beside the session nonce. */
+const MODEL_ERROR_MARKER = "kiro-crew-model-error";
 
 /** A steer file's name after its stem: the zero-padded sequence number. */
 const STEER_SEQ_RE = /^(\d{10})\.json$/;
@@ -274,7 +284,33 @@ function boundInput(toolName: string, input: unknown): Bounded {
   return { value: out, truncated };
 }
 
-function envelope(toolCallId: unknown, toolName: string, input: unknown): string | null {
+/**
+ * The Kiro Crew server this extension registered whose tool *toolName* is, and the
+ * tool's own name, or null. Read from the registration table (the handoff's names and
+ * pi's prefix for each), never from the call: the longest prefix of a server this
+ * session holds wins. Kiro Crew reads it only to bind a Connection approval.
+ */
+function crewMcpOwner(
+  toolName: string,
+  crewServers: Map<string, string>,
+  shadowed: Set<string>,
+): { server: string; tool: string } | null {
+  const spelled = toolName.replace(/[^A-Za-z0-9_]/g, "_");
+  let best: string | null = null;
+  for (const [name, prefix] of crewServers) {
+    if (shadowed.has(name) || !spelled.startsWith(prefix) || spelled.length <= prefix.length) continue;
+    if (best === null || prefix.length > (crewServers.get(best) ?? "").length) best = name;
+  }
+  if (best === null) return null;
+  return { server: best, tool: toolName.slice((crewServers.get(best) ?? "").length) };
+}
+
+function envelope(
+  toolCallId: unknown,
+  toolName: string,
+  input: unknown,
+  owner: { server: string; tool: string } | null = null,
+): string | null {
   const kind = KIND_BY_TOOL[toolName] ?? "other";
   const bounded = boundInput(toolName, input);
   const rendered = JSON.stringify({
@@ -285,6 +321,7 @@ function envelope(toolCallId: unknown, toolName: string, input: unknown): string
     kind,
     input: bounded.value,
     truncated: bounded.truncated,
+    ...(owner ? { mcp: owner } : {}),
   });
   // Still oversize after bounding (a shell command longer than the cap, or too
   // many keys to carry): refuse, because a deny rule cannot judge text it did
@@ -499,10 +536,25 @@ export default function (pi: ExtensionAPI) {
   // Sequence numbers of steers queued on pi and not yet started.
   const steersInFlight = new Set<number>();
 
+  // The model call that failed the latest turn, reported when the run settles.
+  let modelError: { provider: string; model: string; error: string } | null = null;
+
   pi.on("turn_end", async (event, ctx) => {
+    const message = event.message as
+      | { stopReason?: unknown; provider?: unknown; model?: unknown; errorMessage?: unknown }
+      | undefined;
+    const stop = message?.stopReason;
+    // A later turn that did not fail (pi's own retry) clears it.
+    modelError =
+      stop === "error"
+        ? {
+            provider: typeof message?.provider === "string" ? message.provider : "",
+            model: typeof message?.model === "string" ? message.model : "",
+            error: typeof message?.errorMessage === "string" ? message.errorMessage : "",
+          }
+        : null;
     // An aborted or failed model call ends the run without reading pi's steering
     // queue, and a steer queued then would surface at the start of the NEXT run.
-    const stop = (event.message as { stopReason?: unknown } | undefined)?.stopReason;
     if (event.outcome !== "completed" || stop === "error" || stop === "aborted") return;
     if (ctx.signal?.aborted || ctx.isIdle()) return;
     const next = readSteers(ctx.sessionManager.getSessionId(), steerFloor)[0];
@@ -535,7 +587,21 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("agent_settled", async (_event, ctx) => {
+  pi.on("agent_settled", async (event, ctx) => {
+    const failed = modelError;
+    modelError = null;
+    if (failed && !event.aborted && ctx.hasUI) {
+      ctx.ui.notify(
+        JSON.stringify({
+          [MODEL_ERROR_MARKER]: 1,
+          nonce: process.env[NONCE_ENV] ?? "",
+          provider: failed.provider,
+          model: failed.model,
+          error: failed.error,
+        }),
+        "error",
+      );
+    }
     steersInFlight.clear();
     for (const steer of readSteers(ctx.sessionManager.getSessionId(), steerFloor)) {
       steerFloor = Math.max(steerFloor, steer.seq);
@@ -561,7 +627,10 @@ export default function (pi: ExtensionAPI) {
       // No dialog channel means no way to ask, so the call does not run.
       return { block: true, reason: "Kiro Crew tool gate: no permission channel" };
     }
-    const message = envelope(event.toolCallId, toolName, event.input);
+    const owner = toolName.startsWith("mcp__")
+      ? crewMcpOwner(toolName, crewServers, shadowed)
+      : null;
+    const message = envelope(event.toolCallId, toolName, event.input, owner);
     if (message === null) {
       return { block: true, reason: "Kiro Crew tool gate: tool arguments too large to judge" };
     }

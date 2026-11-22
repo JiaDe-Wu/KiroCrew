@@ -8,6 +8,10 @@ from pathlib import Path
 import pytest
 
 from kiro_crew.apps.builtins.auto_improvement.backend import deps, mcp_server, progress, store
+from kiro_crew.testing.synthetic_credentials import synth
+
+#: A GitLab personal access token in its published form (``glpat-`` and 20 characters).
+_GITLAB_TOKEN = "glpat-" + synth(20, seed=7)
 
 
 @pytest.fixture()
@@ -133,25 +137,41 @@ class TestProgressSeries:
 
 
 class TestDeps:
-    def test_reports_git_gh_and_pytest_as_required(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_reports_git_and_the_targets_forge_cli_as_required(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setattr(deps, "_which", lambda b: f"/usr/bin/{b}")
         monkeypatch.setattr(deps, "_gh_authenticated", lambda: (True, "authenticated"))
+        monkeypatch.setattr(deps, "_glab_authenticated", lambda _host: (True, "authenticated"))
+        monkeypatch.setattr(deps, "_configured_provider", lambda: deps.PROVIDER_GITHUB)
         out = deps.check_deps()
         required = {d["id"] for d in out["deps"] if d["required"]}
         assert required == {"git", "gh", "pytest"}
         assert out["ok"] is True and out["blocking"] == []
+
+    def test_a_gitlab_target_swaps_the_required_cli(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(deps, "_which", lambda b: f"/usr/bin/{b}")
+        monkeypatch.setattr(deps, "_gh_authenticated", lambda: (True, "authenticated"))
+        monkeypatch.setattr(deps, "_glab_authenticated", lambda _host: (True, "authenticated"))
+        monkeypatch.setattr(deps, "_configured_provider", lambda: deps.PROVIDER_GITLAB)
+        out = deps.check_deps()
+        required = {d["id"] for d in out["deps"] if d["required"]}
+        assert required == {"git", "glab", "pytest"}
 
     def test_unauthenticated_gh_blocks(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Presence on PATH is not enough: an unauthenticated gh fails only when a
         PR is drafted, which is the worst moment to discover it."""
         monkeypatch.setattr(deps, "_which", lambda b: f"/usr/bin/{b}")
         monkeypatch.setattr(deps, "_gh_authenticated", lambda: (False, "not logged in"))
+        monkeypatch.setattr(deps, "_glab_authenticated", lambda _host: (True, "authenticated"))
+        monkeypatch.setattr(deps, "_configured_provider", lambda: deps.PROVIDER_GITHUB)
         out = deps.check_deps()
         assert out["ok"] is False and "gh" in out["blocking"]
 
     def test_missing_ruff_is_optional(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(deps, "_which", lambda b: "" if b == "ruff" else f"/usr/bin/{b}")
         monkeypatch.setattr(deps, "_gh_authenticated", lambda: (True, "ok"))
+        monkeypatch.setattr(deps, "_glab_authenticated", lambda _host: (True, "ok"))
         out = deps.check_deps()
         assert out["ok"] is True
         assert [d for d in out["deps"] if d["id"] == "ruff"][0]["ok"] is False
@@ -347,7 +367,7 @@ class TestMcpResultsAreRedacted:
 
     A finding's `note`/`signature`/`hypothesis` are the model's own prose, so a credential
     quoted during discovery lands in the ledger and comes back out through `list_findings`.
-    Measured before fixing: `glpat-IOSFODNN7EXAMPLE` in a ledger note came back verbatim in
+    Measured before fixing: a GitLab token in a ledger note came back verbatim in
     the tool result. This was the last unredacted reader — the browser
     (`routes._redact_for_display`) and the activity feed (`runner._redact_activity`) already
     scanned the same class of text. Raised by review of this branch.
@@ -370,7 +390,7 @@ class TestMcpResultsAreRedacted:
                     "target": "m.py::f",
                     "status": "filed",
                     "cr": "https://github.com/o/r/pull/1",
-                    "note": "aws_access_key_id=glpat-IOSFODNN7EXAMPLE",
+                    "note": f"aws_access_key_id={_GITLAB_TOKEN}",
                     "ts": 1.0,
                 }
             )
@@ -386,7 +406,7 @@ class TestMcpResultsAreRedacted:
             }
         )
         text = (out or {}).get("result", {}).get("content", [{}])[0].get("text", "")
-        assert "glpat-IOSFODNN7EXAMPLE" not in text, "a credential reached the LLM"
+        assert _GITLAB_TOKEN not in text, "a credential reached the LLM"
         # The tool must still be USEFUL — redaction that empties the result is not a fix.
         assert "abc123" in text
 
@@ -411,8 +431,8 @@ class TestMcpResultsAreRedacted:
 
         # As above: patch where `redact` is BOUND (this module), not where it is defined.
         monkeypatch.setattr(mcp_server, "redact", _boom)
-        out = mcp_server._redact_result('{"note": "aws_access_key_id=glpat-IOSFODNN7EXAMPLE"}')
-        assert "glpat-IOSFODNN7EXAMPLE" not in out
+        out = mcp_server._redact_result(f'{{"note": "aws_access_key_id={_GITLAB_TOKEN}"}}')
+        assert _GITLAB_TOKEN not in out
         assert "withheld" in out
 
 

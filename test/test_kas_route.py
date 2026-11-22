@@ -13,10 +13,12 @@ from __future__ import annotations
 import logging
 import threading
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from kiro_crew import lts_sign_in
 from kiro_crew.acp import kas_bundle, kas_engine_install, kas_route
 from kiro_crew.acp.harness.base import SpawnContext
 from kiro_crew.acp.harness.kas import KAS_BUNDLE_SPAWN_LABEL, KasHarness
@@ -31,10 +33,23 @@ from kiro_crew.testing.links import make_dir_link
 _REAL_SWITCH_ALLOWED = kas_route.automatic_switch_allowed
 
 
-def _ctx(tmp_path: Path, environ: dict[str, str] | None = None) -> SpawnContext:
+def _ctx(
+    tmp_path: Path, environ: dict[str, str] | None = None, *, harness_pin: str = ""
+) -> SpawnContext:
     return SpawnContext(
-        agent="kirocrew", work_dir=tmp_path, model=None, environ=environ or {}, home=tmp_path
+        agent="kirocrew",
+        work_dir=tmp_path,
+        model=None,
+        environ=environ or {},
+        home=tmp_path,
+        harness_pin=harness_pin,
     )
+
+
+def _executable_file(path: Path) -> Path:
+    path.write_text("#!/bin/sh\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
 
 
 def _installed(tmp_path: Path) -> kas_bundle.InstalledKasBundle:
@@ -50,7 +65,7 @@ def _installed(tmp_path: Path) -> kas_bundle.InstalledKasBundle:
 @pytest.fixture
 def switch_open(monkeypatch):
     """Open the automatic switch the conftest floor keeps closed."""
-    monkeypatch.setattr(kas_route, "automatic_switch_allowed", lambda: True)
+    monkeypatch.setattr(kas_route, "automatic_switch_allowed", lambda pin="": True)
 
 
 # ── the rule ───────────────────────────────────────────────────────────────────
@@ -217,23 +232,51 @@ class TestKiroCliSignedOut:
         assert kas_route.kiro_cli_signed_out(environ={}, home=tmp_path) is False
 
 
-class TestRuleTwoIsGlobalOnly:
-    """Rule 2 reads the installation's ``agent.acp_backend`` alone, never a mate's
-    own pin. The per-pin route is tracked at :attr:`TRACKED_BY`; this pins today's
-    behaviour so a change to it is a deliberate one."""
+class TestRuleTwoReadsTheSessionsPin:
+    """Rule 2 reads the session's own Bot pin when it has one, else the
+    installation's ``agent.acp_backend``."""
 
-    TRACKED_BY = "https://github.com/kirodotdev/KiroCrew/issues/26629"
-
-    def test_the_switch_follows_the_stored_global_pick(self, monkeypatch):
+    def test_no_pin_follows_the_stored_global_pick(self, monkeypatch):
         monkeypatch.setattr(kas_route, "_stored_as_kiro_pick", lambda: True)
         assert _REAL_SWITCH_ALLOWED() is False
         monkeypatch.setattr(kas_route, "_stored_as_kiro_pick", lambda: False)
         assert _REAL_SWITCH_ALLOWED() is True
 
-    def test_it_takes_no_pin(self):
-        import inspect
+    def test_the_route_resolver_judges_the_pin_it_is_given(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(kas_route, "automatic_switch_allowed", _REAL_SWITCH_ALLOWED)
+        monkeypatch.setattr(kas_route, "_stored_as_kiro_pick", lambda: False)
+        assert kas_route.resolve_kas_route(environ={}, home=tmp_path, pin="kiro") == kas_route.RELAY
 
-        assert list(inspect.signature(_REAL_SWITCH_ALLOWED).parameters) == []
+    @pytest.mark.asyncio
+    async def test_a_kiro_cli_pin_stays_on_kiro_cli_under_a_global_kas(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(kas_route, "automatic_switch_allowed", _REAL_SWITCH_ALLOWED)
+        monkeypatch.setattr(kas_route, "_stored_as_kiro_pick", lambda: False)
+        with (
+            patch("kiro_crew.acp.harness.kas._bundle_route_selected", return_value=False),
+            patch("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", _no_bin),
+            patch.object(
+                kas_bundle,
+                "installed_bundle",
+                side_effect=AssertionError("a Kiro CLI pin never takes the bundle"),
+            ),
+        ):
+            with pytest.raises(AcpKiroCliMissing):
+                await KasHarness().resolve_spawn(_ctx(tmp_path, harness_pin="kiro"))
+
+    @pytest.mark.asyncio
+    async def test_a_kas_pin_takes_crews_engine_under_a_global_kiro_cli_pick(
+        self, tmp_path, monkeypatch
+    ):
+        installed = _installed(tmp_path)
+        monkeypatch.setattr(kas_route, "automatic_switch_allowed", _REAL_SWITCH_ALLOWED)
+        monkeypatch.setattr(kas_route, "_stored_as_kiro_pick", lambda: True)
+        with (
+            patch("kiro_crew.acp.harness.kas._bundle_route_selected", return_value=False),
+            patch("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", _no_bin),
+            patch.object(kas_bundle, "installed_bundle", return_value=installed),
+        ):
+            plan = await KasHarness().resolve_spawn(_ctx(tmp_path, harness_pin="kas"))
+        assert plan.argv[0] == str(installed.node_bin)
 
 
 class TestCrewEntrySkipsLauncher:
@@ -249,7 +292,157 @@ class TestCrewEntrySkipsLauncher:
     def test_a_launcher_without_a_sibling_does_not(self, monkeypatch):
         monkeypatch.setattr(kas_route.sys, "platform", "linux")
         monkeypatch.setattr("kiro_crew.kiro_cli.chat_sibling", lambda *a, **k: None)
+        monkeypatch.setattr("kiro_crew.kiro_cli.resolved_kiro_cli_version", lambda b: (2, 35, 2))
         assert kas_route.crew_entry_skips_launcher("/opt/kiro/kiro-cli", {}) is False
+
+    def test_a_launcher_with_a_sibling_skips_it_without_a_version_probe(self, monkeypatch):
+        monkeypatch.setattr(kas_route.sys, "platform", "linux")
+        monkeypatch.setattr(
+            "kiro_crew.kiro_cli.chat_sibling", lambda *a, **k: "/opt/kiro/kiro-cli-chat"
+        )
+        monkeypatch.setattr(
+            "kiro_crew.kiro_cli.resolved_kiro_cli_version",
+            lambda b: pytest.fail("the sibling already answers"),
+        )
+        assert kas_route.crew_entry_skips_launcher("/opt/kiro/kiro-cli", {}) is True
+
+    @pytest.mark.parametrize(
+        ("version", "expected"),
+        [((3, 0, 0), True), ((3, 1, 4), True), (None, False)],
+        ids=["3.0.0", "3.1.4", "unknown"],
+    )
+    def test_a_standalone_kiro_cli_is_the_chat_binary_itself(self, monkeypatch, version, expected):
+        """From 3.0.0 ``kiro-cli`` has no launcher in front of it; an unread version
+        keeps today's answer."""
+        monkeypatch.setattr(kas_route.sys, "platform", "linux")
+        monkeypatch.setattr("kiro_crew.kiro_cli.chat_sibling", lambda *a, **k: None)
+        monkeypatch.setattr("kiro_crew.kiro_cli.resolved_kiro_cli_version", lambda b: version)
+        assert kas_route.crew_entry_skips_launcher("/opt/kiro/kiro-cli", {}) is expected
+
+    def test_a_path_only_kiro_cli_is_read_inside_the_sandbox_not_by_the_pins_probe(
+        self, monkeypatch
+    ):
+        """A ``kiro-cli`` that is not the pin can be a file the agent planted in a
+        ``PATH`` directory, so its version comes only from the sandboxed probe."""
+        monkeypatch.setattr(kas_route.sys, "platform", "linux")
+        monkeypatch.setattr("kiro_crew.kiro_cli.chat_sibling", lambda *a, **k: None)
+        monkeypatch.setattr("kiro_crew.kiro_cli.pin_kiro_cli", lambda: (None, True))
+        monkeypatch.setattr(
+            "kiro_crew.kiro_cli.kiro_cli_version_at",
+            lambda b: pytest.fail("the pin's own read never runs a PATH-only file"),
+        )
+        seen: list[str] = []
+
+        def _sandboxed(binary: str) -> tuple[int, int, int]:
+            seen.append(binary)
+            return (3, 0, 0)
+
+        monkeypatch.setattr("kiro_crew.kiro_cli_path_probe.version_if_known", _sandboxed)
+        venv_bin = "/work/.venv/bin/kiro-cli"
+        assert kas_route.crew_entry_skips_launcher(venv_bin, {}) is True
+        assert seen == [venv_bin]
+
+    def test_the_pinned_kiro_cli_keeps_the_pins_own_read(self, tmp_path, monkeypatch):
+        pinned = _executable_file(tmp_path / "kiro-cli")
+        monkeypatch.setattr(kas_route.sys, "platform", "linux")
+        monkeypatch.setattr("kiro_crew.kiro_cli.chat_sibling", lambda *a, **k: None)
+        monkeypatch.setattr("kiro_crew.kiro_cli.pin_kiro_cli", lambda: (str(pinned), False))
+        monkeypatch.setattr("kiro_crew.kiro_cli.kiro_cli_version_at", lambda b: (3, 0, 0))
+        monkeypatch.setattr(
+            "kiro_crew.kiro_cli_path_probe.version_if_known",
+            lambda b: pytest.fail("the pin is read by its own probe"),
+        )
+        assert kas_route.crew_entry_skips_launcher(str(pinned), {}) is True
+
+    def test_a_wrapper_with_another_name_is_never_probed(self, monkeypatch):
+        monkeypatch.setattr(kas_route.sys, "platform", "linux")
+        monkeypatch.setattr(
+            "kiro_crew.kiro_cli.resolved_kiro_cli_version",
+            lambda b: pytest.fail("only kiro-cli is read for its version"),
+        )
+        assert kas_route.crew_entry_skips_launcher("/opt/kiro/my-kiro", {}) is False
+
+
+class TestCrewSignInStartsSpawn:
+    @pytest.fixture
+    def vault(self, monkeypatch):
+        selection = lts_sign_in.Selection(lts_sign_in.Source.VAULT, "arn")
+        monkeypatch.setattr(lts_sign_in, "resolve", lambda **k: selection)
+
+    @pytest.mark.parametrize("sibling", [True, False], ids=["kiro-cli-chat", "launcher"])
+    def test_on_the_relay_only_the_chat_entry_starts_on_crew_sign_in_alone(
+        self, tmp_path, monkeypatch, vault, sibling
+    ):
+        """The launcher checks kiro-cli's own sign-in before it starts the relay."""
+        monkeypatch.setattr(kas_route, "resolve_kas_route", lambda **k: kas_route.RELAY)
+        monkeypatch.setattr(
+            "kiro_crew.acp.client._resolve_kiro_bin", lambda **k: "/opt/kiro/kiro-cli"
+        )
+        monkeypatch.setattr(kas_route.sys, "platform", "linux")
+        monkeypatch.setattr(
+            "kiro_crew.kiro_cli.chat_sibling",
+            lambda *a, **k: "/opt/kiro/kiro-cli-chat" if sibling else None,
+        )
+        assert kas_route.crew_sign_in_starts_spawn(environ={}, home=tmp_path) is sibling
+
+    def test_the_bundle_route_starts_on_crew_sign_in_alone(self, tmp_path, monkeypatch, vault):
+        bundle = kas_route.KasRoute(bundle=True, reason=kas_route.REASON_NO_KIRO_CLI)
+        monkeypatch.setattr(kas_route, "resolve_kas_route", lambda **k: bundle)
+        monkeypatch.setattr("kiro_crew.acp.client._resolve_kiro_bin", lambda **k: None)
+        assert kas_route.crew_sign_in_starts_spawn(environ={}, home=tmp_path) is True
+
+    def test_no_usable_crew_sign_in_does_not(self, tmp_path, monkeypatch):
+        def _lapsed(**kwargs):
+            raise lts_sign_in.SignInError(
+                "signed out",
+                lts_sign_in.CAUSE_SIGN_IN_UNUSABLE,
+                lts_sign_in.Source.VAULT,
+            )
+
+        monkeypatch.setattr(lts_sign_in, "resolve", _lapsed)
+        monkeypatch.setattr(
+            kas_route, "resolve_kas_route", lambda **k: pytest.fail("route read without a sign-in")
+        )
+        assert kas_route.crew_sign_in_starts_spawn(environ={}, home=tmp_path) is False
+
+
+class TestBundleRouteLacksSignIn:
+    """The gateway's answer to "would a new chat fail for lack of Crew's sign-in"."""
+
+    @staticmethod
+    def _signed_out(**kwargs):
+        raise lts_sign_in.SignInError(
+            "signed out", lts_sign_in.CAUSE_SIGN_IN_UNUSABLE, lts_sign_in.Source.VAULT
+        )
+
+    def test_a_usable_crew_sign_in_never_asks(self, tmp_path, monkeypatch):
+        selection = lts_sign_in.Selection(lts_sign_in.Source.VAULT, "arn")
+        monkeypatch.setattr(lts_sign_in, "resolve", lambda **k: selection)
+        monkeypatch.setattr(
+            kas_route, "resolve_kas_route", lambda **k: pytest.fail("route read while signed in")
+        )
+        assert kas_route.bundle_route_lacks_sign_in(environ={}, home=tmp_path) is False
+
+    @pytest.mark.parametrize(
+        ("route", "expected"),
+        [
+            (kas_route.KasRoute(bundle=True, reason=kas_route.REASON_NO_KIRO_CLI), True),
+            (kas_route.RELAY, False),
+        ],
+        ids=["bundle", "relay"],
+    )
+    def test_signed_out_it_follows_the_route(self, tmp_path, monkeypatch, route, expected):
+        """On the relay kiro-cli's own sign-in can still start the chat."""
+        monkeypatch.setattr(lts_sign_in, "resolve", self._signed_out)
+        monkeypatch.setattr(kas_route, "resolve_kas_route", lambda **k: route)
+        assert kas_route.bundle_route_lacks_sign_in(environ={}, home=tmp_path) is expected
+
+    def test_an_unreadable_store_answers_false(self, tmp_path, monkeypatch):
+        def _broken(**kwargs):
+            raise OSError("store unreadable")
+
+        monkeypatch.setattr(lts_sign_in, "resolve", _broken)
+        assert kas_route.bundle_route_lacks_sign_in(environ={}, home=tmp_path) is False
 
 
 class TestRouteText:
@@ -264,6 +457,15 @@ class TestRouteText:
         route = kas_route.KasRoute(bundle=True, reason=kas_route.REASON_CONFIGURED)
         assert route.automatic is False
         assert "agent.kas_bundle is on" in route.describe()
+
+    def test_the_sharing_preview_route_is_automatic(self):
+        """The preview picks the bundle with agent.kas_bundle off: not the setting."""
+        route = kas_route.KasRoute(bundle=True, reason=kas_route.REASON_SHARING_PREVIEW)
+        assert route.automatic is True
+        assert route.as_dict()["automatic"] is True
+        assert route.describe() == (
+            "KAS runs on Kiro Crew's own engine because the ACP runtime sharing preview is on"
+        )
 
     def test_the_relay(self):
         assert kas_route.RELAY.name == "relay"
@@ -305,13 +507,42 @@ class TestHarnessRoute:
         ):
             plan = await KasHarness().resolve_spawn(_ctx(tmp_path))
         assert plan.argv == build_kas_bundle_argv(
-            str(installed.node_bin), str(installed.acp_server)
+            str(installed.node_bin), str(installed.acp_server), environ={}
         )
         assert plan.host_auth is True
+        assert plan.engine_is_child is False
         assert plan.spawn_label == KAS_BUNDLE_SPAWN_LABEL
         assert kas_route.last_spawn_route() == kas_route.KasRoute(
             bundle=True, reason=kas_route.REASON_NO_KIRO_CLI
         )
+
+    @pytest.mark.asyncio
+    async def test_a_runtime_keeps_its_own_route_after_another_chat_spawns(
+        self, tmp_path, switch_open
+    ):
+        """The route a runtime's sign-in message names is the one ITS spawn
+        took, not the process-wide last spawn, which a second chat moves."""
+        from kiro_crew.acp.runtime_class import AcpRuntime
+
+        installed = _installed(tmp_path)
+        harness = KasHarness()
+        runtime = object.__new__(AcpRuntime)
+        # Before any spawn, and before the runtime resolved a harness: no route.
+        assert runtime.kas_spawn_route is None
+        runtime._harness_resolved = harness
+        assert runtime.kas_spawn_route is None
+        with (
+            patch("kiro_crew.acp.harness.kas._bundle_route_selected", return_value=False),
+            patch("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", _no_bin),
+            patch.object(kas_bundle, "installed_bundle", return_value=installed),
+        ):
+            await harness.resolve_spawn(_ctx(tmp_path))
+        own = kas_route.KasRoute(bundle=True, reason=kas_route.REASON_NO_KIRO_CLI)
+        # Another chat's engine spawns on the relay after this one.
+        kas_route.note_spawn_route(kas_route.RELAY)
+        assert kas_route.last_spawn_route() == kas_route.RELAY
+        assert harness.spawn_route == own
+        assert runtime.kas_spawn_route == own
 
     @pytest.mark.asyncio
     async def test_a_signed_out_launcher_with_a_vault_sign_in_spawns_crews_own_engine(
@@ -333,6 +564,48 @@ class TestHarnessRoute:
         assert kas_route.last_spawn_route().reason == kas_route.REASON_KIRO_CLI_SIGNED_OUT
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("version", "sibling", "relay_entry"),
+        [
+            ((3, 0, 0), None, "/opt/kiro/kiro-cli"),
+            ((2, 35, 2), "/opt/kiro/kiro-cli-chat", "/opt/kiro/kiro-cli-chat"),
+            ((2, 35, 2), None, None),
+        ],
+        ids=["3.x-standalone", "2.x-with-sibling", "2.x-launcher-alone"],
+    )
+    async def test_a_signed_out_kiro_cli_keeps_the_relay_where_crews_sign_in_reaches_it(
+        self, tmp_path, switch_open, monkeypatch, version, sibling, relay_entry
+    ):
+        """kiro-cli signed out, the user signed in through Kiro Crew. From 3.0.0
+        ``kiro-cli`` is the chat binary itself, so the relay asks Crew for the
+        credential as a ``kiro-cli-chat`` sibling does on 2.x; a 2.x launcher with no
+        sibling would refuse, so that host takes Crew's own engine."""
+        installed = _installed(tmp_path)
+        monkeypatch.setattr(kas_route.sys, "platform", "linux")
+        monkeypatch.setattr(kas_route, "kiro_cli_signed_out", lambda **k: True)
+        monkeypatch.setattr("kiro_crew.kiro_cli.chat_sibling", lambda *a, **k: sibling)
+        monkeypatch.setattr("kiro_crew.acp.harness.kas.chat_sibling", lambda *a, **k: sibling)
+        monkeypatch.setattr("kiro_crew.kiro_cli.resolved_kiro_cli_version", lambda b: version)
+        monkeypatch.setattr(
+            "kiro_crew.acp.harness.kas.resolved_kiro_cli_version", lambda b: version
+        )
+        with (
+            patch("kiro_crew.acp.harness.kas._bundle_route_selected", return_value=False),
+            patch("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", _a_bin),
+            patch("kiro_crew.acp.harness.kas.vault_holds_identity_off_loop", return_value=True),
+            patch("kiro_crew.acp.harness.kas.installed_kiro_cli_version", return_value=version),
+            patch("kiro_crew.acp.harness.kas._kiro_cli_sandbox_owns_relay", return_value=False),
+            patch.object(kas_bundle, "installed_bundle", return_value=installed),
+        ):
+            plan = await KasHarness().resolve_spawn(_ctx(tmp_path))
+        if relay_entry is None:
+            assert plan.argv[0] == str(installed.node_bin)
+            assert kas_route.last_spawn_route().reason == kas_route.REASON_KIRO_CLI_SIGNED_OUT
+        else:
+            assert plan.argv == build_kas_argv(relay_entry, host_auth=True, client_flag=True)
+            assert kas_route.last_spawn_route() == kas_route.RELAY
+
+    @pytest.mark.asyncio
     async def test_a_working_kiro_cli_keeps_the_relay(self, tmp_path, switch_open, monkeypatch):
         monkeypatch.setattr(kas_route, "kiro_cli_signed_out", lambda **k: False)
         monkeypatch.setattr(kas_route, "crew_entry_skips_launcher", lambda *a: False)
@@ -349,6 +622,7 @@ class TestHarnessRoute:
         ):
             plan = await KasHarness().resolve_spawn(_ctx(tmp_path))
         assert plan.argv == build_kas_argv("/opt/kiro/kiro-cli")
+        assert plan.engine_is_child is True
         assert kas_route.last_spawn_route() == kas_route.RELAY
 
     @pytest.mark.asyncio
@@ -356,9 +630,7 @@ class TestHarnessRoute:
         """Rule 2: a Kiro CLI pick runs on KAS only because kiro-cli offers v3, so a
         missing kiro-cli stays kiro-cli's own error, not a download."""
         monkeypatch.setattr(kas_route, "_stored_as_kiro_pick", lambda: True)
-        monkeypatch.setattr(
-            kas_route, "automatic_switch_allowed", lambda: not kas_route._stored_as_kiro_pick()
-        )
+        monkeypatch.setattr(kas_route, "automatic_switch_allowed", _REAL_SWITCH_ALLOWED)
         with (
             patch("kiro_crew.acp.harness.kas._bundle_route_selected", return_value=False),
             patch("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", _no_bin),
@@ -386,9 +658,12 @@ class TestHarnessRoute:
             patch("kiro_crew.acp.harness.kas.vault_holds_identity_off_loop", return_value=False),
             patch("kiro_crew.acp.harness.kas.installed_kiro_cli_version", return_value=None),
         ):
-            plan = await KasHarness().resolve_spawn(_ctx(tmp_path, environ))
+            harness = KasHarness()
+            plan = await harness.resolve_spawn(_ctx(tmp_path, environ))
         assert plan.argv[0] == "/opt/kiro/kiro-cli"
         assert kas_route.last_spawn_route().reason == kas_route.REASON_KIRO_CLI_LAUNCHER
+        # The relay arm records the same route on the harness that spawned it.
+        assert harness.spawn_route == kas_route.last_spawn_route()
         text = host_auth.signed_out_message("kas", {"PATH": "/usr/bin"}, "linux")
         assert "`kiro-cli login`" in text
         assert "Kiro sign-in" not in text
@@ -438,6 +713,130 @@ class TestHarnessRoute:
         assert "`kirocrew kas install`" in text
         assert "kiro-cli login" not in text
         assert kas_engine_install.install_snapshot()["error"]
+
+    @pytest.mark.asyncio
+    async def test_a_host_that_cannot_run_the_engine_is_not_told_to_retry(
+        self, tmp_path, switch_open, monkeypatch
+    ):
+        """Amazon Linux 2 with kiro-cli signed out: the bundle route is taken, and the
+        host's glibc is below the engine's floor. No reconnect or retry changes that,
+        so the refusal carries no retry advice and the retry layer reads it as final."""
+        from kiro_crew.llm_helpers import acp_error_is_transient
+
+        monkeypatch.setattr(kas_route, "kiro_cli_signed_out", lambda **k: True)
+        monkeypatch.setattr(kas_route, "crew_entry_skips_launcher", lambda *a: False)
+
+        def unsupported(*a, **k):
+            raise kas_bundle.KasHostUnsupported(
+                "this host's glibc (2.26) is older than KAS requires (glibc 2.28+). "
+                "Nothing was installed."
+            )
+
+        with (
+            patch("kiro_crew.acp.harness.kas._bundle_route_selected", return_value=False),
+            patch("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", _a_bin),
+            patch("kiro_crew.acp.harness.kas.vault_holds_identity_off_loop", return_value=False),
+            patch.object(kas_bundle, "installed_bundle", return_value=None),
+            patch.object(kas_bundle, "install_pinned", side_effect=unsupported),
+        ):
+            with pytest.raises(AcpRuntimeError) as caught:
+                await KasHarness().resolve_spawn(_ctx(tmp_path))
+        text = str(caught.value)
+        assert text.startswith(
+            "KAS runs on Kiro Crew's own engine because kiro-cli is not signed in."
+        )
+        assert "glibc (2.26)" in text
+        error = kas_engine_install.install_snapshot()["error"]
+        assert "glibc (2.26)" in error
+        for shown in (text, error):
+            assert "retry" not in shown.lower()
+            assert "connect it first" not in shown
+            assert "kirocrew kas install" not in shown
+        # On the type, not read from the prose: a reworded cause cannot turn it retryable.
+        assert getattr(caught.value, "transient", None) is False
+        assert acp_error_is_transient(caught.value) is False
+
+
+# ── the pin reaches the spawn ──────────────────────────────────────────────────
+
+
+class _Stop(Exception):
+    pass
+
+
+class TestThePinReachesTheSpawn:
+    """The pin rule 2 reads is the one the factory's selection used, carried by the
+    provider into its runtimes (and a companion's, from the parent provider) to
+    ``SpawnContext``."""
+
+    def test_the_factory_carries_the_pin_its_selection_used(self, monkeypatch):
+        """A Bot pinned ``"kiro"`` carries its pin to the runtime; ``spawn_run(backend="kas")``
+        for it does not: the override chose the harness, so rule 2 reads the
+        installation's pick, not the pin."""
+        from kiro_crew.agent_sdk import backends
+        from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
+
+        member_id = "atlas-0123456789ab"
+        key = f"dashboard:member-{member_id}"
+        cfg = KiroCrewConfig()
+        cfg.agents["atlas"] = KiroCrewAgentConfig(
+            member_id=member_id, kiro_agent="atlas", acp_backend="kiro"
+        )
+        monkeypatch.setattr(backends, "selectable_backends", lambda: frozenset({"", "kas"}))
+        monkeypatch.setattr("kiro_crew.providers.acp.AcpProvider", lambda **kwargs: kwargs)
+        factory = cfg.create_provider_factory()
+        assert factory(session_key=key, agent="atlas")["harness_pin"] == "kiro"
+        assert factory(session_key=key, agent="atlas", backend_override="kas")["harness_pin"] == ""
+
+    @pytest.mark.asyncio
+    async def test_the_provider_builds_its_runtime_with_the_sessions_pin(self, monkeypatch):
+        from kiro_crew.providers.acp import AcpProvider
+
+        captured: dict = {}
+
+        def runtime(**kwargs):
+            captured.update(kwargs)
+            raise _Stop
+
+        monkeypatch.setattr("kiro_crew.providers.acp.AcpRuntime", runtime)
+        with patch("kiro_crew.providers.acp.AcpClient"):
+            provider = AcpProvider(acp_backend="kas", harness_pin="kas")
+        provider._client = MagicMock(backend="kas", _session_key="k", _resume_session_id="")
+        assert provider.harness_pin == "kas"
+        with pytest.raises(_Stop):
+            await provider._start_kiro_runtime_impl({}, {})
+        assert captured["harness_pin"] == "kas"
+
+    @pytest.mark.asyncio
+    async def test_the_runtime_hands_its_pin_to_the_harness(self, monkeypatch):
+        from kiro_crew.acp.runtime import AcpRuntime
+
+        seen: list[SpawnContext] = []
+
+        async def resolve_spawn(self, ctx):
+            seen.append(ctx)
+            raise _Stop
+
+        monkeypatch.setattr(KasHarness, "resolve_spawn", resolve_spawn)
+        with pytest.raises(_Stop):
+            await AcpRuntime(acp_backend="kas", harness_pin="kiro")._resolve_spawn_plan()
+        assert seen[0].harness_pin == "kiro"
+
+    def test_a_companion_runtime_takes_its_parents_pin(self):
+        from kiro_crew.session_allocation_parts import companions
+
+        providers = {
+            key: SimpleNamespace(
+                client=SimpleNamespace(backend="kas"),
+                tool_search_settings=None,
+                work_scratch_dir=None,
+                harness_pin=pin,
+            )
+            for key, pin in (("p", "kiro"), ("q", ""))
+        }
+        owner = SimpleNamespace(get_provider=providers.get)
+        assert companions._collect_parent_runtime_kwargs(owner, "p")["harness_pin"] == "kiro"
+        assert "harness_pin" not in companions._collect_parent_runtime_kwargs(owner, "q")
 
 
 # ── the installer ──────────────────────────────────────────────────────────────
@@ -502,6 +901,26 @@ class TestEngineInstaller:
         with pytest.raises(kas_bundle.KasBundleError, match="--version 0.99.0 --unpinned"):
             kas_engine_install.install_pinned_engine("https://h.test", caller="spawn")
 
+    def test_a_host_that_cannot_run_the_engine_keeps_its_type(self, monkeypatch):
+        """The dashboard's Install and a spawn both see ``KasHostUnsupported``, not a
+        transfer failure, with the cause and no offline or retry advice."""
+        monkeypatch.setattr(kas_bundle, "installed_bundle", lambda **k: None)
+
+        def unsupported(*a, **k):
+            raise kas_bundle.KasHostUnsupported(
+                "KAS bundles are not published for this operating system (plan9)"
+            )
+
+        monkeypatch.setattr(kas_bundle, "install_pinned", unsupported)
+        with pytest.raises(kas_bundle.KasHostUnsupported) as caught:
+            kas_engine_install.install_pinned_engine("https://h.test", caller="dashboard")
+        assert "(plan9)" in str(caught.value)
+        assert "connect it first" not in str(caught.value)
+        snapshot = kas_engine_install.install_snapshot()
+        assert snapshot["running"] is False
+        assert "(plan9)" in snapshot["error"]
+        assert "retry" not in snapshot["error"].lower()
+
     def test_an_installed_engine_installs_nothing(self, tmp_path, monkeypatch):
         installed = _installed(tmp_path)
         monkeypatch.setattr(kas_bundle, "installed_bundle", lambda **k: installed)
@@ -522,8 +941,6 @@ class TestSharedPredicate:
     ):
         """doctor, diagnostics and the install probe read one predicate, so they all
         see the switch."""
-        from types import SimpleNamespace
-
         from kiro_crew.agent_sdk import kas_bundle as facade
 
         agent = SimpleNamespace(acp_backend="kas", kas_bundle=False)

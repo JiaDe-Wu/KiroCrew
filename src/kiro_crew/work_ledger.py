@@ -22,8 +22,8 @@ than one update function with a field allowlist:
 
   * :func:`apply_conductor_action` writes ``title``, ``acceptance``, ``state``,
     ``verdict``, ``decision``, ``worker_session_key``, ``round`` and ``fails``.
-  * :func:`apply_worker_report` writes ``status``, ``reason``, ``summary``,
-    ``artifacts``, ``pr`` and ``last_report_at``.
+  * :func:`apply_worker_report` writes ``status``, ``reason``, ``wake_at``,
+    ``summary``, ``artifacts``, ``pr``, ``discussion`` and ``last_report_at``.
 
 The two field sets are disjoint. Phase 2 mounts one tool on each, so a worker cannot
 reach a conductor field because the function it can call takes no parameter that
@@ -542,17 +542,23 @@ def _rebuild_locked(
             record = dataclasses.replace(record, created_at=existing.created_at)
         if not record.generation and existing.generation:
             record = dataclasses.replace(record, generation=existing.generation)
+        if not record.goal_id and existing.goal_id:
+            # No entry carries it, so the cache's id is kept whatever the trust check
+            # below says. shortcut: after a failed undo (a dirty cache) that can be a
+            # refused new_goal's id; it only keys traces, so a rebuild accepts that.
+            record = dataclasses.replace(record, goal_id=existing.goal_id)
+        if not record.round_started_at and existing.round_started_at:
+            record = dataclasses.replace(record, round_started_at=existing.round_started_at)
         if existing.recorded_at:
             record = dataclasses.replace(record, recorded_at=existing.recorded_at)
-        # The goal's two caps and where its count starts ride no crew-log entry,
-        # so they are the cache's to keep -- but only while the cache holds no
-        # goal write the record lacks. A dirty cache, or one a goal write ahead
-        # of the record, may carry a refused write's caps and count start; those
+        # The goal's concurrency cap and where its count starts ride no crew-log
+        # entry, so they are the cache's to keep -- but only while the cache holds
+        # no goal write the record lacks. A dirty cache, or one a goal write ahead
+        # of the record, may carry a refused write's cap and count start; those
         # are dropped for the defaults below, as for a board with no cache header.
         if not cache_dirty(slot_key) and existing.goal_version == record.goal_version:
             record = dataclasses.replace(
                 record,
-                item_cap=existing.item_cap,
                 concurrency_cap=existing.concurrency_cap,
                 goal_items_base=existing.goal_items_base,
             )
@@ -1003,6 +1009,7 @@ from kiro_crew.work_ledger_records import (  # noqa: E402, F401
     CODE_DUPLICATE_ITEM,
     CODE_FIELD_TOO_LONG,
     CODE_GOAL_CONCURRENCY_CAP_REACHED,
+    CODE_HOST_MEMORY_CRITICAL,
     CODE_INVALID_ACTION,
     CODE_INVALID_STATUS,
     CODE_INVALID_VALUE,
@@ -1011,9 +1018,12 @@ from kiro_crew.work_ledger_records import (  # noqa: E402, F401
     CODE_LEDGER_NOT_FINISHED,
     CODE_NO_LEDGER,
     CODE_UNKNOWN_ITEM,
+    CODE_WAKE_AT_IN_PAST,
+    CODE_WAKE_AT_INVALID,
+    CODE_WAKE_AT_REQUIRES_PROGRESS,
+    CODE_WAKE_AT_TOO_FAR,
     CONDUCTOR_ACTIONS,
     DEFAULT_GOAL_CONCURRENCY_CAP,
-    DEFAULT_GOAL_ITEM_CAP,
     DEFAULT_STALE_WINDOW_SECS,
     EVENT_KINDS,
     ITEM_STATES,
@@ -1027,12 +1037,12 @@ from kiro_crew.work_ledger_records import (  # noqa: E402, F401
     MAX_EVENTS_PER_ITEM,
     MAX_GOAL_CHARS,
     MAX_GOAL_CONCURRENCY_CAP,
-    MAX_GOAL_ITEM_CAP,
     MAX_ITEMS_PER_CONDUCTOR,
     MAX_PR,
     MAX_RECORD_BYTES,
     MAX_SUMMARY_CHARS,
     MAX_TITLE_CHARS,
+    MAX_WAKE_AT_SECS,
     MIN_PR,
     PENDING_BUDGET_SECS,
     SCHEMA_VERSION,
@@ -1050,12 +1060,15 @@ from kiro_crew.work_ledger_records import (  # noqa: E402, F401
     _as_str,
     _finite_int,
     _now_iso,
+    _parse_iso,
     _settle_goal_base,
     _stored_concurrency_cap,
-    _stored_item_cap,
     logger,
+    parse_stamp,
 )
 from kiro_crew.work_ledger_remote import (  # noqa: E402, F401
+    _EVENT_ID_SHAPE,
+    CLOSE_RETIRE_REASONS,
     CODE_RETIRED_HISTORY_FULL,
     CREW_STATES,
     MAX_INSTANCE_ID_CHARS,
@@ -1063,11 +1076,11 @@ from kiro_crew.work_ledger_remote import (  # noqa: E402, F401
     MAX_RETIRED_BINDINGS,
     REMOTE_DIR,
     REMOTE_PULL_FRESH_SECS,
-    REMOTE_PULL_INTERVAL_SECS,
     RETIRE_REASONS,
     RemoteState,
     _binding,
     _board_dirs,
+    _crew_seen_recently,
     _has_pending_close,
     _open_remote_items,
     _require_peer_text,
@@ -1077,7 +1090,9 @@ from kiro_crew.work_ledger_remote import (  # noqa: E402, F401
     apply_remote_report,
     apply_remote_retire,
     binding_id,
-    boards_with_open_remote,
+    board_has_open_remote,
+    boards_with_pending_close,
+    is_peer_event_id,
     item_liveness,
     open_remote_bindings,
     read_remote_state,
@@ -1092,13 +1107,15 @@ from kiro_crew.work_ledger_rules import (  # noqa: E402, F401
     _WARNED_DEPTH_FALLBACKS,
     _decided_after_report,
     _is_placeholder,
-    _parse_iso,
+    _report_clock,
     _require_acceptance,
     _require_artifacts,
     _require_choice,
     _require_count,
+    _require_discussion,
     _require_pr,
     _require_text,
+    _require_wake_at,
     _warn_depth_fallback,
     _worker_owns_next_move,
     child_depth,
@@ -1109,7 +1126,6 @@ from kiro_crew.work_ledger_rules import (  # noqa: E402, F401
     is_stale,
     max_depth,
     may_conduct,
-    parse_stamp,
     quiet_since,
 )
 from kiro_crew.work_ledger_store import (  # noqa: E402, F401
@@ -1119,8 +1135,20 @@ from kiro_crew.work_ledger_store import (  # noqa: E402, F401
     _ITEM_ID_RE,
     _ITEMS_DIR,
     _KEY_FILE,
+    _LISTING_MEMO,
+    _LISTING_MEMO_BOARDS,
+    _LISTING_MEMO_ITEMS,
+    _LISTING_MEMO_LOCK,
+    _LISTINGS,
+    _LISTINGS_LOCK,
     _LOCK_FILE,
+    _READ_MEMO,
+    _READ_MEMO_LOCK,
+    _READ_MEMO_MAX,
     _REMOTE_DIR,
+    _RESOLVED_MEMO,
+    _RESOLVED_MEMO_LOCK,
+    _RESOLVED_MEMO_MAX,
     _UNDELIVERED_DIR,
     CHANGE_MARKS_KEPT,
     DIRTY_FILE,
@@ -1131,10 +1159,19 @@ from kiro_crew.work_ledger_store import (  # noqa: E402, F401
     _change_marks,
     _coalesce_progress,
     _commit_item_locked,
+    _contained,
+    _copy_item,
     _existing_conductor_lock,
+    _is_absent,
+    _item_from_record,
     _item_lock_path,
+    _json_copy,
+    _Kept,
     _last_mark,
+    _leaf_identity,
+    _Listing,
     _mark_changed,
+    _memo_read_bytes,
     _open_lock,
     _read_events_unlocked,
     _read_json_record,
@@ -1145,7 +1182,9 @@ from kiro_crew.work_ledger_store import (  # noqa: E402, F401
     _restore_text,
     _serialize,
     _slot_key_is_shaped,
+    _still_holds,
     _stored_item_ids,
+    _walk_items,
     _work_ledger_root,
     _write_record,
     binding_lock,
@@ -1187,14 +1226,18 @@ from kiro_crew.work_ledger_writes import (  # noqa: E402, F401
     _create_item,
     _header_under_lock,
     _read_binding_text,
+    _refuse_if_host_critical,
     _refuse_if_worker_holds_open_item,
+    _require_ask_options,
     _restore_binding_text,
     _write_binding,
     _write_goal,
     _write_item_action,
     accept_batch,
     apply_acceptance_update,
+    apply_ask_record,
     apply_conductor_action,
+    apply_guard_report,
     apply_person_steer,
     apply_worker_report,
     create_bound_item,
@@ -1223,8 +1266,9 @@ _sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
 __all__ = sorted(n for n in set(globals()) | set(_EXPORTS) if not n.startswith("_"))
 
 if TYPE_CHECKING:  # the project names this module imported that only its owners read
-    from kiro_crew import work_preview  # noqa: F401
+    from kiro_crew import resource_status, work_preview  # noqa: F401
     from kiro_crew.atomic_write import read_bytes_with_retry  # noqa: F401
+    from kiro_crew.conductor_patrol import PATROL_INTERVAL_SECS  # noqa: F401
     from kiro_crew.config.paths import data_home  # noqa: F401
     from kiro_crew.platform_compat import (  # noqa: F401
         file_lock,
@@ -1241,7 +1285,13 @@ if TYPE_CHECKING:  # the project names this module imported that only its owners
         unlink_lock_in_hold,
     )
     from kiro_crew.work_vocab import (  # noqa: F401
+        WORK_ASK_LABEL_CHARS,
+        WORK_ASK_MAX_OPTIONS,
+        WORK_ASK_OUTCOME_CHARS,
+        WORK_ASK_WHAT_CHARS,
+        WORK_ASK_WHY_CHARS,
         WORK_BLOCKED_REASONS,
+        WORK_CONDUCTOR_RETIRE_REASONS,
         WORK_ITEM_STATES,
         WORK_MAX_ARTIFACT_VALUE_CHARS,
         WORK_MAX_DEPTH_DEFAULT,
@@ -1254,7 +1304,10 @@ if TYPE_CHECKING:  # the project names this module imported that only its owners
         WORK_STORED_ITEM_LIMIT,
         WORK_VERDICTS,
         WORK_WORKER_STATUSES,
+        coerce_ask,
+        coerce_discussion,
         coerce_retired_bindings,
+        discussion_problem,
         work_event_id,
         worker_statuses,
     )

@@ -668,6 +668,38 @@ class TestRecursiveForceRmFloor:
         rm_floor._rm_wipe_targets(command)
         assert calls <= 4 * 20 + 2
 
+    @pytest.mark.parametrize("n", [1_000, 2_000])
+    def test_an_fd_prefix_check_reads_only_the_segment_tail(self, n):
+        """Each redirection's fd-prefix check reads a bounded tail of the segment, so a
+        line of many ``<<`` stays linear; counted element reads, not a clock (as above)."""
+        from collections.abc import MutableSequence
+
+        from kiro_crew.security import rm_floor
+
+        class _Counted(MutableSequence):
+            def __init__(self, items):
+                self.items, self.reads = items, 0
+
+            def __getitem__(self, index):
+                self.reads += 1
+                return self.items[index]
+
+            def __setitem__(self, index, value):
+                self.items[index] = value
+
+            def __delitem__(self, index):
+                del self.items[index]
+
+            def __len__(self):
+                return len(self.items)
+
+            def insert(self, index, value):
+                self.items.insert(index, value)
+
+        seg = _Counted(["(", "(", *(["1", " <<"] * n), "1"])
+        assert rm_floor._pull_trailing_fd_prefix(seg) == ""  # type: ignore[arg-type]
+        assert seg.reads <= 8  # 3 measured: the two tail elements and one slice
+
     def test_the_floor_reports_the_catalog_row(self):
         reason = is_denied("rm -fr /")
         assert reason is not None
@@ -1020,6 +1052,54 @@ class TestRmFloorReadsNestedShellPayloads:
         reason = is_denied(command.format("r" + "m -fr ~"))
         assert reason is None or "component=argv-floor" not in reason
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo '{}' | sh",
+            "printf '%s' '{}' | bash",
+            "echo \"bash -c '{}'\" | sh",
+            "bash -c \"echo '{}' | sh\"",
+            "echo '{}' |& sh",
+            "echo '{}' | (sh)",
+            "printf '%s' '{}' |& bash",
+            "printf '%s' '{}' | (bash)",
+            "bash -c \"echo '{}' |& sh\"",
+            "echo '{}' | tee \"$(mktemp)\" | sh",
+        ],
+    )
+    def test_a_script_piped_into_a_shell_is_read(self, command):
+        """What a printer pipes into a stdin shell is read as the script that shell runs."""
+        reason = is_denied(command.replace("{}", "r" + "m -r -f ~"))
+        assert reason is not None and "component=argv-floor" in reason
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "find . -name '*.md' | xargs grep -l '{}'",
+            "grep -rl '{}' docs | xargs wc -l",
+            "echo '{}' | grep -c bash",
+            "echo '{}' | bash ./check.sh",
+            "echo '{}' | bash -n",
+            "echo '{}' | sh < script.sh",
+        ],
+    )
+    def test_a_consumer_that_is_no_stdin_shell_reads_the_text_as_data(self, command):
+        """Only a shell reading its script from the pipe runs the piped text."""
+        reason = is_denied(command.replace("{}", "r" + "m -r -f ~"))
+        assert reason is None or "component=argv-floor" not in reason
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git ls-files --others --exclude-standard --directory | sed 's/^/{}/' | sh",
+            "printf '%s\\n' build dist | sed 's/^/{}/' | sh",
+        ],
+    )
+    def test_a_filter_script_is_not_the_text_the_shell_reads(self, command):
+        """``sed`` prints its input changed: its script's ``/`` is a delimiter, never wiped."""
+        reason = is_denied(command.replace("{}", "r" + "m -rf -- "))
+        assert reason is None or "component=argv-floor" not in reason
+
     @pytest.mark.parametrize("separator", [";", "&&", "&", "\n"])
     def test_a_separator_ends_the_command(self, separator):
         """``echo x <sep> sh`` runs ``sh`` with no input: the printed wipe stays printed."""
@@ -1051,7 +1131,7 @@ class TestRmFloorReadsNestedShellPayloads:
         assert shell_commands.redirect_free_views(command) == ['bash -c "$(sh -c >x ls)"']
 
     def test_the_regex_rows_keep_their_verdicts(self):
-        for command in ("rm -rf /tmp/x", "rm -rf ~/.cache/foo"):
+        for command in ("rm -rf /srv/x", "rm -rf ~/.cache/foo"):
             assert is_denied(command) is not None, command
 
     @pytest.mark.parametrize("wrapper", ["bash -c 2>/dev/null {}", "sh -c >/tmp/o {}"])

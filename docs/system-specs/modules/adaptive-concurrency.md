@@ -14,14 +14,12 @@ spawn floor (`agent.spawn_min_memory_gb`, [subagent.md](subagent.md) *Memory
 guard*), never by this cap. Nothing is ever killed to fit a smaller cap: both
 actuators shrink naturally as in-flight work finishes.
 
-**Why the execution cap does not read memory or loop lag.** It used to: it
-started at `min(user_max, 4)`, halved on 250 ms of gateway loop lag alone or on
-memory at the critical line, and paused dispatch at 0 under severe pressure, on
-top of an auto ceiling that was itself sized from host memory. Every one of
-those is a COUNT bound sitting under the per-start memory floor, so one chat's
-wave held the slots (or the halved cap) another chat's subagents waited for
-while memory was still free -- the "more than two chats with subagents throttle
-each other" report. The floor already prices each start at what it will settle
+**Why the execution cap does not read memory or loop lag.** A cap that started
+low, halved on gateway loop lag alone or on memory at the critical line, or paused
+dispatch at 0 under severe pressure would be a COUNT bound sitting under the
+per-start memory floor, so one chat's wave would hold the slots another chat's
+subagents wait for while memory is still free, and chats with subagents would
+throttle each other. The floor already prices each start at what it will settle
 at and queues the ones that would not leave it free, so a count moved by the
 same memory only stalls work early; and the gateway's loop lag says nothing
 about whether a subagent's own process is healthy. What the floor cannot see --
@@ -71,7 +69,7 @@ has a "not measured" value and an unmeasured field never fires.
 | `procs` | daemon `stats.admission.host_budget` (`procs` / `max_procs`) | both tracks | `>= 90 %` of the budget |
 | `start_latency` | `record_start(duration_ms, ...)` hook (session/new, backend initialize) | both tracks | p95 over the window `>= 30 s` |
 | `timeouts` | attributable start timeouts + attributable run failures / finished in window | both tracks | rate `>= DEFAULT_TIMEOUT_RATE` (0.2) |
-| `completion_rate` | successful runs / runs finished in window (needs >= 5 finished) | both tracks | `< 0.5` |
+| `completion_rate` | successful runs / successful plus attributable runs finished in window (needs >= 5; `non_congestion` runs are left out) | both tracks | `< 0.5` |
 | `slow_keys` | distinct PoolKeys with a slow or failing start in the window | both tracks | `>= 2` |
 | `gate_failures` | `SpawnGate` `failure` outcomes (daemon snapshot, or `note_gate_outcome` for an in-process gate) | both tracks; **sufficient alone for the gate** | `>= 2` in window |
 | `gate_slow_inits` | `SpawnGate` snapshot `slow_inits`: successful inits in the daemon's last `SLOW_INIT_WINDOW_SECS` (60) that took `>= SLOW_INIT_FRACTION` (80 %) of their own `initialize_timeout_secs` | both tracks; **sufficient alone for the gate** | `>= gate_slow_inits` (2), so one slow but healthy server does not cut it |
@@ -237,9 +235,8 @@ exactly the pressure the loop already backs off from. `compute_max_subagents`
 is therefore not a memory figure at all: it is `agent.subagent_auto_max` as
 written (3 when host memory cannot be read, because the floor then fails open,
 and sized from host memory when `agent.spawn_min_memory_gb <= 0` turns the floor
-off);
-`agent.subagent_cpu_cost_cores` is deprecated and inert, preserved on load and
-save so an existing config is not rewritten.
+off). The retired `agent.subagent_cpu_cost_cores` is ignored at load and
+dropped on save (`_SECTION_KEYS_RETIRED`).
 
 `probe_host` reads live signals only: free memory, process RSS, process CPU
 seconds (for metrics only, never classified), fd count and the fd soft limit. It

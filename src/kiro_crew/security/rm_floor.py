@@ -6,6 +6,7 @@ shells included. A seatbelt, not a parser: other shapes stay with the rows and t
 
 from __future__ import annotations
 
+import bisect
 import re
 
 from ..trust_patterns import ENV_ASSIGNMENT_RE
@@ -26,7 +27,7 @@ _RM_FLOOR_BY_KIND: dict[str, tuple[str, str]] = {
 }
 _RM_FLOOR_NOTE = "Matched on the rm flags and target, not the pattern text: recursive and force against this directory itself."
 _RM_FLOOR_UNREAD_NOTE = "Refused because the rm check could not read this command. Simplify it."
-_CAN_FIRE_RE = re.compile(r"r[^\w\s]*m")  # a literal rm, quote splices allowed
+_CAN_FIRE_RE = re.compile(r"(?i)r[^\w\s]*m")  # a literal rm, quote splices allowed
 _RM_WORD_RE = re.compile(r"(?<![\w.-])r[^\w\s/]*m(?![\w.-])")  # rm as its own word
 _EXPANDED_HOME = "\2"  # a ``$HOME`` its carrier expands: home whatever quotes the payload adds
 
@@ -39,31 +40,112 @@ _EXPANDED_HOME = "\2"  # a ``$HOME`` its carrier expands: home whatever quotes t
 #: :func:`_segments` keeps a redirection and its fd prefix in one word (below).
 _HOME_WORDS = frozenset({"~", "$HOME", "${HOME}", _EXPANDED_HOME})
 _LITERAL_SHELLS = _shell._NESTED_SHELL_PROGRAMS - {"busybox"}  # busybox's next word is the applet
+_PRINTERS = frozenset({"echo", "printf"})  # a pipe stage whose own words are what it prints
 _SUBST = _commands.SUBST  # a substitution: may expand to nothing, unlike a literal ``\0``
 #: an unquoted parameter (``$x``, ``${…}``, ``$1``): an unset one expands to nothing
 _PARAM_RE = re.compile(r"\$(?:\{[^}]*\}|[A-Za-z_]\w*|[0-9@*#?$!-])")
-#: A STANDALONE fd prefix (a bare number or ``{name}``) directly before a redirection
-#: operator: ``2>`` and ``{fd}>`` redirect fd 2 / a named fd, but the ``2`` in
-#: ``/tmp/2>x`` is part of the path, so the prefix counts only at a word boundary.
-_FD_PREFIX_RE = re.compile(r"(?:^|(?<=[\s\x00]))(?:\{[A-Za-z_]\w*\}|\d+)\Z")
 
 
 def _pull_trailing_fd_prefix(seg: "list[str]") -> str:
     """Remove and return a standalone fd prefix at the end of *seg*, else ``""``.
 
     Keeps ``2>``/``{fd}>`` as one redirection word rather than splitting the fd
-    number off as its own word (which would be read as the program).
+    number off as its own word (which would be read as the program). It counts only
+    as a whole word (the ``2`` in ``/tmp/2>x`` is part of the path), so only the last
+    word is read and a segment of many redirections stays linear.
     """
-    joined = "".join(seg)
-    match = _FD_PREFIX_RE.search(joined)
-    if match is None:
+    end, head = len(seg), ""
+    while end:
+        text = seg[end - 1]
+        cut = len(text)
+        while cut and not (text[cut - 1].isspace() or text[cut - 1] == "\x00"):
+            cut -= 1
+        if cut:
+            head = text[cut:]
+            break
+        end -= 1
+    word = head + "".join(seg[end:])
+    name = word[1:-1] if word[:1] == "{" and word[-1:] == "}" else ""  # ``{fd}``
+    if not word.isdecimal() and not (
+        name[:1].isascii()
+        and (name[:1].isalpha() or name[:1] == "_")
+        and all(c.isalnum() or c == "_" for c in name)
+    ):
         return ""
-    seg[:] = [joined[: match.start()]]
-    return joined[match.start() :]
+    del seg[end:]
+    if head:
+        seg[end - 1] = text[:cut]
+    return word
 
 
 def _can_fire(command: str) -> bool:
     return bool(_CAN_FIRE_RE.search(command))
+
+
+#: The scratch root whose direct entries an ``rm`` may remove without the root row asking.
+_SCRATCH_ROOT = "/tmp"
+#: Characters that make a word more than its literal text (expansion, glob, brace, tilde).
+_NOT_LITERAL = frozenset("$`*?[]{}~\\'\"()")
+#: What may sit right before or after a plain command: nothing, a blank or a separator.
+#: A backtick or paren there means bash glues other text onto the first or last word.
+_COMMAND_EDGE = frozenset(" \t\n;&|")
+#: Separators that end a plain command (the shared reader's ``ShellCommand.separator``).
+_PLAIN_SEPARATORS = frozenset({"", ";", "&", "&&", "|", "||", "\n"})
+#: kiro-cli's display prefix on a shell call's title (``Running: rm -rf /tmp/x``).
+_TITLE_PREFIX = "Running:"
+_RM_WORDS = frozenset({"rm", "rm.exe", "rm.cmd", "rm.bat"})  # Windows spellings of rm
+
+
+def _is_scratch_entry(word: str) -> bool:
+    """*word* is ``/tmp/<name>``: ONE component directly under the scratch root. With no
+    folder on the way, no symlink an earlier command plants can redirect the delete,
+    and no trailing ``/`` follows a link at ``<name>`` itself."""
+    root, _, name = word.rpartition("/")
+    return root == _SCRATCH_ROOT and name not in ("", ".", "..")
+
+
+def scratch_rm_view(command: str) -> "str | None":
+    """*command* with the words of each plain ``rm`` whose every operand is a scratch
+    entry blanked, or ``None`` when there is none. Only the ``local-destructive-rm-rf-root``
+    row reads this view: its pattern matches any ``rm -rf /…``, and ``rm -rf /tmp/build``
+    is not the root. The ``rm`` must be the program word itself, unquoted, with literal
+    words only, no ``--``, and nothing glued on either edge; its redirections stay in
+    the text, and anything else stays for the row to judge."""
+    if "rm" not in command:
+        return None
+    try:
+        commands = _commands.read_commands(command, heredocs=True)
+    except Exception:  # noqa: BLE001 - an unreadable command keeps the row's reading
+        return None
+    spans: "list[tuple[int, int]]" = []
+    prev_separator = ""
+    for cmd in commands:
+        # A command cut at a backtick or paren, or one that starts right after such a
+        # cut, shares its words with a substitution bash splices in: not plain.
+        cut = {prev_separator, cmd.separator} - _PLAIN_SEPARATORS
+        prev_separator = cmd.separator
+        argv = list(cmd.argv)
+        if argv and argv[0].start == 0 and argv[0].raw == _TITLE_PREFIX:
+            argv = argv[1:]
+        if not argv or argv[0].raw not in _RM_WORDS or cmd.heredocs or cut:
+            continue
+        before, after = argv[0].start - 1, argv[-1].end
+        if before >= 0 and command[before] not in _COMMAND_EDGE:
+            continue
+        if after < len(command) and command[after] not in _COMMAND_EDGE:
+            continue
+        words = [w.raw for w in argv[1:]]
+        operands = [w for w in words if not w.startswith("-")]
+        if not operands or "--" in words or any(set(w) & _NOT_LITERAL for w in words):
+            continue
+        if all(_is_scratch_entry(w) for w in operands):
+            spans.extend((w.start, w.end) for w in argv)
+    if not spans:
+        return None
+    out = list(command)
+    for start, end in spans:
+        out[start:end] = " " * (end - start)
+    return "".join(out)
 
 
 def _names_rm_word(command: str) -> bool:
@@ -139,7 +221,8 @@ def _rm_wipe_targets(command: str) -> "set[str]":
                 words = [bare, *words[1:]] if bare else words[1:]
                 continue
             break
-        if not words or _shell._program_basename(words[0]) != "rm":
+        name = _shell._program_basename(words[0]) if words else ""
+        if name not in _RM_WORDS and name.lower() not in _RM_WORDS - {"rm"}:  # Windows: any case
             continue
         recursive = force = done = False
         operands = []
@@ -211,6 +294,8 @@ def _heredoc_payloads(command: str) -> "list[str]":
     and each command read from a substitution in an unquoted body, which bash runs."""
     commands = _commands.read_commands(command, heredocs=True)
     docs = [d for c in commands for d in c.heredocs if not d.quoted]
+    firsts = sorted((c.steps[0].start, j) for j, c in enumerate(commands) if c.steps)
+    bodies = sorted(d.start for c in commands for d in c.heredocs)
     out: list[str] = []
     for i, cmd in enumerate(commands):
         if cmd.steps and any(d.start <= cmd.steps[0].start < d.end for d in docs):
@@ -218,22 +303,49 @@ def _heredoc_payloads(command: str) -> "list[str]":
         if cmd.heredocs and (
             _runs_shell(cmd)
             or cmd.separator == "|"
-            and i + 1 < len(commands)
-            and _runs_shell(commands[i + 1])
             and _forwards_stdin(cmd)
-            and not _stdin_redirect(commands[i + 1])[0]  # its own stdin replaces the pipe
+            and any(_reads_pipe(r) for r in _pipe_recipients(commands, i, firsts, bodies))
         ):
             out.extend(_stdin_body(cmd))
     return out
 
 
-def _forwards_stdin(cmd: "_commands.ShellCommand") -> bool:
-    """*cmd* copies its stdin to its stdout (``cat``, ``tee``): only then does a piped
-    shell read its heredoc; ``printf ... <<EOF | bash`` sends printf's output instead."""
+def _pipe_recipients(
+    commands: "list[_commands.ShellCommand]",
+    i: int,
+    firsts: "list[tuple[int, int]]",
+    bodies: "list[int]",
+) -> "list[_commands.ShellCommand]":
+    """The commands ``commands[i]``'s pipe may feed: the next one read (a substitution in
+    the recipient's words, ``| grep "$(sh)"``, is read first and reads the pipe too) and
+    the one starting first after it on its own line, as a quoted substitution's commands
+    are read before the command holding them (``| sh -s "$(true)"``)."""
+    out = commands[i + 1 : i + 2]
+    end = commands[i].steps[-1].end  # it holds a heredoc: its ``<<`` is a step, its body later
+    k = bisect.bisect_right(firsts, (end, len(commands)))
+    b = bisect.bisect_right(bodies, end)
+    if k < len(firsts) and firsts[k][0] < bodies[b]:
+        out.append(commands[firsts[k][1]])
+    return out
+
+
+def _reads_pipe(cmd: "_commands.ShellCommand") -> bool:
+    """*cmd* is a shell reading its script from a pipe: no stdin of its own replaces it."""
+    return _runs_shell(cmd) and not _stdin_redirect(cmd)[0]
+
+
+def _program(cmd: "_commands.ShellCommand") -> str:
+    """The program *cmd* runs, wrappers and ``VAR=x`` stepped over (``""`` for none)."""
     from . import argv_rules  # argv_rules imports this module
 
     words = _shell._shell_tokens(" ".join(word.raw for word in cmd.argv))
-    return (argv_rules._program_args(words) or ("",))[0] in ("cat", "tee")
+    return (argv_rules._program_args(words) or ("",))[0]
+
+
+def _forwards_stdin(cmd: "_commands.ShellCommand") -> bool:
+    """*cmd* copies its stdin to its stdout (``cat``, ``tee``): only then does a piped
+    shell read its heredoc; ``printf ... <<EOF | bash`` sends printf's output instead."""
+    return _program(cmd) in ("cat", "tee")
 
 
 def _stdin_body(cmd: "_commands.ShellCommand") -> "list[str]":
@@ -326,22 +438,39 @@ def _literal_shell_script(tokens: "list[str]") -> "str | None":
     return tokens[2]
 
 
-def _command_tokens(text: str) -> "list[list[str]]":
+def _command_tokens(text: str, pipelines: bool = False) -> "list[list[str]]":
     """Dequoted argv of each command the shared reader finds in each line, read every
     way so each reading only adds payloads; a command stopped at ``<<`` runs to the
-    line's end (a herestring is a payload)."""
+    line's end (a herestring is a payload). With *pipelines*, a pipeline whose later stage
+    is a shell reading its script from the pipe is also read as its ``echo`` / ``printf``
+    stages and its shells joined, so the text printed into that shell is a payload
+    (``echo '<script>' | sh``)."""
     out: list[list[str]] = []
     for line in _command_lines(text):
         for part in dict.fromkeys((line, _shell._fold_line_continuations(line))):
             for plain in dict.fromkeys((part, _commands.without_substitutions(part))):
                 for track in (True, False) if "${" in plain or "$[" in plain else (True,):
-                    for cmd in _commands.read_commands(plain, track):
+                    commands = _commands.read_commands(plain, track)
+                    for cmd in commands:
                         words = " ".join(plain[word.start : word.end] for word in cmd.argv)
                         if cmd.separator == "<<":  # the read stops there; the line runs on
                             words = plain[cmd.steps[0].start if cmd.steps else 0 :]
                         out.append(_shell._shell_tokens(words))
                         if "<<<" in plain and (s := cmd.steps):  # its own words, herestring kept
                             out.append(_shell._shell_tokens(plain[s[0].start : s[-1].end]))
+                    groups = _commands.pipelines(commands) if pipelines and "|" in plain else []
+                    if groups:  # a quoted substitution body's commands split no stage
+                        flat = _commands.read_commands(plain, track, nested=False)
+                        groups += _commands.pipelines(flat) if len(flat) < len(commands) else []
+                    for pipe in groups:
+                        if not any(_runs_shell(c) and not _stdin_redirect(c)[0] for c in pipe[1:]):
+                            continue  # no later stage is a shell reading its script from the pipe
+                        # the shell reads what a stage prints: ``echo`` / ``printf`` their own
+                        # words, a filter its input (``sed 's/^/rm -rf -- /'`` wipes no ``/``)
+                        kept = [c for c in pipe if _runs_shell(c) or _program(c) in _PRINTERS]
+                        argvs = [" ".join(plain[w.start : w.end] for w in c.argv) for c in kept]
+                        if len(argvs := [argv for argv in argvs if argv]) > 1:
+                            out.append(_shell._shell_tokens(" | ".join(argvs)))
     return out
 
 
@@ -394,7 +523,7 @@ def _rm_wipe_targets_nested(command: str) -> "set[str]":
                 pending.append(payload)
         views = (source, _ansi_c_newlines(source)) if "$'" in source else (source,)
         readings = dict.fromkeys((*views, *map(_carrier_home, (*views, folded))))
-        for tokens in (t for view in readings for t in _command_tokens(view)):
+        for tokens in (t for view in readings for t in _command_tokens(view, pipelines=True)):
             payloads = _shell._nested_shell_payloads(tokens, allow_join=False)
             if not payloads:
                 continue

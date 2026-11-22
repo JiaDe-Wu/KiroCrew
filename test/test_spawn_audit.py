@@ -178,6 +178,9 @@ _SPAWN_NAMES = {
     "popen_limited",
     # kiro_prerequisite's one-shot wrapper; its call sites must stay visible.
     "spawn_supervised_oneshot",
+    # platform_compat's timeout-kills-the-tree run; its call sites must stay visible.
+    "run_killing_tree_on_timeout",
+    "stdlib_run_killing_tree_on_timeout",
 }
 
 # Tokens whose presence anywhere in the enclosing function marks the spawn as
@@ -192,7 +195,7 @@ _ROUTED_TOKENS = (
 
 # Token marking a routed function as also applying a kernel resource ceiling
 # (RLIMIT_NPROC/NOFILE/CPU/AS) to its child — the second layer of the spawn
-# guarantee (security-review bdf0d7e5). Every sandbox-routed function must
+# guarantee. Every sandbox-routed function must
 # reference one: the sandbox gives the child filesystem + credential isolation,
 # this gives it a fork-bomb / resource ceiling. Functions whose ONLY spawns are
 # fixed-argv internal probes (no agent-influenced child) are exempted in
@@ -208,7 +211,7 @@ _ROUTED_TOKENS = (
 # check scans the enclosing function's raw source, docstrings and comments
 # included, so a bare-name match lets prose like "routed through run_limited"
 # satisfy the gate while the actual spawn silently reverts to a bare
-# ``subprocess.run`` (verified by mutation before the parens were added).
+# ``subprocess.run``.
 _PREEXEC_TOKENS = (
     "create_subprocess_limited(",
     "run_limited(",
@@ -275,7 +278,7 @@ BENIGN_SPAWNS: frozenset[str] = BENIGN_PACKAGE_SPAWNS | BENIGN_APP_SPAWNS
 # Kiro Crew already launches for every ACP session -- resolved only by
 # ``kiro_cli.find_kiro_cli_candidates`` -- with a fixed argv. That binary is
 # already trusted and run on every ACP launch, so the carve-out adds no new
-# trust (owner decision, enterprise sign-in check). Keyed by
+# trust (owner decision, LTS sign-in check). Keyed by
 # ``<relpath>::<enclosing function>``, same discipline as ``BENIGN_SPAWNS``.
 FIRST_PARTY_SPAWNS: frozenset[str] = frozenset(
     {
@@ -288,7 +291,10 @@ FIRST_PARTY_SPAWNS: frozenset[str] = frozenset(
         # env into the child environment and ``LD_PRELOAD`` changes what code
         # runs for the same argv. Third-party servers and any customized
         # managed command/args/env compare unequal, pass False, and keep the
-        # full fail-close + opt-in behavior.
+        # full fail-close + opt-in behavior. On a centrally governed host the
+        # argv may start with a trusted absolute ``env`` binary
+        # (``sandbox_argv._unset_env_argv``) plus the policy markers the gateway
+        # derives itself (``policy_cache_only_env``), never spec text.
         "mcp_discovery_probe.py::probe_server",
         # The built-in SAPI synthesizer. The flag value is COMPUTED
         # (``engine == SYSTEM_ENGINE_SAPI``), so only the Windows branch claims
@@ -309,9 +315,9 @@ FIRST_PARTY_SPAWNS: frozenset[str] = frozenset(
         # because the scan is deliberately value-blind, so a future caller
         # passing True here would still have to be reviewed as its own entry.
         "voice_reply.py::_run_tts_subprocess",
-        # The enterprise sign-in check (owner decision, enterprise smoke test
+        # The LTS sign-in check (owner decision, LTS smoke test
         # P9; owner-approved widening of this rule). ``_probe`` claims the flag
-        # with a literal ``True`` only inside ``edition.is_enterprise()``, only
+        # with a literal ``True`` only inside ``edition.is_lts()``, only
         # after the sandboxed ``--version`` was refused, and only for two fixed
         # argvs: ``--version`` (via ``_audited_probe``) and ``whoami`` (via
         # ``_audited_identity_probe``, real-home branch of ``_run_auth_command``
@@ -326,6 +332,16 @@ FIRST_PARTY_SPAWNS: frozenset[str] = frozenset(
         "kiro_prerequisite_probe.py::_audited_probe",
         "kiro_prerequisite_probe.py::_audited_identity_probe",
         "kiro_prerequisite_probe.py::_run_auth_command",
+        # The pinned kiro-cli's fixed-argv probes (``--version``, ``acp --help``,
+        # ``chat --help``, the ``acp --agent-engine v3`` start, and the unattended
+        # ``whoami``) through ``_sandboxed_probe``, which forwards the flag to
+        # ``_run_process``. Each argv is module constants on the binary
+        # ``pin_kiro_cli`` resolves through ``find_kiro_cli_candidates`` -- the
+        # kiro-cli ACP launches on every session -- so no agent, repo or user text
+        # reaches it. The flag only keeps a backend-less host probing, unconfined,
+        # as these probes always ran; wherever a backend exists they now run
+        # inside the sandbox, because that binary's directory is agent-writable.
+        "kiro_cli.py::_sandboxed_probe",
         "kiro_prerequisite_process.py::_run_process",
         "kiro_prerequisite_process.py::_prepare_sandboxed_spawn",
     }
@@ -400,7 +416,7 @@ def test_every_first_party_spawn_is_allowlisted():
         "chokepoint:\n  "
         + "\n  ".join(sorted(unexpected))
         + "\n\nThis flag permits an UNCONFINED spawn on a host with no sandbox "
-        "backend (issue #1563 carve-out). Confirm the full argv is derived "
+        "backend. Confirm the full argv is derived "
         "inside this package with zero agent/repo/user-config influence (or is "
         "the ACP kiro-cli from find_kiro_cli_candidates with a fixed argv), then "
         "add the file::function key to FIRST_PARTY_SPAWNS with a justification."
@@ -719,8 +735,7 @@ def test_every_spawn_is_routed_or_allowlisted(part: int):
         + "\n\nRoute agent-influenced spawns through "
         "kiro_crew.sandbox.sandboxed_spawn_argv (OS sandbox + scrubbed env), "
         "or, if the command/args/cwd are NOT agent-influenced, add the "
-        "file::function key to BENIGN_SPAWNS in this test with a justification. "
-        "See security-review finding 92e24570."
+        "file::function key to BENIGN_SPAWNS in this test with a justification."
     )
 
 
@@ -808,8 +823,7 @@ def test_every_routed_spawn_applies_resource_limits(part: int):
         + "\n  ".join(sorted(missing))
         + "\n\nPass preexec_fn=kiro_crew.sandbox.resource_limit_preexec() to the "
         "spawn (kernel RLIMIT ceiling — fork bomb / FD / mem / CPU), or add the "
-        "file::function key to PREEXEC_EXEMPT with a justification. "
-        "See security-review finding bdf0d7e5."
+        "file::function key to PREEXEC_EXEMPT with a justification."
     )
 
 
@@ -844,8 +858,7 @@ def test_every_routed_spawn_applies_cgroup_scope(part: int):
         + "\n  ".join(sorted(missing))
         + "\n\nWrap the final argv with kiro_crew.sandbox.cgroup_scope_argv() "
         "(pids.max + memory.max fork-bomb / memory-DoS ceiling), or route the "
-        "spawn through sandboxed_spawn_argv which applies it. "
-        "See security-review finding bdf0d7e5."
+        "spawn through sandboxed_spawn_argv which applies it."
     )
 
 
@@ -980,8 +993,8 @@ _GATEWAY_REL = "slack/gateway.py + slack/gateway_runtime/*.py"
 
 #: Functions that own the kill-the-tree + bounded-reap contract. The shared
 #: helper is `platform_compat.kill_and_reap` (`_kill_and_reap` is its delegate
-#: in `platform/update_provider.py`); the two `_startup_child` methods are the
-#: boot-path equivalent (kill and reap split in two).
+#: in `platform/update_provider.py`); `_kill_startup_child` and
+#: `_reap_startup_child` are the boot-path equivalent (kill and reap split in two).
 _TREE_KILL_FUNCS = frozenset({"kill_and_reap", "_kill_and_reap", "_kill_startup_child"})
 
 
@@ -998,6 +1011,13 @@ def _is_spawn_call(node: ast.AST) -> bool:
         and isinstance(node.func, ast.Attribute)
         and node.func.attr.startswith("create_subprocess_")
     )
+
+
+def _starts_spawn(node: ast.AST) -> bool:
+    """A spawn call, bare or started through ``update_provider._start_installer``."""
+    if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_start_installer":
+        node = node.args[0]
+    return _is_spawn_call(node)
 
 
 def _handler_catches(handler: ast.ExceptHandler, name: str) -> bool:
@@ -1052,18 +1072,18 @@ def test_gateway_spawns_all_own_session():
         spawns += 1
         if not any(kw.arg == "start_new_session" for kw in node.keywords):
             missing.append(f"{_GATEWAY_REL}:{node.lineno}")
-    assert spawns >= 9, (
+    assert spawns >= 2, (
         f"only {spawns} spawn sites found in {_GATEWAY_REL} — the audit's "
         "spawn matcher no longer matches the file's spawn idiom; fix the "
-        "matcher rather than deleting the ratchet. (The floor dropped from 10 "
-        "to 9 when the unattended apply's inline fetch moved to the shared "
-        "update_fetch.fetch_and_pin_upstream helper, which carries the same "
-        "start_new_session discipline and is covered by the spawn allowlist.)"
+        "matcher rather than deleting the ratchet. (The floor dropped from 9 "
+        "to 2 when the unattended apply left the gateway: the update now runs "
+        "at the next start from update_boot_apply, audited in the spawn "
+        "allowlist and the internal-python isolation inventory.)"
     )
     assert not missing, (
         "Spawn(s) in slack/gateway.py without start_new_session — a timeout "
-        "kill would reach only the direct child, abandoning its descendants "
-        "(issue #4210):\n  " + "\n  ".join(missing) + "\n\nAdd "
+        "kill would reach only the direct child, abandoning its descendants"
+        ":\n  " + "\n  ".join(missing) + "\n\nAdd "
         "start_new_session=platform_compat.IS_POSIX to the spawn."
     )
 
@@ -1090,7 +1110,7 @@ def test_gateway_proc_waits_all_kill_on_timeout_and_cancel():
             for stmt in ast.walk(func)
             if isinstance(stmt, ast.Assign)
             and isinstance(stmt.value, ast.Await)
-            and _is_spawn_call(stmt.value.value)
+            and _starts_spawn(stmt.value.value)
             for t in stmt.targets
             if isinstance(t, ast.Name)
         }
@@ -1144,14 +1164,15 @@ def test_gateway_proc_waits_all_kill_on_timeout_and_cancel():
                     f"{_GATEWAY_REL}:{node.lineno} ({func.name}: {proc_name}) lacks a "
                     f"{lacking} arm that tree-kills the proc"
                 )
-    assert audited >= 10, (
+    assert audited >= 2, (
         f"only {audited} proc wait sites found in {_GATEWAY_REL} — the audit's "
         "wait matcher no longer matches the file's idiom; fix the matcher "
         "rather than deleting the ratchet"
     )
     assert not offenders, (
-        "wait_for on a spawned proc without kill+reap discipline (issue "
-        "#4210):\n  " + "\n  ".join(offenders) + "\n\nWrap the wait in explicit "
+        "wait_for on a spawned proc without kill+reap discipline:\n  "
+        + "\n  ".join(offenders)
+        + "\n\nWrap the wait in explicit "
         "TimeoutError and CancelledError arms that call _kill_and_reap (or the "
         "startup-child kill/reap pair) on the proc before returning/re-raising."
     )

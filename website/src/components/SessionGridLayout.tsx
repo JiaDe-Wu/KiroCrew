@@ -29,7 +29,17 @@ export default function SessionGridLayout({
   ownsTopLeft?: boolean
 }) {
   if (node.type === 'leaf') {
-    return <div className="h-full w-full min-w-0 min-h-0 overflow-hidden">{renderLeaf(node, ownsTopLeft)}</div>
+    // The `data-split-*` marks are where the sidebar's session drag finds the
+    // panes to drop on (SplitPaneDropZones).
+    return (
+      <div
+        data-split-leaf={node.id}
+        data-split-slot={node.kind === 'session' ? node.slot : undefined}
+        className="relative h-full w-full min-w-0 min-h-0 overflow-hidden"
+      >
+        {renderLeaf(node, ownsTopLeft)}
+      </div>
+    )
   }
   return <SplitContainer node={node} renderLeaf={renderLeaf} onResize={onResize} ownsTopLeft={ownsTopLeft} />
 }
@@ -118,9 +128,11 @@ function SplitContainer({
                   full-length. The bar's ends are inset by the panes' border
                   radius (rounded-lg = 8px, so 16px total) so it spans exactly
                   the straight segment of the adjacent pane borders instead of
-                  overshooting past where they curve away at the corners. */}
+                  overshooting past where they curve away at the corners.
+                  group-active: a pressed style is what makes Chromium treat the
+                  divider as a touch target. */}
               <div
-                className={`bg-border group-hover/div:bg-accent transition-colors rounded-full ${horizontal ? 'w-[2px] h-[calc(100%-16px)]' : 'h-[2px] w-[calc(100%-16px)]'}`}
+                className={`bg-border group-hover/div:bg-accent group-active/div:bg-accent-hover transition-colors rounded-full ${horizontal ? 'w-[2px] h-[calc(100%-16px)]' : 'h-[2px] w-[calc(100%-16px)]'}`}
               />
             </div>
           )}

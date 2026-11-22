@@ -1,16 +1,19 @@
 """Consolidation tags each ``project.*`` write with a ``kind``, and code routes by it.
 
 Pins the kind parser (missing and unknown read as ``fact``), the exemptions
-(``pref.*``, ``user.*``, ``lesson.*``, deletes, user-stated writes), that
-``shadow`` writes exactly what ``off`` writes, ``enforce`` routing on both the V1
-writer and the member store, and every cap on the shadow log.
+(``pref.*``, ``user.*``, ``lesson.*``, deletes, user-stated writes), that a
+stored ``shadow`` reads as ``enforce``, that ``enforce`` asks ``off``'s
+consolidation prompt and labels the routed items in a separate call, ``enforce``
+routing on both the V1 writer and the member store, and the bounded counter log.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from member_memory_helpers import declare_v2_store
@@ -124,14 +127,14 @@ def test_only_project_creates_and_updates_are_routed(item) -> None:
     "raw, mode",
     [
         ("off", "off"),
-        ("shadow", "shadow"),
+        ("shadow", "enforce"),
         ("enforce", "enforce"),
-        ("ENFORCE", "off"),
-        (None, "off"),
-        (1, "off"),
+        ("ENFORCE", "enforce"),
+        (None, "enforce"),
+        (1, "enforce"),
     ],
 )
-def test_the_setting_defaults_to_off(raw, mode) -> None:
+def test_the_setting_defaults_to_enforce(raw, mode) -> None:
     data = {} if raw is None else {"kind_routing": raw}
     assert _build_memory_config(data).kind_routing == mode
 
@@ -144,17 +147,17 @@ def test_work_state_is_an_audited_reject_code() -> None:
 # routing
 
 
-def test_shadow_and_off_hand_back_the_answer_itself() -> None:
+def test_off_hands_back_the_answer_itself() -> None:
     answer = _answer()
-    for mode in ("off", "shadow"):
-        assert mkr.route_semantic_by_kind(answer, mode).result is answer
-    assert mkr.route_semantic_by_kind(answer, "off").decisions == ()
-    assert [d.kind for d in mkr.route_semantic_by_kind(answer, "shadow").decisions] == [
-        "fact",
-        "event",
-        "state",
-        "fact",
-    ]
+    routing = mkr.route_semantic_by_kind(answer, "off")
+    assert routing.result is answer
+    assert routing.decisions == ()
+
+
+def test_a_stored_shadow_routes_as_the_default_enforce() -> None:
+    assert mkr.route_semantic_by_kind(_answer(), "shadow") == mkr.route_semantic_by_kind(
+        _answer(), "enforce"
+    )
 
 
 def test_enforce_drops_state_and_keeps_events_as_facts() -> None:
@@ -233,29 +236,15 @@ def _with_mode(monkeypatch, mode: str) -> None:
     monkeypatch.setattr(mkr, "_utcnow", lambda: _T0)
 
 
-def test_v1_shadow_writes_exactly_what_off_writes(tmp_path, monkeypatch) -> None:
-    written = {}
-    for mode in ("off", "shadow"):
-        _with_mode(monkeypatch, mode)
-        store = _v1(tmp_path, mode)
-        try:
-            _consolidator(store)._write_structured_memory(_answer(), key="s1")
-            written[mode] = (_facts(store), _episodes(store), _events(store, "work_state"))
-            log = _kind_log(store)
-        finally:
-            store.close()
-        if mode == "off":
-            assert log == {}
-        else:
-            counts = log[mkr.COUNTS_PREFIX + "2026-10-01"]
-            assert counts == {"shadow": {"event": 1, "fact": 2, "state": 1}}
-            assert log[mkr.RESERVOIR_KEY] == {
-                "day": "2026-10-01",
-                "rules": mkr.RULES_VERSION,
-                "seen": 4,
-            }
-    assert written["shadow"] == written["off"]
-    assert "project.app.ci_status" in written["shadow"][0]
+def _labels_as_tagged(answer: dict):
+    """A label call answering each routed item's own ``kind`` tag, by its index."""
+    routed = mkr.route_semantic_by_kind(answer, "enforce").decisions
+    kinds = {str(index): decision.kind for index, decision in enumerate(routed)}
+
+    async def ask(prompt: str) -> dict:
+        return {"kinds": kinds}
+
+    return ask
 
 
 def test_v1_enforce_skips_state_and_writes_events_as_facts(tmp_path, monkeypatch) -> None:
@@ -279,7 +268,7 @@ def test_v1_enforce_skips_state_and_writes_events_as_facts(tmp_path, monkeypatch
         assert log[mkr.COUNTS_PREFIX + "2026-10-01"] == {
             "enforce": {"event": 1, "fact": 2, "state": 1}
         }
-        assert not any(k.startswith(mkr.SAMPLES_PREFIX) for k in log), "enforce keeps no samples"
+        assert list(log) == [mkr.COUNTS_PREFIX + "2026-10-01"], "enforce keeps counters only"
     finally:
         store.close()
 
@@ -319,18 +308,6 @@ def test_v1_log_takes_the_publication_hold(tmp_path, monkeypatch) -> None:
         store.close()
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("mode, named", [("shadow", False), ("off", False), ("enforce", True)])
-async def test_the_key_naming_rule_is_asked_only_under_enforce(monkeypatch, mode, named) -> None:
-    from test_consolidation_semantic_cap import _prompt_for
-
-    monkeypatch.setattr(mkr, "configured_kind_routing_mode", lambda: mode)
-    prompt, _ = await _prompt_for([], include_history=False)
-    assert ('"kind": "fact" | "event" | "state"' in prompt) is (mode != "off")
-    assert ("Will this still be true in a month?" in prompt) is (mode != "off")
-    assert ("never by PR, issue or round number" in prompt) is named
-
-
 # the member store
 
 
@@ -357,19 +334,6 @@ def _apply(store, mode: str, source_id: str = "src-1") -> dict:
     )
 
 
-def test_member_shadow_writes_what_off_writes(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(mkr, "_utcnow", lambda: _T0)
-    written = {}
-    for mode in ("off", "shadow"):
-        store = _member(tmp_path / mode, monkeypatch)
-        try:
-            receipt = _apply(store, mode)
-            written[mode] = (receipt, sorted(_facts(store)), _episodes(store))
-        finally:
-            store.close()
-    assert written["shadow"] == written["off"]
-
-
 def test_member_enforce_routes_inside_the_span_and_replay_logs_once(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(mkr, "_utcnow", lambda: _T0)
     store = _member(tmp_path, monkeypatch)
@@ -388,96 +352,12 @@ def test_member_enforce_routes_inside_the_span_and_replay_logs_once(tmp_path, mo
         store.close()
 
 
-# the caps
+# the counter log
 
 
-def _routing(count: int, *, value: str = "v", mode: str = "shadow") -> mkr.KindRouting:
+def _routing(count: int, *, value: str = "v", mode: str = "enforce") -> mkr.KindRouting:
     decisions = tuple(mkr.KindDecision(f"project.k{i}", "state", value) for i in range(count))
     return mkr.KindRouting({}, mode, decisions)
-
-
-def _samples(store) -> dict[str, list]:
-    return {k: v for k, v in _kind_log(store).items() if k.startswith(mkr.SAMPLES_PREFIX)}
-
-
-def test_samples_cap_at_150_a_day_and_each_value_at_200_chars(tmp_path) -> None:
-    store = _v1(tmp_path, "day")
-    try:
-        mkr.record_kind_routing(store, _routing(100, value="x" * 500), "src", now=_T0)
-        mkr.record_kind_routing(store, _routing(100), "src", now=_T0 + timedelta(hours=1))
-        rows = _samples(store)
-        assert list(rows) == [mkr.SAMPLES_PREFIX + "2026-10-01"]
-        today = rows[mkr.SAMPLES_PREFIX + "2026-10-01"]
-        assert len(today) == mkr.SAMPLES_PER_DAY == 150
-        assert {len(s["value"]) for s in today if s["value"] != "v"} == {200}
-        assert set(today[0]) == {"key", "kind", "value", "store", "ts", "rules"}
-        assert {s["rules"] for s in today} == {mkr.RULES_VERSION}
-        counts = _kind_log(store)[mkr.COUNTS_PREFIX + "2026-10-01"]
-        assert counts["shadow"] == {"state": 200}, "counters count every item"
-        assert counts == {"shadow": {"state": 200}}, "the counts row keeps its shape"
-        assert _kind_log(store)[mkr.RESERVOIR_KEY]["seen"] == 200
-    finally:
-        store.close()
-
-
-def test_samples_stop_fourteen_days_after_shadow_first_ran(tmp_path) -> None:
-    assert mkr.SHADOW_SAMPLE_WINDOW_SECS == 14 * 86_400
-    store = _v1(tmp_path, "window")
-    try:
-        mkr.record_kind_routing(store, _routing(3), "src", now=_T0)
-        mkr.record_kind_routing(store, _routing(3), "src", now=_T0 + timedelta(days=13, hours=23))
-        mkr.record_kind_routing(store, _routing(3), "src", now=_T0 + timedelta(days=14))
-        mkr.record_kind_routing(store, _routing(3), "src", now=_T0 + timedelta(days=30))
-        assert sorted(_samples(store)) == [
-            mkr.SAMPLES_PREFIX + "2026-10-01",
-            mkr.SAMPLES_PREFIX + "2026-10-15",
-        ]
-        log = _kind_log(store)
-        assert log[mkr.COUNTS_PREFIX + "2026-10-31"] == {"shadow": {"state": 3}}
-        assert log[mkr.SHADOW_STARTED_KEY] == _T0.isoformat()
-    finally:
-        store.close()
-
-
-def test_samples_ring_holds_two_thousand_and_drops_the_oldest(tmp_path, monkeypatch) -> None:
-    # Lift the 14-day stop so the ring itself is what bounds the rows.
-    monkeypatch.setattr(mkr, "SHADOW_SAMPLE_WINDOW_SECS", 10**9)
-    store = _v1(tmp_path, "ring")
-    try:
-        for day in range(45):
-            mkr.record_kind_routing(store, _routing(150), "src", now=_T0 + timedelta(days=day))
-        rows = _samples(store)
-        assert sum(len(v) for v in rows.values()) == mkr.SAMPLES_TOTAL == 2_000
-        # 2,000 = 13 whole days of 150 plus 50 left of the oldest day kept.
-        assert len(rows[min(rows)]) == 50
-        assert min(rows) == mkr.SAMPLES_PREFIX + (_T0 + timedelta(days=31)).date().isoformat()
-        assert max(rows) == mkr.SAMPLES_PREFIX + (_T0 + timedelta(days=44)).date().isoformat()
-    finally:
-        store.close()
-
-
-def test_samples_never_pass_one_megabyte(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(mkr, "SHADOW_SAMPLE_WINDOW_SECS", 10**9)
-    store = _v1(tmp_path, "bytes")
-    wide = "\U0001f600" * 300  # 12 bytes a character once JSON-escaped
-    try:
-        for day in range(45):
-            mkr.record_kind_routing(
-                store, _routing(150, value=wide), "src", now=_T0 + timedelta(days=day)
-            )
-        with store._db_lock:
-            size = store.db.execute(
-                "SELECT SUM(LENGTH(CAST(value AS BLOB))) FROM memory_meta WHERE key GLOB ?",
-                (mkr.SAMPLES_PREFIX + "*",),
-            ).fetchone()[0]
-        assert 0 < size <= mkr.SAMPLE_BYTES_CAP == 1_000_000
-        rows = _samples(store)
-        assert sum(len(v) for v in rows.values()) < mkr.SAMPLES_TOTAL, "bytes bound first here"
-        assert max(rows) == mkr.SAMPLES_PREFIX + (_T0 + timedelta(days=44)).date().isoformat()
-        newest = rows[max(rows)]
-        assert len(newest) == 150, "the newest day survives whole"
-    finally:
-        store.close()
 
 
 def test_counter_rows_are_one_per_day_and_pruned_after_400_days(tmp_path) -> None:
@@ -506,157 +386,37 @@ def test_a_corrupt_log_row_is_replaced_not_fatal(tmp_path) -> None:
     store = _v1(tmp_path, "corrupt")
     try:
         store._write_meta(mkr.COUNTS_PREFIX + "2026-10-01", "not json")
-        store._write_meta(mkr.SAMPLES_PREFIX + "2026-10-01", json.dumps({"x": 1}))
         mkr.record_kind_routing(store, _routing(2), "src", now=_T0)
         log = _kind_log(store)
-        assert log[mkr.COUNTS_PREFIX + "2026-10-01"]["shadow"] == {"state": 2}
-        assert len(log[mkr.SAMPLES_PREFIX + "2026-10-01"]) == 2
-    finally:
-        store.close()
-
-
-# the reservoir
-
-
-def _numbered(start: int, count: int) -> mkr.KindRouting:
-    decisions = tuple(
-        mkr.KindDecision(f"project.k{i}", "fact", str(i)) for i in range(start, start + count)
-    )
-    return mkr.KindRouting({}, "shadow", decisions)
-
-
-def test_the_reservoir_spans_the_whole_day_and_never_passes_the_cap(tmp_path, monkeypatch) -> None:
-    import random
-
-    monkeypatch.setattr(mkr, "_RNG", random.Random(1234))
-    store = _v1(tmp_path, "reservoir")
-    per_pass, passes = 20, 150  # 3,000 items in one UTC day
-    try:
-        for n in range(passes):
-            now = _T0 - timedelta(hours=11) + timedelta(minutes=4 * n)
-            mkr.record_kind_routing(store, _numbered(n * per_pass, per_pass), "src", now=now)
-            today = _samples(store)[mkr.SAMPLES_PREFIX + "2026-10-01"]
-            assert len(today) <= mkr.SAMPLES_PER_DAY
-        kept = sorted(int(s["value"]) for s in today)
-        assert len(kept) == len(set(kept)) == mkr.SAMPLES_PER_DAY
-        total = per_pass * passes
-        tenths = [
-            sum(1 for i in kept if t * total // 10 <= i < (t + 1) * total // 10) for t in range(10)
-        ]
-        # 15 expected in each tenth of the day; first-N sampling would put all 150 in the first.
-        assert all(5 <= n <= 28 for n in tenths), tenths
-        counts = _kind_log(store)[mkr.COUNTS_PREFIX + "2026-10-01"]
-        assert counts["shadow"] == {"fact": total}
-        assert _kind_log(store)[mkr.RESERVOIR_KEY]["seen"] == total
-    finally:
-        store.close()
-
-
-def test_a_window_restarted_mid_day_samples_its_own_stream_evenly(tmp_path, monkeypatch) -> None:
-    """Items counted before the restart do not number the new reservoir's stream."""
-    import random
-
-    monkeypatch.setattr(mkr, "_RNG", random.Random(99))
-    store = _v1(tmp_path, "restart")
-    legacy = [
-        {"key": f"project.old{i}", "kind": "fact", "value": "x", "store": "default", "ts": "t"}
-        for i in range(50)
-    ]
-    try:
-        # Shadow under the old rules: its window long closed, 1,000 items counted today.
-        store._write_meta(mkr.SHADOW_STARTED_KEY, (_T0 - timedelta(days=30)).isoformat())
-        store._write_meta(mkr.COUNTS_PREFIX + "2026-10-01", json.dumps({"shadow": {"fact": 1000}}))
-        store._write_meta(mkr.SAMPLES_PREFIX + "2026-10-01", json.dumps(legacy))
-        per_pass, passes = 20, 100  # 2,000 items after the restart
-        for n in range(passes):
-            mkr.record_kind_routing(
-                store, _numbered(n * per_pass, per_pass), "src", now=_T0 + timedelta(minutes=n)
-            )
-        today = _samples(store)[mkr.SAMPLES_PREFIX + "2026-10-01"]
-        assert today[:50] == legacy, "old-rules samples are kept as they were"
-        assert len(today) == mkr.SAMPLES_PER_DAY
-        kept = sorted(int(s["value"]) for s in today[50:])
-        assert len(kept) == 100
-        total = per_pass * passes
-        tenths = [
-            sum(1 for i in kept if t * total // 10 <= i < (t + 1) * total // 10) for t in range(10)
-        ]
-        # 10 expected in each tenth; numbering from the day's 1,000 would crowd the first.
-        assert all(2 <= n <= 20 for n in tenths), tenths
-        counts = _kind_log(store)[mkr.COUNTS_PREFIX + "2026-10-01"]
-        assert counts["shadow"] == {"fact": 1000 + total}, "counters keep going"
-        assert _kind_log(store)[mkr.RESERVOIR_KEY]["seen"] == total
-    finally:
-        store.close()
-
-
-def test_enforce_never_restarts_the_sample_window(tmp_path) -> None:
-    store = _v1(tmp_path, "enforce-window")
-    long_ago = (_T0 - timedelta(days=20)).isoformat()
-    try:
-        store._write_meta(mkr.SHADOW_STARTED_KEY, long_ago)
-        mkr.record_kind_routing(store, _routing(2, mode="enforce"), "src", now=_T0)
-        log = _kind_log(store)
-        assert log[mkr.SHADOW_STARTED_KEY] == long_ago
-        assert mkr.RULES_VERSION_KEY not in log
         assert log[mkr.COUNTS_PREFIX + "2026-10-01"] == {"enforce": {"state": 2}}
     finally:
         store.close()
 
 
-def test_old_format_rows_still_read(tmp_path) -> None:
-    store = _v1(tmp_path, "old")
-    old_sample = {"key": "project.a", "kind": "fact", "value": "x", "store": "default", "ts": "t"}
+# rows the removed shadow mode left
+
+
+def test_rows_the_removed_shadow_wrote_stay_as_they_are(tmp_path) -> None:
+    store = _v1(tmp_path, "old-shadow")
+    old = {
+        "memory_kind_log:shadow_started_at": (_T0 - timedelta(days=20)).isoformat(),
+        "memory_kind_log:rules_version": "4",
+        "memory_kind_log:samples:2026-10-01": json.dumps([{"key": "project.a", "kind": "fact"}]),
+        mkr.COUNTS_PREFIX + "2026-10-01": json.dumps({"shadow": {"fact": 1}}),
+    }
     try:
-        store._write_meta(mkr.COUNTS_PREFIX + "2026-10-01", json.dumps({"shadow": {"fact": 1}}))
-        store._write_meta(mkr.SAMPLES_PREFIX + "2026-10-01", json.dumps([old_sample]))
-        store._write_meta(mkr.SHADOW_STARTED_KEY, _T0.isoformat())
-        store._write_meta(mkr.RULES_VERSION_KEY, str(mkr.RULES_VERSION))
+        for key, value in old.items():
+            store._write_meta(key, value)
+        before = {key: value for key, value in _kind_log(store).items() if "counts:" not in key}
+        assert len(before) == 3
         assert mkr.record_kind_routing(store, _routing(2), "src", now=_T0)
         log = _kind_log(store)
-        assert log[mkr.COUNTS_PREFIX + "2026-10-01"]["shadow"] == {"fact": 1, "state": 2}
-        today = log[mkr.SAMPLES_PREFIX + "2026-10-01"]
-        assert today[0] == old_sample
-        assert len(today) == 3
-    finally:
-        store.close()
-
-
-# the rules version
-
-
-def test_a_new_rules_version_restarts_the_sample_window(tmp_path) -> None:
-    store = _v1(tmp_path, "rules")
-    long_ago = _T0 - timedelta(days=20)
-    try:
-        # A log from before the version existed, its window long since closed.
-        store._write_meta(mkr.SHADOW_STARTED_KEY, long_ago.isoformat())
-        store._write_meta(mkr.COUNTS_PREFIX + long_ago.date().isoformat(), "{}")
-        mkr.record_kind_routing(store, _routing(2), "src", now=_T0)
-        log = _kind_log(store)
-        assert log[mkr.RULES_VERSION_KEY] == mkr.RULES_VERSION == 2
-        assert log[mkr.RULES_CHANGED_KEY] == _T0.isoformat()
-        assert log[mkr.SHADOW_STARTED_KEY] == _T0.isoformat()
-        assert len(log[mkr.SAMPLES_PREFIX + "2026-10-01"]) == 2
-        # The same version later does not restart it again.
-        later = _T0 + timedelta(days=15)
-        mkr.record_kind_routing(store, _routing(2), "src", now=later)
-        log = _kind_log(store)
-        assert log[mkr.SHADOW_STARTED_KEY] == _T0.isoformat()
-        assert log[mkr.RULES_CHANGED_KEY] == _T0.isoformat()
-        assert mkr.SAMPLES_PREFIX + later.date().isoformat() not in log
-        assert log[mkr.COUNTS_PREFIX + later.date().isoformat()] == {"shadow": {"state": 2}}
-    finally:
-        store.close()
-
-
-def test_a_fresh_store_starts_its_window_at_the_first_log(tmp_path) -> None:
-    store = _v1(tmp_path, "fresh")
-    try:
-        mkr.record_kind_routing(store, _routing(1), "src", now=_T0)
-        log = _kind_log(store)
-        assert log[mkr.SHADOW_STARTED_KEY] == _T0.isoformat()
-        assert log[mkr.RULES_VERSION_KEY] == mkr.RULES_VERSION
+        assert {key: value for key, value in log.items() if "counts:" not in key} == before
+        # The counts row keeps its old entry beside the new one.
+        assert log[mkr.COUNTS_PREFIX + "2026-10-01"] == {
+            "shadow": {"fact": 1},
+            "enforce": {"state": 2},
+        }
     finally:
         store.close()
 
@@ -667,54 +427,6 @@ def test_a_fresh_store_starts_its_window_at_the_first_log(tmp_path) -> None:
 def _seed(store: VectorMemoryStore, facts: dict) -> None:
     for key, value in facts.items():
         assert store.set_semantic(key=key, value=value, confidence=0.9, source="seed") is None
-
-
-def test_v1_samples_say_whether_the_key_existed_and_kept_its_value(tmp_path, monkeypatch) -> None:
-    _with_mode(monkeypatch, "shadow")
-    store = _v1(tmp_path, "prior")
-    try:
-        _seed(store, {"project.app.ci_status": "green", "project.app.auth_design": "older text"})
-        _consolidator(store)._write_structured_memory(_answer(), key="s1")
-        samples = {s["key"]: s for s in _samples(store)[mkr.SAMPLES_PREFIX + "2026-10-01"]}
-        assert (
-            samples["project.app.ci_status"]["existed"],
-            samples["project.app.ci_status"]["same_value"],
-        ) == (True, True)
-        assert (
-            samples["project.app.auth_design"]["existed"],
-            samples["project.app.auth_design"]["same_value"],
-        ) == (True, False)
-        assert (
-            samples["project.app.untagged"]["existed"],
-            samples["project.app.untagged"]["same_value"],
-        ) == (False, False)
-    finally:
-        store.close()
-
-
-def test_member_samples_read_the_store_before_the_span_writes(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(mkr, "_utcnow", lambda: _T0)
-    store = _member(tmp_path, monkeypatch)
-    try:
-        _apply(store, "shadow")
-        first = {s["key"]: s["existed"] for s in _samples(store)[mkr.SAMPLES_PREFIX + "2026-10-01"]}
-        assert set(first.values()) == {False}
-        _apply(store, "shadow", source_id="src-2")
-        rows = _samples(store)[mkr.SAMPLES_PREFIX + "2026-10-01"]
-        second = [s for s in rows[len(first) :]]
-        assert second and all(s["existed"] and s["same_value"] for s in second)
-    finally:
-        store.close()
-
-
-def test_a_sample_without_a_prior_read_leaves_the_fields_out(tmp_path) -> None:
-    store = _v1(tmp_path, "noprior")
-    try:
-        mkr.record_kind_routing(store, _routing(1), "src", now=_T0)
-        (sample,) = _samples(store)[mkr.SAMPLES_PREFIX + "2026-10-01"]
-        assert "existed" not in sample and "same_value" not in sample
-    finally:
-        store.close()
 
 
 @pytest.mark.parametrize(
@@ -733,15 +445,15 @@ def test_a_sample_without_a_prior_read_leaves_the_fields_out(tmp_path) -> None:
 def test_a_sibling_suffix_key_is_counted_and_written_as_before(
     tmp_path, monkeypatch, stored, key, counted
 ) -> None:
-    _with_mode(monkeypatch, "shadow")
+    _with_mode(monkeypatch, "enforce")
     store = _v1(tmp_path, "sibling")
     try:
         _seed(store, stored)
         answer = {"semantic": [{"key": key, "value": "b", "confidence": 0.9, "kind": "fact"}]}
         _consolidator(store)._write_structured_memory(answer, key="s1")
         counts = _kind_log(store)[mkr.COUNTS_PREFIX + "2026-10-01"]
-        assert counts.get(mkr.SIBLING_SUFFIX_COUNT) == ({"shadow": 1} if counted else None)
-        assert counts["shadow"] == {"fact": 1}
+        assert counts.get(mkr.SIBLING_SUFFIX_COUNT) == ({"enforce": 1} if counted else None)
+        assert counts["enforce"] == {"fact": 1}
         assert _facts(store)[key][0] == '"b"'
         assert set(_facts(store)) == set(stored) | {key}
     finally:
@@ -757,14 +469,15 @@ def test_capture_never_changes_what_enforce_writes(tmp_path) -> None:
         assert captured.result is routing.result
         assert captured.decisions == routing.decisions
         assert captured.refused == routing.refused
-        assert captured.prior is not None
-        assert set(captured.prior.values) == {"project.app.ci_status"}
+        assert captured.prior == mkr.PriorState(())
     finally:
         store.close()
 
 
 def test_capture_on_an_unreadable_store_hands_the_routing_back() -> None:
-    routing = mkr.route_semantic_by_kind(_answer(), "shadow")
+    # A sibling-suffix key, so capture has a read to fail.
+    answer = {"semantic": [{"key": "project.app.plan_final", "value": "b", "confidence": 0.9}]}
+    routing = mkr.route_semantic_by_kind(answer, "enforce")
     broken = MagicMock()
     broken.db.execute.side_effect = RuntimeError("no table")
     broken._db_lock = __import__("threading").RLock()
@@ -776,78 +489,284 @@ def test_capture_on_an_unreadable_store_hands_the_routing_back() -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_off_prompt_carries_no_kind_text(monkeypatch) -> None:
+@pytest.mark.parametrize("include_history", [False, True], ids=["prefs-only", "history"])
+async def test_every_mode_asks_offs_prompt_with_no_kind_text(monkeypatch, include_history) -> None:
     from test_consolidation_semantic_cap import _prompt_for
 
     prompts = {}
-    for mode in ("off", "shadow"):
+    for mode in ("off", "enforce"):
         monkeypatch.setattr(mkr, "configured_kind_routing_mode", lambda m=mode: m)
-        prompts[mode], _ = await _prompt_for([], include_history=False)
-    assert mkr.SHADOW_KIND_RULES in prompts["shadow"]
-    # Off is shadow with exactly the two kind segments taken out, and nothing else.
-    stripped = prompts["shadow"].replace('"kind": "fact" | "event" | "state", ', "", 1)
-    assert stripped.replace(mkr.SHADOW_KIND_RULES, "", 1) == prompts["off"]
-    for phrase in ("Tag every item with kind", "pending action"):
+        prompts[mode], _ = await _prompt_for([], include_history=include_history)
+    assert prompts["enforce"] == prompts["off"], "enforce asks off's prompt, byte for byte"
+    for phrase in (
+        '"kind"',
+        "Tag every item with kind",
+        "pending action",
+        "Name keys by topic, never by the number of",
+    ):
         assert phrase not in prompts["off"]
 
 
-#: The ``kind`` rules the enforce prompt carried before shadow trialled a
-#: candidate, copied byte for byte. Changing them is a promotion: its own change.
-_ADOPTED_KIND_RULES = (
-    "Tag every item with kind. Ask two questions: Will this still be true in a month? "
-    "Can this be looked up somewhere else? "
-    'kind "fact" = still true in a month and not looked up elsewhere '
-    "(a decision, a root cause, how something works). "
-    'kind "event" = something that happened, worth a dated record. '
-    'kind "state" = the current status of a PR, issue, CI run, branch, round or SHA, '
-    "which GitHub, git or the work ledger already holds. "
-    "pref.* and user.* items are always facts. "
-)
+def test_the_label_call_asks_the_enforce_rules() -> None:
+    assert mkr.ENFORCE_KIND_RULES in mkr.label_prompt([])
 
 
-@pytest.mark.asyncio
-async def test_the_enforce_prompt_keeps_the_adopted_rules(monkeypatch) -> None:
-    from test_consolidation_semantic_cap import _prompt_for
-
-    assert mkr.ENFORCE_KIND_RULES == _ADOPTED_KIND_RULES
-    prompts = {}
-    for mode in ("shadow", "enforce"):
-        monkeypatch.setattr(mkr, "configured_kind_routing_mode", lambda m=mode: m)
-        prompts[mode], _ = await _prompt_for([], include_history=False)
-    assert _ADOPTED_KIND_RULES in prompts["enforce"]
-    assert mkr.CANDIDATE_STATE_RULES not in prompts["enforce"]
-    # Enforce is shadow with the candidate taken out and only the key-naming rule added.
-    key_naming = "Name keys by topic, never by PR, issue or round number. "
-    expected = prompts["shadow"].replace(mkr.SHADOW_KIND_RULES, key_naming + _ADOPTED_KIND_RULES, 1)
-    assert prompts["enforce"] == expected
+@pytest.mark.parametrize("vendor_word", ["GitHub", "PR", "pull request", "Gerrit", "Jira"])
+def test_the_kind_rules_name_no_single_tracker(vendor_word) -> None:
+    assert re.search(rf"\b{re.escape(vendor_word)}\b", mkr.ENFORCE_KIND_RULES) is None
 
 
-def test_the_wider_state_rules_name_what_shadow_found_mistagged() -> None:
-    rules = mkr.CANDIDATE_STATE_RULES
-    assert rules in mkr.SHADOW_KIND_RULES and rules not in mkr.ENFORCE_KIND_RULES
+def test_enforce_asks_the_wider_state_rules_and_the_mixed_item_rule() -> None:
+    rules = mkr.ENFORCE_KIND_RULES
+    assert mkr.WIDER_STATE_RULES in rules and mkr.MIXED_ITEM_RULE in rules
     for phrase in (
+        "a code change under review (by any name or number)",
+        "a ticket or task",
+        "which chat or session owns it",
         "a next step",
         "a pending action",
         "what something is blocked on",
         "a count (tests, cycles, budgets)",
         "the local path of a worktree or scratch folder",
         "a value marked final or latest that will change again",
+        "with every work-item number removed",
     ):
         assert phrase in rules
 
 
+# the label call
+
+
+_CHAT = {"role": "user", "content": "the transcript says CHAT-ONLY-TEXT"}
+
+
+async def _run_pass(
+    tmp_path, monkeypatch, mode: str, label=None
+) -> tuple[list[str], VectorMemoryStore]:
+    """One history pass on a real V1 store; returns every prompt sent, and the store.
+
+    The first call answers :func:`_answer`; a later one goes to *label*, which
+    defaults to answering each item's own tag.
+    """
+    from consolidation_lease_helpers import lease_aware_log
+
+    from kiro_crew import executors
+
+    _with_mode(monkeypatch, mode)
+    log = lease_aware_log()
+    log.snapshot_for_consolidation.return_value = ([_CHAT], 1, 0, 0)
+    log.consolidation_retry_state.return_value = (0, 0.0)
+    memory = MagicMock()
+    memory.read_preferences.return_value = ""
+    memory.read_projects.return_value = ""
+    store = _v1(tmp_path, mode)
+    c = HistoryConsolidator(
+        log=log, memory=memory, sessions=None, vector_store=store, migrated=True
+    )
+    prompts: list[str] = []
+    ask = label or _labels_as_tagged(_answer())
+
+    async def inline(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    async def fake_llm(prompt: str, **_: object) -> object:
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            return _answer()
+        return await ask(prompt)
+
+    monkeypatch.setattr(executors, "run_in_memory_background_pool", inline)
+    with patch.object(c, "_call_llm", side_effect=fake_llm):
+        await c._consolidate("s1", include_history=True)
+    return prompts, store
+
+
+@pytest.mark.asyncio
+async def test_enforce_asks_offs_prompt_and_labels_the_routed_items_only(
+    tmp_path, monkeypatch
+) -> None:
+    runs = {}
+    for mode in ("off", "enforce"):
+        prompts, store = await _run_pass(tmp_path, monkeypatch, mode)
+        try:
+            runs[mode] = (prompts, _facts(store), _kind_log(store))
+        finally:
+            store.close()
+    (off_prompt,) = runs["off"][0]
+    enforce_prompt, label_prompt = runs["enforce"][0]
+    assert enforce_prompt == off_prompt, "what _call_llm receives is the same, byte for byte"
+    assert "project.app.ci_status" in runs["off"][1], "the pass wrote the answer"
+    assert runs["off"][2] == {}
+    # The label call reads the routed keys and values only.
+    assert "CHAT-ONLY-TEXT" not in label_prompt
+    assert mkr.ENFORCE_KIND_RULES in label_prompt
+    assert "project.app.ci_status" in label_prompt and "pref.editor" not in label_prompt
+    assert runs["enforce"][2][mkr.COUNTS_PREFIX + "2026-10-01"] == {
+        "enforce": {"event": 1, "fact": 2, "state": 1}
+    }
+
+
+async def _raises(prompt: str) -> object:
+    raise RuntimeError("throttled")
+
+
+async def _not_dispatched(prompt: str) -> object:
+    from kiro_crew.history_consolidation_span import _ConsolidationNotDispatched
+
+    raise _ConsolidationNotDispatched("provider returned no output")
+
+
+async def _unusable(prompt: str) -> object:
+    return {"kinds": "not a mapping"}
+
+
+async def _times_out(prompt: str) -> object:
+    raise asyncio.TimeoutError  # what wait_for raises once LABEL_TIMEOUT_SECS passes
+
+
+async def _labels_unlike_the_tags(prompt: str) -> dict:
+    """Labels that disagree with every tag the answer carries, by routed index."""
+    return {"kinds": {"0": "state", "1": "event", "2": "fact", "3": "state"}}
+
+
+@pytest.mark.asyncio
+async def test_enforce_drops_what_the_label_call_says_is_state(tmp_path, monkeypatch) -> None:
+    _, off = await _run_pass(tmp_path / "o", monkeypatch, "off")
+    _, enforce = await _run_pass(
+        tmp_path / "e", monkeypatch, "enforce", label=_labels_unlike_the_tags
+    )
+    try:
+        labelled_state = {"project.app.auth_design", "project.app.untagged"}
+        assert {key for key, _ in _events(enforce, "work_state")} == labelled_state
+        assert set(_facts(off)) - set(_facts(enforce)) == labelled_state
+        assert "project.app.ci_status" in _facts(enforce), "the model's own tag never decides"
+        assert _kind_log(enforce)[mkr.COUNTS_PREFIX + "2026-10-01"] == {
+            "enforce": {"event": 1, "fact": 1, "state": 2}
+        }
+    finally:
+        off.close()
+        enforce.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "stored, new, same",
-    [
-        ('"x"', "x", True),
-        ("1", 1, True),
-        ("1", True, False),
-        ("1", 1.0, False),
-        ('{"enabled": 0}', {"enabled": False}, False),
-        ("[1, 2]", [1, True], False),
-        ('{"a": [1]}', {"a": [1]}, True),
-        ("not json", "not json", True),
-    ],
+    "label", [_raises, _not_dispatched, _unusable, _times_out], ids=lambda f: f.__name__
 )
-def test_same_value_is_type_strict_all_the_way_down(stored, new, same) -> None:
-    assert mkr._same_value(stored, new) is same
+async def test_a_failed_label_call_under_enforce_writes_as_off(
+    tmp_path, monkeypatch, label
+) -> None:
+    _, off = await _run_pass(tmp_path / "off", monkeypatch, "off")
+    _, enforce = await _run_pass(tmp_path / "enforce", monkeypatch, "enforce", label=label)
+    try:
+        assert (_facts(enforce), _episodes(enforce)) == (_facts(off), _episodes(off))
+        assert _events(enforce, "work_state") == []
+    finally:
+        off.close()
+        enforce.close()
+
+
+@pytest.mark.asyncio
+async def test_enforce_labels_stamp_routed_items_only_and_leave_the_answer_alone() -> None:
+    answer = _answer()
+    before = json.loads(json.dumps(answer))
+    prompts: list[str] = []
+
+    async def ask(prompt: str) -> dict:
+        prompts.append(prompt)
+        return {"kinds": {"0": "state", "2": "bogus"}}
+
+    out = await mkr.label_enforce_kinds(answer, answer, ask)
+    assert answer == before, "the model's answer is not mutated"
+    assert prompts == [mkr.label_prompt(mkr.route_semantic_by_kind(answer, "enforce").decisions)]
+    assert [item.get("kind") for item in out["semantic"]] == [
+        "state",
+        "fact",
+        "fact",
+        "fact",
+        "state",  # pref.* is never routed: its own tag stays and is never read
+        "event",
+    ]
+    assert [d.key for d in mkr.route_semantic_by_kind(out, "enforce").refused] == [
+        "project.app.auth_design"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_pass_with_nothing_routed_makes_no_label_call() -> None:
+    called: list[str] = []
+
+    async def ask(prompt: str) -> object:
+        called.append(prompt)
+        return {}
+
+    answer = {"semantic": [{"key": "pref.editor", "value": "vim", "confidence": 0.9}]}
+    assert await mkr.label_enforce_kinds(answer, answer, ask) is answer
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_the_label_prompt_is_bounded_and_one_over_the_cap_is_not_sent(monkeypatch) -> None:
+    called: list[str] = []
+
+    async def ask(prompt: str) -> object:
+        called.append(prompt)
+        return {"kinds": {str(i): "state" for i in range(20)}}
+
+    # At the store's key bound (_MAX_KEY_LEN, 100), so every one is routed.
+    keys = [f"project.{i:02d}" + "k" * 90 for i in range(20)]
+    answer = {"semantic": [{"key": k, "value": "v" * 5_000, "confidence": 0.9} for k in keys]}
+    prompt = mkr.label_prompt([mkr.KindDecision(k, "fact", "v" * 5_000) for k in keys])
+    assert '"' + "v" * mkr.SAMPLE_VALUE_CHARS + '"' in prompt
+    assert "v" * (mkr.SAMPLE_VALUE_CHARS + 1) not in prompt
+    # Twenty items at the key and value bounds fit, so the cap never trims a real pass.
+    assert mkr.label_prompt_tokens(prompt) <= mkr.LABEL_INPUT_TOKENS
+    out = await mkr.label_enforce_kinds(answer, answer, ask)
+    assert called == [prompt]
+    assert {item["kind"] for item in out["semantic"]} == {"state"}
+    monkeypatch.setattr(mkr, "LABEL_INPUT_TOKENS", mkr.label_prompt_tokens(prompt) - 1)
+    out = await mkr.label_enforce_kinds(answer, answer, ask)
+    assert called == [prompt], "a prompt over the cap is never sent"
+    assert {item["kind"] for item in out["semantic"]} == {"fact"}, "unlabelled writes as off"
+
+
+def test_labels_are_read_by_index_and_unknown_kinds_are_none() -> None:
+    answer = {"kinds": {"0": " STATE ", "1": "status", "2": 1, "project.c": "fact"}}
+    assert mkr.labels_by_index(answer, 3) == ["state", None, None]
+    assert mkr.labels_by_index({"kinds": {}}, 2) == [None, None]
+    assert mkr.labels_by_index(None, 2) is None
+
+
+@pytest.mark.asyncio
+async def test_a_key_named_twice_is_labelled_per_value() -> None:
+    answer = {
+        "semantic": [
+            {"key": "project.app.ci", "value": "the design keeps CI on one runner"},
+            {"key": "project.app.ci", "value": "red on main"},
+        ]
+    }
+    prompts: list[str] = []
+
+    async def ask(prompt: str) -> dict:
+        prompts.append(prompt)
+        return {"kinds": {"0": "fact", "1": "state"}}
+
+    out = await mkr.label_enforce_kinds(answer, answer, ask)
+    assert "the design keeps CI on one runner" in prompts[0] and "red on main" in prompts[0]
+    assert [(item["value"], item["kind"]) for item in out["semantic"]] == [
+        ("the design keeps CI on one runner", "fact"),
+        ("red on main", "state"),
+    ]
+
+
+@pytest.mark.parametrize("unit", ["v", '"\n', "\u0001", "\\", "\u4e2d"])
+def test_escaped_values_keep_twenty_items_under_the_bound(unit: str) -> None:
+    value = unit * mkr.SAMPLE_VALUE_CHARS
+    decisions = tuple(
+        mkr.KindDecision(f"project.{i:02d}" + "k" * 96, "fact", value) for i in range(20)
+    )
+    prompt = mkr.label_prompt(decisions)
+    assert mkr.label_prompt_tokens(prompt) <= mkr.LABEL_INPUT_TOKENS
+    shown = json.loads(prompt.split("\nItems: ", 1)[1].split("\nReturn ", 1)[0])
+    for item in shown:
+        assert len(json.dumps(item["value"], ensure_ascii=False)) <= mkr.SAMPLE_VALUE_CHARS + 2
+        assert value.startswith(item["value"]) and item["value"]

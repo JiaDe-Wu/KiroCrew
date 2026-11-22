@@ -80,62 +80,31 @@ class TestHandlers:
         assert r.status == 201
         r = asyncio.run(handlers.api_instances_list(_FakeReq(state)))
         b = _body(r)
-        # One crew registered => automatic cap 1, and adding it is enough: the
-        # cap does not wait for the tunnel to come up.
-        assert b["warm_set_cap"] == 1 and len(b["instances"]) == 1
+        # The automatic cap is a flat 5, whatever the registry holds: it also
+        # covers relay Crews, which the registry does not count.
+        assert b["warm_set_cap"] == 5 and len(b["instances"]) == 1
         # no manager on this state => enabled-in-config but not active (needs restart)
         assert b["active"] is False
 
-    def test_automatic_cap_covers_every_registered_crew_not_just_connected_ones(
-        self, tmp_path, monkeypatch
-    ):
-        """The served cap covers every REGISTERED crew, connected or not.
+    def test_automatic_cap_does_not_follow_the_registry(self, tmp_path, monkeypatch):
+        """Auto serves 5 for one crew and for eleven alike.
 
-        A cap from the live connected count arrives one short when a tunnel comes up
-        late, and the viewport evicts a random pane (reads as a disconnect). Here 3 are
-        registered and 2 connected; the cap must still be 3.
+        The cap is shared with relay Crews, which this registry does not hold, so
+        a registered-SSH count would leave a relay-only user no warm pane.
         """
         from kiro_crew.dashboard import handlers_instances as handlers
 
         _enable(tmp_path, monkeypatch)
         reg = self._reg(tmp_path)
-        for name in ("a", "b", "c"):
-            reg.add(name=name, ssh_host=f"{name}-alias")
-        state = _State(reg, _ConnectedMgr(["a", "c"]))
-        b = _body(asyncio.run(handlers.api_instances_list(_FakeReq(state))))
-        assert len(b["instances"]) == 3
-        assert b["warm_set_cap"] == 3
-
-    def test_automatic_cap_serves_ten_and_then_stops_growing(self, tmp_path, monkeypatch):
-        from kiro_crew.dashboard import handlers_instances as handlers
-
-        _enable(tmp_path, monkeypatch)
-        reg = self._reg(tmp_path)
-        for index in range(11):
-            reg.add(name=f"crew-{index}", ssh_host=f"crew-{index}")
         state = _State(reg, _ConnectedMgr([]))
-
+        reg.add(name="crew-0", ssh_host="crew-0")
+        one = _body(asyncio.run(handlers.api_instances_list(_FakeReq(state))))["warm_set_cap"]
+        for index in range(1, 11):
+            reg.add(name=f"crew-{index}", ssh_host=f"crew-{index}")
         body = _body(asyncio.run(handlers.api_instances_list(_FakeReq(state))))
 
         assert len(body["instances"]) == 11
-        assert body["warm_set_cap"] == 10
-
-    def test_adding_a_crew_widens_the_served_cap(self, tmp_path, monkeypatch):
-        """Otherwise every new crew has to be paired with a config edit.
-
-        Forgetting that edit reintroduces the eviction above, so the cap has to
-        rise on its own when the fleet grows.
-        """
-        from kiro_crew.dashboard import handlers_instances as handlers
-
-        _enable(tmp_path, monkeypatch)
-        reg = self._reg(tmp_path)
-        reg.add(name="a", ssh_host="a-alias")
-        state = _State(reg, _ConnectedMgr([]))
-        before = _body(asyncio.run(handlers.api_instances_list(_FakeReq(state))))["warm_set_cap"]
-        reg.add(name="b", ssh_host="b-alias")
-        after = _body(asyncio.run(handlers.api_instances_list(_FakeReq(state))))["warm_set_cap"]
-        assert (before, after) == (1, 2)
+        assert (one, body["warm_set_cap"]) == (5, 5)
 
     def test_explicit_cap_is_served_even_below_the_registered_count(self, tmp_path, monkeypatch):
         """An operator's own number is the budget and is not widened for them."""
@@ -525,6 +494,8 @@ class TestHandlers:
         assert r.status == 502
         assert "token" not in _body(r)  # never serve a token we couldn't confirm
         assert "STALE_TOK" not in r.body.decode()
+        assert "expired" not in _body(r)["error"]
+        assert "check that its remote gateway is running" in _body(r)["error"]
 
     def test_connect_failure_promotes_the_diagnosis_verdict_to_a_top_level_code(
         self, tmp_path, monkeypatch
@@ -654,7 +625,7 @@ class TestHandlers:
             )
         )
         assert r.status == 200 and calls == ["cd-1"]
-        # Regression: the diagnosis must be surfaced even with no live tunnel,
+        # The diagnosis must be surfaced even with no live tunnel,
         # otherwise Diagnose on a disconnected instance shows nothing.
         body = _body(r)
         assert body["diagnosis"]["code"] == "remote_down"
@@ -1111,7 +1082,7 @@ class TestHandlers:
                 events.append(f"teardown(keep_intent={keep_intent})")
                 return True
 
-            async def reconfigure(self, instance_id, apply):
+            async def reconfigure(self, instance_id, apply, needs_teardown=None):
                 events.append("enter-critical-section")
                 await self.disconnect(instance_id, keep_intent=True)
                 out = apply()
@@ -1163,7 +1134,7 @@ class TestHandlers:
         reg.update("cd-1", was_connected=True)
 
         class _WedgedManager:
-            async def reconfigure(self, instance_id, apply):
+            async def reconfigure(self, instance_id, apply, needs_teardown=None):
                 raise OSError("ssh process will not die")
 
             async def disconnect(self, instance_id, *, keep_intent=False):

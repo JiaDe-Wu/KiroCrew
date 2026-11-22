@@ -1,10 +1,14 @@
-"""Optional in-process feature rows of ``kirocrew doctor``: vector memory, speech.
+"""Optional in-process feature rows of ``kirocrew doctor``: vector memory, speech,
+saved prompts.
 
 A prerequisite of a feature this install runs is an issue: the embedding runtime on a
-platform that ships one, an unusable custom embedding model, and the recogniser and
-audio decoder of an enabled speech-to-text provider (reported without counting on
-Windows, where the voice extra is optional). An optional accelerator, a cloud extra,
-or weights fetched on first use is a note.
+platform that ships one, an unusable custom embedding model, the recogniser and audio
+decoder of an enabled speech-to-text provider where the install ships them (a desktop
+release, off Windows), a local recogniser that is installed but cannot run (off
+Windows), and a selected Apple speech provider the host cannot run (on every
+platform). An optional accelerator, a cloud extra, weights fetched on first use, or a
+recogniser or decoder an install does not ship is a note. So is a saved prompt a
+built-in command shadows.
 """
 
 from __future__ import annotations
@@ -22,8 +26,8 @@ if TYPE_CHECKING:
 
 
 def _os_fix_hint(mac: str, linux: str, windows: str | None = None) -> str:
-    """Return the OS-appropriate Fix hint (brew on macOS, winget on Windows,
-    else Linux guidance).
+    """Return the OS-appropriate Fix hint (brew on macOS, the *windows* arm on
+    Windows, else Linux guidance).
 
     Without a Windows arm Windows would fall through to the Linux text, telling a
     Windows user to ``pipx``/drop a static build in ``~/.local/bin``, neither of
@@ -36,6 +40,11 @@ def _os_fix_hint(mac: str, linux: str, windows: str | None = None) -> str:
         return windows
     return linux
 
+
+# Where the Speech-to-Text controls live in the dashboard: a section of the Voice
+# tab, not a tab of its own. The labels are the English catalog's
+# ``settings.tabs.voice.label`` and ``pages.settings.voicePanel.speech_to_text``.
+_STT_SETTINGS_PATH = "Settings → Voice → Speech-to-Text"
 
 # The Linux arm of the missing-ffmpeg remedy, a module constant so the test can hold
 # it against the resolver's real search set. It must not name ``~/.local/bin``, which
@@ -50,13 +59,21 @@ def _os_fix_hint(mac: str, linux: str, windows: str | None = None) -> str:
 # desktop matrix ships; on any other ISA the fetch is refused and the second
 # clause is the remedy), and ``/usr/local/bin`` is both a real
 # ``_FFMPEG_CANDIDATE_DIRS`` entry and the conventional manual-install prefix.
-# Where the Speech-to-Text controls live in the dashboard: a section of the Voice
-# tab, not a tab of its own. The labels are the English catalog's
-# ``settings.tabs.voice.label`` and ``pages.settings.voicePanel.speech_to_text``.
-_STT_SETTINGS_PATH = "Settings → Voice → Speech-to-Text"
 _FFMPEG_LINUX_HINT = (
     f"download the audio decoder from the dashboard ({_STT_SETTINGS_PATH}), "
     "or install ffmpeg into /usr/local/bin"
+)
+
+# The Windows arm of the same rule. It must not name ``winget install Gyan.FFmpeg``:
+# winget lays that package out under ``%LOCALAPPDATA%\Microsoft\WinGet\Packages\
+# Gyan.FFmpeg_<source>\ffmpeg-<version>-full_build\bin`` with a link in
+# ``WinGet\Links``, and ``_ffmpeg_candidate_dirs`` searches neither (``Links`` holds
+# every portable package's executables, a generic user-writable directory). The
+# download has a pinned windows-x86_64 artifact; on any other ISA it is refused and
+# the second clause, a real ``_FFMPEG_CANDIDATE_DIRS`` entry, is the remedy.
+_FFMPEG_WINDOWS_HINT = (
+    f"download the audio decoder from the dashboard ({_STT_SETTINGS_PATH}), "
+    "or install ffmpeg into %ProgramFiles%\\ffmpeg\\bin"
 )
 
 
@@ -266,7 +283,7 @@ def _doctor_speech_to_text(cfg: KiroCrewConfig, issues: list[str]) -> None:
                 + _os_fix_hint(
                     "brew install ffmpeg",
                     _FFMPEG_LINUX_HINT,
-                    windows="winget install Gyan.FFmpeg",
+                    windows=_FFMPEG_WINDOWS_HINT,
                 )
             )
         if stt_fatal:
@@ -316,3 +333,28 @@ def _doctor_speech_to_text(cfg: KiroCrewConfig, issues: list[str]) -> None:
         else:
             print(f"  apple:       ❌ {apple.detail}")
             issues.append(f"apple speech ({apple.code})")
+
+
+def _doctor_saved_prompts() -> None:
+    """Render the ``Saved prompts`` section, only when a built-in command shadows one.
+
+    A ``slash_command`` prompt named after a built-in command never runs: typing
+    the name runs the command. That is a rename for the user, never an issue.
+    The file's stem is a reserved token, so the printed name holds only letters,
+    digits and hyphens.
+    """
+    from kiro_crew import quick_prompts
+
+    shadowed = quick_prompts.reserved_user_prompts()
+    if not shadowed:
+        return
+    print("\nSaved prompts")
+    for path in shadowed:
+        token = f"/{path.stem.lower()}"
+        print(
+            f"  {token + ':':<13}⚠️  ~/.kiro/prompts/{path.name} never runs: "
+            f"{token} is a built-in command"
+        )
+        # Lowercase: a prompt is read as ``<token>.md``, so ``Fork-prompt.md``
+        # would still not load on a case-sensitive filesystem.
+        print(f"               Fix: rename the file, for example to {token[1:]}-prompt.md")

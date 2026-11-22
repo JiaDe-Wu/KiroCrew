@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
-import QueueStack, { SubagentDeliveryProgress, isSystemDelivery, isNonInteractiveQueued } from '../components/QueueStack'
+import { act, render, screen, fireEvent, waitFor } from '@testing-library/react'
+import QueueStack, { SubagentDeliveryProgress, isAppMessageQueued, isServerWrittenQueued, isSystemDelivery, isNonInteractiveQueued } from '../components/QueueStack'
 import type { ChatMessage } from '../types'
 import { buildOutgoingTurn } from '../chat-core/composer/outgoingTurn'
 import { quoteBlock } from '../chat-core/composer/messageQuote'
@@ -52,23 +52,31 @@ describe('QueueStack quote-only entry', () => {
   })
 })
 
+/** A queued row as a real send leaves it: the WIRE text the composer's own
+ *  turn builder produced, its quote, and the envelope mark the gateway keeps
+ *  on the entry (`meta.knowledgeEnvelope`). */
+function sentQueued(input: Parameters<typeof buildOutgoingTurn>[0], queueId = 'q1'): ChatMessage {
+  const turn = buildOutgoingTurn(input, 'send')
+  const { quote, knowledge } = turn.meta
+  return { role: 'queued', content: turn.wire, cls: 'msg msg-queued', ts: '', meta: { queueId, ...(quote ? { quote } : {}), ...(knowledge ? { knowledgeEnvelope: knowledge.envelope } : {}) } } as ChatMessage
+}
+
 describe('QueueStack knowledge-context entry', () => {
-  // The queued row carries the WIRE text a real send produced, so these tests
-  // build it with the composer's own turn builder instead of hand-writing it.
   const KB = { totalTokens: 7, items: [{ id: 'k1', title: 'Doc', content: 'kb line one\n\nkb line two', tokens: 7 }] } as unknown as KnowledgeBlock
+  // A knowledge item that holds the close marker on a line of its own.
+  const MARKED_KB = { totalTokens: 7, items: [{ id: 'k1', title: 'Doc', content: 'Example:\n[END KNOWLEDGE CONTEXT]\nKeep this paragraph.', tokens: 7 }] } as unknown as KnowledgeBlock
 
   it('shows only what the user typed on the card, never the envelope', () => {
-    const wire = buildOutgoingTurn({ text: 'summarize the doc', knowledge: KB }, 'send').wire
-    expect(wire).toContain('[KNOWLEDGE CONTEXT')
-    const { container } = render(<QueueStack messages={[queued(wire, 'q1')]} onCancel={() => {}} onEdit={() => {}} />)
+    const row = sentQueued({ text: 'summarize the doc', knowledge: KB })
+    expect(row.content).toContain('[KNOWLEDGE CONTEXT')
+    const { container } = render(<QueueStack messages={[row]} onCancel={() => {}} onEdit={() => {}} />)
     expect(screen.getByText('summarize the doc')).toBeInTheDocument()
     expect(container.textContent).not.toMatch(/KNOWLEDGE CONTEXT|kb line one/)
   })
 
   it('opens the editor on the typed words and sends the envelope back with the edit', () => {
-    const wire = buildOutgoingTurn({ text: 'summarize the doc', knowledge: KB }, 'send').wire
     const onEdit = vi.fn()
-    render(<QueueStack messages={[queued(wire, 'q1')]} onCancel={() => {}} onEdit={onEdit} />)
+    render(<QueueStack messages={[sentQueued({ text: 'summarize the doc', knowledge: KB })]} onCancel={() => {}} onEdit={onEdit} />)
     const input = openEditor()
     expect(input.value).toBe('summarize the doc')
     fireEvent.change(input, { target: { value: 'summarize it briefly' } })
@@ -79,10 +87,10 @@ describe('QueueStack knowledge-context entry', () => {
 
   it('handles a quote plus knowledge: card shows the typed words, edit restores quote then envelope', () => {
     const quote = { role: 'assistant' as const, text: 'the quoted reply', ts: 't0' }
-    const wire = buildOutgoingTurn({ text: 'why though?', knowledge: KB, quote }, 'send').wire
-    expect(wire.startsWith(quoteBlock(quote))).toBe(true)
+    const row = sentQueued({ text: 'why though?', knowledge: KB, quote })
+    expect(row.content.startsWith(quoteBlock(quote))).toBe(true)
     const onEdit = vi.fn()
-    const { container } = render(<QueueStack messages={[{ role: 'queued', content: wire, cls: '', ts: 't', meta: { queueId: 'q1', quote } }]} onCancel={() => {}} onEdit={onEdit} />)
+    const { container } = render(<QueueStack messages={[row]} onCancel={() => {}} onEdit={onEdit} />)
     expect(screen.getByText('why though?')).toBeInTheDocument()
     expect(container.textContent).not.toMatch(/KNOWLEDGE CONTEXT|kb line one|quoting an earlier message/)
     const input = openEditor()
@@ -94,9 +102,8 @@ describe('QueueStack knowledge-context entry', () => {
 
   it('an entry sent with a quote, knowledge and no typed words edits into a well-formed send', () => {
     const quote = { role: 'assistant' as const, text: 'the quoted reply', ts: 't0' }
-    const wire = buildOutgoingTurn({ text: '', knowledge: KB, quote }, 'send').wire
     const onEdit = vi.fn()
-    render(<QueueStack messages={[{ role: 'queued', content: wire, cls: '', ts: 't', meta: { queueId: 'q1', quote } }]} onCancel={() => {}} onEdit={onEdit} />)
+    render(<QueueStack messages={[sentQueued({ text: '', knowledge: KB, quote })]} onCancel={() => {}} onEdit={onEdit} />)
     const input = openEditor()
     expect(input.value).toBe('')
     fireEvent.change(input, { target: { value: 'why?' } })
@@ -104,22 +111,20 @@ describe('QueueStack knowledge-context entry', () => {
     expect(onEdit).toHaveBeenCalledWith('q1', buildOutgoingTurn({ text: 'why?', knowledge: KB, quote }, 'send').wire)
   })
 
-  it('keeps the whole text when a knowledge item holds the close marker on its own line', () => {
-    // Two close-marker lines: which one ends the envelope cannot be told, so
-    // the card and editor keep the text whole rather than show document text
-    // as the user's words and let an edit overwrite it.
-    const kb = { totalTokens: 7, items: [{ id: 'k1', title: 'Doc', content: 'Example:\n[END KNOWLEDGE CONTEXT]\nKeep this paragraph.', tokens: 7 }] } as unknown as KnowledgeBlock
-    const wire = buildOutgoingTurn({ text: 'Summarize the reference.', knowledge: kb }, 'send').wire
+  it('hides exactly the recorded envelope when a knowledge item holds the close marker on its own line', () => {
     const onEdit = vi.fn()
-    render(<QueueStack messages={[queued(wire, 'q1')]} onCancel={() => {}} onEdit={onEdit} />)
+    const { container } = render(<QueueStack messages={[sentQueued({ text: 'Summarize the reference.', knowledge: MARKED_KB })]} onCancel={() => {}} onEdit={onEdit} />)
+    expect(container.textContent).not.toMatch(/KNOWLEDGE CONTEXT|Keep this paragraph/)
+    expect(screen.getByTestId('queue-card-knowledge')).toBeInTheDocument()
     const input = openEditor()
-    expect(input.value).toBe(wire)
-    expect(input.value).not.toMatch(/^Keep this paragraph/)
+    expect(input.value).toBe('Summarize the reference.')
+    fireEvent.change(input, { target: { value: 'Summarize it briefly.' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onEdit).toHaveBeenCalledWith('q1', buildOutgoingTurn({ text: 'Summarize it briefly.', knowledge: MARKED_KB }, 'send').wire)
   })
 
   it('marks the card when it hides a knowledge envelope, and only then', () => {
-    const withKb = buildOutgoingTurn({ text: 'summarize the doc', knowledge: KB }, 'send').wire
-    const { unmount } = render(<QueueStack messages={[queued(withKb, 'q1')]} onCancel={() => {}} onEdit={() => {}} />)
+    const { unmount } = render(<QueueStack messages={[sentQueued({ text: 'summarize the doc', knowledge: KB })]} onCancel={() => {}} onEdit={() => {}} />)
     const chip = screen.getByTestId('queue-card-knowledge')
     expect(chip).toHaveTextContent('knowledge attached')
     expect(chip).toHaveAttribute('title', expect.stringMatching(/attached/))
@@ -131,8 +136,7 @@ describe('QueueStack knowledge-context entry', () => {
   it('drops the chip label to screen-reader-only on a narrow card, never removing it', () => {
     // jsdom evaluates no container query; this pins the rule that does it
     // (the capture script asserts the real narrow layout).
-    const wire = buildOutgoingTurn({ text: 'summarize the doc', knowledge: KB }, 'send').wire
-    render(<QueueStack messages={[queued(wire, 'q1')]} onCancel={() => {}} onEdit={() => {}} />)
+    render(<QueueStack messages={[sentQueued({ text: 'summarize the doc', knowledge: KB })]} onCancel={() => {}} onEdit={() => {}} />)
     const label = screen.getByTestId('queue-card-knowledge-label')
     expect(label).toHaveTextContent('knowledge attached')
     expect(label.className).toContain('/queuecard:sr-only')
@@ -143,17 +147,16 @@ describe('QueueStack knowledge-context entry', () => {
   })
 
   it('keeps the knowledge mark beside the edit box while editing', () => {
-    const wire = buildOutgoingTurn({ text: 'summarize the doc', knowledge: KB }, 'send').wire
-    render(<QueueStack messages={[queued(wire, 'q1')]} onCancel={() => {}} onEdit={() => {}} />)
+    render(<QueueStack messages={[sentQueued({ text: 'summarize the doc', knowledge: KB })]} onCancel={() => {}} onEdit={() => {}} />)
     openEditor()
     expect(screen.getByTestId('queue-card-knowledge')).toBeInTheDocument()
   })
 
-  it('shows no knowledge mark when the split refuses and the card already shows the envelope', () => {
-    const kb = { totalTokens: 7, items: [{ id: 'k1', title: 'Doc', content: 'Example:\n[END KNOWLEDGE CONTEXT]\nKeep this paragraph.', tokens: 7 }] } as unknown as KnowledgeBlock
-    const wire = buildOutgoingTurn({ text: 'Summarize the reference.', knowledge: kb }, 'send').wire
+  it('keeps a typed copy of an envelope whole: with no recorded mark, nothing is hidden', () => {
+    const wire = buildOutgoingTurn({ text: 'Summarize the reference.', knowledge: KB }, 'send').wire
     render(<QueueStack messages={[queued(wire, 'q1')]} onCancel={() => {}} onEdit={() => {}} />)
     expect(screen.queryByTestId('queue-card-knowledge')).toBeNull()
+    expect(openEditor().value).toBe(wire)
   })
 
   it('leaves a message that merely mentions the marker mid-text untouched', () => {
@@ -173,10 +176,10 @@ describe('QueueStack pasted entry', () => {
 
   function pasted(input: Parameters<typeof buildOutgoingTurn>[0], queueId = 'q1'): ChatMessage {
     const turn = buildOutgoingTurn(input, 'send')
-    const { quote, files } = turn.meta
+    const { quote, files, knowledge } = turn.meta
     // In token order, as `queueEntryPastes` reads them off the recorded display.
     const pastes = findTokenRanges(turn.bubble, turn.meta.pastes ?? []).sort((a, b) => a.start - b.start).map(r => r.block)
-    return { role: 'queued', content: turn.wire, cls: 'msg msg-queued', ts: '', meta: { queueId, ...(files ? { files } : {}), ...(pastes.length ? { pastes } : {}), ...(quote ? { quote } : {}) } } as ChatMessage
+    return { role: 'queued', content: turn.wire, cls: 'msg msg-queued', ts: '', meta: { queueId, ...(files ? { files } : {}), ...(pastes.length ? { pastes } : {}), ...(quote ? { quote } : {}), ...(knowledge ? { knowledgeEnvelope: knowledge.envelope } : {}) } } as ChatMessage
   }
 
   beforeEach(() => { localStorage.clear() })
@@ -500,7 +503,7 @@ describe('QueueStack inline edit', () => {
     const kb = { totalTokens: 7, items: [{ id: 'k1', title: 'Doc', content: 'kb line one', tokens: 7 }] } as unknown as KnowledgeBlock
     const quote = { role: 'assistant' as const, text: 'the quoted reply', ts: 't0' }
     const cards: ChatMessage[] = [
-      queued(buildOutgoingTurn({ text: 'summarize the doc', knowledge: kb }, 'send').wire, 'q1'),
+      sentQueued({ text: 'summarize the doc', knowledge: kb }),
       { role: 'queued', content: `${quoteBlock(quote)}\n\nwhy though?`, cls: '', ts: 't', meta: { queueId: 'q1', quote } } as ChatMessage,
     ]
     for (const card of cards) {
@@ -639,6 +642,16 @@ describe('isNonInteractiveQueued (composer QueueStack exclusion)', () => {
     expect(isNonInteractiveQueued(queued('[Empty response — automatic recovery]\n…', 'q5'))).toBe(true)
   })
 
+  it("excludes the gateway's workflow follow-up prompt", () => {
+    const followup = queued('[Workflow `nightly` finished: finished] Its result was just posted above.', 'q1')
+    expect(isNonInteractiveQueued({ ...followup, meta: { ...followup.meta, kind: 'workflow_followup' } })).toBe(true)
+  })
+
+  it("excludes a heartbeat task's queued prompt", () => {
+    const prompt = queued('💓 Heartbeat\n\nTwo CRs have new comments.', 'q1')
+    expect(isNonInteractiveQueued({ ...prompt, meta: { ...prompt.meta, kind: 'heartbeat_prompt' } })).toBe(true)
+  })
+
   it('keeps real user-typed messages interactive', () => {
     expect(isNonInteractiveQueued(queued('please also check the docs', 'q1'))).toBe(false)
     // A user quoting the prefix mid-sentence is still a user message.
@@ -668,6 +681,25 @@ describe('QueueStack editor hold', () => {
     expect(onEditOpen.mock.calls).toEqual([['q1', true]])
   })
 
+  // The hold lapses on a deadline, so an open editor renews it, and a save
+  // ends the renewals: one landing after the save would hold the queue again.
+  it('renews the hold while the editor stays open, and not after a save', () => {
+    vi.useFakeTimers()
+    try {
+      const onEditOpen = vi.fn()
+      render(<QueueStack messages={[queued('old words', 'q1')]} onCancel={() => {}} onEdit={() => {}} onEditOpen={onEditOpen} />)
+      const input = openEditor()
+      act(() => { vi.advanceTimersByTime(90_000) })
+      expect(onEditOpen.mock.calls).toEqual([['q1', true], ['q1', true], ['q1', true], ['q1', true]])
+      fireEvent.change(input, { target: { value: 'new words' } })
+      fireEvent.keyDown(input, { key: 'Enter' })
+      act(() => { vi.advanceTimersByTime(90_000) })
+      expect(onEditOpen).toHaveBeenCalledTimes(4)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('releases the hold when the stack unmounts with the editor open', () => {
     const onEditOpen = vi.fn()
     const { unmount } = render(<QueueStack messages={[queued('old words', 'q1')]} onCancel={() => {}} onEdit={() => {}} onEditOpen={onEditOpen} />)
@@ -686,5 +718,148 @@ describe('QueueStack editor hold', () => {
     rerender(<QueueStack key="chat-b" messages={[queued('other', 'q9')]} onCancel={() => {}} onEdit={() => {}} onEditOpen={incoming} />)
     expect(outgoing.mock.calls).toEqual([['q1', true], ['q1', false]])
     expect(incoming).not.toHaveBeenCalled()
+  })
+})
+
+describe('QueueStack durable verdict', () => {
+  it('labels only the entry the server says will not survive a restart', () => {
+    render(<QueueStack messages={[queued('kept', 'q1'), { ...queued('refused', 'q2'), meta: { queueId: 'q2', durable: false } }]} />)
+    const labels = screen.getAllByTestId('queue-card-not-durable')
+    expect(labels).toHaveLength(1)
+    expect(labels[0]).toHaveTextContent("won't survive a restart")
+    expect(labels[0].closest('[data-testid="queue-card"]')).toHaveTextContent('refused')
+  })
+})
+
+describe('QueueStack restored card', () => {
+  it('stops the hourglass on a restored card, which waits for the person', () => {
+    const live = render(<QueueStack messages={[queued('live', 'q1')]} />)
+    expect(screen.getByTestId('queue-card-hourglass').className).toContain('animate-')
+    live.unmount()
+    render(<QueueStack messages={[{ ...queued('restored', 'r1'), meta: { queueId: 'r1', restored: true, held: true } }]} />)
+    expect(screen.getByTestId('queue-card-hourglass').className).not.toContain('animate-')
+  })
+
+  it('keeps the hourglass turning on a restored card the server does not hold', () => {
+    render(<QueueStack messages={[{ ...queued('restored', 'r1'), meta: { queueId: 'r1', restored: true } }]} />)
+    expect(screen.getByTestId('queue-card-hourglass').className).toContain('animate-')
+  })
+})
+
+describe('QueueStack held restored card', () => {
+  const restored = (queueId: string): ChatMessage => ({ ...queued('restored words', queueId), meta: { queueId, restored: true, held: true } })
+  const HELD = "Restored after a restart. Won't send on its own."
+
+  it('says in words that a held restored card waits for the person', () => {
+    render(<QueueStack messages={[restored('r1')]} onCancel={() => {}} onInterrupt={() => {}} onEdit={() => {}} />)
+    expect(screen.getByTestId('queue-card-held')).toHaveTextContent(HELD)
+  })
+
+  it('shows no held line where the stack offers no Send now, edit and cancel', () => {
+    const view = render(<QueueStack messages={[restored('r1')]} />)
+    expect(screen.queryByTestId('queue-card-held')).not.toBeInTheDocument()
+    view.rerender(<QueueStack messages={[restored('r1')]} onCancel={() => {}} onEdit={() => {}} />)
+    expect(screen.queryByTestId('queue-card-held')).not.toBeInTheDocument()
+  })
+
+  it('shows no held line on a card that was not restored', () => {
+    render(<QueueStack messages={[queued('live', 'q1')]} onCancel={() => {}} onInterrupt={() => {}} onEdit={() => {}} />)
+    expect(screen.queryByTestId('queue-card-held')).not.toBeInTheDocument()
+  })
+
+  it('reads the server held flag, not restored provenance: a restored card the startup drain accepted shows no line, and shows it once the flag flips', () => {
+    const accepted: ChatMessage = { ...queued('restored words', 'r1'), meta: { queueId: 'r1', restored: true } }
+    const view = render(<QueueStack messages={[accepted]} onCancel={() => {}} onInterrupt={() => {}} onEdit={() => {}} />)
+    expect(screen.queryByTestId('queue-card-held')).not.toBeInTheDocument()
+    view.rerender(<QueueStack messages={[restored('r1')]} onCancel={() => {}} onInterrupt={() => {}} onEdit={() => {}} />)
+    expect(screen.getByTestId('queue-card-held')).toHaveTextContent(HELD)
+  })
+
+  it('puts the held line on its own row under the message, without truncation', () => {
+    render(<QueueStack messages={[restored('r1')]} onCancel={() => {}} onInterrupt={() => {}} onEdit={() => {}} />)
+    const line = screen.getByTestId('queue-card-held')
+    expect(line.className).not.toContain('truncate')
+    expect(line.hasAttribute('title')).toBe(false)
+    expect(line.parentElement?.contains(screen.getByText('restored words'))).toBe(true)
+    expect(line.previousElementSibling?.contains(screen.getByText('restored words'))).toBe(true)
+  })
+
+  it('drops the line while Send now is in flight or accepted, and brings it back when it is declined', () => {
+    const onInterrupt = vi.fn()
+    const view = render(<QueueStack messages={[restored('r1')]} onCancel={() => {}} onInterrupt={onInterrupt} onEdit={() => {}} />)
+    fireEvent.click(screen.getByLabelText('Send now'))
+    expect(onInterrupt).toHaveBeenCalledWith('r1')
+    view.rerender(<QueueStack messages={[restored('r1')]} onCancel={() => {}} onInterrupt={onInterrupt} onEdit={() => {}} pendingIds={new Set(['r1'])} />)
+    expect(screen.queryByTestId('queue-card-held')).not.toBeInTheDocument()
+    view.rerender(<QueueStack messages={[restored('r1')]} onCancel={() => {}} onInterrupt={onInterrupt} onEdit={() => {}} pendingIds={new Set()} />)
+    expect(screen.getByTestId('queue-card-held')).toBeInTheDocument()
+  })
+
+  it('drops the line when the card is cancelled and leaves the queue', async () => {
+    const onCancel = vi.fn()
+    const view = render(<QueueStack messages={[restored('r1')]} onCancel={onCancel} onInterrupt={() => {}} onEdit={() => {}} />)
+    expect(screen.getByTestId('queue-card-held')).toBeInTheDocument()
+    fireEvent.click(screen.getByLabelText('Cancel queued message'))
+    expect(onCancel).toHaveBeenCalledWith('r1')
+    view.rerender(<QueueStack messages={[]} onCancel={onCancel} onInterrupt={() => {}} onEdit={() => {}} />)
+    await waitFor(() => expect(screen.queryByTestId('queue-card-held')).not.toBeInTheDocument())
+  })
+})
+
+describe('QueueStack collapsed stack with a held front card', () => {
+  it('lines every backing card up with the front card top, one peek higher per depth', () => {
+    const held: ChatMessage = { ...queued('front', 'r1'), meta: { queueId: 'r1', restored: true, held: true } }
+    render(<QueueStack messages={[held, queued('second', 'q2')]} onCancel={() => {}} onInterrupt={() => {}} onEdit={() => {}} />)
+    const boxes = screen.getAllByTestId('queue-card').map(c => c.parentElement as HTMLElement)
+    const y = (el: HTMLElement) => Number(/translateY\((-?[\d.]+)px\)/.exec(el.style.transform)?.[1] ?? 0)
+    const h = (el: HTMLElement) => parseFloat(el.style.height)
+    expect(h(boxes[0])).toBeGreaterThan(h(boxes[1]))
+    // The backing card's top sits above the front card's top.
+    expect(y(boxes[1])).toBeLessThan(y(boxes[0]))
+  })
+})
+
+describe('QueueStack server-written entry (resource wake, MCP-App message)', () => {
+  const WAKE_TEXT = '[Webhook wake]\nresource changed: crux://reviews/CR-9\n[End of webhook wake]'
+  const resourceWake = (queueId: string): ChatMessage => ({
+    role: 'queued', content: WAKE_TEXT, cls: 'msg msg-queued', ts: '',
+    meta: { queueId, kind: 'resource_wake', resourceServer: 'crux', resourceSubscription: 'rsub_1' },
+  }) as ChatMessage
+  const appMessage = (queueId: string): ChatMessage => ({
+    role: 'queued', content: 'clicked approve', cls: 'msg msg-queued', ts: '',
+    meta: { queueId, kind: 'mcp_app_message', appLabel: 'demo' },
+  }) as ChatMessage
+
+  it('isServerWrittenQueued holds for both server kinds and never for the person\'s own entry', () => {
+    expect(isServerWrittenQueued(resourceWake('q1'))).toBe(true)
+    expect(isServerWrittenQueued(appMessage('q2'))).toBe(true)
+    expect(isServerWrittenQueued(queued('my own words', 'q3'))).toBe(false)
+    expect(isServerWrittenQueued(undefined)).toBe(false)
+    // The app-only display predicate keeps its scope.
+    expect(isAppMessageQueued(resourceWake('q1'))).toBe(false)
+  })
+
+  it('a queued resource wake offers no edit, keeps cancel, and shows its text as it arrived', () => {
+    const onCancel = vi.fn()
+    render(<QueueStack messages={[resourceWake('q1')]} onCancel={onCancel} onEdit={vi.fn()} onInterrupt={vi.fn()} />)
+    expect(screen.queryByLabelText('Edit queued message')).toBeNull()
+    const cancel = screen.getByLabelText('Cancel queued message')
+    expect(cancel).toHaveAttribute('title', 'Cancel queued message')
+    fireEvent.click(cancel)
+    expect(onCancel).toHaveBeenCalledWith('q1')
+    expect(screen.getByTestId('queue-card').textContent).toContain('resource changed: crux://reviews/CR-9')
+  })
+
+  it('a queued MCP-App message keeps its read-only card and its app attribution', () => {
+    render(<QueueStack messages={[appMessage('q1')]} onCancel={vi.fn()} onEdit={vi.fn()} />)
+    expect(screen.queryByLabelText('Edit queued message')).toBeNull()
+    expect(screen.getByLabelText('Cancel queued message')).toHaveAttribute('title', 'Cancel queued message')
+    expect(screen.getByTestId('queue-card').textContent).toContain('demo')
+  })
+
+  it('the person\'s own queued message keeps its pencil and its move-back-to-input cancel', () => {
+    render(<QueueStack messages={[queued('my own words', 'q1')]} onCancel={vi.fn()} onEdit={vi.fn()} />)
+    expect(screen.getByLabelText('Edit queued message')).toBeInTheDocument()
+    expect(screen.getByLabelText('Cancel queued message')).toHaveAttribute('title', 'Cancel and move back to input')
   })
 })

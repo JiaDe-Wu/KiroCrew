@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -86,17 +87,33 @@ def _git(repo: Path, *args: str) -> str:
     return out.stdout.strip()
 
 
-def _repo(tmp_path: Path) -> Path:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "main")
-    (repo / "mod.py").write_text("def last_char(s):\n    return s[len(s) - 2]\n")
-    (repo / "test_mod.py").write_text(
+_TEMPLATE: list[Path] = []
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _repo_template(tmp_path_factory):
+    """Build the base repo once per module; ``_repo`` copies it for each test.
+
+    Safe to share because no test is handed the template, only a copy of it.
+    """
+    root = tmp_path_factory.mktemp("prove-line-seed") / "repo"
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "main")
+    (root / "mod.py").write_text("def last_char(s):\n    return s[len(s) - 2]\n")
+    (root / "test_mod.py").write_text(
         "from mod import last_char\n\n\ndef test_smoke():\n    assert last_char('abc') == 'b'\n"
     )
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    _git(repo, "checkout", "-q", "-b", "feature")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "base")
+    _git(root, "checkout", "-q", "-b", "feature")
+    _TEMPLATE.append(root)
+    yield
+    _TEMPLATE.remove(root)
+
+
+def _repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    shutil.copytree(_TEMPLATE[-1], repo)
     return repo
 
 
@@ -378,7 +395,7 @@ def test_prove_git_env_drops_location_and_pins_hooks_off(_floor_monkeypatch) -> 
     assert "GIT_CONFIG_PARAMETERS" not in env  # a parent's `git -c key=value` is not inherited
     # the pins are argv options, the one source nothing inherited can outrank
     assert prove._git_argv(["status"]) == [
-        "git",
+        prove._tool_argv.which("git"),
         "-c",
         "core.hooksPath=" + os.devnull,
         "-c",
@@ -399,7 +416,7 @@ def test_prove_git_env_keeps_the_callers_other_config(_floor_monkeypatch) -> Non
 def test_every_git_subprocess_in_prove_goes_through_the_pinned_argv() -> None:
     """Class sweep: no `["git", ...]` literal or bare `subprocess` git call bypasses the pins."""
     source = PROVE.read_text(encoding="utf-8")
-    assert '["git"' not in source.replace('return ["git", *GIT_PINS, *args]', "")
+    assert '["git"' not in source.replace('resolve(["git", *GIT_PINS, *args])', "")
     assert source.count("_git_argv(") >= 3  # _git plus the two `git apply` calls
     assert "GIT_CONFIG_PARAMETERS" in source
 

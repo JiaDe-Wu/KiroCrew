@@ -12,6 +12,8 @@ import type { ComposerControl } from '../composerControl'
 import type { useComposerPickers } from '../../chat-core/composer/pickers'
 import type { ChatInputProps } from './props'
 import { useComposerUploadProgress } from '../../utils/composerSendHolds'
+import { IS_MAC, shortcutPlatform } from '../../hooks/useKeyboardShortcuts'
+import { chordMatchesEvent, shortcutEntry } from '../../lib/shortcutRegistry'
 
 /* The attach control at the head of the bottom row: the "+" drop-up (upload,
    screenshot, sketch, collapse, and the `/` `@` `$` shortcuts) on a pointer
@@ -91,7 +93,7 @@ export function usePlusMenu({ pickers, value, onChange, composerControl, fileInp
   /** Read when the picker closes, so it may close over state declared later in render. */
   isTouchInput: () => boolean
 }) {
-  const { setSlashMenuOpen, setFilePickerOpen, setFileQuery, setSkillPickerOpen, setSkillQuery } = pickers
+  const { setSlashMenuOpen, setFilePickerOpen, setFileQuery, setSkillPickerOpen, setSkillQuery, closePickers } = pickers
   // "+" drop-up menu (upload file / image + browse toggle).
   const [plusOpen, setPlusOpen] = useState(false)
   const [sketchOpen, setSketchOpen] = useState(false)
@@ -118,7 +120,8 @@ export function usePlusMenu({ pickers, value, onChange, composerControl, fileInp
   // notably when the mobile keyboard closes (visualViewport-only signal).
   useAnchorRemeasure(plusOpen, measurePlus)
   const togglePlus = () => {
-    if (!plusOpen) measurePlus()
+    // The menu opens in place of any open picker, never stacked over it.
+    if (!plusOpen) { measurePlus(); closePickers() }
     setPlusOpen(o => !o)
   }
   // Open an in-input trigger picker from the + menu (mirrors typing the sigil):
@@ -151,6 +154,16 @@ export function usePlusMenu({ pickers, value, onChange, composerControl, fileInp
   return { plusOpen, setPlusOpen, sketchOpen, setSketchOpen, plusWrapRef, plusBtnRef, plusMenuRef, plusRect, togglePlus, openTrigger }
 }
 
+/** ⌘⇧U / Ctrl+Shift+U in the composer: the keyboard twin of the Upload file
+ *  tile, so the caller fires it only while that tile can be pressed. A key an
+ *  input method took (the composer's IME guard, e.g. IBus's Ctrl+Shift+U
+ *  Unicode entry) stays the input method's. */
+export function isUploadFileChord(e: React.KeyboardEvent, ime: { isComposing: (e: React.KeyboardEvent) => boolean }): boolean {
+  const platform = shortcutPlatform()
+  const chord = shortcutEntry('upload-file')?.defaults[platform]
+  return !!chord && !ime.isComposing(e) && chordMatchesEvent(e, chord, platform)
+}
+
 /* Progress sits BESIDE the cancel control as text, not as a third button, so
    the row keeps max-two-buttons-per-row. It subscribes here, in the leaf, so a
    progress step re-renders this note and not the composer. The status span is
@@ -169,7 +182,7 @@ function UploadProgressNote({ slot }: { slot: string }) {
   )
 }
 
-export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, uploadCount, uploadSlot, directFilePicker, fileInputId, openPicker, isMac, touchInput, onScreenshot, collapseMenuRow, typedCommandMenus, onFileSelect, optimizeRow = null, appActionRows = null }: {
+export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, uploadCount, uploadSlot, directFilePicker, fileInputId, openPicker, isMac, touchInput, onScreenshot, collapseMenuRow, typedCommandMenus, onFileSelect, optimizeRow = null, appActionRows = null, stashMenuRows }: {
   /** App composer actions (`composerActions.tsx`), a group of their own after
    *  the host's shortcuts so an app's row never sits among the host's. */
   appActionRows?: ReactNode
@@ -195,6 +208,8 @@ export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, upl
   collapseMenuRow: ReactNode
   typedCommandMenus: boolean
   onFileSelect: ChatInputProps['onFileSelect']
+  /** The prompt-stash rows the "+" menu hosts (null when the stash is off). */
+  stashMenuRows?: ReactNode
 }) {
   const { plusOpen, setPlusOpen, setSketchOpen, plusWrapRef, plusBtnRef, plusMenuRef, plusRect, togglePlus, openTrigger } = plus
   // The "+" trigger opens its menu on the mouse press (usePressActivation);
@@ -287,6 +302,7 @@ export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, upl
                 <button
                   type="button"
                   onClick={() => openPicker(false)}
+                  title={i18nT(IS_MAC ? 'components.chatInput.upload_file_title_mac' : 'components.chatInput.upload_file_title')}
                   {...uiLocation('composer.add-menu.upload')}
                   className="flex-1 flex flex-col items-center gap-1.5 px-2 py-3 rounded-lg border border-border bg-transparent hover:bg-bg-hover hover:border-border-strong transition-all cursor-pointer"
                 >
@@ -385,6 +401,7 @@ export function AttachMenu({ plus, onUploadFiles, uploading, onCancelUpload, upl
                   </div>
                 </button>}
               </div>
+              {stashMenuRows}
               {appActionRows}
             </div>
           </OverlayPortal>}

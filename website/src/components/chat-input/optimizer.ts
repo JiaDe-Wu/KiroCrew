@@ -8,7 +8,8 @@ import { i18nT } from '../../i18n/t'
 import type { ComposerControl } from '../composerControl'
 import { terminalCommand } from '../../hooks/useTerminalCommand'
 import type { ChatInputProps } from './props'
-import { useComposerOptimizeBeforeSend } from '../../hooks/useComposerOptimizeBeforeSend'
+import { useComposerOptimizeBeforeSend, useComposerShowOptimizePrompt } from '../../hooks/useComposerOptimizeBeforeSend'
+import { apiTransport } from '../../api/apiTransport'
 
 /* "Optimize prompt": the request, its slot binding, and the undoable
    write-back. The result is never sent; it lands in the draft of the slot
@@ -26,6 +27,11 @@ function keepsFolderMentions(draft: string, rewrite: string): boolean {
 }
 
 const busyNotice = () => i18nT('components.chatInput.optimizing_another_chat_please_wait')
+
+/** Whether this composer offers "Optimize prompt": the host's own
+ *  `promptOptimizer` flag AND Settings > Chat > Composer > Show Optimize
+ *  Prompt. A host that opts out stays off whatever the preference says. */
+export const usePromptOptimizerEnabled = (host: boolean) => useComposerShowOptimizePrompt() && host
 
 export function usePromptOptimizer({ slotId, chatStore, valueRef, pasteBlocks, onChange, onOptimizeResult, lexicalComposer, lexicalLoadFailed, composerControl, inputRef, valueFromUserRef, optimizingRef, appendUndoBoundary, terminalCommands, optimizerMentionGuard, composerDisabled }: {
   slotId: string | null
@@ -122,7 +128,7 @@ export function usePromptOptimizer({ slotId, chatStore, valueRef, pasteBlocks, o
         signal?: AbortSignal
       },
     ) => {
-      const resp = await fetch('/api/optimizer/optimize', {
+      const resp = await apiTransport.request('/api/optimizer/optimize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-session-key': 'dashboard:ui' },
         credentials: 'same-origin',

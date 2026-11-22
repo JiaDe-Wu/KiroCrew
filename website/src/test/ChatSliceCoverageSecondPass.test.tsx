@@ -13,7 +13,7 @@
  *    thinking dedup, a permission arriving for an already-rejected tool,
  *    the steer break and the tail reconcile fallback,
  *  - the approval / permission reducers (`removeByApprovalId`,
- *    `resolveByApprovalId` cross-slot lookup, `clearPendingPermissions`),
+ *    `resolveApprovalRow` cross-slot lookup, `clearPendingPermissions`),
  *  - the per-slot activity seeding read from real localStorage,
  *  - and the thunks whose bodies were never entered: `resumeFromHistory`,
  *    `deleteHistorySession`, `loadOlderMessages`, the delete-navigates-to-a-peer
@@ -44,7 +44,7 @@ import chatReducer, {
   removeQueuedMessage,
   cancelQueuedMessage,
   replaceMessages,
-  resolveByApprovalId,
+  resolveApprovalRow,
   resumeFromHistory,
   selectSubagentActivityCount,
   setActiveSlot,
@@ -73,6 +73,7 @@ import type { ChatMessage, ChatSlot } from '../types'
 import type { RootState } from '../store'
 import { reduceResume } from './resumeLanded'
 import { __resetErrorJournalForTests, recordError } from '../utils/errorReport'
+import { addStashEntry, loadPromptStash, makeStashEntry } from '../utils/promptStash'
 
 const apiMock = vi.hoisted(() => ({
   chatSlotDetail: vi.fn(),
@@ -1107,9 +1108,9 @@ describe('chatSlice active-slot frame branches', () => {
       slot: 'A', tool: 'bash', kind: 'shell', purpose: '', input_preview: 'rm -rf', tool_call_id: 'tc-9',
     }))
     store.dispatch(replaceMessages([
-      msg({ role: 'permission', content: 'first ask', meta: { approval_id: 'ap-1', tool_call_id: 'tc-9' } }),
+      msg({ role: 'permission', content: 'first ask', meta: { approval_id: 'ap-1', tool_call_id: 'tc-9', mid: 'm-1' } }),
     ]))
-    store.dispatch(resolveByApprovalId({ slot: 'A', id: 'ap-1', decision: 'rejected' }))
+    store.dispatch(resolveApprovalRow({ target: { origin: 'native', id: 'ap-1', slot: 'A', mid: 'm-1' }, decision: 'rejected' }))
     // A re-broadcast of the same tool's permission must not reopen the bar.
     store.dispatch(sseChatMessage({
       slot: 'A', role: 'permission', content: 'second ask',
@@ -1321,19 +1322,11 @@ describe('chatSlice approval and permission reducers', () => {
     }))
     store.dispatch(hydrateSlotMessages({
       slot: 'B',
-      messages: [msg({ role: 'permission', content: 'run?', meta: { approval_id: 'ap-5', tool_call_id: 'tc-5' } })],
+      messages: [msg({ role: 'permission', content: 'run?', meta: { approval_id: 'ap-5', tool_call_id: 'tc-5', mid: 'm-5' } })],
     }))
-    store.dispatch(resolveByApprovalId({ id: 'ap-5', slot: 'B', decision: 'rejected' }))
+    store.dispatch(resolveApprovalRow({ target: { origin: 'native', id: 'ap-5', slot: 'B', mid: 'm-5' }, decision: 'rejected' }))
     expect(chat(store).slotMessages.B[0].meta?.resolved).toBe('rejected')
     expect(chat(store).slotActivity.B.toolLog[0].rejected).toBe(true)
-  })
-
-  it('defaults an unspecified decision to approved', () => {
-    const store = makeStore()
-    store.dispatch(setActiveSlot('A'))
-    store.dispatch(replaceMessages([msg({ role: 'permission', content: 'run?', meta: { approval_id: 'ap-1' } })]))
-    store.dispatch(resolveByApprovalId({ slot: 'A', id: 'ap-1' }))
-    expect(chat(store).messages[0].meta?.resolved).toBe('approved')
   })
 
   it('rejects every unanswered approval and unfinished tool when the turn is stopped', () => {
@@ -1609,7 +1602,7 @@ describe('chatSlice thunks', () => {
 
   it('removes a deleted session from the history list', async () => {
     apiMock.sessions.mockResolvedValue({ sessions: [{ key: 'h1' }, { key: 'h2' }], has_more: false })
-    apiMock.deleteSession.mockResolvedValue({})
+    apiMock.deleteSession.mockResolvedValue({ ok: true })
     const store = makeStore()
     await store.dispatch(fetchHistory(false))
     expect(chat(store).history).toHaveLength(2)
@@ -1630,11 +1623,13 @@ describe('chatSlice thunks', () => {
       status: 409,
       body: JSON.stringify({ ok: false, error: 'owned by nobody', code: 'cron_ownership_unknown' }),
     }))
+    expect(addStashEntry('h1', makeStashEntry('keep refused draft', []))).toBe(true)
     const store = makeStore()
     await store.dispatch(fetchHistory(false))
     await store.dispatch(deleteHistorySession('h1'))
     expect(chat(store).history.map(h => h.key)).toEqual(['h1', 'h2'])
     expect(chat(store).undeletableHistory).toEqual({ key: 'h1', title: 'Nightly digest', code: 'cron_ownership_unknown' })
+    expect(loadPromptStash('h1').map(entry => entry.text)).toEqual(['keep refused draft'])
     store.dispatch(clearUndeletableHistory())
     expect(chat(store).undeletableHistory).toBeNull()
   })
@@ -1678,7 +1673,7 @@ describe('chatSlice thunks', () => {
     await store.dispatch(fetchHistory(false))
     await store.dispatch(deleteHistorySession('h1'))
     expect(chat(store).undeletableHistory).toEqual({ key: 'h1', title: '', code: '' })
-    apiMock.deleteSession.mockResolvedValueOnce({})
+    apiMock.deleteSession.mockResolvedValueOnce({ ok: true })
     await store.dispatch(deleteHistorySession('h1'))
     expect(chat(store).undeletableHistory).toBeNull()
     expect(chat(store).history).toEqual([])

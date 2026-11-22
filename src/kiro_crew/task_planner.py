@@ -24,6 +24,7 @@ from kiro_crew.task_models import (
     Task,
     TaskStatus,
 )
+from kiro_crew.task_status_file import validate_status_file
 from kiro_crew.tool_gate_busy import hook_gate_busy
 
 if TYPE_CHECKING:
@@ -44,8 +45,12 @@ _DECOMPOSITION_DENY_REASON = (
 # ── Name Resolution ──
 
 
-def auto_name(spec_content: str, spec_path: str = "") -> str:
-    """Derive a human-readable name from spec content."""
+def auto_name(spec_content: str, spec_path: str = "", first_step: str = "") -> str:
+    """Derive a human-readable name from spec content.
+
+    *first_step* stands in for the first-line fallback: a YAML workflow's first
+    line is a key such as ``agents:``, never a name.
+    """
     lines = [line.strip() for line in spec_content.splitlines()]
     for line in lines:
         if line.startswith("# Task:"):
@@ -55,8 +60,9 @@ def auto_name(spec_content: str, spec_path: str = "") -> str:
             return line[2:].strip()[:60]
     if spec_path:
         return Path(spec_path).stem.replace("_", " ").title()[:60]
-    # Fallback: first non-empty line, trimmed to word boundary
-    for line in lines:
+    # Fallback: first non-empty line (of first_step, if any), trimmed to word boundary
+    fallback = [step_line.strip() for step_line in first_step.splitlines()] or lines
+    for line in fallback:
         if line and not line.startswith(("#", "---", "```")):
             if len(line) <= 60:
                 return line
@@ -334,8 +340,14 @@ async def decompose(
         else:
             full_prompt = prompt
 
+        # Not a person's turn: a person-only directive is refused and audited;
+        # the JSON text is left as it is, so the refusal lives in its SEL row.
+        from kiro_crew.dashboard.session_directive_apply import person_only_directive_refuser
+
+        _refuse_person_only = person_only_directive_refuser(session_key, [])
         text = ""
         async for event in client.stream(full_prompt):
+            await _refuse_person_only(event)
             if event.kind == EVENT_TEXT_CHUNK:
                 text += event.text
             elif event.kind == EVENT_PERMISSION_REQUEST:
@@ -400,6 +412,32 @@ async def decompose(
                         client,
                         event,
                         _DECOMPOSITION_DENY_REASON,
+                        cause=DENY_CAUSE_SURFACE_POLICY,
+                    )
+                    await client.reject_tool(event.request_id)
+                    continue
+                # An organisation's ``ask`` on a KAS web call (``web_ask_rule``):
+                # this phase has nobody to ask, so it is refused, never approved.
+                from kiro_crew.web_ask_rule import held_phrases
+
+                _web_held = held_phrases(event)
+                if _web_held:
+                    sel().log_tool_invocation(
+                        session_key=session_key,
+                        agent=agent or "kirocrew",
+                        source="taskrunner",
+                        tool_name=event.title,
+                        tool_kind=event.tool_kind,
+                        outcome="denied",
+                        request_id=event.request_id,
+                        error="web_ask_rule",
+                        metadata={"phase": "decomposition"},
+                    )
+                    await _steer_host_deny(
+                        client,
+                        event,
+                        "; ".join(_web_held)
+                        + ", so a person must approve it, and this phase has no approver",
                         cause=DENY_CAUSE_SURFACE_POLICY,
                     )
                     await client.reject_tool(event.request_id)
@@ -469,7 +507,12 @@ def plan_to_chat_context(run: Project) -> str:
             "description": t.description,
             "depends_on": t.depends_on,
             "requires_approval": t.requires_approval,
-            **({"force_approval": True} if t.force_approval else {}),
+            # Always explicit, so update_plan_tasks never fills it in by position
+            # after a step is inserted or deleted.
+            "force_approval": t.force_approval,
+            # Always explicit too: an edit that carries it on its steps is read by
+            # that, never by position.
+            "status_file": t.status_file,
         }
         for t in run.tasks
     ]
@@ -497,6 +540,9 @@ def update_plan_tasks(run: Project, tasks: list[dict]) -> Project:
         raise ValueError(f"Run {run.task_id} is not in an updatable state (status={run.status})")
     new_tasks: list[Task] = []
     existing_map = {t.index: t for t in run.tasks} if run.tasks else {}
+    # The plan chat's Tasks JSON carries status_file on every step; the step
+    # editor, which edits steps in place, carries it on none.
+    edit_names_status_file = any(isinstance(item, dict) and "status_file" in item for item in tasks)
     for i, item in enumerate(tasks, 1):
         if not isinstance(item, dict) or "title" not in item:
             continue
@@ -510,6 +556,21 @@ def update_plan_tasks(run: Project, tasks: list[dict]) -> Project:
             new_fa = bool(item["force_approval"])
         else:
             new_fa = existing_map[i].force_approval if i in existing_map else False
+        # An item that names status_file sets it (null or "" clears it), so a step
+        # inserted, removed or moved in the chat JSON keeps its own. Only an edit
+        # that names it on no item, an in-place edit, keeps the old step's at the
+        # same index, where the index is the step's identity.
+        if "status_file" in item:
+            raw_status_file = item["status_file"]
+            status_file = (
+                ""
+                if raw_status_file is None or raw_status_file == ""
+                else validate_status_file(str(item["title"]), raw_status_file)
+            )
+        elif edit_names_status_file or i not in existing_map:
+            status_file = ""
+        else:
+            status_file = existing_map[i].status_file
         new_tasks.append(
             Task(
                 index=i,
@@ -517,6 +578,7 @@ def update_plan_tasks(run: Project, tasks: list[dict]) -> Project:
                 description=item.get("description", item["title"]),
                 requires_approval=bool(item.get("requires_approval")),
                 force_approval=new_fa,
+                status_file=status_file,
                 depends_on=valid_deps,
             )
         )
@@ -541,6 +603,7 @@ _YAML_ALLOWED_AGENT_KEYS = frozenset(
         "shell",
         "requires_approval",
         "force_approval",
+        "status_file",
     }
 )
 _YAML_APPROVAL_KEYS = ("requires_approval", "force_approval")
@@ -631,6 +694,9 @@ def decompose_yaml(yaml_content: str) -> list[Task]:
         for approval_key in _YAML_APPROVAL_KEYS:
             if approval_key in spec and not isinstance(spec[approval_key], bool):
                 raise ValueError(f"Agent '{name}' {approval_key} must be a boolean")
+        status_file = (
+            validate_status_file(name, spec["status_file"]) if "status_file" in spec else ""
+        )
 
         deps = spec.get("depends_on", [])
         if deps is None:
@@ -661,6 +727,7 @@ def decompose_yaml(yaml_content: str) -> list[Task]:
                 depends_on=dep_indices,
                 requires_approval=spec.get("requires_approval", False),
                 force_approval=spec.get("force_approval", False),
+                status_file=status_file,
             )
         )
 
@@ -671,8 +738,10 @@ def decompose_yaml(yaml_content: str) -> list[Task]:
 # Matches the "Agent: ...\nTimeout: ...\n\n<prompt>" preamble that decompose_yaml
 # packs into Task.description on import, so export can round-trip it back out into
 # the dedicated `agent`/`timeout`/`prompt` YAML keys instead of double-wrapping.
+# The prompt part is optional: an agent with no prompt or shell is stripped down
+# to the bare "Agent: ...\nTimeout: ..." pair on import.
 _YAML_PREAMBLE_RE = re.compile(
-    r"^Agent:\s*(?P<agent>[^\n]*)\nTimeout:\s*(?P<timeout>[^\n]*)\n\n(?P<prompt>.*)$",
+    r"^Agent:[ \t]*(?P<agent>[^\n]*)\nTimeout:[ \t]*(?P<timeout>[^\n]*)(?:\n\n(?P<prompt>.*))?$",
     re.DOTALL,
 )
 
@@ -697,8 +766,8 @@ def plan_to_yaml(tasks: list[Task]) -> str:
     Inverse of :func:`decompose_yaml` — the emitted YAML re-imports through
     ``decompose_yaml`` to the same task graph (titles + dependency structure).
     ``depends_on`` is emitted as agent-name references (not indices) so the DAG
-    survives re-import's renumbering. Approval gates round-trip so saving a
-    reusable plan never weakens it.
+    survives re-import's renumbering. Approval gates and a step's declared
+    ``status_file`` round-trip so saving a reusable plan never weakens it.
     """
     if not tasks:
         raise ValueError("no tasks to export")
@@ -726,7 +795,7 @@ def plan_to_yaml(tasks: list[Task]) -> str:
                 spec["agent"] = agent_val
             if timeout_val:
                 spec["timeout"] = timeout_val
-            prompt = m.group("prompt")
+            prompt = m.group("prompt") or ""
         else:
             prompt = t.description or ""
         spec["prompt"] = prompt
@@ -737,6 +806,8 @@ def plan_to_yaml(tasks: list[Task]) -> str:
             spec["requires_approval"] = True
         if t.force_approval:
             spec["force_approval"] = True
+        if t.status_file:
+            spec["status_file"] = t.status_file
         agents[idx_to_name[t.index]] = spec
 
     return _yaml.safe_dump(

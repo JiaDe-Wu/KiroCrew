@@ -64,7 +64,7 @@ export const ContentRenderer = memo(function ContentRenderer({
   isRichType, richSource = false, fileType, filePath, content, editing,
   lang, lineNums, wordWrap, onChange, onSave,
   previewRef, displayContent, isMarkdown,
-  markdownClassName, previewStyle, flush, editorRef, diffBase, diffSplit, diffExpandUnchanged,
+  markdownClassName, previewStyle, flush, editorRef, diffBase, diffSplit, diffExpandUnchanged, onLiveDiffDegraded,
   onFileOpen, onFolderOpen,
 }: {
   isRichType: boolean
@@ -104,6 +104,9 @@ export const ContentRenderer = memo(function ContentRenderer({
   diffExpandUnchanged?: boolean
   /** Split vs unified layout for the live-diff editing surface. */
   diffSplit?: boolean
+  /** Live-diff editing only: whether the code editor dropped its live diff
+   *  for being over the inline budget (see `PierreEditorImpl`). */
+  onLiveDiffDegraded?: (degraded: boolean) => void
 }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const codeFile = useMemo(
@@ -198,10 +201,11 @@ export const ContentRenderer = memo(function ContentRenderer({
           diffBase={diffBase}
           diffSplit={diffSplit}
           diffExpandUnchanged={diffExpandUnchanged}
+          onLiveDiffDegraded={onLiveDiffDegraded}
         />
       )}
       {!isRichType && !editing && isMarkdown && (
-        <div ref={previewRef as React.RefObject<HTMLDivElement>} className={markdownClassName ?? 'msg-content text-sm leading-relaxed'}>
+        <div ref={previewRef as React.RefObject<HTMLDivElement>} data-hl-scope="" className={markdownClassName ?? 'msg-content text-sm leading-relaxed'}>
           <BasePathCtx.Provider value={filePath || null}>
             <MarkdownRenderer content={displayContent} sourcePos onFileOpen={onFileOpen} onFolderOpen={onFolderOpen} />
           </BasePathCtx.Provider>
@@ -210,6 +214,7 @@ export const ContentRenderer = memo(function ContentRenderer({
       {!isRichType && !editing && !isMarkdown && (
         <div
           ref={previewRef as React.RefObject<HTMLDivElement>}
+          data-hl-scope=""
           className={`relative w-full h-full overflow-hidden ${flush ? '' : 'border border-border rounded-md'}`}
         >
           {/* previewRef is a QUERY root only (TreeWalker / selection
@@ -226,5 +231,7 @@ export const ContentRenderer = memo(function ContentRenderer({
       )}
     </>
   )
-  return previewStyle ? <div className="h-full" style={previewStyle}>{inner}</div> : inner
+  // `data-chat-scope`: every previewStyle names `--mc-content-width`, and
+  // cli-mode.css anchors its chat rules on this attribute (see its header).
+  return previewStyle ? <div className="h-full" style={previewStyle} data-chat-scope="">{inner}</div> : inner
 })

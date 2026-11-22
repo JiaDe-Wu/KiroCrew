@@ -4,6 +4,17 @@ const { contextBridge, ipcRenderer, webUtils } = require("electron");
 let cursorAwaySubscribers = 0;
 // Whether this document has sent `navigate-ready`; see `onNavigate`.
 let navigateReadySent = false;
+// Set for a window whose gateway is not this machine's: the bridges whose
+// channels `assertLocalDashboard` refuses are then withheld, not exposed.
+// Asked of the shell on every load; only an explicit `false` exposes them.
+const REMOTE_GATEWAY = ipcRenderer.sendSync("dashboard:is-remote-gateway") !== false;
+// macOS Natural scrolling as main last reported it (scroll-touch.js): true,
+// false, or null until it says. Cached here so the page can read it
+// synchronously on the first wheel of a swipe.
+let naturalScrolling = null;
+ipcRenderer.on("scroll-direction", (_e, value) => {
+  if (typeof value === "boolean") naturalScrolling = value;
+});
 
 contextBridge.exposeInMainWorld("kirocrew", {
   platform: process.platform,
@@ -13,6 +24,16 @@ contextBridge.exposeInMainWorld("kirocrew", {
   // via webPreferences.additionalArguments). The SPA reserves header space
   // for the injected caption controls only when this is set.
   linuxFrameless: process.argv.includes("--kc-linux-frameless"),
+  // This shell serves the in-app application menu on a frameless Linux window:
+  // `menuItems` and `executeMenu` in window-lifecycle.js answer for that
+  // surface, not Windows alone. The SPA and the shell install separately, so an
+  // older shell can serve a newer SPA; `linuxFrameless` cannot tell them apart,
+  // because a frameless window is what that shell always was. Without this
+  // flag the SPA would mount the trigger there and every popup would open
+  // empty, the old guard returning [] with nothing on screen saying why. A
+  // literal, not a runtime probe: the flag ships in the same bundle as the two
+  // functions it promises, so an older shell omits it by not having this line.
+  linuxAppMenu: true,
   // Absolute filesystem path for a File the OS handed the renderer (drag-drop,
   // file input). Browsers deliberately hide real paths, and Electron removed
   // File.path, so webUtils in the preload is the only remaining bridge. Returns
@@ -50,8 +71,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // load error: a hashed chunk the gateway once answered 404+immutable is
   // replayed from cache forever, and only eviction gets the pane past Loading.
   // Resolves to whether a purge ran; the caller reloads regardless.
-  clearPaneHttpCache: (origin) =>
-    ipcRenderer.invoke("pane:clear-http-cache", String(origin || "")),
+  ...(REMOTE_GATEWAY ? {} : {
+    clearPaneHttpCache: (origin) =>
+      ipcRenderer.invoke("pane:clear-http-cache", String(origin || "")),
+  }),
   // Copy the image drawn at a main-frame point (CSS pixels) to the OS clipboard.
   copyImageAt: (x, y) => ipcRenderer.invoke("image:copy-at", Number(x), Number(y)),
   onStatus: (cb) => {
@@ -71,10 +94,14 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // boot splash (loading.html) can paint in the user's chosen colour. Read back
   // by main.js and injected as a query param — see showLoadingThenConnect.
   setThemeAccent: (hex) => ipcRenderer.send("theme-accent-changed", String(hex || "")),
+  // Hand over the active theme pack's splash art ({ type, bytes }), or null
+  // when it ships none, for the next boot splash (see theme-splash.js).
+  setThemeSplash: (image) => ipcRenderer.send("theme-splash-changed", image || null),
   // Report the user's dark/light mode PREFERENCE ("system" | "dark" | "light")
   // so main.js can set `nativeTheme.themeSource` to match. Must be the
   // preference, not the resolved mode: pinning themeSource to dark/light also
-  // pins `prefers-color-scheme`, which is what Auto resolves through.
+  // pins `prefers-color-scheme`, which is what Auto resolves through. Scheduled
+  // has no themeSource, so it sends the resolved mode (themes.md, *Mode preference*).
   setThemeMode: (pref) => ipcRenderer.send("theme-mode-changed", String(pref || "")),
   // Report the RESOLVED dark/light mode ("dark" | "light") so main.js can sync
   // the Windows titleBarOverlay colors. Separate from setThemeMode because that
@@ -121,7 +148,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Windows custom titlebar: menu surfaces render in the dashboard so hover
   // can switch between them; command execution stays in the main process.
   getAppMenuItems: (id) => ipcRenderer.invoke("app-menu:items", id),
-  executeAppMenuItem: (id, index) => ipcRenderer.send("app-menu:execute", id, index),
+  // Answers whether the click DISPATCHED. `invoke`, not `send`, because the
+  // renderer acts on a refusal: a row can be painted enabled and still be
+  // refused by the per-action gate, and the refusal is the only moment the
+  // renderer can learn its rows are stale. It refetches on `false`, which
+  // greys the gated rows and renders the footer naming the reason.
+  executeAppMenuItem: (id, index) => ipcRenderer.invoke("app-menu:execute", id, index),
   // App-menu navigation: main.js sends an in-app path ("/settings",
   // "/settings/about") when the user picks Settings…/About from the
   // native application menu; the SPA routes to it (see App.tsx).
@@ -145,6 +177,13 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.on("focus-mode:toggle", handler);
     return () => ipcRenderer.removeListener("focus-mode:toggle", handler);
   },
+  // The OS session locked (macOS and Windows; see session-lock.js). The page
+  // stops a dictation that is still recording.
+  onSessionLocked: (cb) => {
+    const handler = () => cb();
+    ipcRenderer.on("os-session-locked", handler);
+    return () => ipcRenderer.removeListener("os-session-locked", handler);
+  },
   // A macOS swipe main.js relays as one route-history step: -1 Back, 1 Forward
   // (see swipe-history.js). The SPA takes it through its guarded history step.
   onHistoryStep: (cb) => {
@@ -163,6 +202,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.on("scroll-touch", handler);
     return () => ipcRenderer.removeListener("scroll-touch", handler);
   },
+  // macOS Natural scrolling: true on, false off, null not known yet. A wheel's
+  // deltaX flips sign with it, so the swipe reader needs it to follow the
+  // fingers (see scroll-touch.js).
+  getNaturalScrolling: () => naturalScrolling,
   // Second argument: whether the macOS menu bar can slide over the window.
   // Only an explicit `menuBarOverlap: false` from main turns it off, so a
   // missing or malformed payload keeps the renderer's menu-bar band.
@@ -240,9 +283,34 @@ contextBridge.exposeInMainWorld("localGatewayAPI", {
 // and resolves "switching", "cancelled" or "unavailable". Neither takes an
 // argument: the main process decides everything from the sender. Absent in
 // plain browsers, where setup has no local gateway to replace.
-contextBridge.exposeInMainWorld("remoteCrewSetupAPI", {
+if (!REMOTE_GATEWAY) contextBridge.exposeInMainWorld("remoteCrewSetupAPI", {
   available: () => ipcRenderer.invoke("first-run:can-use-remote-crew"),
   start: () => ipcRenderer.invoke("first-run:use-remote-crew"),
+});
+
+// Settings → About's Restart gateway, for the gateway this app runs.
+// `available` resolves true only where `restart` can work; `restart` resolves
+// "restarting" (the app then replaces this page with its splash and reconnects)
+// or "unavailable". Neither takes an argument: the main process decides from
+// the sender. Absent in plain browsers and in windows on another machine's
+// gateway, which this app does not run.
+if (!REMOTE_GATEWAY) contextBridge.exposeInMainWorld("gatewayRestartAPI", {
+  available: () => ipcRenderer.invoke("gateway:can-restart"),
+  restart: () => ipcRenderer.invoke("gateway:restart"),
+});
+
+// Remote Crew panes reached through the app's managed SSH forward. Each pane
+// loads a port the crew's gateway opened on its own machine, so in client-only
+// mode the app's keeper must carry that port too. `forwardPorts` names the
+// pane ports this window shows and resolves {port: "up" | "down"} once each
+// has been tried, or null where the app keeps no forward. Exposed to a remote
+// gateway's window too, which is the one that needs it; the main process
+// admits only the launch port's dashboard. Absent in plain browsers.
+contextBridge.exposeInMainWorld("remoteCrewPaneAPI", {
+  forwardPorts: (ports) => ipcRenderer.invoke(
+    "remote-crew:forward-pane-ports",
+    Array.isArray(ports) ? ports.slice(0, 64).map(Number) : [],
+  ),
 });
 
 // Crash-artifact notice for the dashboard banner (CrashReportNotice).
@@ -252,12 +320,13 @@ contextBridge.exposeInMainWorld("remoteCrewSetupAPI", {
 // a main-process crash reaches us as "it closed by itself" with the evidence
 // still unread on the reporter's disk. This bridge is what closes that loop.
 //
-// `get` resolves { newCount } and NOTHING else: no paths, no filenames, no
-// exception codes, not even a timestamp. `reveal` takes no argument — main.js knows
+// `get` resolves the count of new crashes and the newest one's time
+// ({ newCount, lastCrashAt }); no path, file name, module name, exception code
+// or logs directory crosses. `reveal` takes no argument — main.js knows
 // where the log is from the scan it performed, so this cannot be turned into a
 // request to open an arbitrary file. Absent in plain browsers and in the PWA,
 // where there is no local disk to reveal; the banner hides itself.
-contextBridge.exposeInMainWorld("crashReportsAPI", {
+if (!REMOTE_GATEWAY) contextBridge.exposeInMainWorld("crashReportsAPI", {
   get: () => ipcRenderer.invoke("crash-reports:get"),
   reveal: () => ipcRenderer.invoke("crash-reports:reveal"),
 });
@@ -269,7 +338,7 @@ contextBridge.exposeInMainWorld("crashReportsAPI", {
 // gets a rejection here rather than the host's distro inventory. Absent in
 // plain browsers — the card treats a missing bridge as "not an Electron
 // shell" and renders nothing.
-contextBridge.exposeInMainWorld("wslAPI", {
+if (!REMOTE_GATEWAY) contextBridge.exposeInMainWorld("wslAPI", {
   detect: () => ipcRenderer.invoke("wsl:detect"),
 });
 
@@ -288,14 +357,76 @@ contextBridge.exposeInMainWorld("trayIconAPI", {
   set: (show) => ipcRenderer.invoke("tray-icon:set", !!show),
 });
 
+// Whether minimizing the main window hides it to the tray, as
+// {on, offered, canEnable}. Answered only to the main window's own dashboard,
+// like closeActionAPI.
+contextBridge.exposeInMainWorld("minimizeToTrayAPI", {
+  get: () => ipcRenderer.invoke("minimize-to-tray:get"),
+  set: (on) => ipcRenderer.invoke("minimize-to-tray:set", on === true),
+});
+
 // File-open bridge for the chat path chip's "Open in editor" affordance. Hands
 // a filesystem PATH — never a URL scheme — to the main process, which validates
 // it and calls shell.openPath so the file opens in the OS default handler on the
 // user's own machine. Resolves { ok, error? }. Absent in a plain browser and in
 // the PWA — the renderer treats a missing bridge as "cannot open externally" and
 // hides the control, keeping the built-in viewer as the only path there.
-contextBridge.exposeInMainWorld("fileOpenAPI", {
+if (!REMOTE_GATEWAY) contextBridge.exposeInMainWorld("fileOpenAPI", {
   open: (filePath) => ipcRenderer.invoke("dashboard:open-file", String(filePath || "")),
+});
+
+// Relay viewer: open one remote Crew reached through the Kiro relay, in its own
+// window. Takes the endpoint ID ONLY. Main asks the local gateway for the
+// access token and the Crew URL, so neither crosses this bridge, and no token
+// is ever returned. Resolves { ok: true } or { ok: false, error: "<code>" }.
+// Absent in plain browsers and in the PWA; the dashboard hides the relay list
+// when the bridge is missing. `closeAll()` takes nothing and can only close
+// every relay Crew window, after this dashboard's Sign out or Switch account.
+// The pane calls show a Crew in this window instead, below the local top bar:
+// they carry the endpoint ID, the pane's rect with this page's viewport size,
+// or whether a local overlay covers the pane or another tab is in front of it.
+// `onPaneEvent(cb)` hears a pane's switch chord, whether its theme is dark, or
+// its close, as `{ type, endpointId, index, dark }` and nothing more, and
+// returns its unsubscribe. An
+// `openPane` from another dashboard window is handed to the main window's
+// dashboard, which hears it through `onOpenRequest(cb)` (the endpoint ID only)
+// while it is subscribed; one subscriber at a time, the newest.
+let openRequestHandler = null;
+let openRequestSeq = 0;
+if (!REMOTE_GATEWAY) contextBridge.exposeInMainWorld("relayCrewAPI", {
+  open: (endpointId) => ipcRenderer.invoke("relay-crew:open", String(endpointId || "")),
+  closeAll: () => ipcRenderer.invoke("relay-crew:close-all"),
+  openPane: (endpointId, rect, viewport) => ipcRenderer.invoke("relay-crew:open-pane", String(endpointId || ""), rect, viewport),
+  prewarmPane: (endpointId, rect, viewport) => ipcRenderer.invoke("relay-crew:prewarm-pane", String(endpointId || ""), rect, viewport),
+  setPaneBounds: (endpointId, rect, viewport) => ipcRenderer.invoke("relay-crew:pane-bounds", String(endpointId || ""), rect, viewport),
+  setPaneOverlay: (endpointId, active) => ipcRenderer.invoke("relay-crew:pane-overlay", String(endpointId || ""), !!active),
+  setPaneInactive: (endpointId, inactive) => ipcRenderer.invoke("relay-crew:pane-inactive", String(endpointId || ""), !!inactive),
+  closePane: (endpointId) => ipcRenderer.invoke("relay-crew:pane-close", String(endpointId || "")),
+  // This shell sends a pane's `loaded` event, so the dashboard may wait for it.
+  paneLoadEvents: true,
+  onPaneEvent: (cb) => {
+    const handler = (_e, m) => cb({
+      type: String(m?.type || ""),
+      endpointId: String(m?.endpointId || ""),
+      index: Number.isInteger(m?.index) ? m.index : -1,
+      dark: typeof m?.dark === "boolean" ? m.dark : null,
+    });
+    ipcRenderer.on("relay-crew:pane-event", handler);
+    return () => ipcRenderer.removeListener("relay-crew:pane-event", handler);
+  },
+  onOpenRequest: (cb) => {
+    const handler = (_e, endpointId) => { if (typeof endpointId === "string") cb(endpointId); };
+    if (openRequestHandler) ipcRenderer.removeListener("relay-crew:open-request", openRequestHandler);
+    openRequestHandler = handler;
+    ipcRenderer.on("relay-crew:open-request", handler);
+    void ipcRenderer.invoke("relay-crew:open-requests", true, ++openRequestSeq).catch(() => {});
+    return () => {
+      if (openRequestHandler !== handler) return;
+      openRequestHandler = null;
+      ipcRenderer.removeListener("relay-crew:open-request", handler);
+      void ipcRenderer.invoke("relay-crew:open-requests", false, ++openRequestSeq).catch(() => {});
+    };
+  },
 });
 
 // Native folder chooser for the project picker's "Open system folder picker"
@@ -308,7 +439,7 @@ contextBridge.exposeInMainWorld("fileOpenAPI", {
 // cancels, and rejects when the shell refuses or no dialog could be shown.
 // Absent in a plain browser and in the PWA -- the picker hides the button there
 // and keeps its in-app browser as the only path.
-contextBridge.exposeInMainWorld("folderPickAPI", {
+if (!REMOTE_GATEWAY) contextBridge.exposeInMainWorld("folderPickAPI", {
   available: () => ipcRenderer.invoke("dashboard:can-pick-folder"),
   pick: () => ipcRenderer.invoke("dashboard:pick-folder"),
 });
@@ -323,7 +454,7 @@ contextBridge.exposeInMainWorld("folderPickAPI", {
 // gateway and starts nothing without it, so no app name, path or argument
 // crosses this bridge. `open` rejects for a window whose gateway is not this
 // machine's. Absent in a plain browser and the PWA, where the row is hidden.
-contextBridge.exposeInMainWorld("externalTerminalAPI", {
+if (!REMOTE_GATEWAY) contextBridge.exposeInMainWorld("externalTerminalAPI", {
   detect: () => ipcRenderer.invoke("external-terminal:detect"),
   open: (grant) => ipcRenderer.invoke("external-terminal:open", String(grant || "")),
 });
@@ -395,7 +526,17 @@ contextBridge.exposeInMainWorld("updateAPI", {
   },
   check: () => ipcRenderer.invoke("update:check"),
   download: () => ipcRenderer.invoke("update:download"),
+  // This shell's install ARMS the update. An older shell's install applies it at
+  // once, so the dashboard offers "Install when I quit" only when this is true.
+  armsOnQuit: true,
+  // ARMS the update: it installs when the user quits, never while the app runs.
   install: () => ipcRenderer.invoke("update:install"),
+  // A plain quit and relaunch with no update command of its own. An armed
+  // update is applied by the quit it triggers.
+  relaunch: () => ipcRenderer.invoke("update:relaunch"),
+  // Whether this window's relaunch would be accepted; false on a window the
+  // relaunch gate refuses, so the dashboard does not offer Restart now there.
+  canRelaunch: () => ipcRenderer.invoke("update:can-relaunch"),
   getInfo: () => ipcRenderer.invoke("update:get-info"),
   // Channel switcher (Settings > About): "" follows the build stamp,
   // "insider"|"stable" opts the production app onto that lane.
@@ -406,5 +547,7 @@ contextBridge.exposeInMainWorld("updateAPI", {
   // Notify the main process that a security policy provider now governs (or no
   // longer governs) this install's updates. Called from useUpdateSubscription
   // whenever update_bundled_by_app and update_managed_by align. Fire-and-forget.
-  notifyPolicyGoverned: (governed) => ipcRenderer.send("update:notify-policy-governed", governed),
+  ...(REMOTE_GATEWAY ? {} : {
+    notifyPolicyGoverned: (governed) => ipcRenderer.send("update:notify-policy-governed", governed),
+  }),
 });

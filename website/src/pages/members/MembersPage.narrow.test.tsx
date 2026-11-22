@@ -4,7 +4,7 @@
  * This file, MembersPage.test.tsx and the other files that import
  * src/test/MembersPageTestUtils.tsx (their shared fixtures) carry the same api
  * mock and module stubs below, word for word: change them together. */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from 'vitest'
 import { screen, fireEvent, waitFor, act, within } from '@testing-library/react'
 import { Route, Routes, useNavigate } from 'react-router-dom'
 import { renderWithProviders } from '../../test/helpers'
@@ -26,6 +26,8 @@ import {
 vi.mock('../../api/client', () => ({
   api: {
     members: vi.fn(),
+    // The owner check behind Import from file (`useViewerIsNotOwner`): the owner.
+    viewerOwnerOk: vi.fn(() => Promise.resolve(true)),
     // The roster's team grouping reads the team list; "no teams" keeps the
     // list flat, which is the shape every case here was written against.
     teams: { list: vi.fn(() => Promise.resolve({ teams: [] })), create: vi.fn(), update: vi.fn(), remove: vi.fn() },
@@ -408,6 +410,26 @@ describe('MembersPage default member, memory and URL', () => {
       await waitFor(() => expect(screen.queryByTestId('member-side-panel')).toBeNull(), { timeout: 3000 })
     })
 
+    it('a closing drag that lands after the opening settle ran out of time still puts the side panel away', async () => {
+      setWindowWidth(390)
+      await renderPage(alphaBeta(), 'kirocrew', { route: '/members?member=alpha' })
+      await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)
+      // A busy main thread: each settle's whole duration passes before its first
+      // frame, so the closing drag's takeover is what ends the opening settle.
+      const realNow = performance.now.bind(performance)
+      let busy = 0
+      const now = vi.spyOn(performance, 'now').mockImplementation(() => realNow() + busy)
+      onTestFinished(() => { now.mockRestore() })
+      drag(330, 80)
+      expect(screen.getByTestId('member-side-panel')).toBeTruthy()
+      busy = 1000
+      // One microtask and no frame: framer caches its clock until the next microtask.
+      await Promise.resolve()
+      drag(80, 330)
+      busy = 2000
+      await waitFor(() => expect(screen.queryByTestId('member-side-panel')).toBeNull(), { timeout: 3000 })
+    })
+
     it('lands on the remembered mate like a wide window, with the roster waiting in a closed drawer', async () => {
       localStorage.setItem(LAST_MEMBER_KEY, 'beta')
       await renderPage(alphaBeta())
@@ -424,7 +446,7 @@ describe('MembersPage default member, memory and URL', () => {
       expect(toggle.querySelector('.pi-pane')).not.toBeNull()
       expect(toggle.querySelector('.lucide-arrow-left')).toBeNull()
       // A screen reader hears a toggle too, not "Back", in either state.
-      expect(toggle).toHaveAccessibleName('Toggle Bots')
+      expect(toggle).toHaveAccessibleName('Toggle bots')
       expect(toggle).toHaveAttribute('aria-expanded', 'false')
       fireEvent.click(toggle)
       await screen.findByTestId('roster-drawer')
@@ -709,6 +731,96 @@ describe('MembersPage default member, memory and URL', () => {
         expect(header).toHaveAttribute('data-in-topbar')
         expect(within(slot).getByTestId('member-back')).toBeInTheDocument()
         expect(within(slot).getByTestId('member-identity-pill')).toBeInTheDocument()
+      } finally {
+        slot.remove()
+      }
+    })
+
+    it('in the shell bar caps the fixed identity stack clear of the side controls and lets only its face and chip catch taps', async () => {
+      // jsdom cannot lay out, so this pins the classes that keep the fixed,
+      // z-30 stack's box off the drawer toggle, channel chip and panel opener.
+      const slot = document.createElement('div')
+      slot.id = 'mobile-topbar-slot'
+      document.body.appendChild(slot)
+      try {
+        await renderPage(alphaBeta(), 'kirocrew', { route: '/members?member=alpha' })
+        await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)
+        const pill = await within(slot).findByTestId('member-identity-pill')
+        expect(pill).toHaveClass('fixed', 'max-w-[calc(100vw-12rem)]', 'pointer-events-none')
+        expect(pill).not.toHaveClass('pointer-events-auto')
+        expect(pill).not.toHaveClass('max-w-full')
+        const face = within(pill).getByTestId('member-pill-face')
+        expect(face).toHaveClass('pointer-events-auto')
+        const name = within(pill).getByTestId('member-pill-name')
+        const chip = name.closest('.glass-shadow')
+        expect(chip).toHaveClass('pointer-events-auto', 'max-w-full')
+        expect(name).toHaveClass('truncate')
+        expect(within(pill).getByTestId('member-pill-activity')).toHaveClass('truncate')
+        // The bar's side cells sit above the stack and pass input through to
+        // their controls only, so they neither lose taps to the chip nor cover the face.
+        for (const id of ['member-thread-header-lead', 'member-thread-header-trail']) {
+          const cell = within(slot).getByTestId(id)
+          expect(cell).toHaveClass('relative', 'z-40', 'pointer-events-none')
+        }
+        expect(within(slot).getByTestId('member-thread-header-lead')).toContainElement(within(slot).getByTestId('member-back'))
+        expect(within(slot).getByTestId('member-thread-header-trail')).toContainElement(within(slot).getByTestId('member-panel-toggle'))
+        // Still the one button: a tap on the chip bubbles to it and opens Profile.
+        fireEvent.click(name)
+        await screen.findByTestId('crew-profile-modal')
+      } finally {
+        slot.remove()
+      }
+    })
+
+    it('in the shell bar the identity stack steps out while the side panel or the roster drawer is on screen', async () => {
+      // The bar (shell header, z-45) paints the fixed stack over every page
+      // overlay that opens under it, so the stack must not cover their tops.
+      const slot = document.createElement('div')
+      slot.id = 'mobile-topbar-slot'
+      document.body.appendChild(slot)
+      try {
+        await renderPage(alphaBeta(), 'kirocrew', { route: '/members?member=alpha' })
+        await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)
+        const pill = await within(slot).findByTestId('member-identity-pill')
+        // Stepped out = zero opacity, and neither the face nor the chip catches
+        // a tap; never `invisible`, which would drop a keyboard user's focus.
+        const steppedOut = (shown: boolean) => {
+          const p = within(slot).getByTestId('member-identity-pill')
+          const hit = [within(p).getByTestId('member-pill-face'), within(p).getByTestId('member-pill-name').closest('.glass-shadow')!]
+          expect(p).not.toHaveClass('invisible')
+          if (shown) {
+            expect(p).toHaveClass('opacity-0')
+            for (const el of hit) { expect(el).toHaveClass('pointer-events-none'); expect(el).not.toHaveClass('pointer-events-auto') }
+          } else {
+            expect(p).not.toHaveClass('opacity-0')
+            for (const el of hit) expect(el).toHaveClass('pointer-events-auto')
+          }
+        }
+        steppedOut(false)
+        // The side panel sheet.
+        fireEvent.click(within(slot).getByTestId('member-panel-toggle'))
+        await screen.findByTestId('member-side-panel')
+        steppedOut(true)
+        fireEvent.click(within(slot).getByTestId('member-panel-toggle'))
+        await waitFor(() => expect(screen.queryByTestId('member-side-panel')).toBeNull(), { timeout: 3000 })
+        await waitFor(() => expect(within(slot).getByTestId('member-identity-pill')).not.toHaveClass('opacity-0'), { timeout: 3000 })
+        steppedOut(false)
+        // Profile opened from the keyboard: the stack steps out but keeps
+        // focus, so pressing it again closes the card.
+        pill.focus()
+        fireEvent.click(pill)
+        await screen.findByTestId('crew-profile-modal')
+        steppedOut(true)
+        expect(pill).toHaveFocus()
+        expect(pill).toHaveAttribute('aria-expanded', 'true')
+        fireEvent.click(pill)
+        await waitFor(() => expect(screen.queryByTestId('crew-profile-modal')).toBeNull(), { timeout: 3000 })
+        await waitFor(() => expect(pill).toHaveAttribute('aria-expanded', 'false'), { timeout: 3000 })
+        await waitFor(() => steppedOut(false), { timeout: 3000 })
+        // The roster drawer.
+        fireEvent.click(within(slot).getByTestId('member-back'))
+        await screen.findByTestId('roster-drawer')
+        steppedOut(true)
       } finally {
         slot.remove()
       }

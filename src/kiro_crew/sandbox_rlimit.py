@@ -9,6 +9,8 @@ the limited ``create_subprocess`` / ``run`` / ``Popen`` wrappers. One of the own
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import errno
 import logging
 import os
@@ -28,7 +30,7 @@ except ImportError:  # non-POSIX (Windows)
     _resource_mod = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
     from typing import Any
 
 # Logged under the sandbox's name, which operator log filters, level settings
@@ -116,7 +118,7 @@ def extractor_resource_limit_preexec() -> "Callable[[], None] | None":
         _EXTRACTOR_PREEXEC = apply_resource_limits(
             {
                 "resource_limits": {
-                    "max_memory_mb": _EXTRACTOR_MAX_AS_BYTES // (1024 * 1024),
+                    "max_address_space_mb": _EXTRACTOR_MAX_AS_BYTES // (1024 * 1024),
                     "max_cpu_seconds": _EXTRACTOR_MAX_CPU_SECS,
                     "max_open_files": _EXTRACTOR_MAX_NOFILE,
                 }
@@ -284,11 +286,22 @@ except OSError:  # pragma: no cover - only if the install is truncated
 RLIMIT_PROFILE_TOOL = "tool"
 RLIMIT_PROFILE_BUILD = "build"
 RLIMIT_PROFILE_SESSION_HOST = "session_host"
+# A session host the cgroup scope did NOT wrap (no cgroup v2 delegation, or no
+# trusted ``systemd-run``). Same limits as ``session_host``, plus the OOM bias.
+# With no ``memory.max`` on the agent tree, the host-wide OOM killer is the only
+# memory ceiling left. An unbiased agent tree ties the gateway at
+# ``oom_score_adj`` 0, so the kernel picks by size and the gateway, usually the
+# largest single process, dies and takes every session with it. Biased, the
+# kernel kills the largest process in some agent tree instead: at worst that
+# runtime and the sessions it serves, rather than every session on the host.
+# Everything the agent runs inherits the bias, including the shell commands its
+# harness executes itself, which no ``tool`` spawn covers.
+RLIMIT_PROFILE_UNBOUNDED_SESSION_HOST = "unbounded_session_host"
 # A first-party document parser fed untrusted bytes (``pdf_extract_child``). Its
 # ceiling is FIXED, not read from ``resource_limits``: the ``tool`` profile only
-# applies RLIMIT_AS when an operator sets ``max_memory_mb`` (default 0), and a
-# parser whose allocation precedes any length check needs a memory bound that
-# is on by default. RLIMIT_AS caps VIRTUAL address space, which is why ``tool``
+# applies RLIMIT_AS when an operator sets ``max_address_space_mb`` (default 0),
+# and a parser whose allocation precedes any length check needs a memory bound
+# that is on by default. RLIMIT_AS caps VIRTUAL address space, which is why ``tool``
 # leaves it opt-in (Node/V8 reserves far more than it touches); this child is
 # pure CPython plus ``pdfplumber``, measured at ~270 MB VmPeak on a one-page
 # document, so 1 GiB is headroom for a large document and a hard stop for a
@@ -310,8 +323,9 @@ _PROFILE_OOM_BIAS = {
     RLIMIT_PROFILE_EXTRACTOR: True,
     # session_host_preexec raises NOFILE and does nothing else -- notably it does
     # NOT bias the OOM score, and a trusted session host should not be the
-    # preferred kill target.
+    # preferred kill target while its cgroup scope bounds it.
     RLIMIT_PROFILE_SESSION_HOST: False,
+    RLIMIT_PROFILE_UNBOUNDED_SESSION_HOST: True,
     RLIMIT_PROFILE_NONE: False,
 }
 
@@ -322,6 +336,9 @@ _PROFILE_OOM_BIAS = {
 _SHIM_ARGV_SEPARATOR = "--"
 _SHIM_CHDIR_FD_FLAG = "--chdir-fd="
 _SHIM_CTTY_FD_FLAG = "--ctty-fd="
+_SHIM_SETSID_FLAG = "--setsid"
+_SHIM_CHDIR_FLAG = "--chdir="
+_SHIM_CLOSE_FDS_FLAG = "--close-fds"
 
 _SHIM_ARGV_CACHE: dict[str, tuple[str, ...]] = {}
 _SHIM_UNAVAILABLE_LOGGED = False
@@ -337,7 +354,7 @@ def _rlimit_spec(profile: str) -> str:
 
     if profile == RLIMIT_PROFILE_NONE:
         return ""
-    if profile == RLIMIT_PROFILE_SESSION_HOST:
+    if profile in (RLIMIT_PROFILE_SESSION_HOST, RLIMIT_PROFILE_UNBOUNDED_SESSION_HOST):
         # Faithful port of session_host_preexec: it touches NOFILE only, and
         # deliberately leaves NPROC/CPU/AS inherited. A session host multiplexes
         # pipe pairs for a whole tree of MCP servers, and the tool-grade 1024 cap
@@ -465,7 +482,9 @@ def _preexec_for_profile(profile: str) -> "Callable[[], None] | None":
     """Legacy ``preexec_fn`` for *profile*, used only when the shim is missing."""
     if profile == RLIMIT_PROFILE_NONE:
         return None
-    if profile == RLIMIT_PROFILE_SESSION_HOST:
+    if profile in (RLIMIT_PROFILE_SESSION_HOST, RLIMIT_PROFILE_UNBOUNDED_SESSION_HOST):
+        # The OOM bias rides on the shim only; a shim-less install keeps the
+        # session host's NOFILE headroom, never the tool's 1024 cap.
         return session_host_preexec()
     if profile == RLIMIT_PROFILE_BUILD:
         return build_resource_limit_preexec()
@@ -605,6 +624,60 @@ def _pinned_spawn_path(
         entries = screened
     source["PATH"] = os.pathsep.join(entries)
     return source
+
+
+#: Set inside :func:`fork_free_spawns`: shim-prefixed spawns in that context start
+#: with ``posix_spawn`` instead of ``fork``. CPython holds the GIL for the whole
+#: ``fork()``, and on macOS that fork copies the gateway's memory map, so even a
+#: fork on a worker thread stops the event loop for as long as it takes;
+#: ``posix_spawn`` copies nothing.
+_FORK_FREE_SPAWN: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "kirocrew_fork_free_spawn", default=False
+)
+
+# Popen options its posix_spawn start cannot carry and the shim does not take over:
+# a spawn that sets one keeps the fork start.
+_FORK_ONLY_SPAWN_KWARGS = ("pass_fds", "user", "group", "extra_groups")
+
+
+@contextlib.contextmanager
+def fork_free_spawns() -> "Iterator[None]":
+    """Start the children :func:`create_subprocess_limited` makes here without ``fork``.
+
+    Scoped to the calling task: ``contextvars`` gives each task its own copy, so a
+    sibling task's spawns keep the fork start.
+    """
+    token = _FORK_FREE_SPAWN.set(True)
+    try:
+        yield
+    finally:
+        _FORK_FREE_SPAWN.reset(token)
+
+
+def _fork_free_spawn_plan(prefix: "tuple[str, ...]", kwargs: "dict[str, Any]") -> "tuple[str, ...]":
+    """Rewrite a shim spawn so ``Popen`` can start it with ``posix_spawn``.
+
+    ``Popen`` takes ``posix_spawn`` only with ``close_fds``, ``cwd`` and
+    ``start_new_session`` all off, so the shim does those three after it starts:
+    ``--setsid``, ``--chdir=`` and ``--close-fds``. *kwargs* is edited in place.
+    A spawn that needs an option the shim cannot take over keeps the fork start.
+    """
+    if any(kwargs.get(name) for name in _FORK_ONLY_SPAWN_KWARGS):
+        return prefix
+    if kwargs.get("process_group", -1) not in (-1, None) or kwargs.get("umask", -1) >= 0:
+        return prefix
+    flags = []
+    if kwargs.pop("start_new_session", False):
+        flags.append(_SHIM_SETSID_FLAG)
+    cwd = kwargs.pop("cwd", None)
+    if cwd is not None:
+        flags.append(f"{_SHIM_CHDIR_FLAG}{os.fsdecode(cwd)}")
+    # A caller that asked for close_fds=False meant to hand its inheritable
+    # descriptors on, so the shim leaves them open too.
+    if kwargs.get("close_fds", True):
+        flags.append(_SHIM_CLOSE_FDS_FLAG)
+    kwargs["close_fds"] = False
+    return (*prefix[:-1], *flags, prefix[-1])
 
 
 def _needs_path_search(argv: "Sequence[str]") -> bool:
@@ -758,6 +831,8 @@ async def create_subprocess_limited(
         # A PATH search stats every entry, so it runs off the loop. One stalled
         # NFS/autofs entry would otherwise freeze the gateway.
         resolved = await asyncio.to_thread(_resolve_spawn_target, argv, search_env, search_cwd)
+    if chdir_fd is None and _FORK_FREE_SPAWN.get():
+        prefix = _fork_free_spawn_plan(prefix, kwargs)
     for delay in _INTERPRETER_ENOENT_DELAYS:
         try:
             return await asyncio.create_subprocess_exec(
@@ -863,13 +938,26 @@ def run_limited(
     :func:`popen_limited`: this wrapper never hands back a handle, so no
     cancellation registry can be keyed on the child and the lost-cancel hazard
     that hook exists to close cannot arise. Add one when a caller needs it.
+
+    On Windows the spawn goes through
+    :func:`kiro_crew.platform_compat.run_killing_tree_on_timeout`, so a ``timeout``
+    also ends the child's descendants and the call returns at about the timeout
+    instead of when the last process holding its pipes exits.
     """
     cmd, preexec = _prepare_limited_spawn(argv, profile, kwargs, "run_limited")
     reported = list(argv)
+    # Windows only: the stdlib's timeout arm kills just the child and then waits
+    # for every descendant holding its pipes. POSIX keeps subprocess.run.
+    tree_timeout = platform_compat.IS_WINDOWS
     try:
         for delay in _INTERPRETER_ENOENT_DELAYS:
             try:
-                result = subprocess.run(cmd, preexec_fn=preexec, **kwargs)
+                if tree_timeout:
+                    result = platform_compat.run_killing_tree_on_timeout(
+                        cmd, preexec_fn=preexec, **kwargs
+                    )
+                else:
+                    result = subprocess.run(cmd, preexec_fn=preexec, **kwargs)
                 break
             except FileNotFoundError as exc:
                 if not _retry_interpreter_enoent(exc, cmd, delay):
@@ -880,7 +968,12 @@ def run_limited(
             # popen_limited: whatever this raises reaches the caller unchanged,
             # so a genuinely broken install still reports the error it reports
             # today -- just ~4s later.
-            result = subprocess.run(cmd, preexec_fn=preexec, **kwargs)
+            if tree_timeout:
+                result = platform_compat.run_killing_tree_on_timeout(
+                    cmd, preexec_fn=preexec, **kwargs
+                )
+            else:
+                result = subprocess.run(cmd, preexec_fn=preexec, **kwargs)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         exc.cmd = reported
         raise

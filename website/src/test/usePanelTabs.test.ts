@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
-import { usePanelTabs, openPanelView, __resetPanelTabs, useAnyLiveAppTab, useAllAppTabs, evictDocumentBodies, purgeDocumentBodiesForRedactionChange, documentBodyEpochNow, takePlainPanelShow, notePanelStoppedShowing, notePanelShown, MAX_TERMINALS_PER_CHAT } from '../hooks/usePanelTabs'
+import { usePanelTabs, openPanelView, __resetPanelTabs, useAnyLiveAppTab, useAllAppTabs, evictDocumentBodies, purgeDocumentBodiesForRedactionChange, documentBodyEpochNow, takePlainPanelShow, notePanelStoppedShowing, notePanelShown } from '../hooks/usePanelTabs'
 import * as panelTabsModule from '../hooks/usePanelTabs'
 import { shouldMountSidePanel, isSidePanelHidden } from '../pages/chat/sidePanelMount'
 
@@ -100,6 +100,51 @@ describe('usePanelTabs', () => {
     rerender({ slot: 'pane-b' })
     expect(result.current.tabs.map(t => t.id)).toEqual(['file:/x/spec.md'])
     expect(result.current.activeTab).toMatchObject({ slot: 'pane-b', content: 'body' })
+  })
+
+  it('routes the folder tab into the NAMED slot bucket, not the bound one (split panes, side chat)', () => {
+    // The folder twin of the #9921 file case: a folder chip in split pane B
+    // goes through the opener bound to the active slot A.
+    const { result, rerender } = renderHook(({ slot }: { slot: string | null }) => usePanelTabs(slot, mock.descriptors), {
+      initialProps: { slot: 'pane-a' as string | null },
+    })
+    act(() => result.current.openFolder('/x/dir', 'pane-b'))
+    expect(result.current.tabs).toEqual([]) // A's bucket is untouched
+    act(() => result.current.openFolder('/x/own')) // a null slot keeps the bound bucket
+    expect(result.current.tabs.map(t => t.id)).toEqual(['folder:/x/own'])
+
+    rerender({ slot: 'pane-b' })
+    expect(result.current.tabs.map(t => t.id)).toEqual(['folder:/x/dir'])
+    expect(result.current.activeTab).toMatchObject({ kind: 'folder', title: 'dir', slot: 'pane-b' })
+  })
+
+  it('a folder opened held in another slot keeps the focus against that slot\'s discovery open', () => {
+    // A split pane's folder chip opens in its own chat's strip, held, then the
+    // panel switches to that chat, whose history (and PR link) loads after.
+    const { result, rerender } = renderHook(({ slot }: { slot: string | null }) => usePanelTabs(slot, mock.descriptors), {
+      initialProps: { slot: 'pane-a' as string | null },
+    })
+    act(() => result.current.openFolder('/x/dir', 'pane-b', { hold: true }))
+    act(() => result.current.openFolder('/x/plain', 'pane-c'))
+    rerender({ slot: 'pane-b' })
+    act(() => result.current.openView('changes', { automatic: true }))
+    expect(result.current.tabs.map(t => t.id)).toEqual(['folder:/x/dir', 'changes'])
+    expect(result.current.activeId).toBe('folder:/x/dir')
+    // Without the hold, the same discovery open takes the focus.
+    rerender({ slot: 'pane-c' })
+    act(() => result.current.openView('changes', { automatic: true }))
+    expect(result.current.activeId).toBe('changes')
+  })
+
+  it('a file opened held in another slot keeps the focus against that slot\'s discovery open', () => {
+    // The file twin of the held folder: a split pane's file chip or diff Open.
+    const { result, rerender } = renderHook(({ slot }: { slot: string | null }) => usePanelTabs(slot, mock.descriptors), {
+      initialProps: { slot: 'pane-a' as string | null },
+    })
+    act(() => result.current.openFile('/x/held.md', 'body', 'pane-b', { hold: true }))
+    rerender({ slot: 'pane-b' })
+    act(() => result.current.openView('changes', { automatic: true }))
+    expect(result.current.activeId).toBe('file:/x/held.md')
   })
 
   it('evictDocumentBodies drops clean file bodies and diff tabs, keeps dirty buffers, in every slot', () => {
@@ -399,7 +444,7 @@ describe('usePanelTabs', () => {
   })
 
   it('keeps a folder tab while files open in separate de-duplicated tabs', () => {
-    const { result } = renderHook(() => usePanelTabs(null, mock.descriptors))
+    const { result } = renderHook(() => usePanelTabs('chat-a', mock.descriptors))
     act(() => result.current.openFolder('/Users/me/workspace/KiroCrew', 'chat-a'))
     expect(result.current.activeTab).toMatchObject({
       id: 'folder:/Users/me/workspace/KiroCrew', kind: 'folder', title: 'KiroCrew', slot: 'chat-a',
@@ -799,7 +844,7 @@ describe('usePanelTabs — per-slot isolation', () => {
   })
 
   it('a held view keeps the focus against a discovery open until the next tab choice', () => {
-    // The Ultra Mode board opens a worker with Workers held in front; the
+    // The conductor mode board opens a worker with Workers held in front; the
     // worker's history then loads and its PR link opens Changes for discovery.
     act(() => openPanelView('worker-slot', 'workers', { hold: true }))
     const { result } = renderHook(() => usePanelTabs('worker-slot', mock.descriptors))
@@ -1166,31 +1211,20 @@ describe('openPanelView', () => {
     })
   })
 
-  /* At the terminal cap a request reuses only a terminal on the same machine:
-   * a remote one must never land in a gateway shell, nor a local one in a
-   * workspace. With no match it is refused (empty id), leaving focus alone. */
+  /* No per-chat cap: every request mints its own shell on the machine it
+   * names, past the old cap of four. The gateway's ceiling is the only limit. */
   it.each([
-    ['remote', { remoteSlot: 'chat-r' }, {}],
-    ['local', {}, { remoteSlot: 'chat-r' }],
-  ])('at the cap a %s request never reuses a terminal on the other machine', (_name, ask, held) => {
+    ['remote', { remoteSlot: 'chat-r' }],
+    ['local', {}],
+  ])('opens a fresh %s terminal on every request', (_name, ask) => {
     const { result } = renderHook(() => usePanelTabs('chat-r', mock.descriptors))
-    for (let i = 0; i < MAX_TERMINALS_PER_CHAT; i++) act(() => { result.current.openTerminal(held) })
-    const before = result.current.activeId
-    let sid = 'unset'
-    act(() => { sid = result.current.openTerminal(ask) })
-    expect(sid).toBe('')
-    expect(result.current.activeId).toBe(before)
-    expect(result.current.tabs.filter(t => t.kind === 'terminal')).toHaveLength(MAX_TERMINALS_PER_CHAT)
-  })
-
-  it('at the cap a remote request reuses the newest remote terminal', () => {
-    const { result } = renderHook(() => usePanelTabs('chat-r', mock.descriptors))
-    let remote = ''
-    act(() => { remote = result.current.openTerminal({ remoteSlot: 'chat-r' }) })
-    for (let i = 1; i < MAX_TERMINALS_PER_CHAT; i++) act(() => { result.current.openTerminal() })
-    let sid = ''
-    act(() => { sid = result.current.openTerminal({ remoteSlot: 'chat-r' }) })
-    expect(sid).toBe(remote)
-    expect(result.current.activeId).toBe(`terminal:${remote}`)
+    const ids: string[] = []
+    for (let i = 0; i < 6; i++) act(() => { ids.push(result.current.openTerminal(ask)) })
+    expect(new Set(ids).size).toBe(6)
+    expect(ids.every(Boolean)).toBe(true)
+    const terms = result.current.tabs.filter(t => t.kind === 'terminal')
+    expect(terms).toHaveLength(6)
+    expect(terms.every(t => (t.remoteSlot ?? '') === ((ask as { remoteSlot?: string }).remoteSlot ?? ''))).toBe(true)
+    expect(result.current.activeId).toBe(`terminal:${ids.at(-1)}`)
   })
 })

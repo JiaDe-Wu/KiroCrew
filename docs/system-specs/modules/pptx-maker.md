@@ -207,6 +207,7 @@ variable body is opaque to the contract scanner.
 | Code | Condition | Status |
 |------|-----------|--------|
 | `app_disabled` | The app is not enabled | 403 |
+| `owner_only` | A PUT, POST or DELETE from a caller that is not the owner and holds no app token | 403 |
 | `body_not_json` | Request body is not JSON | 400 |
 | `body_not_object` | Request body is JSON but not an object | 400 |
 | `unexpected_config_key` | `PUT /config` body has a key other than `deckRoot` | 400 |
@@ -271,9 +272,9 @@ user cannot act on. An existing config or existing decks are never touched.
 **A failed swap never leaves the user with no engine.** `_swap_in` moves the new
 tree next to the destination, moves the old one aside, then renames the new one into
 place. If that last rename fails, the retired tree is the ONLY remaining copy — so it
-is restored before unwinding, and removed only once `engine_root` is populated again.
+is restored before unwinding, and removed only once the swap commits.
 An unconditional cleanup deleted both and turned a failed *update* into a broken
-install; the contract is the same one `_ensure_clone` already promises on a network
+install; the contract is the same one `install_engine` already promises on a network
 failure, namely "still on the previous version". Pinned by
 `test_pptx_maker_engine_source.py::TestSwapRollback`.
 
@@ -310,7 +311,7 @@ that staging records in its log; it never copies over a surviving stale tree.
 
 **It does NOT register those resources.** The enable path and the boot reconcile both
 call `bridges.register_app`, and `bridges._placeholder_values` computes this app's
-`{UV_BIN}` / `{ENGINE_ROOT}` / `{ENGINE_MCP_DIR}` / `{APP_PROMPTS}` in the GATEWAY from
+`{UV_BIN}` / `{ENGINE_ROOT}` / `{ENGINE_MCP_DIR}` / `{APP_PROMPTS}` / `{TOOLS_PATH}` in the GATEWAY from
 the data home and the installed package — the same values the provisioner resolves — so
 the agents and skill land without the provisioner registering anything. Registering here
 would be redundant AND an unclosable race: provisioning is a detached job that runs for
@@ -391,8 +392,9 @@ matches, and redirects may change host (`/archive/` 302s to
 `codeload.github.com`) but never leave https. That digest is the trust
 anchor; the commit is the locator and `ENGINE_TAG` is display-only (it never
 appears in the URL, so it cannot influence which bytes arrive). Bumping the
-engine means bumping all three together — bumping the commit alone fails
-verification on every host, which is the intended failure mode.
+engine means bumping all three together, plus `ENGINE_LOCK_SHA256` (below);
+bumping the commit alone fails verification on every host, which is the intended
+failure mode.
 
 This is viable because a GitHub `/archive/` tarball is byte-stable for a fixed
 commit sha; the digest was confirmed by downloading the artifact four times and
@@ -439,6 +441,14 @@ the current pin, so bumping either makes an existing install re-fetch instead of
 silently keeping an older engine, and a tree left behind by an older git-based
 install (no marker) correctly reads as "not installed".
 
+It also requires the tree's `mcp-local/uv.lock` to hash to `ENGINE_LOCK_SHA256`,
+the lock inside the pinned archive. Every `uv` call installs that lock as-is, so a
+lock rewritten after install (a `uv run` without `--frozen` moves `mcp` to
+2.x, which the server cannot import) would be reinstalled by every provision. Such a
+tree reads as not installed instead: the banner offers provisioning again, and that
+run re-fetches the tree and rebuilds its venv with `uv sync --frozen`. Pinned by
+`test_pptx_maker_engine_source.py::TestInstallEngine::test_a_pinned_tree_with_a_rewritten_lock_is_fetched_again`.
+
 `engine.engine_tag()` reads that marker instead of shelling out to `git
 describe` — cheap enough for the status endpoints that call it on every poll, and
 **honest**: an unverified or absent tree reports `"unknown"` rather than the tag
@@ -448,7 +458,8 @@ as the wire name the dashboard reads; it reports `engine_source.is_installed`.
 ## Agents
 
 Four agent templates ship with the app, rendered at provision time
-(`{ENGINE_ROOT}` / `{ENGINE_MCP_DIR}` / `{APP_PROMPTS}` placeholders). Each
+(`{UV_BIN}` / `{ENGINE_ROOT}` / `{ENGINE_MCP_DIR}` / `{APP_PROMPTS}` / `{TOOLS_PATH}`
+placeholders). Each
 config's declared `name` is the dispatchable identifier; the platform writes the
 FILE under a namespaced `pptx-maker--<name>.json` filename, but that stem (like
 the `pptx-maker/<name>` display namespace) is not a name dispatch can resolve:
@@ -503,8 +514,11 @@ sensitive-path check and the governance ceiling — would never be reached.
   `default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:; sandbox`.
 - **Agent-authored IDENTIFIERS are refused, not redacted.** These fields name a
   filesystem path AND a URL segment the browser sends back, so scrubbing them would
-  hand out a handle that resolves to nothing. Refusal is scoped as narrowly as the
-  identifier allows:
+  hand out a handle that resolves to nothing. Each refuses through
+  `security.refuses(value, redact)`: the redaction changes it, or the exfil scan
+  flags a URL in it. Redaction masks only credential values inside a URL, so a URL
+  carrying other data out passes the comparison alone. Refusal is scoped as narrowly
+  as the identifier allows:
   - the **deck id** (`paths.resolve_deck_dir`) — refuses the whole deck;
   - a **slide slug** (`decks.deck_detail`) — skips that slide, the rest still renders.
     Screened at the slide level *as well as* in the URL builder because the slug is
@@ -529,7 +543,7 @@ sensitive-path check and the governance ceiling — would never be reached.
   files' full contents raw would be an inconsistent hole: a credential the model
   echoed into a brief, an outline or a compose payload would reach the dashboard
   verbatim. `_read_artifact` runs
-  `security.redact` (credentials + exfiltration URLs) over the textual suffixes.
+  `security.redact` (credentials, inside URLs too) over the textual suffixes.
   Three properties make this safe in both directions:
   - **The text/binary split is data, not a code path.** `SERVED_SUFFIXES` maps each
     suffix to a frozen `ServedSuffix(content_type, text=…)`. `text` has no default,
@@ -568,8 +582,10 @@ sensitive-path check and the governance ceiling — would never be reached.
     WebP `XMP `) has a metadata chunk that holds arbitrary text — so a blob beginning
     `\x89PNG…` and continuing `tEXtComment\0AKIA…` would pass a header-only check,
     skip the scan, and reach the browser verbatim. `routes._scanned_bitmap_bytes`
-    therefore decodes the WHOLE body and exempts it only if the redactor finds
-    nothing in it (and the encoded text passes the encoded-credential screen below); a
+    therefore decodes the WHOLE body and exempts it only if `security.refuses` passes
+    it (the redactor finds nothing and the exfil scan flags no URL; pinned by
+    `::test_a_url_carrying_data_out_in_bitmap_metadata_is_not_exempted`), and the
+    encoded text passes the encoded-credential screen below; a
     credential-bearing "image" stays in the redaction path and loses the picture,
     which is the right trade. Pinned by
     `::test_a_credential_in_bitmap_metadata_is_not_exempted` and
@@ -619,9 +635,8 @@ sensitive-path check and the governance ceiling — would never be reached.
     `::test_every_legal_uri_terminator_keeps_the_image` (JSON quote, escaped quote, CSS
     `url(...)`, markdown, end-of-text all round-trip byte-identical).
     **A condemned region is excised here, not delegated.** Handing it to the text pass
-    assumed `redact()` recognises the same tokens this scan does; it recognises fewer
-    (a `gh[pousr]_` body shorter than a real 36-char PAT matches here and is invisible
-    there), so delegating would serve those tokens. `_scanned_bitmap_bytes` returns
+    assumed `redact()` recognises the same tokens this scan does; it need not, so
+    delegating could serve those tokens. `_scanned_bitmap_bytes` returns
     `(bytes, credential_found)` and the caller replaces a credential-bearing region
     with the shared `REDACTED_CREDENTIAL_TAG`, while a blob that merely is not a raster
     still falls through to ordinary prose scanning. Pinned by
@@ -815,8 +830,8 @@ sensitive-path check and the governance ceiling — would never be reached.
   ordinary style still reads.
 - **SEL audit fields are redacted at the chokepoint.** `_audit` runs `redact` over
   both free-text fields. Every call site interpolates a user- or agent-chosen value —
-  a style/template name, a deck root, a `deckId/subpath`, an exception string — and an
-  `AKIA`-shaped name is legal under `SEGMENT_RE`, so without redaction the credential
+  a style/template name, a deck root, a `deckId/subpath`, an exception string — and a
+  `ghp_`-shaped name is legal under `SEGMENT_RE`, so without redaction the credential
   would be written verbatim into the SEL and served back by `GET /api/sel/events`. An audit log is a
   user-facing surface, and a *durable* one: unlike a response body, a leak there
   persists. Redaction is centralized in `_audit` rather than repeated at each call
@@ -915,7 +930,7 @@ resolution), `..._decks.py` (in-progress decks listed, newest compose epoch wins
 outline-driven slide order, relative URLs only), `..._library.py` (validation
 ladder, collision refusal, pin/metadata bookkeeping across rename and delete),
 `..._routes.py` (deny-by-default on every route, served-extension allow-list,
-CSP header, artifact redaction — an `AKIA`-shaped credential in a served
+CSP header, artifact redaction — a `ghp_`-shaped credential in a served
 `.json`/`.md`/`.svg`/`.html` comes back redacted, a `.pptx`/`.png` comes back
 byte-identical, inline raster art survives, an undecodable byte sequence does not
 raise — `PUT /config` key equality, no `/deps/install`), `..._engine.py`

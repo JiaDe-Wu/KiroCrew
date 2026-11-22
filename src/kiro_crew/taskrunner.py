@@ -214,6 +214,7 @@ class TaskRunner:
     start_background = _run_lifecycle.start_background
     delete_run = _run_lifecycle.delete_run
     cancel = _run_lifecycle.cancel
+    cancel_paused = _run_lifecycle.cancel_paused
     pause = _run_lifecycle.pause
     _ensure_resumable_workspace = _run_lifecycle._ensure_resumable_workspace
 
@@ -322,17 +323,17 @@ class TaskRunner:
         self._stop_settles: dict[str, asyncio.Task[None]] = {}
         # task_id -> the conversation the run was started FROM, so a notification
         # can be routed back to the surface the operator is actually watching.
-        # Deliberately in memory only and deliberately not on ``Project``: it is
-        # a routing hint for the lifetime of one process, and a persisted channel
-        # key would outlive the binding it names and send a restart's first
-        # notice into a conversation that may no longer resolve.
+        # A routing hint, not on ``Project``: ``runs.json`` carries it across a
+        # restart so the recovery and resume notices reach that conversation,
+        # and the sink resolves it at delivery time (an open dashboard tab, a
+        # governed channel binding), so a key that does not resolve reaches
+        # only the bell.
         self._run_session_keys: dict[str, str] = {}
         # Optional publication port into the shared workflow history. TaskRunner
         # remains the owner of planning/execution semantics; this port only
         # mirrors lifecycle and progress for one unified management surface.
         self._workflow_service = workflow_service
         self._workflow_initializing = False
-        self._agent: str = ""
         # Durable task queue (``taskq``): attached by the gateway once the
         # SubagentManager's store is open. None keeps the legacy behaviour --
         # a fixed run cap and no rows. See ``attach_task_admission``.
@@ -344,6 +345,7 @@ class TaskRunner:
         # holds their records meanwhile).
         self._recovery_pending: set[str] = set()
         self._last_id_suffix = 0  # ``mint_task_id``'s last suffix
+        self._runs_file = self._work_dir / self._RUNS_FILE  # ``_load_runs`` settles it
         self._load_runs()
 
     @property
@@ -367,6 +369,7 @@ class TaskRunner:
         fresh: bool = False,
         workspace_dir: str = "",
         auto_approve: bool = False,
+        adopting: bool = False,
     ) -> str:
         self._require_workflow_ready()
         run = self._runs.get(task_id)
@@ -389,6 +392,11 @@ class TaskRunner:
         await self._reserve_start(task_id)
 
         try:
+            # An automatic adoption resumes only a run that is still waiting: one
+            # cancelled while the sweep ran an earlier run stays cancelled. The
+            # reservation above already refuses a cancel from here on.
+            if adopting and run.status not in ("paused", "planned"):
+                raise ValueError(f"Run {task_id} is no longer waiting (status={run.status})")
             # Optional per-run workspace override: only applied to a run that has NOT
             # begun yet (status "planned"). A resumed run (paused/cancelled/failed) keeps
             # its original work_dir, so re-targeting the folder can't orphan work already
@@ -398,6 +406,11 @@ class TaskRunner:
             _override = _resolve_workspace_dir(workspace_dir)
             if _override and run.status == "planned":
                 run.work_dir = _override
+            # The agent follows the same rule: a run that has begun keeps the agent its
+            # steps ran with, so resuming it (the Projects page sends its selector with
+            # Resume too) or adopting it after a restart cannot switch it.
+            if agent and run.status == "planned":
+                run.agent = agent
 
             # Guard: limit concurrent running tasks — check BEFORE mutating state.
             # With the task queue attached the cap is the lane's: excess steps
@@ -426,7 +439,6 @@ class TaskRunner:
             await self._grant_run_trust(run, bool(auto_approve))
             await self._apersist_runs()
 
-            self._agent = agent
             history_key = await self._bound_history_key(run, f"taskrunner:run:{task_id}")
         except BaseException:
             self._release_start(task_id)
@@ -473,7 +485,7 @@ class TaskRunner:
                 save_progress(run)
                 task_list = "\n".join(f"  {t.index}. {t.title}" for t in run.tasks)
                 await self._notify(
-                    "\U0001f680 Executing plan",
+                    "Executing plan",
                     f"{len(run.tasks)} task(s):\n{task_list}",
                     run=run,
                 )
@@ -485,7 +497,7 @@ class TaskRunner:
                     run.finished_at = time.time()
                     await self._apersist_runs()
                     await self._notify(
-                        "\u2705 Task completed",
+                        "Task completed",
                         format_completion_summary(run),
                         run=run,
                     )
@@ -506,7 +518,7 @@ class TaskRunner:
                     logger.exception("Plan execution error")
                     run.status = "failed"
                     run.error = str(exc)
-                    await self._notify("\u274c Task error", str(exc), run=run)
+                    await self._notify("Error: Task error", str(exc), run=run)
             finally:
                 try:
                     await asyncio.shield(self._cleanup_run_sessions(run))
@@ -597,6 +609,7 @@ class TaskRunner:
                 run.finished_at,
                 run.started_at,
                 run.last_task_time,
+                run.agent,
             )
             previous_tasks = [
                 (task, task.status, task.error, task.result, task.verification, task.attempts)
@@ -613,6 +626,9 @@ class TaskRunner:
                 run.error = ""
                 run.finished_at = 0.0
                 run.started_at = run.last_task_time = time.time()
+                # An explicit agent re-targets the retried steps; none keeps the run's.
+                if agent:
+                    run.agent = agent
                 # The global timeout counts from here; the watchdog and the executor
                 # both read this one age of it, so they cannot disagree after a step.
                 _MonotonicAge.of_run_start(run, fresh=True)
@@ -621,14 +637,18 @@ class TaskRunner:
                 # Persistence drains its worker even on repeated cancellation.
                 # Restore in place: callers may retain the Project/Task objects.
                 # Restore live state until a later snapshot succeeds.
-                run.status, run.error, run.finished_at, run.started_at, run.last_task_time = (
-                    previous_run
-                )
+                (
+                    run.status,
+                    run.error,
+                    run.finished_at,
+                    run.started_at,
+                    run.last_task_time,
+                    run.agent,
+                ) = previous_run
                 for task, status, error, result, verification, attempts in previous_tasks:
                     task.status, task.error, task.result = status, error, result
                     task.verification, task.attempts = verification, attempts
                 raise
-            self._agent = agent
         except BaseException:
             self._release_start(task_id)
             raise
@@ -639,7 +659,7 @@ class TaskRunner:
                 await self._workflow_rebind(run)
                 if not await self._ensure_resumable_workspace(run, "retry"):
                     return
-                await self._notify("\U0001f504 Retrying", f"From task {from_task}", run=run)
+                await self._notify("Retrying", f"From task {from_task}", run=run)
                 await self._taskq_begin_run(run)
                 watchdog_task = asyncio.create_task(self._watchdog_loop(run))
                 await self._execute_tasks(run, history_key)
@@ -649,7 +669,7 @@ class TaskRunner:
                     await self._apersist_runs()
                     passed = sum(1 for t in run.tasks if t.status == TaskStatus.PASSED)
                     await self._notify(
-                        "\u2705 Task completed", f"{passed}/{len(run.tasks)} passed", run=run
+                        "Task completed", f"{passed}/{len(run.tasks)} passed", run=run
                     )
             except asyncio.CancelledError:
                 # Always a cancellation, never read as the stop: the stop ends a

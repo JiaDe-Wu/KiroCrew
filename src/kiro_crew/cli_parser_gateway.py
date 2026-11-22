@@ -1,8 +1,8 @@
 """Argparse definitions for the ``Start here``, ``Run the gateway`` and ``Set it up`` commands.
 
 One registrar per command of those ``cli_help.COMMAND_GROUPS`` sections: doctor, service,
-status, restart, stop, gateway-pid, logs, token, logout, ledger-sweep, update, setup,
-config, sandbox, kas and manifest. ``kiro_crew.cli.main`` builds the top-level parser and
+status, usage, restart, stop, gateway-pid, logs, token, logout, ledger-sweep, tmp, update,
+setup, config, sandbox, kas and manifest. ``kiro_crew.cli.main`` builds the top-level parser and
 calls every registrar in the command line's registration order, so a new command of these
 sections gets a registrar here and a call there. The ``gateway`` command's own arguments
 stay in ``cli.py``: ``pod.runtime_boot.target_supports_flag`` reads them from that file.
@@ -15,10 +15,11 @@ here reads a name a test patches through ``kiro_crew.cli``
 from __future__ import annotations
 
 import argparse
+from datetime import date
 from typing import TYPE_CHECKING
 
 from kiro_crew import cli_help
-from kiro_crew.cli_arg_types import non_negative_int
+from kiro_crew.cli_arg_types import non_negative_int, positive_int
 
 if TYPE_CHECKING:
     _Commands = argparse._SubParsersAction[argparse.ArgumentParser]
@@ -33,6 +34,33 @@ def register_doctor_parser(sub: _Commands) -> None:
         "--bundle",
         action="store_true",
         help="Collect logs + crash reports into a redacted diagnostics zip",
+    )
+    _doctor_parser.add_argument(
+        "--reconcile-memory",
+        action="store_true",
+        help="Re-check every memory row's record metadata now (the full pass a start skips)",
+    )
+
+
+def register_tmp_parser(sub: _Commands) -> None:
+    # tmp reclaim -- the person's command for agent leftovers in the system temp
+    # roots. Every check that decides a removal lives in ``temp_reclaim``.
+    tmp_parser = cli_help.add_command(sub, "tmp")
+    tmp_sub = tmp_parser.add_subparsers(dest="tmp_action", required=True)
+    reclaim = tmp_sub.add_parser(
+        "reclaim",
+        description=(
+            "Remove each named top-level entry of /tmp or /var/tmp once it is provably idle and "
+            "unused: owned by you, unchanged for 30 minutes, holding no git repository, "
+            "and named by no running process. Anything in doubt is kept and the reason "
+            "is printed. Exit 0 when every path was removed, 1 when any was kept."
+        ),
+    )
+    reclaim.add_argument(
+        "paths", nargs="+", metavar="PATH", help="A /tmp/<name> or /var/tmp/<name> to remove"
+    )
+    reclaim.add_argument(
+        "--dry-run", action="store_true", help="Run every check and remove nothing"
     )
 
 
@@ -207,7 +235,17 @@ def register_gateway_pid_parser(sub: _Commands) -> None:
     # `stop --expect-pid`/`restart` use. The desktop supervisor calls this when
     # its listener snapshot cannot name a draining gateway (socket released, lock
     # still held) so recovery can wait for that pid instead of giving up.
-    cli_help.add_command(sub, "gateway-pid")
+    gateway_pid_parser = cli_help.add_command(sub, "gateway-pid")
+    gateway_pid_parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=(
+            "When the lock is held but its holder cannot be named (a Windows "
+            "mandatory lock), name it from the gateway's fresh run record for "
+            "this port."
+        ),
+    )
 
 
 def register_service_parser(sub: _Commands) -> None:
@@ -273,7 +311,7 @@ def register_kas_parser(sub: _Commands) -> None:
         epilog="""
 Examples:
   kirocrew kas install                   # latest pinned engine + Node, from agent.kas_bundle_url
-  kirocrew kas install --version 0.66.33
+  kirocrew kas install --version 0.66.117
   kirocrew kas install --from ./bundle   # offline: manifest.json + artifacts in a directory
   kirocrew kas status
   kirocrew kas remove
@@ -283,7 +321,8 @@ Examples:
   kirocrew kas logout
   kirocrew kas route                     # kas-bundle | kiro-cli: which program owns the sign-in here
 
-Then: kirocrew config set agent.kas_bundle true && kirocrew restart
+Then: kirocrew config set agent.kas_bundle true
+      kirocrew restart
 The engine signs in through Kiro Crew's own login (dashboard → Sign in, or `kas login`).
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -378,6 +417,53 @@ def register_status_parser(sub: _Commands) -> None:
     )
 
 
+def _iso_day(raw: str) -> date:
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"must be a day as YYYY-MM-DD, got {raw!r}") from None
+
+
+def register_usage_parser(sub: _Commands) -> None:
+    usage_parser = cli_help.add_command(
+        sub,
+        "usage",
+        formatter_class=_fmt,
+        epilog="""
+Reads this install's usage store directly; no running gateway is needed.
+
+Examples:
+  kirocrew usage                     # spend per day, last 7 days
+  kirocrew usage --by model          # the same window, one row per model
+  kirocrew usage --since 2026-11-01  # from that local day through today
+  kirocrew usage --days 1 --json     # today, as one JSON document
+""",
+    )
+    window = usage_parser.add_mutually_exclusive_group()
+    window.add_argument(
+        "--days",
+        type=positive_int,
+        default=7,
+        help="Last N local days, today included (default: 7; at most 30)",
+    )
+    window.add_argument(
+        "--since",
+        type=_iso_day,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="From this local day through today (at most the last 30 days, today included)",
+    )
+    usage_parser.add_argument(
+        "--by",
+        choices=("model", "agent", "channel", "session"),
+        default=None,
+        help="Group the window's totals by this field instead of by day",
+    )
+    usage_parser.add_argument(
+        "--json", action="store_true", help="Print one JSON document instead of a table"
+    )
+
+
 def register_config_parser(sub: _Commands) -> None:
     cfg_parser = cli_help.add_command(
         sub,
@@ -392,6 +478,7 @@ Examples:
   kirocrew config defaults              # Stored values holding a superseded default
   kirocrew config defaults --adopt      # Take the current defaults for all of them
   kirocrew config defaults --keep session.autocompact_pct   # Affirm one as intentional
+  kirocrew config pending               # Files changed outside Kiro Crew, held for review
 
 The dashboard port comes from the port in dashboard.url; the KIROCREW_PORT
 env var overrides it.
@@ -442,3 +529,16 @@ env var overrides it.
         action="store_true",
         help="Record the stored values as intentional and stop reporting them",
     )
+    cfg_pending = cfg_sub.add_parser(
+        "pending",
+        help="Apply or discard a settings file changed outside Kiro Crew (no dashboard needed)",
+    )
+    pending_sub = cfg_pending.add_subparsers(dest="pending_action")
+    pending_sub.add_parser("list", help="Show each file held for review and what changed (default)")
+    for action, text in (
+        ("apply", "Keep the outside change"),
+        ("discard", "Put the saved version back"),
+    ):
+        resolve = pending_sub.add_parser(action, help=text)
+        resolve.add_argument("file", help="The file name, e.g. config.json")
+        resolve.add_argument("signature", help="The version `kirocrew config pending` printed")

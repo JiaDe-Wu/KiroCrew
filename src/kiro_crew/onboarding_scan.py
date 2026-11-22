@@ -189,13 +189,18 @@ class _Scan:
         reason: str,
         *,
         unsupported: bool = False,
+        failed: bool = False,
         count: int | None = None,
     ) -> None:
+        """Record one skipped row. ``failed`` marks a caught failure (a read, parse
+        or open that raised), not a deliberate skip, so the review shows an error."""
         key = (self.source_id, category, reason)
         if key in self._diagnostic_keys:
+            existing_diagnostic = self.skipped[self._diagnostic_keys[key]]
             if count is not None:
-                existing_diagnostic = self.skipped[self._diagnostic_keys[key]]
                 existing_diagnostic["count"] = max(int(existing_diagnostic.get("count", 0)), count)
+            if failed:
+                existing_diagnostic["failed"] = True
             return
         diagnostic: dict[str, Any] = {
             "source_id": self.source_id,
@@ -204,6 +209,8 @@ class _Scan:
         }
         if count is not None:
             diagnostic["count"] = count
+        if failed:
+            diagnostic["failed"] = True
         self._diagnostic_keys[key] = len(self.skipped)
         self.skipped.append(diagnostic)
         if unsupported:
@@ -455,7 +462,7 @@ def _read_bytes(path: Path, anchor: Path, scan: _Scan, category: str) -> bytes |
         scan.diagnostic(category, "file_too_large")
         return None
     if content is None:
-        scan.diagnostic(category, "read_failed")
+        scan.diagnostic(category, "read_failed", failed=True)
         return None
     if len(content) > _MAX_FILE_BYTES:
         scan.diagnostic(category, "file_too_large")
@@ -489,6 +496,18 @@ def _sanitize_text(text: str, scan: _Scan) -> str:
     cleaned, credential_warnings, url_warnings = redact_with_findings(bounded)
     scan.secret_count += len(credential_warnings) + len(url_warnings)
     return cleaned.strip()
+
+
+def _refuses_text(text: str) -> bool:
+    """Whether an imported item holding *text* is dropped: the refusal every gate reads.
+
+    A credential read in full whatever the setting, or a URL the exfiltration scan
+    flags, over the same bounded text :func:`_sanitize_text` redacts.
+    """
+    from kiro_crew.security import redact
+    from kiro_crew.security.exfil import refuses
+
+    return refuses(text[:_MAX_TEXT_CHARS], redact)
 
 
 def _count_secret_fields(value: Any) -> int:
@@ -569,7 +588,7 @@ def _read_json(
         text = strip_utf8_bom(text)
         return _parse_json5(text) if json5 else json.loads(text)
     except (ValueError, RecursionError):
-        scan.diagnostic(category, "invalid_config")
+        scan.diagnostic(category, "invalid_config", failed=True)
         return None
 
 
@@ -583,7 +602,7 @@ def _read_toml(path: Path, anchor: Path, scan: _Scan) -> dict[str, Any]:
     try:
         result = _toml.loads(content.decode("utf-8", errors="strict"))
     except ValueError:
-        scan.diagnostic("settings", "invalid_config")
+        scan.diagnostic("settings", "invalid_config", failed=True)
         return {}
     return result if isinstance(result, dict) else {}
 
@@ -604,7 +623,7 @@ def _read_simple_yaml(path: Path, anchor: Path, scan: _Scan) -> dict[str, Any]:
     try:
         result = _load_no_alias_yaml(text)
     except (yaml.YAMLError, RecursionError, ValueError):
-        scan.diagnostic("settings", "invalid_config")
+        scan.diagnostic("settings", "invalid_config", failed=True)
         return {}
     return result if isinstance(result, dict) else {}
 
@@ -632,7 +651,7 @@ def _skill_package(
             return None
         screened, credential_warnings, url_warnings = redact_with_findings(text)
         scan.secret_count += len(credential_warnings) + len(url_warnings)
-        if credential_warnings or url_warnings or screened != text:
+        if credential_warnings or url_warnings or screened != text or _refuses_text(text):
             scan.diagnostic("skills", "credential_bearing_skill")
             return None
         if path.name == "SKILL.md":
@@ -838,7 +857,7 @@ def _sqlite_database_is_safe(
         except FileNotFoundError:
             continue
         except OSError:
-            scan.diagnostic(category, "unsafe_database_sidecar")
+            scan.diagnostic(category, "unsafe_database_sidecar", failed=True)
             return False
         if not stat.S_ISREG(sidecar_stat.st_mode) or sidecar_stat.st_nlink != 1:
             scan.diagnostic(category, "unsafe_database_sidecar")
@@ -891,7 +910,7 @@ def _sqlite_snapshot(
                 max_bytes=_MAX_DB_BYTES,
             )
             if content is None:
-                scan.diagnostic(category, "database_read_failed")
+                scan.diagnostic(category, "database_read_failed", failed=True)
                 raise OSError(f"could not snapshot {source}")
             if scan.bytes_read.get(category, 0) + len(content) > _MAX_TOTAL_BYTES:
                 scan.diagnostic(category, "source_byte_limit")
@@ -932,7 +951,7 @@ def _open_snapshot_db(
         try:
             connection = sqlite3.connect(snapshot.absolute().as_uri() + "?mode=ro", uri=True)
         except (OSError, sqlite3.Error, ValueError):
-            scan.diagnostic(category, "database_open_failed")
+            scan.diagnostic(category, "database_open_failed", failed=True)
             yield None
             return
         yield connection
@@ -998,7 +1017,7 @@ def _decoded_value_is_unsafe(value: Any, scan: _Scan) -> str:
     except _TooDeepToScreen:
         return "unscreenable_memory_record"
     for text in texts:
-        if _sanitize_text(text, scan) != text[:_MAX_TEXT_CHARS].strip():
+        if _sanitize_text(text, scan) != text[:_MAX_TEXT_CHARS].strip() or _refuses_text(text):
             return "credential_bearing_memory"
         if contains_injection(text):
             return "injection_memory_excluded"

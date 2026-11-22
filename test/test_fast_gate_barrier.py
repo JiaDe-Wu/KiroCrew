@@ -56,6 +56,7 @@ _SOURCE_GATE_SCRIPTS = (
     "scripts/check_brand_name.py",
     "scripts/check_comment_history.py",
     "scripts/check_focus_cue.py",
+    "scripts/check_emoji_icons.py",
     "scripts/check_feature_map.py",
     "scripts/check_changelog_history.py",
     "scripts/check_decisions_history.py",
@@ -74,10 +75,10 @@ _SOURCE_GATES_JOB = "source-gates"
 #: so needs a step of its own. Every other gate self-tests inside its own step.
 _SOURCE_GATE_SELF_TEST_STEPS = 1
 # Every job in fast-gate.yml, in file order: the stdlib gates share one job so
-# a push holds one runner slot for all fourteen instead of fourteen; the two
+# a push holds one runner slot for all fifteen instead of fifteen; the two
 # pytest-backed ratchets keep their own because each installs the package.
 # Explicit for the same reason as _SOURCE_GATE_SCRIPTS -- a job added without
-# the push/variable clause would be the one job left running on a queue-on
+# the push/variable clause would be the one job left running on a queue-landed
 # push, and a file-derived list would admit it silently.
 _FAST_GATE_JOBS = (
     _SOURCE_GATES_JOB,
@@ -88,13 +89,21 @@ _FAST_GATE_JOBS = (
 #: verdicts of the gates after it (the job still fails; see the workflow header).
 _GATE_STEP_CONDITION = "${{ !cancelled() }}"
 
-#: The exact `if` clause that trims a job off the push path while the repository
-#: variable MERGE_QUEUE_ENABLED is 'true', and keeps it there while it is unset.
-_PUSH_SKIP_CLAUSE = "github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true'"
+#: The actor GitHub records on the push the merge queue makes when it lands a group.
+_QUEUE_ACTOR = "github.actor == 'github-merge-queue[bot]'"
+#: The exact `if` clause that trims a job off the push path only on a queue-landed
+#: push (the repository variable MERGE_QUEUE_ENABLED 'true' AND the queue as the
+#: actor), and keeps it on every other push.
+_PUSH_SKIP_CLAUSE = (
+    "github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true' "
+    "|| github.actor != 'github-merge-queue[bot]'"
+)
 #: The exact clause under which the boot leg admits a push with no needs to lean on.
-_PUSH_ADMIT_CLAUSE = "github.event_name == 'push' && vars.MERGE_QUEUE_ENABLED == 'true'"
+_PUSH_ADMIT_CLAUSE = (
+    "github.event_name == 'push' && vars.MERGE_QUEUE_ENABLED == 'true' && " + _QUEUE_ACTOR
+)
 #: The exact run-level concurrency group of every workflow a push to main runs:
-#: a group per COMMIT only on the queue-on push, the per-ref group otherwise.
+#: a group per COMMIT only on the queue-landed push, the per-ref group otherwise.
 _PUSH_GROUP_EXPR = (
     "${{ " + _PUSH_ADMIT_CLAUSE + " && format('{0}-{1}', github.workflow, github.sha)"
     " || format('{0}-{1}', github.workflow, github.ref) }}"
@@ -105,12 +114,19 @@ _LINT_GATE = "lint-gate"
 _BARRIER_PASSED = "needs.await-fast-gate.result == 'success'"
 #: The two jobs the lint gate aggregates.
 _LINT_JOBS = ("backend-lint", "frontend-lint")
+#: The opt-in AI review hold. It runs after the lint jobs and the gate reads its
+#: `hold` output, so it feeds the gate and cannot wait for it.
+_AI_HOLD = "ai-block-hold"
 #: Cheap jobs that deliberately do NOT wait for lint: lint-first saves the minutes
 #: of heavy jobs, and holding a 10-minute check behind an 8-minute lint adds
 #: latency to its own verdict for no saving.
 _NOT_BEHIND_LINT: dict[str, str] = {
     "lockfile-engines-floor": "10-minute lockfile check; cheaper than the wait",
     "cfn-lint": "10-minute template lint; gives its own early verdict",
+    "metrics-schema-history": "stdlib manifest diff against the base; seconds, no install",
+    # Runs only when `lint-gate` is skipped on purpose: a docs-only pull
+    # request has no code to lint, and this job is its whole test verdict.
+    "docs-contract-tests": "docs-only pull requests skip lint-gate; this is their test lane",
     # These two hold the baselined ratchets. They are OFF the gate path
     # deliberately, and the trade is real: a ratchet failure does not SAVE the
     # matrix, it reds the pull request alongside it. What is bought is the
@@ -156,13 +172,13 @@ def _evaluate_guard(guard: str, values: dict[str, str]) -> bool:
     Every context reference (``needs.<job>.result``, ``needs.<job>.outputs.<k>``,
     ``github.<k>``, ``vars.<k>``) is replaced by its value from ``values`` (absent
     means ``''``, as on GitHub), so what is left is constants joined by
-    ``&&`` / ``||`` / ``==`` / ``!=`` / ``contains``, walked as a Python AST.
+    ``&&`` / ``||`` / ``!(...)`` / ``==`` / ``!=`` / ``contains``, walked as a Python AST.
     """
     expr = guard.strip()
     if expr.startswith("${{") and expr.endswith("}}"):
         expr = expr[3:-2]
     expr = re.sub(
-        r"\b(?:needs\.[\w-]+\.(?:result|outputs\.\w+)|github\.\w+|vars\.\w+)",
+        r"\b(?:needs\.[\w-]+\.(?:result|outputs\.\w+)|github(?:\.\w+)+|vars\.\w+)",
         lambda m: repr(values.get(m.group(0), "")),
         expr,
     )
@@ -172,6 +188,7 @@ def _evaluate_guard(guard: str, values: dict[str, str]) -> bool:
         expr,
     )
     expr = expr.replace("!cancelled()", "True").replace("&&", " and ").replace("||", " or ")
+    expr = expr.replace("!(", " not (")
 
     def walk(node: ast.AST) -> object:
         if isinstance(node, ast.Expression):
@@ -180,6 +197,8 @@ def _evaluate_guard(guard: str, values: dict[str, str]) -> bool:
             return node.value
         if isinstance(node, ast.List):
             return [walk(item) for item in node.elts]
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return not walk(node.operand)
         if isinstance(node, ast.BoolOp):
             parts = [bool(walk(value)) for value in node.values]
             return all(parts) if isinstance(node.op, ast.And) else any(parts)
@@ -198,13 +217,17 @@ def _evaluate_guard(guard: str, values: dict[str, str]) -> bool:
 
 
 def _simulate_pull_request(
-    ci: dict, surface: dict[str, str], forced: dict[str, str] | None = None
+    ci: dict,
+    surface: dict[str, str],
+    forced: dict[str, str] | None = None,
+    context: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Each job's result on a pull_request run, with GitHub's skip semantics.
 
     A job whose `if:` has no status function gets the implicit `success()`, which
     is true only when EVERY ancestor (not just each direct need) succeeded. A job
-    that runs is taken to succeed unless ``forced`` names its result.
+    that runs is taken to succeed unless ``forced`` names its result. ``context``
+    adds or replaces context values (a repository variable, a job output).
     """
     jobs = ci["jobs"]
     forced = forced or {}
@@ -227,6 +250,7 @@ def _simulate_pull_request(
         "github.event_name": "pull_request",
         "github.ref": "refs/pull/1/merge",
         **{f"needs.changes.outputs.{key}": value for key, value in surface.items()},
+        **(context or {}),
     }
     pending = list(jobs)
     while pending:
@@ -348,11 +372,11 @@ _SCRIPT = _REPO_ROOT / ".github" / "scripts" / "await-fast-gate.sh"
 _CANCEL_SCRIPT = _REPO_ROOT / ".github" / "scripts" / "cancel-superseded-run.sh"
 
 #: The one job allowed to hold actions:write, and the exact condition that keeps
-#: it to a push to main while the merge queue is off.
+#: it to a push to main the merge queue did not land.
 _CANCEL_JOB = "cancel-superseded-run"
 _CANCEL_IF = (
     "github.event_name == 'push' && github.ref == 'refs/heads/main' "
-    "&& vars.MERGE_QUEUE_ENABLED != 'true'"
+    "&& !(vars.MERGE_QUEUE_ENABLED == 'true' && github.actor == 'github-merge-queue[bot]')"
 )
 
 
@@ -405,7 +429,7 @@ def _assert_push_to_main_reaches_exactly_the_macos_boot_leg(ci: dict) -> None:
         if name in skipped_on_push or name == "e2e-boot-matrix":
             continue
         if name == _CANCEL_JOB:
-            # Needs neither (it runs beside the barrier), so the queue-on push
+            # Needs neither (it runs beside the barrier), so the queue-landed push
             # has to be trimmed by its own condition, which carries the same
             # variable clause the barrier's does.
             assert spec["if"] == _CANCEL_IF, spec.get("if")
@@ -454,11 +478,13 @@ def _assert_push_to_main_reaches_exactly_the_macos_boot_leg(ci: dict) -> None:
     ), f"expected non-push / queue-on / queue-off matrix split, got: {matrix_os}"
     non_push_side, queue_on_side, queue_off_side = sides
     assert "github.event_name != 'push'" in non_push_side
-    assert "vars.MERGE_QUEUE_ENABLED == 'true'" in queue_on_side
+    assert "vars.MERGE_QUEUE_ENABLED == 'true' && " + _QUEUE_ACTOR in queue_on_side
     assert "&&" not in queue_off_side, "the fallback literal must be unguarded"
 
     def platforms(side: str) -> list[str]:
-        start = side.index("[")
+        # The quoted literal, not the first bracket: the queue-landed side's
+        # actor check, 'github-merge-queue[bot]', carries one ahead of it.
+        start = side.index("'[") + 1
         end = side.index("]", start) + 1
         parsed = json.loads(side[start:end])
         assert isinstance(parsed, list) and all(isinstance(item, str) for item in parsed)
@@ -496,7 +522,7 @@ class TestTheGatesLiveInTheGateWorkflow:
         assert not strays, f"gate(s) back in ci.yml, racing the matrix again: {strays}"
 
     def test_every_gate_step_runs_unless_the_run_was_cancelled(self, fast_gate: dict) -> None:
-        # One job, fourteen gates: without the condition the first red gate ends
+        # One job, fifteen gates: without the condition the first red gate ends
         # the job and the author learns about the others one push at a time.
         # Exactly `!cancelled()`, not `always()`: a cancelled run (a superseding
         # push) must not keep spending its runner on gates nobody will read.
@@ -545,10 +571,10 @@ class TestTheGatesLiveInTheGateWorkflow:
     def test_every_gate_skips_only_the_queued_push(self, fast_gate: dict, job: str) -> None:
         # A `needs:` lets a failed sibling skip it and an `if:` lets a diff shape
         # dodge it. The ONE condition a gate may carry is the exact push/variable
-        # clause: on a push to main while MERGE_QUEUE_ENABLED is 'true' the merge
-        # group already ran every gate on this tree, so the push run skips
-        # whole -- and then neither this workflow nor ci.yml requests a fleet
-        # slot on the queue-on push path (only fleet-labelled jobs can be
+        # clause: on a push the merge queue landed while MERGE_QUEUE_ENABLED is
+        # 'true' the merge group already ran every gate on this tree, so the push
+        # run skips whole -- and then neither this workflow nor ci.yml requests a
+        # fleet slot on the queue-landed push path (only fleet-labelled jobs can be
         # orphaned; build.yml's matrix resolver and the heal-exempt ratchet
         # audit are what remain). Equality, not containment: an extra `&&` term is a way
         # to dodge, and `==`/`!=` swapped would skip every PR instead.
@@ -561,7 +587,7 @@ class TestTheGatesLiveInTheGateWorkflow:
     def test_the_queued_push_run_is_all_skipped_not_failed(self, fast_gate: dict) -> None:
         # Job by job above, and here as a whole: the job list is pinned so a gate
         # ADDED without the clause (which would be the one job left running on the
-        # queue-on push, holding a fleet slot) fails, and so does one dropped.
+        # queue-landed push, holding a fleet slot) fails, and so does one dropped.
         assert tuple(fast_gate["jobs"]) == _FAST_GATE_JOBS
         carrying = {
             name for name, spec in fast_gate["jobs"].items() if spec.get("if") == _PUSH_SKIP_CLAUSE
@@ -577,8 +603,8 @@ class TestTheGatesLiveInTheGateWorkflow:
         ci_on = dict(ci.get("on", ci.get(True)))
         fg_on = dict(fast_gate.get("on", fast_gate.get(True)))
         expected = {
-            "push": {"branches": ["main"]},
-            "pull_request": {"branches": ["main"]},
+            "push": {"branches": ["main", "release/**"]},
+            "pull_request": {"branches": ["main", "release/**"]},
             "merge_group": {"types": ["checks_requested"]},
         }
         assert ci_on == expected
@@ -586,20 +612,20 @@ class TestTheGatesLiveInTheGateWorkflow:
         # barrier consumes that run before the full push matrix.
         assert fg_on == expected, (
             "Fast Gate's triggers drifted from ci.yml's. A WIDER filter newly reviews "
-            "fork PRs on a non-main base (the fork reviewers key on this workflow), and "
+            "fork PRs on bases CI never tests (the fork reviewers key on this workflow), and "
             "a NARROWER one leaves await-fast-gate waiting for a run that never starts."
         )
         assert list(fg_on) == list(expected), "keep the trigger order matching ci.yml"
 
     @pytest.mark.parametrize("path", [_CI, _FAST_GATE, _BUILD], ids=lambda p: p.name)
-    def test_a_push_is_grouped_per_commit_only_while_the_queue_is_on(self, path: Path) -> None:
+    def test_a_push_is_grouped_per_commit_only_when_the_queue_landed_it(self, path: Path) -> None:
         """Re-derived stronger: the exact concurrency block, on every workflow a push runs.
 
         With MERGE_QUEUE_ENABLED unset a push runs the FULL matrix, so it must keep
         today's per-ref group: one running plus one pending, later pushes evict the
         pending one. A per-SHA group there would let N concurrent main matrices hold
         2N hosted macOS jobs with nothing evicting or queueing them. Only the trimmed
-        queue-on push (one macOS leg per commit) earns a group per commit.
+        queue-landed push (one macOS leg per commit) earns a group per commit.
         """
         assert _workflow(path)["concurrency"] == {
             "group": _PUSH_GROUP_EXPR,
@@ -611,9 +637,44 @@ class TestTheGatesLiveInTheGateWorkflow:
         assert "github.sha" in sha_arm and "github.sha" not in ref_arm
         assert "vars." not in ref_arm and "github.ref" in ref_arm
 
+    @pytest.mark.parametrize("path", [_CI, _FAST_GATE, _BUILD], ids=lambda p: p.name)
+    def test_a_push_the_queue_did_not_make_runs_as_if_the_variable_were_unset(
+        self, path: Path
+    ) -> None:
+        """With MERGE_QUEUE_ENABLED 'true', only a commit the merge queue landed was
+        proven by a merge group. A direct push, or a merge made while the ruleset has
+        the queue off, must take the full-matrix path the variable-unset push takes,
+        so every job `if:` and step `env:` reading the variable answers for it exactly
+        as for an unset variable, and differently only for the queue's own push."""
+
+        def answer(expr: str, variable: str, actor: str) -> bool:
+            return _evaluate_guard(
+                expr,
+                {
+                    "github.event_name": "push",
+                    "github.ref": "refs/heads/main",
+                    "vars.MERGE_QUEUE_ENABLED": variable,
+                    "github.actor": actor,
+                },
+            )
+
+        reads: list[str] = []
+        for job in _workflow(path)["jobs"].values():
+            exprs = [job.get("if")] + [
+                value
+                for step in job.get("steps") or []
+                for value in (step.get("env") or {}).values()
+            ]
+            reads += [str(expr) for expr in exprs if "vars.MERGE_QUEUE_ENABLED" in str(expr)]
+        assert reads, f"{path.name} reads MERGE_QUEUE_ENABLED in no job condition"
+        for expr in reads:
+            person, queue = "a-maintainer", "github-merge-queue[bot]"
+            assert answer(expr, "true", person) == answer(expr, "", person), expr
+            assert answer(expr, "true", queue) != answer(expr, "", queue), expr
+
     def test_a_push_to_main_reaches_exactly_the_macos_boot_leg(self, ci: dict) -> None:
-        """Re-derived stronger: pin the push path job by job under both states of
-        MERGE_QUEUE_ENABLED -- trimmed to the mac boot leg when set, full matrix when unset."""
+        """Re-derived stronger: pin the push path job by job -- trimmed to the mac
+        boot leg on a queue-landed push, the full matrix on every other push."""
         _assert_push_to_main_reaches_exactly_the_macos_boot_leg(ci)
 
 
@@ -786,8 +847,9 @@ class TestTheBarrierFailsClosed:
         # restated here or the API read 404s and the barrier fails closed on every run.
         # Read and nothing more: the barrier runs on pull requests and merge groups, and
         # the one write a superseded push needs lives in the cancel job.
+        # checks:read reads the commit's check-runs when the listing answers none.
         perms = ci["jobs"]["await-fast-gate"]["permissions"]
-        assert perms == {"actions": "read", "contents": "read"}
+        assert perms == {"actions": "read", "checks": "read", "contents": "read"}
 
     def test_the_barrier_script_makes_no_write(self, barrier_script: str) -> None:
         # `gh api` with -f fields defaults to POST, so every call names its method,
@@ -832,18 +894,27 @@ class TestOnlyThePushOnlyCancelJobCanWrite:
         }
         assert writers == {_CANCEL_JOB}, writers
 
-    def test_the_cancel_job_holds_exactly_actions_write_and_contents_read(self, ci: dict) -> None:
-        assert ci["jobs"][_CANCEL_JOB]["permissions"] == {"actions": "write", "contents": "read"}
+    def test_the_cancel_job_holds_exactly_actions_write_checks_and_contents_read(
+        self, ci: dict
+    ) -> None:
+        # checks:read lets the probe make the barrier's own check-runs read.
+        assert ci["jobs"][_CANCEL_JOB]["permissions"] == {
+            "actions": "write",
+            "checks": "read",
+            "contents": "read",
+        }
 
     def test_the_cancel_job_runs_only_on_a_push_to_main(self, ci: dict) -> None:
         guard = ci["jobs"][_CANCEL_JOB]["if"]
         assert guard == _CANCEL_IF
         # A conjunction only: one `||` would let a second event through.
         assert "||" not in guard
-        # The trigger list is what makes `push` mean main; the guard restates it.
+        # `push` also fires for release branches, so the guard's own
+        # `refs/heads/main` test is what keeps this job off a release push.
         # PyYAML reads the bare key `on` as boolean True.
         triggers = ci.get(True) or ci.get("on") or {}
-        assert triggers["push"] == {"branches": ["main"]}
+        assert triggers["push"] == {"branches": ["main", "release/**"]}
+        assert "github.ref == 'refs/heads/main'" in guard
 
     def test_the_cancel_job_runs_beside_the_barrier_and_gates_nothing(self, ci: dict) -> None:
         assert "needs" not in ci["jobs"][_CANCEL_JOB]
@@ -1229,6 +1300,7 @@ class TestLintRunsBeforeTheHeavyJobs:
             "changes",
             "await-fast-gate",
             *_LINT_JOBS,
+            _AI_HOLD,
         }
         for lint in _LINT_JOBS:
             assert _LINT_GATE not in self._needs(ci, lint), "a lint job cannot wait on its gate"
@@ -1256,6 +1328,7 @@ class TestLintRunsBeforeTheHeavyJobs:
             "await-fast-gate",
             "cancel-superseded-run",
             *_LINT_JOBS,
+            _AI_HOLD,
             *_NOT_BEHIND_LINT,
         }
         # Reporters that consume the shards reach the gate through them.
@@ -1438,3 +1511,59 @@ class TestLintRunsBeforeTheHeavyJobs:
         assert lint_at < body.index("frontend-test=$FE -- failing closed")
         assert lint_at < body.index("backend-test=$BE -- failing closed")
         assert "Backend Lint & Type Check" in body and "Frontend Lint & Type Check" in body
+
+
+_DOCS_CONTRACT_FIRST_SHARD = "matrix.shard == 1"
+
+
+def test_docs_contract_tests_always_runs_the_whole_electron_suite(ci: dict) -> None:
+    # Electron specs read docs by computed paths the reader selector cannot
+    # see, and `electron-test` skips on a docs-only pull request. The job is a
+    # backend file-shard matrix; the Electron suite runs on exactly one leg,
+    # whatever the selector picked.
+    job = ci["jobs"]["docs-contract-tests"]
+    assert 1 in job["strategy"]["matrix"]["shard"]
+    steps = job["steps"]
+    electron = [
+        step
+        for step in steps
+        if step.get("working-directory") == "website/electron" and "npm test" in step.get("run", "")
+    ]
+    assert electron
+    for step in electron:
+        assert step.get("if") == _DOCS_CONTRACT_FIRST_SHARD
+        assert step["env"]["ELECTRON_SKIP_BINARY_DOWNLOAD"] == "1"
+    node = [step for step in steps if str(step.get("uses", "")).startswith("actions/setup-node@")]
+    assert node
+    for step in node:
+        assert step.get("if") == _DOCS_CONTRACT_FIRST_SHARD
+        assert "website/electron/package-lock.json" in step["with"]["cache-dependency-path"]
+    seed = [step for step in steps if step.get("uses") == "./.github/actions/seed-node-tool-cache"]
+    assert seed
+    for step in seed:
+        assert step.get("if") == _DOCS_CONTRACT_FIRST_SHARD
+    vitest = [step for step in steps if "npx vitest run" in step.get("run", "")]
+    assert vitest
+    for step in vitest:
+        assert step["if"].startswith(_DOCS_CONTRACT_FIRST_SHARD + " && ")
+
+
+def test_docs_contract_tests_shards_the_backend_list_without_argv(ci: dict) -> None:
+    # Positional test files bypass collect_ignore and make pytest walk a
+    # file's directory once per argument (scripts/ci_file_shards.py), so the
+    # selected list reaches pytest only through --file-shard-targets.
+    job = ci["jobs"]["docs-contract-tests"]
+    assert job["strategy"]["fail-fast"] is False
+    shards = job["strategy"]["matrix"]["shard"]
+    assert shards == list(range(1, len(shards) + 1))
+    assert str(job["env"]["SHARD_COUNT"]) == str(len(shards))
+    pytest_steps = [step for step in job["steps"] if "pytest" in step.get("run", "")]
+    assert pytest_steps
+    for step in pytest_steps:
+        body = step["run"]
+        assert "-p scripts.ci_file_shards" in body
+        assert '--file-shard-targets="$BACKEND_FILE"' in body
+        assert '--file-shards "$SHARD_COUNT" --file-shard ${{ matrix.shard }}' in body
+        assert "-p scripts.ci_main_red_skip" in body
+        assert step["env"]["CI_MAIN_RED_SKIP"] == "${{ needs.changes.outputs.main_red_skip }}"
+        assert "mapfile" not in body and "targets[@]" not in body

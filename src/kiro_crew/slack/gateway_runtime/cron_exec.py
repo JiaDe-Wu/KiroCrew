@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     import asyncio
 
     from kiro_crew.slack.gateway import (
+        _CRON_FAILURE_DETAIL_CAP,
         CronClaimTimeDenied,
         CronJob,
         CronQueueTimeout,
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
         logger,
         redact,
         rehydrate_slot_from_history_async,
+        resurface_stale_grant,
         run_command_sandboxed,
         run_in_cron_pool,
         run_script_sandboxed,
@@ -155,6 +157,7 @@ async def _cron_run_command(self: GatewayOrchestrator, job: CronJob) -> str | No
             job.id,
             job.secret_env,
             job.secret_env_pin,
+            job.env,
             timeout=_claim_backstop(job, cmd_timeout),
         )
         if result.get("status") == "cancelled":
@@ -236,8 +239,27 @@ async def _cron_run_command(self: GatewayOrchestrator, job: CronJob) -> str | No
             logger.debug("SEL logging failed in cron command result path", exc_info=True)
         if job.last_status == "error":
             # A non-zero exit DOES produce output, and that output is
-            # the reason — carry it, not just the exit code.
-            await self._alert_cron_failure(job, f"{job.last_error}\n{output}")
+            # the reason — carry it. The exit code goes in the alert's
+            # header, once; the body leads with the stderr tail, where a
+            # dying command writes its cause. A run with no process (a
+            # timeout, a spawn error) reports -1 and a one-line reason
+            # whose failure lead the header already shows.
+            from kiro_crew.cron_script import _strip_error_lead
+
+            code = result.get("exit_code")
+            reason = _strip_error_lead(output)
+            if "stderr" in result:
+                # The streams come only from a process that exited, so its
+                # code is real even when it is -1 (killed by SIGHUP).
+                # The alert keeps the head of its body: hand it stderr's tail.
+                err = result["stderr"][-_CRON_FAILURE_DETAIL_CAP:]
+                out = result["stdout"]
+                reason = f"{err}\n\nstdout:\n{out}" if err and out else err or out or "no output"
+            elif code == -1:
+                code = None
+            await self._alert_cron_failure(
+                job, reason, exit_code=code if isinstance(code, int) else None
+            )
         return job.last_result
     except CronQueueTimeout as exc:
         # Pool starvation, not a broken command: every worker was
@@ -431,10 +453,20 @@ async def _cron_run_command(self: GatewayOrchestrator, job: CronJob) -> str | No
 
 
 async def _deliver_script_result(
-    self: GatewayOrchestrator, job: CronJob, message: str, *, remove: bool = False
+    self: GatewayOrchestrator,
+    job: CronJob,
+    message: str,
+    *,
+    remove: bool = False,
+    pin: tuple[str, str] | None = None,
 ) -> None:
-    """Deliver a script cron result to the originating session. Optionally remove the job."""
+    """Deliver a script cron result to its origin session and its pin. Optionally remove the job.
+
+    *pin* is the ``(channel_type, target_id)`` the run launched with.
+    """
     delivered = False
+    # `result_ts` names the stored result the note carries (`message` is it).
+    note_meta = {"job_id": job.id, "result_ts": job.last_result_ts}
     try:
         if message and not job.silent and self.dashboard_state and job.session_key:
             slot_key = job.session_key.removeprefix("dashboard:")
@@ -482,17 +514,24 @@ async def _deliver_script_result(
                     # Nothing in the full queue could give way, or the session
                     # closed meanwhile: the result goes out as a notification,
                     # as it does when the session is gone.
-                    self.dashboard_state.notify(
-                        "cron", f"⚡ {label}", message, meta={"job_id": job.id}
-                    )
+                    self.dashboard_state.notify("cron", f"{label}", message, meta=note_meta)
             else:
-                self.dashboard_state.notify("cron", f"⚡ {label}", message, meta={"job_id": job.id})
+                self.dashboard_state.notify("cron", f"{label}", message, meta=note_meta)
         elif message and not job.silent and self.dashboard_state:
             label = redact(job.name)
-            self.dashboard_state.notify("cron", f"⚡ {label}", message, meta={"job_id": job.id})
+            self.dashboard_state.notify("cron", f"{label}", message, meta=note_meta)
         delivered = True
     except Exception as notify_exc:
         logger.warning("Cron '%s' delivery failed: %s", job.name, notify_exc)
+    if message and not job.silent:
+        # The creating app is read off the stored job, so this runs before a removal.
+        # No origin key: a script's result never went to the chat channel that made it.
+        try:
+            await self._deliver_cron_to_channel(
+                "", f"⏰ Cron: {job.name}\n\n{message}", actor_key=f"cron:{job.id}", pin=pin
+            )
+        except Exception as pin_exc:
+            logger.warning("Cron '%s' pinned delivery failed: %s", job.name, pin_exc)
     if remove and delivered and self.cron_svc:
         try:
             await self.cron_svc.remove_job_async(
@@ -533,6 +572,8 @@ async def _cron_run_script(self: GatewayOrchestrator, job: CronJob) -> str | Non
     # can always reach it -- including on the fire-time deny paths that
     # return before anything is submitted.
     handoff = _ClaimHandoff()
+    # Set at launch, below; a failure before it has no run output to route.
+    run_dest: tuple[str, str] | None = None
     try:
         try:
             sel().log_tool_invocation(
@@ -597,6 +638,15 @@ async def _cron_run_script(self: GatewayOrchestrator, job: CronJob) -> str | Non
         # runs inside the worker, after the wait, so the decision
         # holds at the moment of use.  It shares the backstop below,
         # which is why it must stay short.
+        #
+        # The pin is read ONCE: the job object is shared with the store, so an
+        # approval landing during the run rewrites job.secret_env_pin in place,
+        # and the stale-grant resurfacer must compare against the pin this run
+        # actually verified, not the one that replaced it. The destination pair is
+        # read once for the same reason: this run's output goes where the grant
+        # fingerprint below bound it, not to a pin edited while the script ran.
+        run_pin = job.secret_env_pin
+        run_dest = (job.channel_type, job.target_id)
         result = await run_in_cron_pool(
             _vet_at_claim_then,
             handoff,
@@ -607,14 +657,16 @@ async def _cron_run_script(self: GatewayOrchestrator, job: CronJob) -> str | Non
             job.message,
             script_timeout,
             job.secret_env,
-            job.secret_env_pin,
+            run_pin,
             delivery_fingerprint(
                 job.session_key,
                 job.silent,
                 job.channel or "",
                 job.thread_ts or "",
+                *run_dest,
             ),
             self._live_internal_secret,
+            job.env,
             timeout=_claim_backstop(job, script_timeout),
         )
         status = result.get("status", "error")
@@ -672,6 +724,7 @@ async def _cron_run_script(self: GatewayOrchestrator, job: CronJob) -> str | Non
             # Result-less like the deny paths: a Skip that carried the
             # previous run's output read as though it had produced it.
             job.clear_carried_result()
+            job.idle_run = True
             try:
                 sel().log_tool_invocation(
                     session_key=f"cron:{job.id}",
@@ -683,7 +736,10 @@ async def _cron_run_script(self: GatewayOrchestrator, job: CronJob) -> str | Non
                 logger.debug("SEL logging failed in cron script skip path", exc_info=True)
             return None
         elif status == "done":
-            msg = result.get("message", "")
+            msg = result.get("message")
+            # Any JSON type may arrive: redact() takes text, and an empty value sends nothing.
+            if msg and not isinstance(msg, str):
+                msg = str(msg)
             script_msg = redact(msg) if msg else ""
             job.set_run_result(script_msg)
             job.last_error = ""
@@ -695,7 +751,7 @@ async def _cron_run_script(self: GatewayOrchestrator, job: CronJob) -> str | Non
             # streak is a LIFETIME total, so after enough deaths the bound is
             # permanently tripped and the exemption silently stops applying.
             runtime_death.clear_shared_deaths(f"cron:{job.id}")
-            await self._deliver_script_result(job, script_msg, remove=True)
+            await self._deliver_script_result(job, script_msg, remove=True, pin=run_dest)
             try:
                 sel().log_tool_invocation(
                     session_key=f"cron:{job.id}",
@@ -707,7 +763,10 @@ async def _cron_run_script(self: GatewayOrchestrator, job: CronJob) -> str | Non
                 logger.debug("SEL logging failed in cron script done path", exc_info=True)
             return script_msg or "done"
         elif status == "report":
-            msg = result.get("message", "")
+            msg = result.get("message")
+            # Any JSON type may arrive: redact() takes text, and an empty value sends nothing.
+            if msg and not isinstance(msg, str):
+                msg = str(msg)
             script_msg = redact(msg) if msg else ""
             job.set_run_result(script_msg)
             job.last_error = ""
@@ -720,7 +779,7 @@ async def _cron_run_script(self: GatewayOrchestrator, job: CronJob) -> str | Non
             # permanently tripped and the exemption silently stops applying.
             runtime_death.clear_shared_deaths(f"cron:{job.id}")
             # Deliver Report message (keep job running)
-            await self._deliver_script_result(job, script_msg)
+            await self._deliver_script_result(job, script_msg, pin=run_dest)
             try:
                 sel().log_tool_invocation(
                     session_key=f"cron:{job.id}",
@@ -733,6 +792,12 @@ async def _cron_run_script(self: GatewayOrchestrator, job: CronJob) -> str | Non
             return script_msg or "report"
         else:
             err = result.get("error", "unknown error")
+            if result.get("grant_stale") is True and self.cron_svc is not None:
+                # The run failed closed on a grant pinned to older code. File
+                # the re-approval request the operator needs to heal it, so the
+                # Schedule page shows something to approve; the run itself is
+                # still recorded as the failure below.
+                await resurface_stale_grant(self.cron_svc, job.id, run_pin)
             raise RuntimeError(err)
     except CronQueueTimeout as exc:
         # Pool starvation, not a broken script: every worker was
@@ -799,7 +864,7 @@ async def _cron_run_script(self: GatewayOrchestrator, job: CronJob) -> str | Non
             )
         except Exception:
             logger.debug("SEL logging failed in cron script timeout path", exc_info=True)
-        await self._alert_cron_failure(job, f"script {job.last_error}")
+        await self._alert_cron_failure(job, f"script {job.last_error}", pin=run_dest)
         return None
     except CronClaimTimeDenied as exc:
         # Governance refused this run when the worker claimed it --
@@ -890,7 +955,7 @@ async def _cron_run_script(self: GatewayOrchestrator, job: CronJob) -> str | Non
         # startup RuntimeError, a missing dependency) and identical on
         # every fire, so it read as an idle job rather than a broken
         # one until this alert carried the reason out.
-        await self._alert_cron_failure(job, f"{type(exc).__name__}: {exc}")
+        await self._alert_cron_failure(job, f"{type(exc).__name__}: {exc}", pin=run_dest)
         return None
     finally:
         # Abandon BEFORE releasing the overlap guard, and do it here

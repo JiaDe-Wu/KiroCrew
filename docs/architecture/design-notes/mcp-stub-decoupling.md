@@ -112,18 +112,28 @@ Two paths can emit stubs, and both apply the same explicit
 `mcp_gateway.stub_servers` roster to stdio servers:
 
 - **Agent-declared servers** in `~/.kiro/agents/*.json`, wrapped in that agent's
-  overlay only when the server name is in the roster.
+  overlay only when the server name is in the roster and the agent's `tools`
+  names it. kiro-cli offers a declared server's tools only when `tools` names it,
+  but the session mounts every stub it is sent, so an unnamed server keeps its raw
+  entry. An unnamed one whose env holds a `secret://` reference gets a stub that
+  starts nothing and offers no tools instead, because its raw entry would start it
+  with the literal reference. A server the rebuild withheld for its `secret://`
+  reference is still wrapped once it is routed: the rebuild stripped its refs
+  itself and restores them after that pass.
 - **Global `settings/mcp.json` servers**, injected into each agent's overlay only
   when rostered so the stub carries the right agent identity. The injected stub takes precedence
   over the raw same-named global entry at ACP `session/new`
   (`session_servers.py`), which is what keeps a server from being wrapped twice
   under two identities; no settings overlay is written and the real settings
-  file is never modified (#8111). The roster, not poolability, decides the
+  file is never modified. The roster, not poolability, decides the
   injection: a rostered server that is not shared still gets a stub and a
   callback address, and a server off the roster merges raw with no stub. An
-  agent whose spec sets `includeMcpJson: false` gets no injected stubs: kiro-cli
-  merges nothing from the global file into it, so its overlay mounts only the
-  servers its own spec declares.
+  agent whose spec sets `includeMcpJson: false` (or its deprecated alias
+  `useLegacyMcpJson: false`) gets no injected stubs: kiro-cli merges nothing
+  from the global file into it, so its overlay mounts only the servers its own
+  spec declares. Any other agent gets a stub only for a server its `tools`
+  names, since the session mounts every injected stub whatever `tools` says; a
+  server it does not name is left to kiro-cli's own merge, unpooled.
 
 ## The acquisition path
 

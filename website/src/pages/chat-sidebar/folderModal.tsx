@@ -5,11 +5,17 @@ import type React from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { api } from '../../api/client'
 import FolderConfigModal from '../../components/FolderConfigModal'
+import { foldByName } from '../../hooks/useAgents'
 import { requestFolderReveal } from '../../store/chatSlice'
 import { isInstancesDisabledError } from '../../utils/instancesDisabled'
 import { safeSetItem } from '../../utils/safeStorage'
 import { FLAT_VIEW_LS_KEY } from './persistence'
 import type { FolderModalTarget, SidebarScope } from './scope'
+
+/** The folder's own directory's roster, folded to one row per name like the
+ *  sidebar's. Module-level so its identity is stable across renders. */
+const loadProjectAgents = async (projectDir: string) =>
+  foldByName((await api.agentCatalog(undefined, projectDir)).agents ?? [])
 
 /** The modal, fed the crew list *Send a copy to* already reads (same query key,
  *  so no extra request). The gateway's own `instances_disabled` 403 (Instances
@@ -36,7 +42,7 @@ function FolderConfigModalWithCrews(props: React.ComponentProps<typeof FolderCon
 
 /** The modal for the folder the sidebar targets. */
 export function renderFolderModal(shell: SidebarScope, folderModal: FolderModalTarget): React.ReactNode {
-  const { createFolderMutation, defaultAgent, dispatch, flatView, folders, installedAgents, refetchTags, setFlatView,
+  const { createFolderMutation, defaultAgent, dispatch, flatView, folders, hideEmptyFolders, installedAgents, refetchTags, setFlatView,
     setFolderModal, tagsData, tagsQueryFailed, updateFolderMutation } = shell
   return (
         <FolderConfigModalWithCrews
@@ -46,6 +52,7 @@ export function renderFolderModal(shell: SidebarScope, folderModal: FolderModalT
           folder={folderModal.mode === 'edit' ? folders.find(f => f.id === folderModal.folderId) : undefined}
           folders={folders}
           installedAgents={installedAgents}
+          loadProjectAgents={loadProjectAgents}
           globalDefaultAgent={defaultAgent}
           availableTags={tagsData}
           availableTagsFailed={tagsQueryFailed}
@@ -86,9 +93,11 @@ export function renderFolderModal(shell: SidebarScope, folderModal: FolderModalT
               // A subfolder lands inside its parent, and a collapsed parent would
               // hide it, so the create looked like it had done nothing. The folder
               // reveal opens the parent and every collapsed ancestor, scrolls the
-              // new row into view and flashes it.
+              // new row into view and flashes it. A new folder is also empty, so
+              // with empty folders hidden it would vanish the moment it lands; the
+              // reveal keeps it shown for this visit.
               const createdId = (created as { id?: unknown } | null)?.id
-              if (folderModal.parentId && typeof createdId === 'string' && createdId) {
+              if ((folderModal.parentId || hideEmptyFolders) && typeof createdId === 'string' && createdId) {
                 dispatch(requestFolderReveal(createdId))
               }
             } else {

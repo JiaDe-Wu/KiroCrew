@@ -357,6 +357,24 @@ def test_seatbelt_keeps_a_window_over_a_lift_and_never_lifts_the_voice_runtime()
     assert linux.windows == ()
 
 
+def test_seatbelt_records_the_directories_realpath_stats_to_reach_an_exposed_file() -> None:
+    """A file carved out of a Seatbelt mask is reached through the masked directories
+    above it, and ``realpath`` stats each one: a launch config staged in a masked tree is
+    unopenable by a CLI that canonicalizes its path unless they are recorded."""
+    staging = f"{CREW}/auth-store-staging"
+    exposed = f"{staging}/sub/strands-mcp-1-x.json"
+    macos = _plan(
+        "standard", BACKEND_SEATBELT, extra_hidden_dirs=(staging,), extra_expose_files=(exposed,)
+    )
+    [caller] = [m for m in macos.masks if m.path == staging]
+    assert caller.exposed == (exposed,)
+    assert caller.exposed_ancestors == (f"{staging}/sub", staging)
+    aws = {m.path: m for m in _plan("cc", BACKEND_SEATBELT).masks}[f"{HOME}/.aws"]
+    assert aws.exposed_ancestors == (f"{HOME}/.aws",)
+    unexposed = {m.path: m for m in _plan("strict", BACKEND_SEATBELT).masks}[f"{HOME}/.aws"]
+    assert unexposed.exposed_ancestors == ()
+
+
 def test_only_the_namespace_launcher_folds_crew_home_aliases() -> None:
     alias = (f"{HOME}/.kiro/crew", "/real/crew", 1, 2)
     request = {"crew_home_aliases": (alias,), "extra_hidden_dirs": (f"{CREW}/apps",)}
@@ -376,6 +394,118 @@ def test_seatbelt_write_seals_the_trees_whose_writes_matter() -> None:
     assert by_path[f"{CREW}/.env"].write_sealed and by_path[f"{CREW}/.env"].literal_write_sealed
     assert by_path[VOICE].write_sealed
     assert not by_path[f"{HOME}/.aws"].write_sealed
+
+
+def test_seatbelt_guards_every_ancestor_of_a_caller_mask_against_rename() -> None:
+    mask = f"{HOME}/data/store/item.bin"
+    host = _host(caller_ancestor_guards=(f"{HOME}/data/store", f"{HOME}/data", HOME, "/other"))
+    profile = sandbox_seatbelt.render_seatbelt_profile(
+        _plan("strict", BACKEND_SEATBELT, host=host, extra_hidden_dirs=(mask,))
+    )
+    for ancestor in (f"{HOME}/data/store", f"{HOME}/data", HOME):
+        assert f'(deny file-write* (literal "{ancestor}"))' in profile
+    # Only the ancestors of a live mask: an unrelated guard the host listed is dropped.
+    assert '(literal "/other")' not in profile
+    namespace = _plan("strict", host=host, extra_hidden_dirs=(mask,))
+    assert f"{HOME}/data/store" in namespace.runtime_ancestor_guards
+
+
+def test_namespace_guards_every_ancestor_of_a_caller_mask_against_rename() -> None:
+    mask = f"{HOME}/data/store/item.bin"
+    guards = (f"{HOME}/data/store", f"{HOME}/data", HOME, "/other")
+    plan = _plan("strict", host=_host(caller_ancestor_guards=guards), extra_hidden_dirs=(mask,))
+    for ancestor in (f"{HOME}/data/store", f"{HOME}/data", HOME):
+        assert ancestor in plan.runtime_ancestor_guards
+    # Only the ancestors of a live mask: an unrelated guard the host listed is dropped.
+    assert "/other" not in plan.runtime_ancestor_guards
+    assert plan.runtime_ancestor_guards == _plan("strict", host=_host()).runtime_ancestor_guards + (
+        f"{HOME}/data/store",
+        f"{HOME}/data",
+        HOME,
+    )
+
+
+def test_a_caller_mask_file_is_sealed_and_its_parent_guarded_on_both_backends() -> None:
+    mask = f"{HOME}/data/store/item.bin"
+    host = _host(caller_ancestor_guards=(f"{HOME}/data/store", f"{HOME}/data", HOME))
+    macos = _plan("strict", BACKEND_SEATBELT, host=host, extra_hidden_dirs=(mask,))
+    profile = sandbox_seatbelt.render_seatbelt_profile(macos)
+    assert f'(deny file-write* (literal "{mask}"))' in profile
+    assert f'(deny file-write* (literal "{HOME}/data/store"))' in profile
+    linux = _plan("strict", host=host, extra_hidden_dirs=(mask,))
+    assert mask in [m.path for m in linux.masks]
+    assert f"{HOME}/data/store" in linux.runtime_ancestor_guards
+    # The built-in paths plan the same with and without a caller entry.
+    base = _host()
+    assert (
+        _plan("strict", host=base, extra_hidden_dirs=(mask,)).runtime_ancestor_guards
+        == _plan("strict", host=base).runtime_ancestor_guards
+    )
+
+
+def test_live_host_guards_only_the_caller_ancestors_that_exist(
+    live_host: Path, tmp_path: Path
+) -> None:
+    present = tmp_path / "present"
+    present.mkdir()
+    request = SandboxRequest(
+        tier="strict",
+        backend=BACKEND_SEATBELT,
+        extra_hidden_dirs=(str(present / "item.bin"), str(tmp_path / "absent" / "item.bin")),
+    )
+    for backend in (BACKEND_SEATBELT, BACKEND_NAMESPACE):
+        guards = sandbox._live_plan_host(replace(request, backend=backend)).caller_ancestor_guards
+        assert str(present) in guards
+        assert str(tmp_path) in guards
+        assert str(tmp_path / "absent") not in guards
+
+
+def _namespace_host(request: SandboxRequest) -> PlanHost:
+    return sandbox._live_plan_host(replace(request, backend=BACKEND_NAMESPACE))
+
+
+def test_live_host_filters_caller_parents_by_what_this_uid_can_rename(
+    live_host: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "shared"
+    parent.mkdir()
+    seen: list[int] = []
+
+    def _can_rename(path: str, uid: int) -> bool:
+        seen.append(uid)
+        return path != str(parent)
+
+    from kiro_crew import sandbox_workspace
+
+    monkeypatch.setattr(sandbox_workspace, "_caller_can_rename", _can_rename)
+    request = SandboxRequest(
+        tier="strict", backend=BACKEND_NAMESPACE, extra_hidden_dirs=(str(parent / "item.bin"),)
+    )
+    guards = _namespace_host(request).caller_ancestor_guards
+    assert str(parent) not in guards
+    assert str(tmp_path) in guards
+    assert set(seen) == {os.getuid()}
+
+
+def test_live_host_pins_a_caller_parent_that_is_an_app_folder_after_the_masks(
+    live_host: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_dir = live_host / ".kiro" / "crew" / "apps" / "demo"
+    data = app_dir / "data"
+    data.mkdir(parents=True)
+    monkeypatch.setattr(
+        sandbox, "_app_declared_leaves", lambda: ("apps/demo/data/tokens/oauth.json",)
+    )
+    request = SandboxRequest(
+        tier="strict", backend=BACKEND_NAMESPACE, extra_hidden_dirs=(str(data / "item.bin"),)
+    )
+    host = _namespace_host(request)
+    assert str(app_dir) not in host.caller_ancestor_guards
+    assert str(app_dir) not in host.readonly_ancestor_guards
+    assert str(app_dir) in host.mask_parent_pins
+    # Every other folder above the entry stays pinned before the masks.
+    assert str(data) in host.caller_ancestor_guards
+    assert str(app_dir.parent) in host.caller_ancestor_guards
 
 
 # --------------------------------------------------------------------------- #
@@ -659,6 +789,7 @@ _SEATBELT_GOLDEN = """\
 (deny file-read* (literal "/work/relative/hidden"))
 (deny file-write* (literal "/work/relative/hidden"))
 (deny file-link (literal "/work/relative/hidden"))
+(allow file-read-metadata (literal "/work/relative/hidden"))
 (deny file-read* (require-all (subpath "/srv/u/.ssh") (require-not (literal "/srv/u/.ssh/known_hosts"))))
 (deny file-write* (subpath "/srv/u/.ssh"))
 (deny file-link (subpath "/srv/u/.ssh"))
@@ -699,6 +830,12 @@ def live_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     )
     monkeypatch.setattr(sandbox, "_ssh_supports_accept_new", lambda: False)
     monkeypatch.setattr(sandbox, "_runtime_dir_is_durable", lambda _root: False)
+    # The tier lists below are the policy's own; a built-in's ``credentialMasks`` would add
+    # to them, so this host reads no shipped declaration.
+    from kiro_crew.apps import credential_masks
+
+    monkeypatch.setattr(credential_masks, "_builtin_manifests", lambda: [])
+    credential_masks.clear_cache()
     return home
 
 
@@ -1155,3 +1292,53 @@ def test_the_kernel_refuses_connecting_renaming_and_linking_a_credential_agent_s
                 os.unlink(path)
             except FileNotFoundError:
                 pass
+
+
+def test_the_kernel_lets_realpath_reach_an_exposed_file_and_keeps_its_siblings_hidden(
+    tmp_path: Path,
+) -> None:
+    """A file carved out of a Seatbelt mask canonicalizes inside the sandbox, as a Node
+    CLI's ``realpath`` of its ``--mcp-config`` does at boot, while the masked directory
+    stays unlistable and a sibling in it stays unreadable."""
+    _require_unsandboxed_seatbelt()
+    base = os.path.realpath(tmp_path)
+    masked = os.path.join(base, "auth-store-staging")
+    sub = os.path.join(masked, "sub")
+    os.makedirs(sub)
+    exposed = os.path.join(sub, "strands-mcp-1-x.json")
+    sibling = os.path.join(masked, "token_signing.key")
+    for path in (exposed, sibling):
+        Path(path).write_text("{}", encoding="utf-8")
+    request = SandboxRequest(
+        tier="standard",
+        backend=BACKEND_SEATBELT,
+        extra_hidden_dirs=(masked,),
+        extra_expose_files=(exposed,),
+    )
+    profile = sandbox_seatbelt.render_seatbelt_profile(
+        plan_confinement(request, PlanHost(home=base))
+    )
+    child = (
+        "import os, sys\n"
+        "exposed, masked, sibling = sys.argv[1:]\n"
+        "def attempt(f, *a):\n"
+        "    try:\n"
+        "        f(*a); return 'ok'\n"
+        "    except OSError as e:\n"
+        "        return str(e.errno)\n"
+        "print(attempt(lambda p: os.path.realpath(p, strict=True), exposed))\n"
+        "print(attempt(lambda p: open(p).read(), exposed))\n"
+        "print(attempt(os.listdir, masked))\n"
+        "print(attempt(lambda p: open(p).read(), sibling))\n"
+    )
+    result = subprocess.run(
+        ["/usr/bin/sandbox-exec", "-p", profile, sys.executable, "-I", "-c", child]
+        + [exposed, masked, sibling],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+    realpath, read, listing, sibling_read = result.stdout.split()
+    assert (realpath, read) == ("ok", "ok")
+    assert listing != "ok" and sibling_read != "ok"

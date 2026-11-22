@@ -4,6 +4,9 @@ The crewmate modules (``mate_config``, ``mate_worker``, ``mate_worker_kit``,
 ``mate_capability_catalog``, ``mate_config_migration``, and the heartbeat's ``goal_reminder``) read
 custom-agent specs the way a session would: the hardened reader in
 ``acp.kas_agents`` and the per-session MCP switch-off in ``acp.session_mcp``.
+The shared execution-prompt reader (``context_assembly.agent_spec``) takes KAS's
+prompt spelling, ``file://`` expansion and path check here too, and a script cron's
+MCP client (``cron_script_mcp``) reads how KAS's header bridge dials a remote entry.
 Application code may not import ``kiro_crew.acp``
 (``scripts/check_agent_sdk_boundary.py``), so this module is the one seam they
 reach those reads through.
@@ -19,7 +22,7 @@ own module is seen here.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
 class AgentSpecUnreadable(ValueError):
@@ -59,6 +62,30 @@ def resolve_prompt(spec: dict[str, Any], *, agent_id: str, agents_dir: Path) -> 
         raise AgentSpecUnreadable(str(exc)) from exc
 
 
+def spec_prompt(spec: dict[str, Any]) -> Any:
+    """*spec*'s prompt as written: ``prompt``, else kiro-cli's ``systemPrompt`` (``acp.kas_prompt``)."""
+    from kiro_crew.acp import kas_prompt
+
+    return kas_prompt.spec_prompt(spec)
+
+
+def expand_prompt_ref(ref: str) -> Path:
+    """A ``file://`` prompt *ref* with ``$VAR`` and ``~`` expanded as KAS expands them, unresolved.
+
+    ``acp.kas_prompt.expand_prompt_ref``; raises ``RuntimeError`` for ``~nosuchuser``.
+    """
+    from kiro_crew.acp import kas_prompt
+
+    return kas_prompt.expand_prompt_ref(ref)
+
+
+def is_unsafe_prompt_path(path: Path) -> bool:
+    """Whether the RESOLVED *path* may not be inlined into a prompt (``acp.kas_prompt_paths``)."""
+    from kiro_crew.acp import kas_prompt_paths
+
+    return kas_prompt_paths.is_unsafe_prompt_path(path)
+
+
 def agent_spec_absent(agents_dir: Path, agent_id: str) -> bool:
     """Whether *agents_dir* holds no spec at all for *agent_id*. Blocking.
 
@@ -81,6 +108,18 @@ def session_mcp_server_is_disabled(name: str, agent: str | None) -> bool:
     return session_mcp.session_mcp_server_is_disabled(name, agent)
 
 
+def switched_off_tools(spec: dict[str, Any] | None) -> frozenset[tuple[str, str]]:
+    """The ``(server, tool)`` pairs switched off in *spec* or the global MCP settings.
+
+    ``acp.session_mcp.session_mcp_disabled_tools`` for a caller that has already
+    parsed its spec, so it reads switched-off tools as a chat session does.
+    Blocking, and never raises.
+    """
+    from kiro_crew.acp import session_mcp
+
+    return session_mcp.session_mcp_disabled_tools(None, spec=spec)
+
+
 def authored_spec_is_toolless(agent: str, work_dir: Any = None) -> bool:
     """Whether the spec *agent* resolves to in *work_dir* mounts nothing. Blocking.
 
@@ -92,8 +131,14 @@ def authored_spec_is_toolless(agent: str, work_dir: Any = None) -> bool:
     return client_mcp_array.authored_agent_spec_is_toolless(agent, work_dir)
 
 
-def authored_spec_toolless_verdict(agent: str, work_dir: Any = None) -> bool | None:
+def authored_spec_toolless_verdict(
+    agent: str, work_dir: Any = None, *, backend: str | None = None
+) -> bool | None:
     """Like :func:`authored_spec_is_toolless`, but ``None`` when no spec exists. Blocking.
+
+    *backend* is the backend the caller's session starts on. On KAS the background
+    helper is judged as KAS is sent it (``client_mcp_array.kas_lite_spec_is_toolless``);
+    any other backend, or no backend, judges the file as the harness loads it.
 
     ``False`` means a spec exists and it mounts something, or it exists and the
     reader will not answer for it: two specs declaring the name (ambiguous), a
@@ -108,11 +153,16 @@ def authored_spec_toolless_verdict(agent: str, work_dir: Any = None) -> bool | N
 
     from kiro_crew.acp import client_mcp_array, session_mcp
     from kiro_crew.agent import agent_spec_path, kiro_agents_dir_path
+    from kiro_crew.agent_sdk.backends import ACP_BACKEND_KAS
     from kiro_crew.agent_spec_format import agent_spec_candidates
     from kiro_crew.config.paths import project_agents_dir
 
     spec = session_mcp.agent_spec_snapshot(agent, work_dir=work_dir)
     if spec is not None:
+        if backend == ACP_BACKEND_KAS:
+            sent = client_mcp_array.kas_lite_spec_is_toolless(agent, work_dir)
+            if sent is not None:
+                return sent
         return client_mcp_array.spec_is_toolless(spec)
     try:
         if agent_spec_path(agent) is not None:
@@ -166,21 +216,50 @@ def sweep_kas_launch_snapshots(boot_time: float) -> bool:
     return True
 
 
+def spec_grants(spec: dict[str, Any], *, audit: bool = True) -> set[str]:
+    """The ``allowedTools`` entries and governed ``autoApprove`` refs of *spec*.
+
+    *audit* False is for a reader that only asks and projects nothing."""
+    from kiro_crew.acp.kas_auto_approve import auto_approve_refs
+
+    allowed = spec.get("allowedTools")
+    listed = allowed if isinstance(allowed, list) else []
+    return {e for e in listed if isinstance(e, str)} | set(auto_approve_refs(spec, audit=audit))
+
+
 def session_spec_grants(agent: str) -> set[str] | None:
-    """The ``allowedTools`` entries and governed ``autoApprove`` refs of *agent*'s
-    user-level spec, or ``None`` when none reads. Blocking.
+    """:func:`spec_grants` of *agent*'s user-level spec, or ``None`` when none
+    reads. Blocking.
 
     A project checkout's spec is never read: a cloned repository could plant one
     that grants what the session's own spec withholds."""
     from kiro_crew.acp import session_mcp
-    from kiro_crew.acp.kas_auto_approve import auto_approve_refs
 
     spec = session_mcp.agent_spec_snapshot(agent, work_dir=None)
     if not isinstance(spec, dict):
         return None
-    allowed = spec.get("allowedTools")
-    listed = allowed if isinstance(allowed, list) else []
-    return {e for e in listed if isinstance(e, str)} | set(auto_approve_refs(spec))
+    return spec_grants(spec)
+
+
+_SESSION_VERB = "@kirocrew-dashboard/session_"
+
+
+def creates_without_send(grants: Iterable[str]) -> bool:
+    """Whether *grants* auto-approve ``session_create`` and not ``session_send``.
+
+    The one reading of that fact. The first-message gate refuses a seeded create
+    on it (``message_needs_send_approval``), and the spec writer states it in the
+    prompt of the agent it is true of (``auto_approve.govern_spec``), so the two
+    cannot disagree. Create over-matches (a wider read refuses more); send must
+    be a grant kiro-cli itself honours, or the seed would skip a prompt it still
+    shows.
+    """
+    from kiro_crew.agent_sdk.mcp_refs import entry_grants, entry_reaches
+
+    entries = tuple(grants)
+    create = any(entry_reaches(e.strip(), _SESSION_VERB + "create") for e in entries)
+    send = any(entry_grants(e, _SESSION_VERB + "send") for e in entries)
+    return create and not send
 
 
 def deferred_call_arguments(params: Any, server: str, tool: str) -> tuple[Any, bool]:
@@ -193,3 +272,25 @@ def deferred_call_arguments(params: Any, server: str, tool: str) -> tuple[Any, b
     from kiro_crew.acp._dispatch import _workspace_call_arguments
 
     return _workspace_call_arguments(params, server, tool)
+
+
+def remote_bridge_url(url: str) -> str:
+    """*url* as KAS's header bridge dials it: a plain ``http`` loopback host in its
+    canonical spelling, userinfo dropped (``acp.kas_env_launch.bridge_url``)."""
+    from kiro_crew.acp import kas_env_launch
+
+    return kas_env_launch.bridge_url(url)
+
+
+def plain_http_headers_refused(url: str) -> bool:
+    """Whether headers bound for *url* are refused because they would travel in
+    cleartext: a plain ``http`` url to a host KAS does not accept (not loopback),
+    while the operator's ``agent.kas_refuse_plain_http_mcp_headers`` opt-in is on
+    (``acp.kas_env_launch.refuses_plain_http_headers``, off by default)."""
+    from kiro_crew.acp import kas_env_launch
+
+    return (
+        url.strip().lower().startswith("http://")
+        and not kas_env_launch.kas_accepts_url(url)
+        and kas_env_launch.refuses_plain_http_headers()
+    )

@@ -22,10 +22,11 @@ import os
 import stat
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 from kiro_crew import hooks, platform_compat
+from kiro_crew.agent_sdk.claude_transcripts import claude_session_paths
 from kiro_crew.chat_attachments import ATTACHMENTS_DIR_SUFFIX, attachments_dir
 from kiro_crew.config.paths import (
     CONFIG_DIR_LEAF,
@@ -69,15 +70,12 @@ from kiro_crew.session_storage_parts.store_layout import (
 
 # ------------------------------------------------------------------ scan cache
 #
-# Enumerating both stores is the whole cost of every read on this surface. The
-# measured motivating machine holds ~470,000 replay files, which is ~2s of
-# stat() per pass — and one open of the inventory screen needs the same
-# enumeration for the row list, again for the totals printed beside it, and again
-# for every row the user expands. That is seconds of disk per interaction for an
-# answer that cannot meaningfully change between them.
+# Enumerating both stores is the whole cost of every read here. One measured
+# machine holds ~470,000 replay files, ~2s of stat() per pass, and one open of
+# the inventory screen needs the enumeration for the rows, again for the totals,
+# and again per expanded row: seconds of disk for an answer that does not change.
 #
-# So a pass is kept for a few seconds and shared. Two properties make that safe
-# rather than merely faster:
+# So a pass is kept for a few seconds and shared. Two properties make that safe:
 #
 # * Only the filesystem halves are cached — the store scan and, on read paths,
 #   the co-tenant pass beside it (its own cache, further down). The flags derived
@@ -90,12 +88,18 @@ from kiro_crew.session_storage_parts.store_layout import (
 #   the index inside the mutation lock, so the selection it acts on is current.
 #
 # A mutation invalidates the entry outright, so a screen refetching after a move
-# does not show what it just deleted.
+# does not show what it just deleted. A pass that was already running when the
+# mutation invalidated is not stored either (see ``_scan_epoch``).
 _SCAN_CACHE_TTL = 30.0
 
 _scan_cache_lock = threading.Lock()
 # (expires_at, cache key, units)
 _scan_cache: tuple[float, tuple[object, ...], list[_RawUnit]] | None = None
+#: Bumped by every :func:`invalidate_scan_cache`, in place (one item, never rebound). A
+#: read pass enumerates with no mutation lock held, so a move can finish and invalidate
+#: while that pass is still running; the pass then describes the stores from before the
+#: move, and :func:`_store_scan` keeps it only if no invalidation landed since it began.
+_scan_epoch = [0]
 
 
 def _scan_key(sid_for_stem: Mapping[str, str]) -> tuple[object, ...]:
@@ -137,9 +141,19 @@ def _cached_scan(sid_for_stem: Mapping[str, str]) -> list[_RawUnit] | None:
         return units
 
 
-def _store_scan(sid_for_stem: Mapping[str, str], units: list[_RawUnit]) -> None:
+def _scan_started() -> int:
+    """The invalidation count a pass about to enumerate the stores starts under."""
+    with _scan_cache_lock:
+        return _scan_epoch[0]
+
+
+def _store_scan(sid_for_stem: Mapping[str, str], units: list[_RawUnit], started: int) -> None:
     global _scan_cache
     with _scan_cache_lock:
+        if _scan_epoch[0] != started:
+            # A mutation invalidated the cache while this pass ran, so the pass may
+            # predate it. Return it to this caller, but do not serve it to the next.
+            return
         _scan_cache = (time.monotonic() + _SCAN_CACHE_TTL, _scan_key(sid_for_stem), units)
 
 
@@ -162,6 +176,7 @@ def invalidate_scan_cache() -> None:
     global _scan_cache, _cotenant_cache
     with _scan_cache_lock:
         _scan_cache = None
+        _scan_epoch[0] += 1
     with _cotenant_cache_lock:
         _cotenant_cache = None
 
@@ -245,9 +260,10 @@ def _scan_raw(
         hit = _cached_scan(sid_for_stem)
         if hit is not None:
             return hit
+    started = _scan_started()
     result = _scan_raw_uncached(sid_for_stem, strict=strict)
     if cached:
-        _store_scan(sid_for_stem, result)
+        _store_scan(sid_for_stem, result, started)
     return result
 
 
@@ -672,12 +688,40 @@ def _same_filesystem(a: Path, b: Path) -> bool:
     return dev_a is not None and dev_a == dev_b
 
 
+def _claude_code_usage(sessions: Iterable[tuple[str, str]]) -> tuple[int, int]:
+    """``(bytes, sessions)`` Claude Code keeps for these ``(sid, cwd)`` pairs.
+
+    Each path is sized once, so a sid two pairs name is never counted twice, and
+    a sid with none of its paths present is not a session here. Reads only.
+    """
+    sized: set[Path] = set()
+    found: set[str] = set()
+    total = 0
+    for sid, cwd in sessions:
+        for path in claude_session_paths(sid, cwd):
+            if path in sized:
+                found.add(sid)
+                continue
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            sized.add(path)
+            found.add(sid)
+            if stat.S_ISDIR(info.st_mode):
+                total += _tree_bytes(path)
+            elif stat.S_ISREG(info.st_mode):
+                total += info.st_size
+    return total, len(found)
+
+
 def measure(
     index: SessionIndex,
     *,
     now: float | None = None,
     units: list[SessionUnit] | None = None,
     batches: list[TrashBatch] | None = None,
+    claude_sessions: Iterable[tuple[str, str]] = (),
 ) -> StorageReport:
     """Measure session storage and report what is reclaimable.
 
@@ -691,8 +735,14 @@ def measure(
     every batch manifest uncached on each call — so a caller that already has the
     list should always hand it over, and a payload that lists the batches beside
     these totals must not let the two describe different instants.
+
+    *claude_sessions* are the ``(sid, cwd)`` pairs of this instance's mapped
+    Claude chats. What Claude Code keeps for them is sized on every call, never
+    cached, and lands only in ``claude_code_bytes`` / ``claude_code_sessions``:
+    Storage never moves those files, so no other total includes them.
     """
     clock = time.time() if now is None else now
+    claude_bytes, claude_count = _claude_code_usage(claude_sessions)
     units = _scan_units(index, cached=True) if units is None else units
     active = [u for u in units if u.active]
     # Sub-floor sessions are neither active nor offered: reporting them as
@@ -711,6 +761,8 @@ def measure(
         trash_batches=len(batches),
         trash_same_filesystem=_same_filesystem(kiro_sessions_dir(), trash_root()),
         reclaim_blocked_reason=reclaim_block_reason(cached=True),
+        claude_code_bytes=claude_bytes,
+        claude_code_sessions=claude_count,
     )
     # The per-store split stays out of the report but is the first thing worth
     # knowing when a total looks wrong.

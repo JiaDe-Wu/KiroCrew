@@ -80,6 +80,7 @@ describe('EmbeddingModelCard Apply label follows the path it will submit', () =>
     })
     renderWithProviders(<EmbeddingModelCard />)
     await screen.findByTestId('embed-model-path-status-error')
+    await screen.findByDisplayValue('/models/model.gguf')
     // Same path, so the label is the reapply one, and the path error still disables it.
     expect(applyButton()).toHaveTextContent('Rebuild memory vectors')
     expect(applyButton()).toBeDisabled()
@@ -117,6 +118,7 @@ describe('EmbeddingModelCard Apply label follows the path it will submit', () =>
     setStatus({ ...CUSTOM_OK, reembed: { step: 'running', done: 1, total: 4 } })
     renderWithProviders(<EmbeddingModelCard />)
     await screen.findByRole('progressbar')
+    await screen.findByDisplayValue('/models/model.gguf')
     expect(applyButton()).toBeDisabled()
     expect(applyButton()).toHaveTextContent('Rebuild memory vectors')
   })
@@ -160,6 +162,27 @@ describe('EmbeddingModelCard Apply label follows the path it will submit', () =>
     expect(applyButton()).toBeDisabled()
     release()
     await waitFor(() => expect(applyButton()).toHaveTextContent('Rebuild memory vectors'))
+  })
+})
+
+describe('EmbeddingModelCard reports an unapplied path as unsaved work (#32024)', () => {
+  it('is unsaved while the field differs from the configured path, until Apply lands', async () => {
+    setStatus(CUSTOM_OK)
+    const onDirtyChange = vi.fn()
+    renderWithProviders(<EmbeddingModelCard onDirtyChange={onDirtyChange} />)
+    const input = await screen.findByDisplayValue('/models/model.gguf')
+    expect(onDirtyChange).toHaveBeenLastCalledWith(false)
+
+    fireEvent.change(input, { target: { value: '/models/other.gguf' } })
+    expect(onDirtyChange).toHaveBeenLastCalledWith(true)
+    fireEvent.change(input, { target: { value: '/models/model.gguf' } })
+    expect(onDirtyChange).toHaveBeenLastCalledWith(false)
+    fireEvent.change(input, { target: { value: '/models/other.gguf' } })
+    fireEvent.click(applyButton())
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Change model' }))
+
+    await waitFor(() => expect(api.vectorApplyEmbedModel).toHaveBeenCalledWith('/models/other.gguf'))
+    await waitFor(() => expect(onDirtyChange).toHaveBeenLastCalledWith(false))
   })
 })
 

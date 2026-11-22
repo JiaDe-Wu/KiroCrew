@@ -9,12 +9,13 @@ import asyncio
 import re
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
+import kiro_crew.apps.lifecycle as lifecycle_mod
 from kiro_crew.apps.lifecycle import LifecycleDispatcher
 from kiro_crew.apps.manifest import app_name_error
 from kiro_crew.testing.wait import async_wait_until, await_until
@@ -22,6 +23,14 @@ from kiro_crew.testing.wait import async_wait_until, await_until
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_detached_hook_tasks() -> Iterator[None]:
+    # The registry is module-global and outlives each test's loop.
+    lifecycle_mod._DETACHED_HOOK_TASKS.clear()
+    yield
+    lifecycle_mod._DETACHED_HOOK_TASKS.clear()
 
 
 async def _thread_event_set(event: threading.Event, what: str) -> bool:
@@ -189,7 +198,6 @@ class TestShellBeforePython:
         Mocks both _run_lifecycle_script and on_app_enable in the
         handle_enable_app flow and asserts shell is called first.
         """
-        import sys
         from unittest.mock import MagicMock, patch
 
         from dashboard_owner_helpers import owner_claims
@@ -210,10 +218,6 @@ class TestShellBeforePython:
             "resources": "gateway",
             "enabled": True,
         }
-
-        # Pre-mock dashboard.server to avoid circular import with mimir
-        if "kiro_crew.dashboard.server" not in sys.modules:
-            sys.modules["kiro_crew.dashboard.server"] = MagicMock()
 
         with (
             patch("kiro_crew.apps.routes.get_app", return_value=fake_app_info),

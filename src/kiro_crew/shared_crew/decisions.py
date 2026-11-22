@@ -558,6 +558,15 @@ def resolve_state_approval(
     registry = decisions_for(state)
     decision_id = state_approval_decision_id(request_id)
     session_key = str(record.get("slot") or "state")
+    future = getattr(state, "_approval_futures", {}).get(request_id)
+    if future is not None and future.done():
+        # This instance is already settled and only awaits its cleanup. Its
+        # decision is the winner's: classify against it, never reopen it, or a
+        # second click would replace the winner's record with a pending one.
+        late = registry.classify_late(decision_id, response_id, request_principal(request))
+        if late.decision is None:
+            return None
+        return lost_race_reply(late, response_id)
     registry.open(
         decision_id,
         DecisionKind.APPROVAL,
@@ -607,19 +616,44 @@ def settled_reply(
     """
     if not isinstance(request_id, str) or not request_id:
         return None
-    registry = decisions_for(state)
     for decision_id in (
         approval_decision_id(slot_key, request_id),
         state_approval_decision_id(request_id),
     ):
-        resolution = (
-            registry.classify(decision_id, response_id)
-            if responder is None or not response_id
-            else registry.classify_late(decision_id, response_id, responder)
-        )
-        if resolution.decision is not None:
-            return lost_race_reply(resolution, response_id)
+        reply = _settled_reply_for(state, decision_id, response_id, responder)
+        if reply is not None:
+            return reply
     return None
+
+
+def settled_state_reply(
+    state: Any,
+    request_id: object,
+    response_id: str,
+    responder: Principal | None = None,
+) -> Reply | None:
+    """:func:`settled_reply` for a coordinator request: its state decision only.
+
+    A native request in the same slot can hold the same id, and its decision
+    is not this click's outcome.
+    """
+    if not isinstance(request_id, str) or not request_id:
+        return None
+    return _settled_reply_for(state, state_approval_decision_id(request_id), response_id, responder)
+
+
+def _settled_reply_for(
+    state: Any, decision_id: str, response_id: str, responder: Principal | None
+) -> Reply | None:
+    registry = decisions_for(state)
+    resolution = (
+        registry.classify(decision_id, response_id)
+        if responder is None or not response_id
+        else registry.classify_late(decision_id, response_id, responder)
+    )
+    if resolution.decision is None:
+        return None
+    return lost_race_reply(resolution, response_id)
 
 
 def resolve_approval_by_id(
@@ -665,28 +699,58 @@ def resolve_approval_by_id(
             "code": APPROVAL_AMBIGUOUS,
         }
     for slot, future in pending:
-        registry = decisions_for(state)
-        decision_id = approval_decision_id(slot.key, approval_id)
-        registry.open(decision_id, DecisionKind.APPROVAL, slot.key, turn_initiator(slot.messages))
-        resolution = registry.resolve(
-            decision_id,
+        return resolve_pinned_slot_approval(
+            state,
+            request,
+            slot,
+            approval_id,
+            future,
+            approved=approved,
+            rejected_once=rejected_once,
             response_id=response_id,
-            responder=request_principal(request),
-            outcome=decision,
-            apply=partial(
-                _settle_slot_by_id, state, slot, approval_id, approved, rejected_once, future
-            ),
         )
-        if resolution.applied and resolution.decision is not None:
-            broadcast_decision(state, resolution.decision)
-            return 200, {"ok": True, "decision": resolution.decision.to_public_dict()}
-        return lost_race_reply(resolution, response_id)
     responder = request_principal(request)
     for slot_key in [s.key for s in state._slots.values()]:
         settled = settled_reply(state, slot_key, approval_id, response_id, responder)
         if settled is not None:
             return settled
     return settled_reply(state, "", approval_id, response_id, responder)
+
+
+def resolve_pinned_slot_approval(
+    state: Any,
+    request: Any,
+    slot: Any,
+    approval_id: str,
+    future: Any,
+    *,
+    approved: bool,
+    rejected_once: bool,
+    response_id: str = "",
+) -> Reply | None:
+    """Settle the request *future* that *slot* holds under *approval_id*, once.
+
+    For a caller that has already chosen the one request it means. The slot's
+    resolver settles only while the slot still holds that same future, so a later
+    request under the same id is never answered in its place.
+    """
+    decision = "approved" if approved else "rejected_once" if rejected_once else "rejected"
+    registry = decisions_for(state)
+    decision_id = approval_decision_id(slot.key, approval_id)
+    registry.open(decision_id, DecisionKind.APPROVAL, slot.key, turn_initiator(slot.messages))
+    resolution = registry.resolve(
+        decision_id,
+        response_id=response_id,
+        responder=request_principal(request),
+        outcome=decision,
+        apply=partial(
+            _settle_slot_by_id, state, slot, approval_id, approved, rejected_once, future
+        ),
+    )
+    if resolution.applied and resolution.decision is not None:
+        broadcast_decision(state, resolution.decision)
+        return 200, {"ok": True, "decision": resolution.decision.to_public_dict()}
+    return lost_race_reply(resolution, response_id)
 
 
 def _settle_slot_by_id(

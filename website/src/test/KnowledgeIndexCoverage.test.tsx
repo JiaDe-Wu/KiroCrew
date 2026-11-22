@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, waitFor, fireEvent, act, within } from '@testing-library/react'
+import { confirmAction } from './confirmAction'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router-dom'
@@ -255,6 +256,18 @@ describe('KnowledgePage — help dialog', () => {
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
     expect(screen.getByText('1 selected')).toBeInTheDocument()
   })
+
+  it('Escape on the bulk-delete confirmation cancels it and keeps the selection', async () => {
+    render(<KnowledgePage />, { wrapper: Wrapper })
+    await searchFor('ledger')
+    await userEvent.click(await screen.findByLabelText('Select Quarterly ledger notes'))
+    expect(await screen.findByText('1 selected')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Delete' }))
+    await screen.findByRole('dialog', { name: 'Delete' })
+    fireEvent.keyDown(document.body, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    expect(screen.getByText('1 selected')).toBeInTheDocument()
+  })
 })
 
 describe('KnowledgePage — keyboard shortcuts', () => {
@@ -287,6 +300,52 @@ describe('KnowledgePage — keyboard shortcuts', () => {
     // Past the last page there is nothing to advance to.
     fireEvent.keyDown(document.body, { key: 'ArrowLeft' })
     expect(await screen.findByText('Page 1 of 3')).toBeInTheDocument()
+  })
+
+  it('keeps keyboard focus on the flat-results pager when Next or Prev goes disabled', async () => {
+    flatTotal = 40 // 2 pages at limit=20
+    render(<KnowledgePage />, { wrapper: Wrapper })
+    await searchFor('ledger')
+    expect(await screen.findByText('Page 1 of 2')).toBeInTheDocument()
+    // The pager re-renders while each page loads, so read the buttons fresh.
+    const next = () => screen.getByRole('button', { name: /Next/ })
+    const prev = () => screen.getByRole('button', { name: /Prev/ })
+    act(() => { next().focus() })
+    fireEvent.click(next())
+    expect(await screen.findByText('Page 2 of 2')).toBeInTheDocument()
+    await waitFor(() => expect(document.activeElement).toBe(prev()))
+    fireEvent.click(prev())
+    expect(await screen.findByText('Page 1 of 2')).toBeInTheDocument()
+    await waitFor(() => expect(document.activeElement).toBe(next()))
+  })
+
+  it('keeps keyboard focus on the pager when the arrow keys page onto an edge', async () => {
+    flatTotal = 40 // 2 pages at limit=20
+    render(<KnowledgePage />, { wrapper: Wrapper })
+    await searchFor('ledger')
+    expect(await screen.findByText('Page 1 of 2')).toBeInTheDocument()
+    const next = () => screen.getByRole('button', { name: /Next/ })
+    const prev = () => screen.getByRole('button', { name: /Prev/ })
+    act(() => { next().focus() })
+    fireEvent.keyDown(next(), { key: 'ArrowRight' })
+    expect(await screen.findByText('Page 2 of 2')).toBeInTheDocument()
+    await waitFor(() => expect(document.activeElement).toBe(prev()))
+    fireEvent.keyDown(prev(), { key: 'ArrowLeft' })
+    expect(await screen.findByText('Page 1 of 2')).toBeInTheDocument()
+    await waitFor(() => expect(document.activeElement).toBe(next()))
+  })
+
+  it('leaves focus alone when the arrow keys page from outside the pager', async () => {
+    flatTotal = 40 // 2 pages at limit=20
+    render(<KnowledgePage />, { wrapper: Wrapper })
+    await searchFor('ledger')
+    expect(await screen.findByText('Page 1 of 2')).toBeInTheDocument()
+    act(() => { (document.activeElement as HTMLElement | null)?.blur() })
+    expect(document.activeElement).toBe(document.body)
+    fireEvent.keyDown(document.body, { key: 'ArrowRight' })
+    expect(await screen.findByText('Page 2 of 2')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Next/ })).toBeDisabled()
+    expect(document.activeElement).toBe(document.body)
   })
 
   it('renders the flat-results page indicator as one catalog sentence', async () => {
@@ -406,23 +465,19 @@ describe('KnowledgePage — bulk actions', () => {
   })
 
   it('deletes the selection only after the confirm prompt is accepted', async () => {
-    const confirmSpy = vi.fn(() => true)
-    vi.stubGlobal('confirm', confirmSpy)
     await selectFlatItem()
     await userEvent.click(screen.getByRole('button', { name: 'Delete' }))
+    await confirmAction(/delete/i)
     await waitFor(() => expect(mutationCalls('DELETE')).toHaveLength(1))
     expect(mutationCalls('DELETE')[0][0]).toBe('/items/f1')
-    expect(confirmSpy).toHaveBeenCalled()
-    vi.unstubAllGlobals()
   })
 
   it('writes nothing when the delete prompt is dismissed', async () => {
-    vi.stubGlobal('confirm', vi.fn(() => false))
     await selectFlatItem()
     await userEvent.click(screen.getByRole('button', { name: 'Delete' }))
+    await confirmAction('Cancel')
     expect(mutationCalls('DELETE')).toHaveLength(0)
     expect(screen.getByText('1 selected')).toBeInTheDocument()
-    vi.unstubAllGlobals()
   })
 
   it('copies the content of the selected items', async () => {

@@ -19,7 +19,12 @@ from dev_fleet_app_helpers import _reset_make_live_committed_latch  # noqa: F401
 from dev_fleet_app_helpers import _reset_shutdown_admission_state  # noqa: F401 - fixture
 from dev_fleet_app_helpers import _sweep_staged_sync_tempdirs  # noqa: F401 - fixture
 from dev_fleet_app_helpers import _venv_maps_to_the_synced_checkout  # noqa: F401 - fixture
-from dev_fleet_app_helpers import _POSIX_ONLY, _mk_make_live_wt, _stub_make_live
+from dev_fleet_app_helpers import (
+    _POSIX_ONLY,
+    _mk_make_live_wt,
+    _stub_make_live,
+    simulate_live_platform,
+)
 
 import kiro_crew.apps.builtins.dev_fleet.server as mod
 from kiro_crew.apps.builtins.dev_fleet import live as live_mod
@@ -173,6 +178,33 @@ async def test_restart_of_a_desktop_supervised_gateway_names_the_app(monkeypatch
     assert mod._MAKE_LIVE_COMMITTED is False
 
 
+@pytest.mark.asyncio
+async def test_restart_of_a_service_launched_gateway_spawns_nothing(monkeypatch, tmp_path):
+    """A `kirocrew service install` unit's gateway is its manager's to restart: a
+    detached restart would run in the unit's cgroup and die with the gateway it
+    stops. Restart spawns nothing and names the service, not a foreground one."""
+    from kiro_crew.config.loader import consume_managed_service_launch_environment
+
+    monkeypatch.setenv("KIROCREW_SERVICE_MANAGED", "1")
+    # The gateway takes the marker out of its environment at start and keeps it.
+    consume_managed_service_launch_environment()
+    kc = _mk_kcbin(tmp_path)
+    fg, spawned = _fg(tmp_path, launcher=str(kc))
+    assert await fg.status() == "ok"
+    monkeypatch.setattr(live_mod, "_gateway_backend", lambda: None)
+    monkeypatch.setattr(live_mod, "_live_user_unit_status", AsyncMock(return_value="no_user_unit"))
+    monkeypatch.setattr(live_mod, "_foreground_backend", lambda: fg)
+    monkeypatch.setattr(live_mod, "_MAKE_LIVE_COMMITTED", False, raising=False)
+
+    res = await mod._restart_gateway()
+
+    assert res["ok"] is False
+    assert "service install` unit" in res["error"] and "kirocrew restart" in res["error"]
+    assert "foreground" not in res["error"]
+    assert spawned == []
+    assert mod._MAKE_LIVE_COMMITTED is False
+
+
 def test_default_desktop_supervised_asks_the_cli_check_for_that_port(monkeypatch):
     from kiro_crew import cli_server_stop
     from kiro_crew.apps.builtins.dev_fleet import gateway_service as gs
@@ -317,8 +349,8 @@ async def test_make_live_foreground_spawn_failure_keeps_advisory(monkeypatch, tm
 @pytest.mark.asyncio
 async def test_make_live_foreground_unavailable_keeps_advisory(monkeypatch, tmp_path):
     """Eligible codes without a usable foreground gateway (no/ambiguous marker,
-    unresolvable binary, confined backend) keep the pre-existing staged_only
-    behaviour."""
+    unresolvable binary, confined backend, a service-launched gateway) keep the
+    pre-existing staged_only behaviour."""
     kc = _mk_kcbin(tmp_path)
     wt = _mk_make_live_wt(tmp_path, venv=True, dist=True)
     ptr_dir = tmp_path / "ptr"
@@ -328,7 +360,12 @@ async def test_make_live_foreground_unavailable_keeps_advisory(monkeypatch, tmp_
         # The CLI's restart refuses a desktop-supervised gateway, so a spawn
         # would latch a cutover that never lands.
         ("desktop", dict(launcher=str(kc), desktop=True)),
+        # A generated service definition launched the gateway, so its manager
+        # owns the restart (last: the marker stays set).
+        ("service_managed", dict(launcher=str(kc))),
     ):
+        if label == "service_managed":
+            monkeypatch.setenv("KIROCREW_SERVICE_MANAGED", "1")
         _stub_make_live(monkeypatch, wt, unit_status="no_systemd", pointer_dir=ptr_dir / label)
         monkeypatch.setattr(live_mod, "_MAKE_LIVE_COMMITTED", False, raising=False)
         fg, spawned = _fg(tmp_path, **fg_kwargs)
@@ -535,9 +572,9 @@ async def test_gateway_pointer_flows_call_no_filesystem_primitive_on_the_loop_th
     while the gateway-side flows run — the live-target read (``pointer_state``), the
     service-manager resolution behind it and the cutover itself."""
     # Fixture work first: it resolves paths on this very thread, which the traps
-    # below must not count.
-    expected_live = str(tmp_path.resolve())
+    # below must not count. The unit names a checkout, as a cutover's drop-in does.
     wt = _mk_make_live_wt(tmp_path, venv=True, dist=True)
+    expected_live = str(wt.resolve())
 
     which_threads: list[int] = []
 
@@ -546,9 +583,9 @@ async def test_gateway_pointer_flows_call_no_filesystem_primitive_on_the_loop_th
         return "/usr/bin/systemctl"
 
     async def fake_run_cmd(cmd, **kw):
-        return (0, f"{tmp_path}\n", "")
+        return (0, f"{wt}\n", "")
 
-    monkeypatch.setattr(live_mod, "sys", MagicMock(platform="linux"))
+    simulate_live_platform(monkeypatch, "linux")
     monkeypatch.setattr(live_mod, "shutil", MagicMock(which=_which))
     monkeypatch.setattr(runtime_mod, "_run_cmd", fake_run_cmd)
     monkeypatch.setattr(live_mod, "_POINTER_PROVIDER", None, raising=False)

@@ -117,6 +117,10 @@ export function WebexPanel() {
   const [botToken, setBotToken] = useState('')
   const [botClear, setBotClear] = useState(false)
   const [formKey, setFormKey] = useState(0) // bump to remount the secret field after save
+  // The save's onSuccess reads the token field as it is when it lands, not as
+  // it was when the request started.
+  const secretRef = useRef({ botToken, botClear })
+  useEffect(() => { secretRef.current = { botToken, botClear } }, [botToken, botClear])
   const [saved, setSaved] = useState(false)
   const [restartHint, setRestartHint] = useState(false)
   const [verifyWarning, setVerifyWarning] = useState('')
@@ -131,9 +135,9 @@ export function WebexPanel() {
   // Which threshold the error is about, so only that field is marked invalid.
   const [thresholdErrorField, setThresholdErrorField] = useState<'soft' | 'hard'>('soft')
 
-  // Sync the local draft when server config arrives. Guarded so only the
-  // initial load and post-save invalidation reseed it — a background refetch
-  // must not discard in-progress edits (including a just-pasted token).
+  // Sync the local draft when server config first arrives. Only the initial
+  // load seeds it: a background refetch or a save's invalidation must not
+  // discard in-progress edits (including a just-pasted token).
   const syncArmed = useRef(true)
   useEffect(() => {
     if (data && syncArmed.current) {
@@ -164,8 +168,22 @@ export function WebexPanel() {
       setRestartHint(!!res.restart_required)
       setVerifyWarning(res.verify_warning || '')
       setTokenVerified(!!vars.bot_token && !res.verify_warning)
-      syncArmed.current = true
-      setFormKey(k => k + 1)
+      // Not re-arming the draft sync: the server took the values we sent, and
+      // a reseed would overwrite any field edited while the save was in
+      // flight. Only the token just sent is cleared, and only while the field
+      // still holds what was sent.
+      const s = secretRef.current
+      const nextToken = vars.bot_token && s.botToken.trim() === vars.bot_token ? '' : s.botToken
+      setBotToken(nextToken)
+      if (vars.bot_token_clear) setBotClear(false)
+      // Collapse the token field back to its stored preview only when no newer
+      // edit is pending in it; a remount would hide it.
+      if (!nextToken && !(s.botClear && !vars.bot_token_clear)) setFormKey(k => k + 1)
+      // A blank folder name was saved as the channel's own name: show that,
+      // unless the field was cleared after a named folder was sent.
+      setDraft(d => (d && d.session_folder_on && !d.session_folder.trim() && vars.session_folder === CHANNEL_NAME
+        ? { ...d, session_folder: vars.session_folder }
+        : d))
       setTimeout(() => setSaved(false), 6000)
       qc.invalidateQueries({ queryKey: ['webex-config'] })
     },
@@ -296,6 +314,9 @@ export function WebexPanel() {
             isSet={data.bot_token_set}
             preview={data.bot_token_preview}
             readOnly={ro}
+            // A value still pending (typed during a save) stays in the editor,
+            // even once the refetch reports a stored credential.
+            editing={botToken ? true : undefined}
             value={botToken}
             onChange={setBotToken}
             cleared={botClear}
@@ -328,7 +349,7 @@ export function WebexPanel() {
               space is readable by every member, including people the email
               allow-list excludes. Off by default, and the room allow-list is
               deny-all, so the switch alone grants nothing. */}
-          <div className="border-t border-border mt-4 pt-4">
+          <div className="border-t border-border mt-3 pt-3">
             <SettingsToggle
               label={i18nT('pages.settings.webexPanel.allow_group_spaces')}
               description={i18nT('pages.settings.webexPanel.allow_group_spaces_desc_summary')} hint={i18nT('pages.settings.webexPanel.allow_group_spaces_desc')}
@@ -361,7 +382,7 @@ export function WebexPanel() {
           </div>
           {/* Optional per-channel session filing. Off by default: Webex
               conversations stay unfiled in the sidebar, as before. */}
-          <div className="border-t border-border mt-4 pt-4">
+          <div className="border-t border-border mt-3 pt-3">
             <SettingsToggle
               label={i18nT('pages.settings.botChannelPanel.file_sessions_in_folder')}
               hint={i18nT('pages.settings.botChannelPanel.file_sessions_in_folder_desc', { channel: CHANNEL_NAME })}
@@ -425,7 +446,7 @@ export function WebexPanel() {
       </SettingsSection>
 
       {/* ── Save (hidden on read-only remote sessions) ── */}
-      {!ro && <div className="flex items-center gap-3 mt-1 mb-4">
+      {!ro && <div className="flex flex-row-reverse flex-wrap items-center gap-3 mt-3 mb-4 max-w-[720px]">
         <Btn primary onClick={handleSave} disabled={saveMut.isPending}>
           {saveMut.isPending ? i18nT('pages.settings.webexPanel.saving') : i18nT('pages.settings.webexPanel.save_webex_settings')}
         </Btn>

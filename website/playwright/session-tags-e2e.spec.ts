@@ -206,13 +206,19 @@ test.describe('E2E: sidebar tag columns', () => {
     const col = await (await request.post('/api/chat/tag-columns', { data: { tag_ids: [done], mode: 'any' } })).json()
     // Simulate the drop via API (HTML5 DnD in playwright is notoriously flaky;
     // we trust the UI-path via the explicit button tests + API contract here).
+    // The column renders before the page's own slot-list read returns. A reply
+    // serialized before the drop but applied after the drop's slots push puts
+    // the pre-drop row back, and nothing pushes again. So the drop waits until
+    // that read has finished, and only the push can then change the row.
+    const slotListRead = page.waitForResponse(r =>
+      r.request().method() === 'GET' && new URL(r.url()).pathname === '/api/chat/slots')
     await page.goto('/chat')
     await page.waitForSelector(`[data-testid="column-${col.id}"]`)
+    await (await slotListRead).finished()
     const res = await (await request.post(`/api/chat/slots/${slotKey}/drop`, { data: { column_id: col.id } })).json()
     expect(res.ok).toBe(true)
     expect(res.tags).toContain(done)
-    // UI refreshes → slot now appears in Done column
-    await page.waitForTimeout(500)
+    // The drop's slots push moves the slot into the Done column.
     await expect(page.locator(`[data-testid="column-${col.id}"] [data-slot-key="${slotKey}"]`)).toBeVisible()
   })
 
@@ -253,10 +259,12 @@ test.describe('E2E: sidebar tag columns', () => {
     const input = page.locator(`[data-testid="tag-create-${col.id}"]`)
     await input.fill(uniq)
     await input.press('Enter')
-    await page.waitForTimeout(400)
-    const tags = await (await request.get('/api/chat/tags')).json()
-    const created = tags.find((t: { name: string }) => t.name === uniq)
-    expect(created).toBeTruthy()
+    const findCreated = async () => {
+      const tags = await (await request.get('/api/chat/tags')).json()
+      return tags.find((t: { name: string }) => t.name === uniq)
+    }
+    await expect.poll(findCreated).toBeTruthy()
+    const created = await findCreated()
     expect(created.status).toBe(false)
     await request.delete(`/api/chat/tags/${created.id}`)
   })
@@ -470,10 +478,17 @@ test.describe('E2E: sidebar tag columns', () => {
     const done = tags.find((t: { name: string }) => t.name === 'Done').id
     const colTodo = await (await request.post('/api/chat/tag-columns', { data: { tag_ids: [todo], mode: 'any' } })).json()
     const colDone = await (await request.post('/api/chat/tag-columns', { data: { tag_ids: [done], mode: 'any' } })).json()
+    // The socket's connect snapshot can render the row before the page's own
+    // slot-list read returns. A reply serialized before the drop but applied
+    // after the drop's slots push puts the pre-drop row back, and nothing
+    // pushes again. So the drag waits until that read has finished (as in 8).
+    const slotListRead = page.waitForResponse(r =>
+      r.request().method() === 'GET' && new URL(r.url()).pathname === '/api/chat/slots')
     await page.goto('/chat')
     await page.waitForSelector(`[data-testid="column-${colDone.id}"]`)
     // Slot row must be present in the ToDo column before we can drag it
     await page.waitForSelector(`[data-testid="column-${colTodo.id}"] [data-slot-key="${slotKey}"]`, { timeout: 10_000 })
+    await (await slotListRead).finished()
 
     await page.evaluate(([sKey, targetColId]) => {
       const source = document.querySelector(`[data-slot-key="${sKey}"]`) as HTMLElement
@@ -738,11 +753,11 @@ test.describe('E2E: sidebar tag columns', () => {
     await page.getByRole('menuitem', { name: /Tags/ }).click()
     const picker = page.locator('[data-testid="slot-tag-picker"]')
     await expect(picker).toBeVisible()
-    await picker.getByRole('menuitemcheckbox', { name: /Review/ }).click()
-    await page.waitForTimeout(400)
-    const updated = await (await request.get('/api/chat/slots')).json()
-    const slot = updated.find((x: { key: string }) => x.key === s.key)
-    expect(slot.tags).toContain('review')
+    await picker.getByRole('option', { name: /Review/ }).click()
+    await expect.poll(async () => {
+      const updated = await (await request.get('/api/chat/slots')).json()
+      return updated.find((x: { key: string }) => x.key === s.key)?.tags ?? []
+    }).toContain('review')
   })
 
   test('17b. right-click on ANOTHER row while the Tags picker is open closes the picker and opens that row\'s menu', async ({ page, request }) => {
@@ -816,7 +831,7 @@ test.describe('E2E: sidebar tag columns', () => {
     await expect(menu).toBeVisible()
     await menu.getByRole('menuitem', { name: /Tags/ }).click()
     await expect(picker).toBeVisible()
-    await picker.getByRole('menuitemcheckbox', { name: /Review/ }).click()
+    await picker.getByRole('option', { name: /Review/ }).click()
     await expect.poll(async () => {
       const slots = await (await request.get('/api/chat/slots')).json()
       return slots.find((x: { key: string }) => x.key === b.key)?.tags ?? []

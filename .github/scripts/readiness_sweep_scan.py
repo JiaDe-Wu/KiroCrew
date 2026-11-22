@@ -45,6 +45,7 @@ Output is one JSON object per line on stdout, one per open pull request:
      "newest_completed_check_at": "<ISO8601>" | null,
      "newest_failed_check_at": "<ISO8601>" | null,
      "newest_review_at": "<ISO8601>" | null,
+     "running_checks": 0,
      "checks_complete": true}
 
 A 200 body can carry `errors` next to usable `data`: GitHub nulls the one field
@@ -105,6 +106,31 @@ FAILURE_CONCLUSIONS = frozenset(
     }
 )
 
+# The workflows readiness waits on: pr-readiness.yml's `on.workflow_run`
+# list, whose `in_progress` holds the verdict. A queued or running check-run
+# of any other Actions workflow (`macOS Tests (on demand)`, say) is not a lane
+# the sweep's debounce waits for. test_readiness_sweep_scan.py compares the
+# two lists so they cannot drift apart.
+MONITORED_WORKFLOWS = frozenset(
+    {
+        "CI",
+        "Fast Gate",
+        "Build",
+        "Code Review",
+        "PR Hygiene",
+        "Issue Gate",
+        "Opus 5.5 Review",
+        "GPT 6.1 Review",
+        "Design Review",
+        "UX Review",
+        "First Principles Review",
+        "Security Scope Review",
+        "CodeQL",
+        "Internal Content Scan Gate",
+        "Sensitive Change Review (approval)",
+    }
+)
+
 ATTEMPTS = 3
 # Two waits for three attempts.
 BACKOFF_SECONDS = (2.0, 4.0)
@@ -157,7 +183,10 @@ query($owner: String!, $name: String!, $first: Int!, $cursor: String) {
                   pageInfo { hasNextPage endCursor }
                   nodes {
                     __typename
-                    ... on CheckRun { status conclusion completedAt }
+                    ... on CheckRun {
+                      status conclusion completedAt
+                      checkSuite { workflowRun { workflow { name } } }
+                    }
                   }
                 }
               }
@@ -184,7 +213,10 @@ query($owner: String!, $name: String!, $oid: GitObjectID!, $after: String!) {
             pageInfo { hasNextPage endCursor }
             nodes {
               __typename
-              ... on CheckRun { status conclusion completedAt }
+              ... on CheckRun {
+                status conclusion completedAt
+                checkSuite { workflowRun { workflow { name } } }
+              }
             }
           }
         }
@@ -344,17 +376,30 @@ def _readiness(commit: dict[str, Any], status_context: str) -> dict[str, str] | 
     return None
 
 
-def _fold_checks(nodes: list[Any], completed: list[str], failed: list[str]) -> None:
+def _fold_checks(nodes: list[Any], completed: list[str], failed: list[str]) -> int:
     """Accumulate completion timestamps from one page of rollup contexts.
+
+    Returns how many check-runs on the page have not completed yet (queued or
+    in progress). The sweep holds a "check completed later" re-fire while any
+    is still running, because the next completion would re-open it. A
+    check-run filed under an Actions workflow outside MONITORED_WORKFLOWS is
+    not counted: readiness does not wait on that workflow, and one can stay
+    queued for hours. One with no workflow run (another app's check) still
+    is. Every completion stays evidence.
 
     Non-CheckRun nodes (the commit statuses the rollup mixes in) carry no
     conclusion and are skipped -- the readiness verdict is read from
     `status.contexts` instead, so nothing is lost here.
     """
+    running = 0
     for node in nodes:
         if not isinstance(node, dict) or node.get("__typename") != "CheckRun":
             continue
         if node.get("status") != "COMPLETED":
+            run = (node.get("checkSuite") or {}).get("workflowRun") or {}
+            workflow = (run.get("workflow") or {}).get("name")
+            if workflow is None or workflow in MONITORED_WORKFLOWS:
+                running += 1
             continue
         at = node.get("completedAt")
         if not at:
@@ -362,6 +407,7 @@ def _fold_checks(nodes: list[Any], completed: list[str], failed: list[str]) -> N
         completed.append(str(at))
         if str(node.get("conclusion") or "").upper() in FAILURE_CONCLUSIONS:
             failed.append(str(at))
+    return running
 
 
 def _newest(values: list[str]) -> str | None:
@@ -406,7 +452,7 @@ def _scan_pr(
     failed: list[str] = []
 
     contexts = ((commit.get("statusCheckRollup") or {}).get("contexts")) or {}
-    _fold_checks(contexts.get("nodes") or [], completed, failed)
+    running = _fold_checks(contexts.get("nodes") or [], completed, failed)
     total = contexts.get("totalCount") or 0
     if isinstance(total, int) and total > CONTEXTS_PAGE_SIZE:
         counters.oversized += 1
@@ -440,7 +486,7 @@ def _scan_pr(
             )
             or {}
         ).get("contexts") or {}
-        _fold_checks(contexts.get("nodes") or [], completed, failed)
+        running += _fold_checks(contexts.get("nodes") or [], completed, failed)
         if document.get("errors"):
             # A field error nulled part of this page: whatever it held past the
             # nodes that did arrive was never read.
@@ -470,6 +516,7 @@ def _scan_pr(
         "newest_completed_check_at": _newest(completed),
         "newest_failed_check_at": _newest(failed),
         "newest_review_at": _newest_review(pr),
+        "running_checks": running,
         "checks_complete": checks_complete,
     }
 

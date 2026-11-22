@@ -172,7 +172,7 @@ async def test_agent_command_switches_through_the_pickers_transaction(tmp_path, 
     state.sessions.reset.assert_awaited()
     assert slot.agent == WORKER
     assert slot.agent_kind == "template"
-    assert _last_assistant(slot) == f"🔄 Switched to agent: {WORKER}"
+    assert _last_assistant(slot) == f"Switched to agent: {WORKER}"
     execution = read_session_execution("dashboard:template-chat")
     assert execution is not None and execution.selection_kind == "template"
 
@@ -185,6 +185,49 @@ async def test_agent_command_switches_through_the_pickers_transaction(tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_a_caller_whose_gate_closes_before_the_commit_is_refused(tmp_path, monkeypatch):
+    """``still_permitted`` is read at the commit, after the transaction's awaits."""
+    state, slot = await _chat_with_worker(tmp_path, monkeypatch)
+    before = slot.agent
+    checks: list[str] = []
+
+    def closed() -> bool:
+        checks.append(str(slot.agent))
+        return False
+
+    caller = SlotAgentSwitchCaller(
+        app="", remote="test", owner=False, notice=False, still_permitted=closed
+    )
+    resp = await chat_handlers.switch_slot_agent(state, slot, slot.key, WORKER, "template", caller)
+    ok, body = chat_handlers.agent_switch_outcome(resp)
+    assert not ok and resp.status == 403 and body["code"] == "caller_not_permitted"
+    assert slot.agent == before and checks == [before]
+    state.sessions.reset.assert_not_awaited()
+
+    # Open, it commits as before.
+    resp = await chat_handlers.switch_slot_agent(
+        state, slot, slot.key, WORKER, "template", caller._replace(still_permitted=lambda: True)
+    )
+    assert chat_handlers.agent_switch_outcome(resp)[0] and slot.agent == WORKER
+
+
+@pytest.mark.asyncio
+async def test_a_code_channel_pick_leaves_one_agent_row(tmp_path, monkeypatch):
+    """The code channel's picker runs the real switch transaction with
+    ``notice=False`` and writes its own line: one pick, one row (iamwhatever r113)."""
+    from kiro_crew.slack.code_channels import agent_picker
+
+    state, slot = await _chat_with_worker(tmp_path, monkeypatch)
+    before = len(slot.messages)
+    ok, _body = await agent_picker._switch(state, slot, WORKER, lambda: True)
+    assert ok and slot.agent == WORKER
+    assert slot.messages[before:] == []  # the transaction itself adds no boundary row
+    await agent_picker._announce(state, slot, WORKER, "")
+    added = slot.messages[before:]
+    assert len(added) == 1 and WORKER in added[0]["content"]
+
+
+@pytest.mark.asyncio
 async def test_unknown_agent_is_refused_and_changes_nothing(tmp_path, monkeypatch):
     state, slot = await _chat_with_worker(tmp_path, monkeypatch)
     before = (slot.agent, slot.agent_kind, slot.workspace, slot.memory_store)
@@ -194,7 +237,7 @@ async def test_unknown_agent_is_refused_and_changes_nothing(tmp_path, monkeypatc
     state.sessions.reset.assert_not_awaited()
     assert (slot.agent, slot.agent_kind, slot.workspace, slot.memory_store) == before
     reply = _last_assistant(slot)
-    assert reply.startswith("⚠️ Could not switch to agent `no-such-agent`:")
+    assert reply.startswith("Warning: Could not switch to agent `no-such-agent`:")
     assert "not available" in reply
 
 
@@ -251,7 +294,7 @@ async def test_announce_appends_the_same_line_the_in_turn_command_does(tmp_path,
     assert status == 200 and body["ok"], body
     assert slot.agent == WORKER
     assert _assistant_rows(slot) == [*before, switch_announcement(WORKER)]
-    assert switch_announcement(WORKER) == f"🔄 Switched to agent: {WORKER}"
+    assert switch_announcement(WORKER) == f"Switched to agent: {WORKER}"
 
 
 @pytest.mark.asyncio

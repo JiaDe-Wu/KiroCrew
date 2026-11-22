@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useId, useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import {
   CheckCircle2,
@@ -13,6 +13,7 @@ import Modal from './Modal'
 import { api, ApiError } from '../api/client'
 
 import { i18nT } from '../i18n/t'
+import { Trans } from 'react-i18next'
 import { fmtNumber } from '../i18n/format'
 
 type CollectResult = Awaited<ReturnType<typeof api.collectDiagnostics>>
@@ -48,6 +49,7 @@ interface ReportProblemModalProps {
 export default function ReportProblemModal({ open, onClose, initialNote = '' }: ReportProblemModalProps) {
   const [note, setNote] = useState(initialNote)
   const [includeLogs, setIncludeLogs] = useState(true)
+  const logsHintId = useId()
   const [result, setResult] = useState<CollectResult | null>(null)
   const [error, setError] = useState('')
 
@@ -129,11 +131,11 @@ export default function ReportProblemModal({ open, onClose, initialNote = '' }: 
               <div className="text-[13px] text-text font-medium">
                 {i18nT('components.reportProblemModal.include_recent_logs')}
               </div>
-              <div className="text-[12px] text-muted">
+              <div id={logsHintId} className="text-[12px] text-muted">
                 {i18nT('components.reportProblemModal.include_logs_hint')}
               </div>
             </div>
-            <Toggle checked={includeLogs} onChange={setIncludeLogs} disabled={mut.isPending} />
+            <Toggle checked={includeLogs} onChange={setIncludeLogs} disabled={mut.isPending} label={i18nT('components.reportProblemModal.include_recent_logs')} describedBy={logsHintId} />
           </div>
 
           <div
@@ -166,7 +168,7 @@ export default function ReportProblemModal({ open, onClose, initialNote = '' }: 
             })}
           </div>
           <div className="text-[12px] text-muted break-all">
-            {i18nT('components.reportProblemModal.saved_to')} <code>{result.zip_path}</code>
+            <Trans i18nKey="components.reportProblemModal.saved_to_path" components={{ path: <code>{result.zip_path}</code> }} />
           </div>
           <div className="flex flex-wrap gap-2">
             <a href={result.download_url} download>

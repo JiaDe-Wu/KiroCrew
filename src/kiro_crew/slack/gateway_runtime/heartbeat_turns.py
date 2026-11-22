@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from kiro_crew.slack.gateway import (
         HEARTBEAT_KEY,
         HEARTBEAT_TASK_TIMEOUT_SECS,
+        UNATTENDED_MCP_WAIT_SECS,
         AgentTurnUsage,
         Any,
         Callable,
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
         _build_heartbeat_hooks,
         configured_fallback_chain,
         consume_reinjection,
+        declared_mcp_not_ready_change,
         is_keep_response,
         logger,
         note_turn_landed,
@@ -39,6 +41,7 @@ if TYPE_CHECKING:
         read_context_tokens,
         read_effective_agent,
         rearm_reinjection,
+        record_interaction_event,
         redact_and_truncate,
         redact_credentials,
         redact_exfiltration_urls,
@@ -49,6 +52,7 @@ if TYPE_CHECKING:
         stop_reason_landed,
         stream_and_collect,
         strip_keep_sentinel,
+        wait_for_declared_mcp,
     )
 
 
@@ -122,7 +126,11 @@ async def _init_heartbeat(self: GatewayOrchestrator) -> None:
     # once-at-init snapshot would let a heartbeat session keep enforcing a
     # just-disabled rule — or skip a just-added one — until restart.
     assert self.ctx_builder is not None
+    # Imported here: this module's functions run on the gateway's globals (see the
+    # module docstring), so a module-level import would not be in scope.
+    from kiro_crew.tracing import surfaces as trace_surfaces
 
+    @trace_surfaces.rooted(trace_surfaces.TRIGGER_HEARTBEAT)
     async def _heartbeat_task(task_text: str, deliver: str) -> str | None:
         assert self.sessions is not None
         assert self.ctx_builder is not None
@@ -132,6 +140,7 @@ async def _init_heartbeat(self: GatewayOrchestrator) -> None:
         # without a gateway restart (cross-surface consistency).
         heartbeat_hooks = _build_heartbeat_hooks(self.ctx_builder.hooks)
         _acquired = False
+        timed_out = False
         # Whether this task's prompt landed, read from its completion's stop
         # reason, so the finally can settle the skill-body record its build
         # wrote: a prompt that never landed must not leave the next task of
@@ -167,6 +176,10 @@ async def _init_heartbeat(self: GatewayOrchestrator) -> None:
                 agent="kirocrew-heartbeat",
             )
             _acquired = True
+            if is_new:
+                # Unattended: hold the first prompt (bounded) for the agent spec's
+                # MCP servers, which nobody can reconnect during a heartbeat.
+                await wait_for_declared_mcp(client, UNATTENDED_MCP_WAIT_SECS)
 
             # Prepend an unmissable HEARTBEAT_KEEP reminder to every task
             # text before message build.  This survives context
@@ -192,6 +205,9 @@ async def _init_heartbeat(self: GatewayOrchestrator) -> None:
                 memory_store=_memory_store,
                 needs_reinjection=_needs_reinjection,
                 skill_bodies_session=session_key,
+                # Triggers read the task as the operator wrote it, never the
+                # HEARTBEAT_KEEP reminder prepended above.
+                skill_trigger_text=task_text,
             )
 
             # A heartbeat turn runs unattended. Bound it with a hard deadline
@@ -228,12 +244,24 @@ async def _init_heartbeat(self: GatewayOrchestrator) -> None:
             _turn_landed = stop_reason_landed(_turn_stop["reason"])
             if _turn_landed:
                 note_turn_landed(self.sessions, session_key)
+                # Per-interaction telemetry, as every landed-turn engine reports it.
+                record_interaction_event(client, session_key, "heartbeat")
 
             if not result_text:
                 result_text = "_No response._"
             result_text = _annotate_model_fallback(
                 result_text, client, stop_reason=_turn_stop["reason"]
             )
+            # A HEARTBEAT_KEEP result is not delivered, so it does not count as printed.
+            # Keyed on the deliver target too: same-text tasks bound for
+            # different channels each warn their own channel.
+            _missing = declared_mcp_not_ready_change(
+                client,
+                f"{session_key}:{deliver}:{task_text}",
+                record=not is_keep_response(result_text),
+            )
+            if _missing:
+                result_text = f"Warning: {_missing}.\n\n{result_text}"
 
             # ── Per-turn usage row: attribute heartbeat spend. ──
             await _persist_turn_row(
@@ -282,9 +310,11 @@ async def _init_heartbeat(self: GatewayOrchestrator) -> None:
             except Exception:
                 logger.warning("Heartbeat: session reset after timeout failed", exc_info=True)
             # Produce a graceful incomplete result rather than crashing the loop.
+            # The task stays in HEARTBEAT.md and runs again next beat.
+            timed_out = True
             result_text = (
                 f"_Heartbeat task timed out after {HEARTBEAT_TASK_TIMEOUT_SECS}s "
-                "and was cancelled._"
+                "and was cancelled. It stays in HEARTBEAT.md and runs again next beat._"
             )
         except Exception:
             logger.exception("Heartbeat task failed: %s", task_text[:80])
@@ -315,7 +345,7 @@ async def _init_heartbeat(self: GatewayOrchestrator) -> None:
         display_text = strip_keep_sentinel(result_safe)
         # Only notify when task is complete — suppress delivery for
         # incomplete tasks (HEARTBEAT_KEEP) to avoid spamming every cycle.
-        if is_keep_response(result_safe):
+        if is_keep_response(result_safe) and not timed_out:
             # Gate-side LOG line, so it takes the context spelling: a host with
             # a companion loaded must not have this text scanned with the
             # weaker OSS pass. Truncation comes AFTER redaction — the
@@ -332,11 +362,16 @@ async def _init_heartbeat(self: GatewayOrchestrator) -> None:
         else:
             task_safe = redact_and_truncate(task_text, 100)
             await self._deliver_result(
-                "💓 Heartbeat",
+                "Heartbeat",
                 task_safe,
                 display_text,
                 deliver,
             )
+        if timed_out:
+            # Delivered above; the sentinel keeps the line for the next beat.
+            from kiro_crew.heartbeat import _KEEP_SENTINEL
+
+            return f"{result_safe}\n{_KEEP_SENTINEL}"
         return result_safe
 
     async def _on_cycle_end() -> None:
@@ -360,11 +395,13 @@ async def _init_heartbeat(self: GatewayOrchestrator) -> None:
 
     async def _admitted_heartbeat_task(task_text: str, deliver: str) -> str | None:
         # Shared Crew fair admission: a heartbeat is Crew automation. A refused
-        # task is skipped this beat (None, like a task that produced nothing).
+        # task is skipped this beat and kept for the next one:
+        # ``_heartbeat_task`` never returns None, so None means it did not run.
+        from kiro_crew.heartbeat import _KEEP_SENTINEL
         from kiro_crew.shared_crew.admission import OperationKind
         from kiro_crew.shared_crew.turn_gate import run_admitted
 
-        return await run_admitted(
+        result = await run_admitted(
             _heartbeat_task(task_text, deliver),
             session_key=HEARTBEAT_KEY,
             text=task_text,
@@ -374,6 +411,7 @@ async def _init_heartbeat(self: GatewayOrchestrator) -> None:
                 "Heartbeat task skipped by fair admission (%s)", getattr(reason, "value", reason)
             ),
         )
+        return _KEEP_SENTINEL if result is None else result
 
     self.heartbeat_svc = HeartbeatService(
         memory=memory,

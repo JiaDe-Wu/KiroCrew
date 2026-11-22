@@ -83,6 +83,16 @@ def _crew_sensitive_paths() -> list[str]:
     ]
 
 
+def _sealed(path: str, readonly: set[str]) -> bool:
+    """*path* is sealed read-only: named itself, or inside a read-only DIRECTORY bind.
+
+    The endorsed copies of the read+write leaves sit inside ``config-provenance``,
+    which every sandbox binds read-only as a directory, so no entry of their own is
+    needed for the shell to be unable to write them.
+    """
+    return path in readonly or any(path.startswith(entry + os.sep) for entry in readonly)
+
+
 def _expected_exceptions() -> set[str]:
     home = _home()
     return {
@@ -186,6 +196,9 @@ class TestKeystonesAreSealedInEveryMode:
         # provider. Same class: the seal is what makes "the owner consents to
         # the egress, never the agent" true.
         "decisions_consent.json",
+        # The steering files each chat switched off: a writable record would let
+        # an agent switch off, for its own chat, a rule the operator wrote.
+        "chat_steering_off.json",
         # The Browser Harness prefix the unsandboxed gateway executes: a write
         # would choose the interpreter and the Chromium the gateway runs.
         "browser-harness",
@@ -472,7 +485,7 @@ class TestTheReconciliationIsComplete:
         unaccounted = [
             path
             for path in _crew_sensitive_paths()
-            if path not in hidden and path not in readonly and path not in exceptions
+            if path not in hidden and not _sealed(path, readonly) and path not in exceptions
         ]
         assert not unaccounted, (
             "crew-home paths the tool gate fences but the OS sandbox does not, and that "
@@ -490,7 +503,9 @@ class TestTheReconciliationIsComplete:
         """
         hidden, readonly, _files = _launcher_sets(mode)
         unrestricted = {
-            path for path in _crew_sensitive_paths() if path not in hidden and path not in readonly
+            path
+            for path in _crew_sensitive_paths()
+            if path not in hidden and not _sealed(path, readonly)
         }
         declared = _expected_exceptions()
 
@@ -725,22 +740,30 @@ class TestThirdPartyCredentialsKeepTheirExistingTiering:
             assert ".local/share/amazon-q" not in listing
 
 
+def _notes_backend_targets(mode: str = "standard") -> tuple[str, ...]:
+    """What the shipped Notes backend's spawn gets back: its own manifest's declaration."""
+    return sandbox.app_declared_mask_targets("md-notebook", builtin=True, mode=mode)
+
+
 class TestAppBackendOwnedLeaves:
     """An app's OWN backend gets its state leaves back; nothing else changes.
 
-    The md-notebook leaves are masked to fence agent subprocesses, but the Notes
-    backend is itself a sandboxed spawn and is those files' only legitimate
-    reader/writer. Masking it from itself made every attach/clone fail on the
-    registry's final atomic rename. The spawn passes the resolved leaf paths as
-    ``extra_visible_dirs``; these tests pin that the exemption lifts exactly those
-    targets, on both platform builders, and that a default build keeps the mask.
+    The Notes state is masked to fence agent subprocesses, but the Notes backend is
+    itself a sandboxed spawn and is those files' only legitimate reader/writer. Its
+    manifest declares the directory (``credentialMasks: ["state/"]``) and the spawn passes
+    what that declaration lifts as ``extra_visible_dirs``; these tests pin that it lifts
+    exactly that directory, on both platform builders, that a default build keeps the
+    mask, and that core hands the backend nothing of its own any more.
     """
 
     #: The Notes backend owns one masked DIRECTORY, which holds all three state files.
-    LEAVES = ("md-notebook-staging",)
+    LEAVES = ("apps/md-notebook/data/state",)
+
+    def test_core_hands_the_notes_backend_nothing_by_name(self) -> None:
+        assert sandbox.app_backend_visible_targets("md-notebook") == ()
 
     def test_the_helper_resolves_both_home_spellings(self) -> None:
-        targets = sandbox.app_backend_visible_targets("md-notebook")
+        targets = _notes_backend_targets()
 
         for prefix in _CREW_PREFIXES:
             for leaf in self.LEAVES:
@@ -755,17 +778,19 @@ class TestAppBackendOwnedLeaves:
         plan = sandbox._spawn_plan(
             sandbox_plan.BACKEND_NAMESPACE,
             "standard",
-            extra_visible_dirs=sandbox.app_backend_visible_targets("md-notebook"),
+            extra_visible_dirs=_notes_backend_targets(),
         )
         hidden = set(plan.sensitive_dirs)
 
         for prefix in _CREW_PREFIXES:
             for leaf in self.LEAVES:
                 assert _crew_path(prefix, leaf) not in hidden, f"{leaf} still masked"
+            # The previous state directory stays masked for the backend as well.
+            assert _crew_path(prefix, "md-notebook-staging") in hidden
 
     def test_macos_drops_every_rule_for_the_owned_leaves(self) -> None:
         profile = sandbox._build_seatbelt_profile(
-            "standard", extra_visible_dirs=sandbox.app_backend_visible_targets("md-notebook")
+            "standard", extra_visible_dirs=_notes_backend_targets()
         )
 
         for prefix in _CREW_PREFIXES:
@@ -851,10 +876,10 @@ class TestForeignMaskShadowGuard:
         spawn and is dropped from a strict one."""
         monkeypatch.setattr(sandbox.Path, "home", staticmethod(lambda: tmp_path))
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / ".aws" / "relocated-crew"))
-        reloc = str(tmp_path / ".aws" / "relocated-crew" / "md-notebook-staging")
+        reloc = str(tmp_path / ".aws" / "relocated-crew" / "apps/md-notebook/data/state")
 
-        assert reloc in sandbox.app_backend_visible_targets("md-notebook")
-        assert reloc not in sandbox.app_backend_visible_targets("md-notebook", mode="strict")
+        assert reloc in _notes_backend_targets()
+        assert reloc not in _notes_backend_targets(mode="strict")
 
     def test_a_governance_floor_clamps_the_check_up(self, monkeypatch) -> None:
         """A ``sandbox.min_level`` floor raises the tier the masks are built for,
@@ -1032,8 +1057,8 @@ class TestForeignMaskShadowGuard:
     def test_every_crew_home_carveout_producer_asks_the_guard(self) -> None:
         """The guard's worth is the SET of producers that call it.
 
-        Four crew-home carve-out producers exist, and each asks the guard before
-        handing a spelling to a spawn. A fifth that forgets is the defect this
+        Five crew-home carve-out producers exist, and each asks the guard before
+        handing a spelling to a spawn. A sixth that forgets is the defect this
         test catches. Structural, like the two sibling tests in this class, so
         deleting a call reds here instead of silently unmasking a tree.
 
@@ -1049,6 +1074,7 @@ class TestForeignMaskShadowGuard:
 
         for name, obj in (
             ("app_backend_visible_targets", sandbox.app_backend_visible_targets),
+            ("app_declared_mask_targets", sandbox.app_declared_mask_targets),
             ("policy-cache spawn", backend_mod._start_app_backend_body),
             ("aws-control preview staging", storage_mod.get_object_head_bytes),
             ("pod Azure provider CLI spawn", provider_cli_mod.run_provider_cli),
@@ -1084,18 +1110,19 @@ class TestForeignMaskShadowGuard:
         # Positive first, so the absence loop below cannot pass vacuously: the
         # relocated spelling really is minted by the resolver and really does
         # trip the guard.
-        shadowed_leaf = str(tmp_path / ".gnupg" / "relocated-crew" / "md-notebook-staging")
-        assert shadowed_leaf in sandbox._relocated_crew_targets(("md-notebook-staging",))
+        leaf = "apps/md-notebook/data/state"
+        shadowed_leaf = str(tmp_path / ".gnupg" / "relocated-crew" / leaf)
+        assert shadowed_leaf in sandbox._relocated_crew_targets((leaf,))
         assert sandbox.carveout_shadowed_by_foreign_mask(shadowed_leaf)
 
-        targets = sandbox.app_backend_visible_targets("md-notebook")
+        targets = _notes_backend_targets()
 
         shadowed_root = str(tmp_path / ".gnupg") + os.sep
         assert targets, "the default home spellings must survive the refusal"
         for target in targets:
             assert not target.startswith(shadowed_root), f"{target} would unmask ~/.gnupg"
         # The refusal is per-spelling: the default-home entries are still carved.
-        assert os.path.join(str(tmp_path), ".kiro/crew/md-notebook-staging") in targets
+        assert os.path.join(str(tmp_path), f".kiro/crew/{leaf}") in targets
 
     def test_the_cache_site_guards_its_carveout(self) -> None:
         """`apps/backend.py` must thread the cache path through the shadow guard.

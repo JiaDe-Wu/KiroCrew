@@ -6,6 +6,7 @@ import { NavBackBar } from './NavBackBar'
 import { useRegisterNavigationLeaveGuard, usePublishNavigationStake } from './NavigationLeaveGuard'
 import { hasSubSelection, deleteSubSelection, COARSE_TOUCH_TARGET, SUBNAV_PUSH_STATE, toPathSegment, parsePathSegments } from './subNavParams'
 import { useIsMobile } from '../hooks/useIsMobile'
+import { useRenderedLocationIsCurrent } from '../hooks/useRenderedLocationIsCurrent'
 import { useScrollEdgesY } from '../hooks/useScrollEdges'
 import { useVisualViewport } from '../hooks/useVisualViewport'
 import { useBottomTerminalOpen, useTerminalPosition } from '../hooks/useBottomTerminal'
@@ -26,6 +27,8 @@ export interface SidePanelTab {
   description?: string
   /** Presence dot after the label (e.g. About while an update is available). */
   dot?: boolean
+  /** The dot's accessible name; defaults to "update available". */
+  dotLabel?: string
   /** Count pill after the label, for items waiting on the user inside this tab
    *  (e.g. Skills while generated skill candidates wait for review). Nothing
    *  renders at a count of 0. `label` names what is counted, count included,
@@ -41,10 +44,9 @@ export interface SidePanelTab {
   /** Contain THIS tab's pane to the viewport instead of letting the page grow:
    *  the tab's own header stays put and the pane's `overflow-y-auto` children
    *  do the scrolling. Per-tab because a page can legitimately mix the two —
-   *  Settings is one long scrolling form on sixteen tabs and a two-column
-   *  archive with its own rail on one, and a page-wide switch would have to
-   *  break one of them. The page-level `fixedContent` prop still forces it for
-   *  every tab. */
+   *  long scrolling forms beside a two-column pane with its own rail — and a
+   *  page-wide switch would have to break one of them. The page-level
+   *  `fixedContent` prop still forces it for every tab. */
   fixedContent?: boolean
   /** THIS tab's pane hosts a SettingsSubNav, so a second-level selection param
    *  (?sub= or a legacy alias) means a deeper level is showing its own back
@@ -216,15 +218,22 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
   const [params, setParams] = useSearchParams()
   const location = useLocation()
   const navigate = useNavigate()
+  const renderedLocationIsCurrent = useRenderedLocationIsCurrent()
   const isMobile = useIsMobile()
   // "More below" cue under the desktop tab list. Settings has twenty rows, so
-  // on a laptop-height window the last few (Developer, Releases, About) sit
+  // on a laptop-height window the last few (Developer, About) sit
   // below the fold, and the overlay scrollbar stays hidden until hovered: the
   // list read as complete and a first-time user could not find Developer. The
   // cue says so while rows are hidden below, in its own strip outside every
   // row. `attachContent` watches the rows themselves, so a tab appearing or a
   // late font changing a row's height re-measures too.
   const [attachTabList, tabListEdges, , attachTabListContent] = useScrollEdgesY<HTMLDivElement>()
+  // The cue scrolls this list when clicked.
+  const tabListRef = React.useRef<HTMLDivElement | null>(null)
+  const attachTabListNode = React.useCallback((node: HTMLDivElement | null) => {
+    tabListRef.current = node
+    attachTabList(node)
+  }, [attachTabList])
   // Keyboard avoidance for the bottom-float dock. iOS Safari shrinks only the
   // VISUAL viewport when the keyboard opens (the layout viewport `fixed`
   // resolves against keeps its height — see CommandPalette.tsx), so a
@@ -467,9 +476,11 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
   // Deliberately a passive effect, NOT useLayoutEffect: react-router 7 drops
   // navigations fired from a layout effect during the initial mount (its ready
   // flag is set in a passive effect) — see the same note on SettingsPage's
-  // legacy tab remap.
+  // legacy tab remap. The write is skipped while a newer navigation is still
+  // pending, so it never replaces the entry that navigation created.
   React.useEffect(() => {
     if (isMobile || !rememberKey || rawTab || !tab || tab === first) return
+    if (!renderedLocationIsCurrent()) return
     if (basePath) {
       const seg = toPathSegment(tab)
       if (seg != null) navigate({ pathname: `${basePath}/${seg}`, search: location.search }, { replace: true })
@@ -480,7 +491,7 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
       next.set('tab', tab)
       return next
     }, { replace: true })
-  }, [isMobile, rememberKey, rawTab, tab, first, setParams, basePath, navigate, location.search])
+  }, [isMobile, rememberKey, rawTab, tab, first, setParams, basePath, navigate, location.search, renderedLocationIsCurrent])
 
   // Remember the tab that is effectively shown — in component state, so an
   // in-place param drop has something to fall back to, and in sessionStorage,
@@ -533,7 +544,7 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
                       ? <span className="w-[30px] h-[30px] shrink-0 flex items-center justify-center rounded-[8px] text-[color:var(--tile-fg)] [&_svg]:w-4 [&_svg]:h-4" style={{ background: t.tile }}>{t.icon}</span>
                       : <span className="w-5 h-5 shrink-0 flex items-center justify-center text-muted">{t.icon}</span>}
                     <span className="flex-1 min-w-0 truncate">{t.label}</span>
-                    {t.dot && <span className="w-2 h-2 bg-accent rounded-full shrink-0" role="status" aria-label={i18nT('components.sidePanelLayout.update_available')} />}
+                    {t.dot && <span className="w-2 h-2 bg-accent rounded-full shrink-0" role="status" aria-label={t.dotLabel ?? i18nT('components.sidePanelLayout.update_available')} />}
                     <TabCountBadge badge={t.badge} />
                     <ChevronRight size={15} className="text-muted-strong shrink-0" />
                   </button>
@@ -601,7 +612,7 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
           )}
           {/* Only the tab list scrolls — the title and navTop above and the
             * footer below stay fixed. */}
-          <div ref={attachTabList} data-testid="side-panel-tab-list" className="flex-1 min-h-0 overflow-y-auto">
+          <div ref={attachTabListNode} data-testid="side-panel-tab-list" className="flex-1 min-h-0 overflow-y-auto">
           <div ref={attachTabListContent} className="flex flex-col gap-0.5">
           {tabs.map((t, i) => (
             <React.Fragment key={t.key}>
@@ -612,7 +623,10 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
                 </div>
               )}
               <button
-                className={`flex items-center gap-2.5 w-full px-2.5 py-2 rounded-md text-[13px] text-left font-medium cursor-pointer border-none transition-all ${
+                // `focus-visible:outline-offset-[-2px]` draws the focus ring inside the
+                // row: the list scrolls (`overflow-y-auto` clips the x axis too) and has
+                // no side padding, so a ring outside a full-width row loses its sides.
+                className={`flex items-center gap-2.5 w-full px-2.5 py-2 rounded-md text-[13px] text-left font-medium cursor-pointer border-none transition-all focus-visible:outline-offset-[-2px] ${
                   tab === t.key
                     ? 'bg-accent-subtle text-accent'
                     : 'bg-transparent text-muted hover:text-text hover:bg-bg-hover'
@@ -628,7 +642,7 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
                       {t.icon}
                     </span>}
                 {t.label}
-                {t.dot && <span className="ml-auto w-2 h-2 bg-accent rounded-full shrink-0" role="status" aria-label={i18nT('components.sidePanelLayout.update_available')} />}
+                {t.dot && <span className="ml-auto w-2 h-2 bg-accent rounded-full shrink-0" role="status" aria-label={t.dotLabel ?? i18nT('components.sidePanelLayout.update_available')} />}
                 {/* The dot, when present, already holds the row's right edge. */}
                 <TabCountBadge badge={t.badge} className={t.dot ? '' : 'ml-auto'} />
               </button>
@@ -640,7 +654,7 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
             * rather than part of any row. The strip keeps its height for as
             * long as the list overflows at all. */}
           {(tabListEdges.top || tabListEdges.bottom) && (
-            <MoreBelowCue visible={tabListEdges.bottom} testId="side-panel-tab-list-more" />
+            <MoreBelowCue visible={tabListEdges.bottom} testId="side-panel-tab-list-more" scrollerRef={tabListRef} />
           )}
           {footer && <div className="shrink-0 pt-3 px-2.5">{footer}</div>}
         </nav>}
@@ -649,7 +663,9 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
         {isMobile && !subDrilled && <NavBackBar label={title} onBack={backToRoot} />}
         {!subDrilled && <div data-testid={isMobile ? 'mobile-detail-header' : 'side-panel-header'} className={`flex items-end justify-between gap-4 shrink-0 ${isMobile ? 'px-4 pb-2' : 'px-6 pt-2 pb-3'}`}>
           <div>
-            <div className="text-2xl font-bold tracking-tight text-text-strong">{meta?.label || ''}</div>
+            {/* A heading, so the tab's title is the page's first heading for a
+                screen reader rather than plain text above its cards. */}
+            <h2 className="text-2xl font-bold tracking-tight text-text-strong">{meta?.label || ''}</h2>
             {meta?.description && <div className="text-muted text-sm mt-1">{meta.description}</div>}
           </div>
           {/* Only the 'header' dock renders here. 'bottom-float' lives in the

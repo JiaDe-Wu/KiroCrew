@@ -90,17 +90,32 @@ export default function ReasoningEffortDropdown({ slot, currentEffort, defaultEf
   const [isDefault, setIsDefault] = useState(propDefault)
   useEffect(() => { setIsDefault(propDefault) }, [propDefault])
 
-  // idx = the concrete level the slider points at. Persists while Default is on
-  // so toggling Default off restores the user's last explicit pick.
-  const [idx, setIdx] = useState(() => currentIdx >= 0 ? currentIdx : Math.min(2, maxIdx))
+  // idx = the concrete level the slider points at. With no override it is the
+  // configured default: that is the level the turn runs at and the one the
+  // header and the switch name, and turning the switch off pins it, so a thumb
+  // anywhere else both misreads the state and changes the level on the flip.
+  // Only without a configured default is there nothing to point at (the model's
+  // own choice has no index), and the middle notch stands in. A remembered
+  // explicit pick survives while Default is on until the inheritance has
+  // persisted; from then on the thumb shows what is inherited.
+  const [idx, setIdx] = useState(() => currentIdx >= 0 ? currentIdx : defaultIdx >= 0 ? defaultIdx : Math.min(2, maxIdx))
   useEffect(() => { if (currentIdx >= 0) setIdx(currentIdx) }, [currentIdx])
+  // The default's index moves when the live level list replaces the cold-start
+  // fallback, or when Settings changes the default while the popover is open.
+  useEffect(() => { if (currentIdx < 0 && isDefault && defaultIdx >= 0) setIdx(defaultIdx) }, [currentIdx, isDefault, defaultIdx])
   useEffect(() => { setIdx(prev => Math.min(prev, maxIdx)) }, [maxIdx])
+  // The two effects above land one render late: in the render the level list
+  // changes in, idx still indexes the old list, where it can point past the
+  // end or at another level. Every read of the thumb goes through the same
+  // rules here, so a switch flip in that render pins the level it names.
+  const thumbIdx = currentIdx < 0 && isDefault && defaultIdx >= 0 ? defaultIdx : Math.min(idx, maxIdx)
   // Async failures must restore the latest authoritative props, not the values
-  // captured when a debounced pick started. Keep the concrete selection while
-  // Default is authoritative: it is intentionally remembered for the next
-  // time the user disables Default.
+  // captured when a debounced pick started. While Default is authoritative the
+  // concrete selection is the thumb's current level (the configured default once
+  // inheritance has persisted, or a pick still remembered before that), so a
+  // rollback never moves the thumb somewhere the header does not name.
   const authoritativeRef = useRef({ isDefault: propDefault, idx: currentIdx >= 0 ? currentIdx : idx })
-  authoritativeRef.current = { isDefault: propDefault, idx: currentIdx >= 0 ? currentIdx : idx }
+  authoritativeRef.current = { isDefault: propDefault, idx: currentIdx >= 0 ? currentIdx : thumbIdx }
 
   // Persist one level pick through the shared switch protocol (#4523): the
   // local optimistic state above masks staleness in THIS popover, but the
@@ -185,7 +200,7 @@ export default function ReasoningEffortDropdown({ slot, currentEffort, defaultEf
   }
 
   const handleSlide = (next: number) => { setIsDefault(false); setIdx(next); commit(concrete[next] ?? '') }
-  const handleToggleDefault = (useDefault: boolean) => { setIsDefault(useDefault); commit(useDefault ? '' : (concrete[idx] ?? '')) }
+  const handleToggleDefault = (useDefault: boolean) => { setIsDefault(useDefault); commit(useDefault ? '' : (concrete[thumbIdx] ?? '')) }
 
   // In the no-override state, name what is actually inherited. A bare "Default"
   // implied the model picks its own effort, which is false once a default is
@@ -194,8 +209,8 @@ export default function ReasoningEffortDropdown({ slot, currentEffort, defaultEf
     ? (defaultEffort
         ? i18nT('components.reasoningEffortDropdown.default_with_level', { level: effortLabel(defaultEffort) })
         : i18nT('lib.effort.default'))
-    : effortLabel(concrete[idx] ?? '')
-  const atMax = !isDefault && idx >= maxIdx
+    : effortLabel(concrete[thumbIdx] ?? '')
+  const atMax = !isDefault && thumbIdx >= maxIdx
   // Turning the toggle on clears the per-slot override — which yields the
   // Settings default when one is configured, and only the model's own choice
   // when it is not. The row sits right under the model list, so the label
@@ -256,7 +271,7 @@ export default function ReasoningEffortDropdown({ slot, currentEffort, defaultEf
           min={0}
           max={maxIdx}
           step={1}
-          value={idx}
+          value={thumbIdx}
           onChange={handleSlide}
           disabled={isDefault}
           emphasizeMax={!isDefault}

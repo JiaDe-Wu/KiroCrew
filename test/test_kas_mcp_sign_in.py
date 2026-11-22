@@ -20,9 +20,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from session_handle_helpers import bare_session_handle
 
+from kiro_crew.acp.mcp_session_report import STATUS_CAP
 from kiro_crew.acp.runtime import AcpRuntime
-from kiro_crew.acp.session_handle import BUCKET_CAP, AcpSessionHandle
+from kiro_crew.acp.session_handle import BUCKET_CAP, AcpRuntimeDead, AcpSessionHandle
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     EVENT_MCP_OAUTH_REQUEST,
@@ -33,7 +35,7 @@ from kiro_crew.acp.types import (
     JsonRpcMessage,
 )
 from kiro_crew.config.paths import kiro_agents_dir
-from kiro_crew.testing.wait import finished
+from kiro_crew.testing.wait import await_until, finished
 
 _DEAD_URL = "https://auth.example.com/authorize?state=passive"
 _LIVE_URL = "https://auth.example.com/authorize?state=explicit"
@@ -235,6 +237,21 @@ async def test_the_url_goes_to_the_session_that_started_the_sign_in(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_the_consent_request_is_in_the_sessions_report_before_anyone_reads_it(monkeypatch):
+    """The runtime makes this frame itself, so the reader's fold never sees it."""
+    runtime = _runtime()
+    _capture_answers(runtime, monkeypatch)
+    report = runtime._open_mcp_report("s2", [{"name": "remote"}])
+    runtime._mcp_sign_in = ("s2", "remote")
+
+    await runtime._answer_open_external_url(8, {"url": _LIVE_URL})
+
+    assert report.payload()["awaiting_auth"] == ["remote"]
+    assert report.not_ready() == {"needs_sign_in": ("remote",)}
+    assert runtime._session_queues["s2"].qsize() == 1
+
+
+@pytest.mark.asyncio
 async def test_only_one_sign_in_runs_per_process(monkeypatch):
     runtime = _runtime()
     gate = asyncio.Event()
@@ -281,6 +298,53 @@ def test_a_host_without_the_capability_starts_nothing():
     assert runtime.begin_mcp_sign_in("s1", "a") is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "answer, told",
+    [
+        ({"success": False}, ["remote"]),
+        (TimeoutError(), ["remote"]),
+        ({"success": True}, []),
+        ({}, []),
+        (AcpRuntimeDead("process exited"), []),
+    ],
+    ids=["unconnected", "no-answer", "connected", "unstated", "process-died"],
+)
+async def test_a_sign_in_that_ends_unconnected_tells_the_chat_that_showed_its_link(
+    monkeypatch, answer, told
+):
+    """The engine closes an attempt's callback listener when the attempt ends, so a
+    link it showed is dead; the dashboard's hook withdraws it. An answer that does
+    not say the attempt failed retires nothing, and a process that died is left to
+    the dead-child banner gate."""
+    from kiro_crew.acp.session_provider import AcpSessionProvider
+    from kiro_crew.providers.acp import AcpProvider
+
+    runtime = _runtime()
+    inner = AcpSessionProvider.__new__(AcpSessionProvider)
+    inner._handle = SimpleNamespace(session_id="s1")
+    inner._runtime = runtime
+    outer = AcpProvider.__new__(AcpProvider)
+    outer._client = inner
+    ended: list[str] = []
+    outer.set_mcp_sign_in_ended_hook(ended.append)
+
+    async def send_and_await(method, params, timeout=0):
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(runtime, "_send_and_await", send_and_await)
+    assert runtime.begin_mcp_sign_in("s1", "remote") is True
+    assert outer.mcp_sign_in_ended("remote") is False
+    await asyncio.gather(*runtime._answer_tasks)
+    assert ended == told
+    assert runtime._mcp_sign_in is None
+    assert outer.mcp_sign_in_ended("remote") is True
+    runtime.unregister_session("s1")
+    assert "s1" not in runtime._mcp_sign_in_ended_hooks
+
+
 # ── session handle: which servers still need a sign-in ────────────────────────
 
 
@@ -289,7 +353,7 @@ def _handle(begun: list, accept: bool = True) -> AcpSessionHandle:
         begun.append((session_id, name))
         return accept
 
-    handle = AcpSessionHandle.__new__(AcpSessionHandle)
+    handle = bare_session_handle()
     handle._session_id = "s1"
     handle._runtime = SimpleNamespace(begin_mcp_sign_in=begin)
     handle._mcp_sign_in_needed = set()
@@ -300,6 +364,13 @@ def _handle(begun: list, accept: bool = True) -> AcpSessionHandle:
     handle._mcp_sign_in_dropped = 0
     handle._mcp_reattempt_waiting = set()
     handle._mcp_reattempt_counts = {}
+    handle._mcp_reattempt_dropped = set()
+    handle._mcp_sign_in_probes = {}
+    handle._mcp_sign_in_probed = set()
+    handle._mcp_sign_in_spent = set()
+    handle._mcp_launches = {}
+    handle._mcp_network_urls = {}
+    handle._session_key = ""
     handle._oauth_emitted_servers = {"remote"}
     return handle
 
@@ -366,6 +437,307 @@ def test_a_message_naming_a_connected_server_starts_nothing():
     handle.want_mcp_sign_in_named("search notion for the roadmap")
     handle._offer_mcp_sign_in()
     assert begun == []
+
+
+def _sse_405() -> JsonRpcMessage:
+    """How KAS reports a remote OAuth server it holds no grant for: its SSE
+    fallback's error, never ``failedAuthorization``."""
+    return _status(
+        {"name": "gw", "status": "failed", "errorMessage": "SSE error: Non-200 status code (405)"}
+    )
+
+
+def _probing_handle(
+    monkeypatch,
+    row: dict,
+    answer: str,
+    begun: list,
+    gate=None,
+    crew_owned: bool = False,
+    grant: bool = False,
+    vault: list | None = None,
+    on_answer=None,
+):
+    """A KAS handle mid-turn whose remote probe of ``gw`` answers *answer*.
+
+    *gate* is ``(entered, release)``: the probe sets ``entered``, then waits for ``release``.
+    *crew_owned* makes ``gw`` a Crew-owned Connection. *grant* is what the KAS grant
+    vault says for the url, each read of it appended to *vault*. *on_answer* runs just
+    before the probe answers.
+    """
+    from kiro_crew import mcp_discovery, mcp_grant_kas
+    from kiro_crew.acp.mcp_session_report import McpSessionReport
+    from kiro_crew.connections import crew_oauth_proxy
+
+    probes: list[str] = []
+
+    async def probe_server(server):
+        probes.append(server.name)
+        if gate is not None:
+            gate[0].set()
+            await gate[1].wait()
+        if on_answer is not None:
+            on_answer()
+        server.status = answer
+        return server
+
+    async def kas_grant_observed(url):
+        if vault is not None:
+            vault.append(url)
+        return grant
+
+    rows = [mcp_discovery.McpServerInfo(name="gw", **row)]
+    monkeypatch.setattr(mcp_discovery, "list_servers", lambda: rows)
+    monkeypatch.setattr(mcp_discovery, "probe_server", probe_server)
+    monkeypatch.setattr(mcp_grant_kas, "kas_grant_observed", kas_grant_observed)
+    monkeypatch.setattr(
+        crew_oauth_proxy,
+        "is_connection_server",
+        lambda session_key, server: crew_owned and (session_key, server) == ("key-1", "gw"),
+    )
+    handle = _handle(begun)
+    handle._session_key = "key-1"
+    # The session declared ``gw`` at the url the row has.
+    handle._mcp_network_urls = {"gw": _GW_URL}
+    handle._runtime.begin_mcp_reattempt = lambda *_: False
+    handle._runtime.reattempts_mcp_servers = True
+    handle._runtime.is_alive = lambda: True
+    handle._turn_done = asyncio.Event()
+    handle._cancelled = False
+    handle._mcp_report = McpSessionReport()
+    handle._mcp_report.begin_session([])
+    return handle, probes
+
+
+_GW_URL = "https://gw.example.edu/mcp"
+
+
+@pytest.mark.parametrize(
+    ("row", "crew_owned", "grant", "answer", "probed", "signs_in"),
+    [
+        pytest.param({"url": _GW_URL}, False, False, "needs_auth", True, True, id="oauth"),
+        pytest.param({"url": _GW_URL}, False, False, "ok", True, False, id="no-auth"),
+        # KAS holds a grant for the url, so the server failed for another reason.
+        pytest.param({"url": _GW_URL}, False, True, "needs_auth", True, False, id="kas-grant"),
+        pytest.param(
+            {"command": "gw-server"}, False, False, "needs_auth", False, False, id="stdio"
+        ),
+        pytest.param(
+            {"url": _GW_URL, "headers": {"X-Api-Key": "k"}},
+            False,
+            False,
+            "needs_auth",
+            False,
+            False,
+            id="headers-bridged",
+        ),
+        pytest.param(
+            {"url": _GW_URL}, True, False, "needs_auth", False, False, id="crew-connection"
+        ),
+        # A disabled row whose cache still reads needs_auth is probed anyway, so
+        # ``probe_server``'s consent refusal answers (``disabled``), not the cache.
+        pytest.param(
+            {"url": _GW_URL, "disabled": True, "status": "needs_auth"},
+            False,
+            False,
+            "disabled",
+            True,
+            False,
+            id="disabled-cached-needs-auth",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_failed_server_is_signed_in_only_when_its_remote_probe_asks(
+    monkeypatch, row, crew_owned, grant, answer, probed, signs_in
+):
+    begun: list = []
+    vault: list = []
+    handle, probes = _probing_handle(
+        monkeypatch, row, answer, begun, crew_owned=crew_owned, grant=grant, vault=vault
+    )
+    handle._mcp_report.record_frame(_sse_405(), owned=True)
+    handle._note_mcp_sign_in_status(_sse_405(), offer=False)
+    # The turn's ask is matched before the answer lands; the answer offers it.
+    handle.want_mcp_sign_in_named("Sign in to gw")
+    handle._offer_mcp_sign_in()
+    assert begun == []
+    await finished(asyncio.gather(*handle._mcp_sign_in_probes.values()), "the sign-in probes")
+    # A later snapshot neither probes again nor undoes the answer.
+    handle._mcp_report.record_frame(_sse_405(), owned=True)
+    handle._note_mcp_sign_in_status(_sse_405(), offer=True)
+
+    report = handle._mcp_report.payload()
+    assert probes == (["gw"] if probed else [])
+    assert begun == ([("s1", "gw")] if signs_in else [])
+    assert (report["awaiting_auth"], report["failed"]) == (
+        (["gw"], []) if signs_in else ([], ["gw"])
+    )
+    # The vault is read only for a needs_auth answer.
+    assert vault == ([_GW_URL] if probed and answer == "needs_auth" else [])
+
+
+_SSE_ERROR = "SSE error: Non-200 status code (405)"
+_OTHER_URL = "https://other.example.edu/mcp"
+
+
+@pytest.mark.parametrize(
+    ("launches", "urls", "error", "started", "probed", "signs_in"),
+    [
+        # The same name the session runs as a process is another server.
+        pytest.param(
+            {"gw": (("uvx", "gw"),)}, {}, _SSE_ERROR, False, False, False, id="session-stdio"
+        ),
+        # A remote entry spelled with a placeholder command is still the url server.
+        pytest.param(
+            {"gw": (("http",),)}, {"gw": _GW_URL}, _SSE_ERROR, True, True, True, id="remote-command"
+        ),
+        # The row is read, but it is not the endpoint the session declared.
+        pytest.param({}, {"gw": _OTHER_URL}, _SSE_ERROR, True, False, False, id="other-url"),
+        pytest.param({}, {"gw": _GW_URL}, _SSE_ERROR, True, True, True, id="same-url"),
+        # Mounted from an mcp.json alone: list_servers' row of that name need
+        # not be the server KAS mounts.
+        pytest.param({}, {}, _SSE_ERROR, False, False, False, id="mcp-json-only"),
+        pytest.param({}, {}, "spawn uvx ENOENT", False, False, False, id="not-the-sse-fallback"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_failed_server_is_probed_only_as_this_session_declared_it(
+    monkeypatch, launches, urls, error, started, probed, signs_in
+):
+    begun: list = []
+    handle, probes = _probing_handle(monkeypatch, {"url": _GW_URL}, "needs_auth", begun)
+    handle._mcp_launches = launches
+    handle._mcp_network_urls = urls
+    failed = _status({"name": "gw", "status": "failed", "errorMessage": error})
+    handle._mcp_report.record_frame(failed, owned=True)
+    handle._note_mcp_sign_in_status(failed, offer=False)
+    handle.want_mcp_sign_in_named("Sign in to gw")
+    await finished(asyncio.gather(*handle._mcp_sign_in_probes.values()), "the sign-in probes")
+    handle._mcp_report.record_frame(failed, owned=True)
+    handle._note_mcp_sign_in_status(failed, offer=True)
+
+    report = handle._mcp_report.payload()
+    assert list(handle._mcp_sign_in_probes) == (["gw"] if started else [])
+    assert probes == (["gw"] if probed else [])
+    assert begun == ([("s1", "gw")] if signs_in else [])
+    assert (report["awaiting_auth"], report["failed"]) == (
+        (["gw"], []) if signs_in else ([], ["gw"])
+    )
+    if not signs_in:
+        # The start failure keeps the reason it was reported with.
+        assert "gw" in report["failures"]
+
+
+@pytest.mark.asyncio
+async def test_a_probe_answer_that_lands_with_no_frame_after_it_is_announced(monkeypatch):
+    """The reader that republishes the report hears the move the answer made."""
+    begun: list = []
+    handle, _ = _probing_handle(monkeypatch, {"url": _GW_URL}, "needs_auth", begun)
+    changes: list[dict] = []
+    report = handle._mcp_report
+    report.on_change = lambda: changes.append(report.payload())
+    # Folded where the runtime's reader loop folds it, then read by the turn.
+    report.fold_frame(_sse_405())
+    handle._note_mcp_sign_in_status(_sse_405(), offer=True)
+    announced = len(changes)
+    await finished(asyncio.gather(*handle._mcp_sign_in_probes.values()), "the sign-in probes")
+
+    assert (report.payload()["awaiting_auth"], report.payload()["failed"]) == (["gw"], [])
+    assert len(changes) == announced + 1
+    assert (changes[-1]["awaiting_auth"], changes[-1]["failed"]) == (["gw"], [])
+
+
+@pytest.mark.parametrize("landed", [True, False], ids=["answered", "in-flight"])
+@pytest.mark.asyncio
+async def test_a_probe_answer_is_spent_once_the_server_connects(monkeypatch, landed):
+    begun: list = []
+    entered, release = asyncio.Event(), asyncio.Event()
+    handle, probes = _probing_handle(
+        monkeypatch, {"url": _GW_URL}, "needs_auth", begun, (entered, release)
+    )
+    handle._note_mcp_sign_in_status(_sse_405(), offer=False)
+    started = list(handle._mcp_sign_in_probes.values())
+    assert len(started) == 1
+    probe = started[0]
+    if landed:
+        release.set()
+        await await_until(probe, what="the probe's answer")
+    else:
+        await await_until(entered, what="the probe to start")
+    connected = _status({"name": "gw", "status": "connected"})
+    handle._mcp_report.record_frame(connected, owned=True)
+    handle._note_mcp_sign_in_status(connected, offer=False)
+    release.set()
+    await finished(asyncio.gather(probe, return_exceptions=True), "the probe's end")
+    # A later failure reads as it is: no sign-in, no second probe.
+    handle._mcp_report.record_frame(_sse_405(), owned=True)
+    handle._note_mcp_sign_in_status(_sse_405(), offer=False)
+    handle.want_mcp_sign_in_named("Sign in to gw")
+    handle._offer_mcp_sign_in()
+
+    assert probe.cancelled() is not landed
+    assert probes == ["gw"]
+    assert handle._mcp_sign_in_needed == set()
+    assert handle._mcp_report.payload()["failed"] == ["gw"]
+
+
+@pytest.mark.asyncio
+async def test_a_probe_answer_landing_after_the_server_connects_is_ignored(monkeypatch):
+    """The probe ends, then ``connected`` is read before the probe's done callback runs."""
+    begun: list = []
+    done_when_connected: list[bool] = []
+    connected = _status({"name": "gw", "status": "connected"})
+
+    def connect():
+        (probe,) = handle._mcp_sign_in_probes.values()
+        done_when_connected.append(probe.done())
+        handle._mcp_report.record_frame(connected, owned=True)
+        handle._note_mcp_sign_in_status(connected, offer=False)
+
+    handle, probes = _probing_handle(
+        monkeypatch,
+        {"url": _GW_URL},
+        "needs_auth",
+        begun,
+        on_answer=lambda: asyncio.get_running_loop().call_soon(connect),
+    )
+    handle._note_mcp_sign_in_status(_sse_405(), offer=False)
+    (probe,) = handle._mcp_sign_in_probes.values()
+    await finished(asyncio.gather(probe), "the probe's end")
+    # A later failure reads as it is: no sign-in, no second probe.
+    handle._mcp_report.record_frame(_sse_405(), owned=True)
+    handle._note_mcp_sign_in_status(_sse_405(), offer=False)
+    handle.want_mcp_sign_in_named("Sign in to gw")
+    handle._offer_mcp_sign_in()
+
+    report = handle._mcp_report.payload()
+    assert done_when_connected == [True]
+    assert probe.result() is True
+    assert probes == ["gw"]
+    assert handle._mcp_sign_in_needed == set()
+    assert begun == []
+    assert (report["awaiting_auth"], report["failed"]) == ([], ["gw"])
+
+
+@pytest.mark.parametrize("status", ["connected", "disabled"])
+@pytest.mark.asyncio
+async def test_a_server_that_was_up_is_not_probed_when_it_later_fails(monkeypatch, status):
+    begun: list = []
+    handle, probes = _probing_handle(monkeypatch, {"url": _GW_URL}, "needs_auth", begun)
+    up = _status({"name": "gw", "status": status})
+    handle._mcp_report.record_frame(up, owned=True)
+    handle._note_mcp_sign_in_status(up, offer=False)
+    handle._mcp_report.record_frame(_sse_405(), owned=True)
+    handle._note_mcp_sign_in_status(_sse_405(), offer=False)
+    await finished(asyncio.gather(*handle._mcp_sign_in_probes.values()), "the sign-in probes")
+    handle.want_mcp_sign_in_named("Sign in to gw")
+    handle._offer_mcp_sign_in()
+
+    report = handle._mcp_report.payload()
+    assert probes == []
+    assert begun == []
+    assert (report["awaiting_auth"], report["failed"]) == ([], ["gw"])
 
 
 @pytest.mark.parametrize(
@@ -555,13 +927,26 @@ def test_an_oversized_server_name_is_not_tracked():
 def test_entries_past_the_cap_are_counted_and_logged_once(caplog):
     begun: list = []
     handle = _handle(begun, accept=False)
-    servers = [{"name": f"s{i}", "status": "connected"} for i in range(66)]
+    servers = [{"name": f"s{i}", "status": "connected"} for i in range(STATUS_CAP + 2)]
     with caplog.at_level("WARNING", logger="kiro_crew.acp.session_handle"):
         handle._note_mcp_sign_in_status(_status(*servers), offer=True)
         handle._note_mcp_sign_in_status(_status(*servers), offer=True)
     warnings = [r for r in caplog.records if "skipped 2 status entries" in r.getMessage()]
     assert len(warnings) == 1
     assert handle._mcp_sign_in_dropped == 2
+
+
+def test_a_server_the_host_lists_after_64_others_is_still_tracked_for_its_sign_in():
+    """The session's report reads this far into a snapshot, so the tracker must too."""
+    begun: list = []
+    handle = _handle(begun, accept=False)
+    ahead = [{"name": f"many-{i:02d}", "status": "connected"} for i in range(1, 65)]
+    locked = {"name": "remote", "status": "failed", "failedAuthorization": True}
+
+    handle._note_mcp_sign_in_status(_status(*ahead, locked), offer=False)
+
+    assert handle._mcp_sign_in_needed == {"remote"}
+    assert handle._mcp_sign_in_dropped == 0
 
 
 def test_a_completion_past_the_cap_is_dropped_and_counted(caplog):

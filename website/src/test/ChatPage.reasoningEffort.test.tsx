@@ -4,6 +4,7 @@
  * level; the slider that changes it lives inside the model picker.
  * Tests the ChatInput component directly to avoid ChatPage's complex dependencies.
  */
+import { useLayoutEffect } from 'react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, act, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
@@ -447,6 +448,52 @@ describe('ReasoningEffortDropdown', () => {
     await vi.waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', 'high'))
   })
 
+  // With a configured default and no override, the thumb is the only
+  // graphical readout of the level and must sit where the header and the
+  // switch say the session runs. A fixed middle notch looked right only when
+  // the default happened to be High.
+  it('starts the thumb on the configured default when the slot has no override', async () => {
+    renderDropdown({ currentEffort: '', defaultEffort: 'xhigh' })
+    const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })
+    await vi.waitFor(() => expect(slider.getAttribute('aria-valuemax')).toBe('4'))
+    expect(slider).toHaveAttribute('aria-valuenow', '3')
+    expect(slider).toHaveAttribute('aria-valuetext', 'Extra High')
+    expect(screen.getByText('Default · Extra High')).toBeInTheDocument()
+  })
+
+  it('seeds a default below the middle notch too', async () => {
+    renderDropdown({ currentEffort: '', defaultEffort: 'low' })
+    const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })
+    await vi.waitFor(() => expect(slider.getAttribute('aria-valuemax')).toBe('4'))
+    expect(slider).toHaveAttribute('aria-valuenow', '0')
+    expect(slider).toHaveAttribute('aria-valuetext', 'Low')
+  })
+
+  it('toggling default off pins the configured default, not the middle notch', async () => {
+    renderDropdown({ currentEffort: '', defaultEffort: 'xhigh' })
+    const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })
+    await vi.waitFor(() => expect(slider.getAttribute('aria-valuemax')).toBe('4'))
+    fireEvent.click(screen.getByRole('switch', { name: 'Use default effort (Extra High)' }))
+    await vi.waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', 'xhigh'))
+    expect(mockApi.chatSlotReasoningEffort).not.toHaveBeenCalledWith('s1', 'high')
+    expect(slider).toHaveAttribute('aria-valuetext', 'Extra High')
+  })
+
+  it('follows the configured default while the switch is on', async () => {
+    const view = renderDropdown({ currentEffort: '', defaultEffort: 'high', levelsOverride: ['low', 'medium', 'high', 'xhigh', 'max'] })
+    const slider = screen.getByRole('slider', { name: 'Reasoning effort' })
+    expect(slider).toHaveAttribute('aria-valuenow', '2')
+    view.rerender(
+      <QueryClientProvider client={new QueryClient()}>
+        <Provider store={view.store}>
+          <ReasoningEffortDropdown slot="s1" currentEffort="" defaultEffort="max" onClose={vi.fn()} levelsOverride={['low', 'medium', 'high', 'xhigh', 'max']} />
+        </Provider>
+      </QueryClientProvider>,
+    )
+    expect(slider).toHaveAttribute('aria-valuenow', '4')
+    expect(slider).toHaveAttribute('aria-valuetext', 'Max')
+  })
+
   // With a Settings default configured, the no-override state names the
   // configured value ("Default · High") rather than a bare "Default", which
   // would read as "the model decides" and hide the value the turn runs at.
@@ -494,6 +541,32 @@ describe('ReasoningEffortDropdown', () => {
     // The debounced persist writes the slot row after the mock resolves; wait
     // for that write so it lands inside the waiting window, not after the test.
     await waitFor(() => expect(store.getState().dashboard.slots.find(s => s.key === 's1')?.reasoning_effort).toBe('max'))
+  })
+
+  it('pins the configured default when the switch flips in the render the level list changes in', async () => {
+    // The thumb follows the default through an effect, so for one render after
+    // the list changes the stored index still points into the old list. A
+    // click landing in that render (as on a loaded runner) must still pin
+    // the level the switch names: here 'high', which sits at index 0 of the
+    // new list while the stale index 2 is past its end.
+    function FlipWhenLevelsChange({ levels }: { levels: string[] }) {
+      useLayoutEffect(() => {
+        if (levels.length === 2) screen.getByRole('switch', { name: 'Use default effort (High)' }).click()
+      }, [levels])
+      return <ReasoningEffortDropdown slot="s1" currentEffort="" defaultEffort="high" onClose={vi.fn()} levelsOverride={levels} />
+    }
+    const store = configureStore({
+      reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
+      preloadedState: {
+        dashboard: { slots: [{ key: 's1', messages: 0, running: false, reasoning_effort: '' }], unreadSlots: [], refreshTrigger: 0, subagentRunning: {}, subagentDetails: {}, subagentText: {} } as unknown as RootState['dashboard'],
+      } as Partial<RootState>,
+    })
+    const tree = (levels: string[]) => <QueryClientProvider client={new QueryClient()}><Provider store={store}><FlipWhenLevelsChange levels={levels} /></Provider></QueryClientProvider>
+    const view = render(tree(['low', 'medium', 'high', 'xhigh', 'max']))
+    view.rerender(tree(['high', 'max']))
+    await waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', 'high'))
+    expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(store.getState().dashboard.slots.find(s => s.key === 's1')?.reasoning_effort).toBe('high'))
   })
 
   it('keeps the remembered concrete pick while persisting default inheritance', async () => {

@@ -252,7 +252,7 @@ async def _connect_slack(self: GatewayOrchestrator) -> bool:
     dashboard, cron, and task runner keep running in dashboard-only mode.
 
     ponytail: no background retry of the initial connect — Slack DM stays
-    disabled until the next gateway restart.
+    disabled until a Reconnect (``slack.reconnect``) or the next gateway restart.
 
     Slack is a GOVERNED transport like every other channel: a ``channels``
     policy that denies ``slack`` must stop it from CONNECTING, not merely drop
@@ -604,7 +604,7 @@ async def _on_slack_config_change(self: GatewayOrchestrator, change: ConfigChang
       so the Slack-native modal (which edits the same set objects) and a CLI
       write converge on one set.
     * ``slack.channels`` / ``slack.dm_activation`` / ``messaging.*`` /
-      ``trusted_bot_*`` / ``home_tab_sessions_per_kind`` /
+      ``trusted_bot_*`` / ``home_tab_builtin`` / ``home_tab_sessions_per_kind`` /
       ``forward_to_agent_callback`` -> the shared config object every Slack
       read goes through (``handler.slack_cfg()``), updated section-by-section
       in place so ``orch._cfg`` and ``handler._orch_cfg`` cannot diverge.
@@ -624,14 +624,14 @@ async def _on_slack_config_change(self: GatewayOrchestrator, change: ConfigChang
 
     new = change.new
     # Slack's tokens live in ``.env`` / the vault, and its socket client is
-    # host-managed (``_connect_slack``), so unlike every other channel there is
-    # no in-process restart path that can re-authenticate it with a rotated
-    # token. The owner id is read once at construction into ``_owner_id`` and
-    # the owner allowlist, so a replaced or removed owner keeps authorizing the
-    # previous one until the next start. A ``.env`` edit to either is surfaced
-    # as the watcher's synthetic ``credentials.<KEY>`` path; apply what can be
-    # applied live below, but tell the operator the new token or owner needs a
-    # gateway restart, the same honest fallback as ``slack.command``.
+    # host-managed (``_connect_slack``), so unlike every other channel the
+    # watcher has no restart path that re-authenticates it with a rotated
+    # token. The owner id is read once into ``_owner_id`` and the owner
+    # allowlist, so a replaced or removed owner keeps authorizing the previous
+    # one until a Reconnect (``slack.reconnect``) or the next start. A ``.env``
+    # edit to either is surfaced as the watcher's synthetic
+    # ``credentials.<KEY>`` path; apply what can be applied live below, and
+    # tell the operator how to apply the new token or owner.
     # Matched by canonical environment-entry name, the same rule as
     # ``registry.changed_credential_keys``: on Windows ``os.environ`` is
     # case-insensitive, so a lowercase ``slack_bot_token`` line rotates the same
@@ -654,11 +654,17 @@ async def _on_slack_config_change(self: GatewayOrchestrator, change: ConfigChang
         # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure -- the format names a token, its argument is the KEY name only (never a credential value)
         logger.warning(
             "Slack credential(s) changed in .env (%s); Slack's socket connection and "
-            "owner authorization are fixed at gateway start and keep the previous "
-            "token and owner until the next start. "
-            "Run `kirocrew restart` to apply the new Slack token or owner.",
+            "owner authorization keep the previous token and owner until a Reconnect "
+            "or the next start. Click Reconnect in Settings → Messaging Channels → Slack, "
+            "or run `kirocrew restart`, to apply the new Slack token or owner.",
             ", ".join(slack_cred_keys),
         )
+        # A credential any writer (the CLI included) changed away from what an
+        # open owner-claim window pinned closes it; a re-save of the same
+        # tokens (this notice arriving after the window opened) does not.
+        claim = getattr(self.dashboard_state, "slack_owner_claim", None)
+        if claim is not None:
+            claim.recheck_soon("credential_change")
     slack_paths = change.under("slack")
     if slack_paths and "slack" in new.degraded_sections:
         # Deferred, not dropped: the watcher retries these paths once the
@@ -728,10 +734,9 @@ async def _on_slack_config_change(self: GatewayOrchestrator, change: ConfigChang
 
         await asyncio.to_thread(slack_enterprise.reload_allowed_team_ids)
     if "slack.command" in slack_paths:
-        logger.warning(
-            "slack.command changed in config; the slash command is registered in "
-            "the Slack app manifest, so this takes effect on the next gateway start"
-        )
+        # The name help text shows and the router answers beside the manifest
+        # names; Slack's routing is the app manifest's, so nothing reconnects.
+        self.slack_command = new.slack.command
 
 
 def _on_default_agent_config_change(self: GatewayOrchestrator, change: ConfigChange) -> None:
@@ -851,9 +856,13 @@ async def _replay_spooled_inbound(self: GatewayOrchestrator, *, spool: Path | No
         # local prevents every other shared send ladder from discovering a
         # Slack transport it was never designed to route through.
         if self.slack is not None:
+            from kiro_crew.slack import shared_access
+
+            # A shared user (slack.shared_access) the owner still lists is owed the
+            # notice for their own refused message, in the conversation it came from.
             transports["slack"] = SlackTransport(
                 self.slack,
-                allowed_users=self._allowed_users,
+                allowed_users=set(self._allowed_users) | set(shared_access.listed_ids(self._cfg)),
             )
         await inbound_spool.replay_spooled(transports=transports, path=spool)
     except asyncio.CancelledError:

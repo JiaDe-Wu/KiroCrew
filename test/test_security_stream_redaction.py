@@ -9,17 +9,25 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+from datetime import datetime, timezone
 
 import pytest
 import security_helpers
 
 from kiro_crew import security
 from kiro_crew.security import REDACTED_CREDENTIAL_TAG, redact_and_truncate, scan_history
+from kiro_crew.testing.synthetic_credentials import github_classic
+
+# A synthetic 40-character GitHub token with a valid checksum. AWS key IDs
+# (``AKIA...``) are identifiers the redactor keeps visible, and so is a bare
+# 40-character run, so the tests below redact a published-format token instead.
+_TOKEN = github_classic(seed=83)
 
 
-def _jose_header(min_len: int) -> str:
+def _jose_header(min_len: int, **extra: str) -> str:
     """A base64url JOSE header segment at least *min_len* characters long."""
-    raw = json.dumps({"alg": "HS256", "pad": "A" * min_len}).encode()
+    raw = json.dumps({"alg": "HS256", **extra, "pad": "A" * min_len}).encode()
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
@@ -32,9 +40,9 @@ class TestRedactAndTruncate:
         assert len(result) <= 100
 
     def test_redacts_credentials_in_truncated(self) -> None:
-        text = "Key: AKIAIOSFODNN7EXAMPLE in output"
+        text = f"Key: {_TOKEN} in output"
         result = redact_and_truncate(text)
-        assert "AKIAIOSFODNN7EXAMPLE" not in result
+        assert _TOKEN not in result
 
     def test_handles_none(self) -> None:
         assert redact_and_truncate(None) == ""
@@ -43,18 +51,18 @@ class TestRedactAndTruncate:
         """A secret spanning the max_chars cut must not leak a partial.
 
         Redaction runs over the full text before truncation. Truncating first
-        would slice AKIA...EXAMPLE in half, leaving an unredactable prefix that
+        would slice the secret in half, leaving an unredactable prefix that
         does not match the credential regex and would leak on the wire.
         """
         prefix = "prefix "  # 7 chars
-        secret = "AKIAIOSFODNN7EXAMPLE"  # 20-char AWS access key ID
+        secret = _TOKEN  # 40-char GitHub token
         text = prefix + secret + " trailing"
-        # Boundary lands 8 chars into the 20-char key.
+        # Boundary lands 8 chars into the 40-char token.
         max_chars = len(prefix) + 8
         result = redact_and_truncate(text, max_chars=max_chars)
         assert len(result) <= max_chars
-        # No fragment of the access key ID (which starts with "AKIA") survives.
-        assert "AKIA" not in result
+        # No fragment of the secret survives.
+        assert secret[:4] not in result
 
 
 class TestSELEmittersRedactBeforeTruncate:
@@ -62,9 +70,9 @@ class TestSELEmittersRedactBeforeTruncate:
 
     Slicing to 200 chars before redacting writes a credential straddling the
     200-char boundary to the durable audit event with its tail cut off, in the
-    shape the credential regex cannot match. Each test plants the 20-char
-    AWS access key ID 'AKIAIOSFODNN7EXAMPLE' straddling index 200 and asserts no
-    fragment of it (its 'AKIA' prefix) survives in the emitted event's metadata.
+    shape the credential regex cannot match. Each test plants a 40-char
+    GitHub token straddling index 200 and asserts no fragment of it
+    (its first four characters) survives in the emitted event's metadata.
 
     These call the emitters DIRECTLY, so they pin the emitter's own ordering and
     nothing about what a caller feeds it. Redaction here is case-sensitive by
@@ -73,7 +81,7 @@ class TestSELEmittersRedactBeforeTruncate:
     (``test_allow_audit_records_the_raw_command_not_the_matching_view``).
     """
 
-    SECRET = "AKIAIOSFODNN7EXAMPLE"  # 20-char AWS access key ID
+    SECRET = _TOKEN  # 40-char GitHub token
 
     def test_push_allow_event_redacts_straddling_secret(
         self, monkeypatch: pytest.MonkeyPatch
@@ -102,7 +110,9 @@ class TestSELEmittersRedactBeforeTruncate:
         assert len(logged) == 1
         event = logged[0]
         assert event.event_type == "push_allowed"
-        assert not any("AKIA" in str(value) for value in event.metadata.values()), event.metadata
+        assert not any(
+            self.SECRET[:4] in str(value) for value in event.metadata.values()
+        ), event.metadata
 
     def test_injection_dropped_event_redacts_straddling_secret(
         self, monkeypatch: pytest.MonkeyPatch
@@ -117,7 +127,9 @@ class TestSELEmittersRedactBeforeTruncate:
 
         monkeypatch.setattr(security, "SecurityEventLog", lambda: _RecorderLog())
 
-        pad = "p" * (200 - 4)
+        # The space keeps the secret a run of its own; glued to the pad it
+        # would be one long run and no 40-character secret.
+        pad = "p" * (200 - 5) + " "
         sample = pad + self.SECRET + " " + "z" * 300
         assert len(sample) > 200
         assert 200 - len(pad) < len(self.SECRET)  # key straddles the cut
@@ -133,44 +145,282 @@ class TestSELEmittersRedactBeforeTruncate:
         assert len(logged) == 1
         event = logged[0]
         assert event.event_type == "prompt_injection_dropped"
-        assert not any("AKIA" in str(value) for value in event.metadata.values()), event.metadata
+        assert not any(
+            self.SECRET[:4] in str(value) for value in event.metadata.values()
+        ), event.metadata
+
+
+def _write_rows(path, rows) -> None:
+    """Write *rows* as one transcript file, one JSON object per line."""
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def _shell_row(command: str) -> dict:
+    """A tool row in the transcript shape: the command rides ``meta.input`` as JSON."""
+    return {
+        "role": "tool",
+        "content": "Run",
+        "meta": {"kind": "execute", "input": json.dumps({"command": command})},
+    }
 
 
 class TestScanHistory:
-    """Tests for scan_history()."""
+    """Tests for scan_history() over session transcripts."""
 
     def test_detects_suspicious_command_in_history(self, tmp_path) -> None:
-        history_file = tmp_path / "session1.jsonl"
-        entries = [
-            json.dumps({"role": "assistant", "content": "rm -rf /"}),
-            json.dumps({"role": "assistant", "content": "echo hello"}),
-        ]
-        history_file.write_text("\n".join(entries))
-        findings = scan_history(tmp_path)
-        assert len(findings) == 1
+        _write_rows(
+            tmp_path / "session1.jsonl",
+            [
+                {"role": "assistant", "content": "rm -rf /"},
+                {"role": "assistant", "content": "echo hello"},
+            ],
+        )
+        findings, scanned = scan_history(tmp_path)
+        assert len(findings) == 1 and scanned == 2
         assert "rm -rf /" in findings[0]["snippet"]
 
+    def test_detects_command_in_a_tool_row(self, tmp_path) -> None:
+        """A shell tool row carries its command in ``meta.input``, not ``content``."""
+        _write_rows(
+            tmp_path / "dashboard_chat-1-1.jsonl",
+            [{"_type": "metadata", "title": "t"}, _shell_row("chmod 777 /srv/app")],
+        )
+        findings, scanned = scan_history(tmp_path)
+        assert scanned == 1
+        assert [f["snippet"] for f in findings] == ["chmod 777 /srv/app"]
+        assert findings[0]["file"] == "dashboard_chat-1-1.jsonl"
+
+    def test_detects_a_command_inside_a_use_aws_tool_row(self, tmp_path) -> None:
+        """A structured ``use_aws`` payload is audited the way the gate reads it."""
+        params = {
+            "service_name": "ssm",
+            "operation_name": "send-command",
+            "parameters": {"parameters": {"commands": ["chmod 777 /srv/app"]}},
+        }
+        row = {"role": "tool", "content": "Run", "meta": {"input": json.dumps(params)}}
+        _write_rows(tmp_path / "aws.jsonl", [row])
+        findings, scanned = scan_history(tmp_path)
+        assert scanned == 1
+        assert [f["file"] for f in findings] == ["aws.jsonl"]
+
+    def test_reads_the_newest_rows_of_a_long_transcript(self, tmp_path) -> None:
+        """The flagged row is the LAST of 150, so a head read of 100 misses it."""
+        rows = [_shell_row("echo ok") for _ in range(149)] + [_shell_row("rm -rf ~")]
+        _write_rows(tmp_path / "s.jsonl", rows)
+        findings, scanned = scan_history(tmp_path, last_n=100)
+        assert scanned == 100
+        assert [f["snippet"] for f in findings] == ["rm -rf ~"]
+
+    def test_budget_spans_files_newest_first(self, tmp_path) -> None:
+        old, new = tmp_path / "old.jsonl", tmp_path / "new.jsonl"
+        _write_rows(old, [_shell_row("rm -rf /"), _shell_row("echo old")])
+        _write_rows(new, [_shell_row("echo new")])
+        os.utime(old, (1_000_000, 1_000_000))
+        os.utime(new, (2_000_000, 2_000_000))
+        assert scan_history(tmp_path, last_n=2) == ([], 2)
+        findings, scanned = scan_history(tmp_path, last_n=3)
+        assert scanned == 3 and [f["file"] for f in findings] == ["old.jsonl"]
+
+    def test_newest_rows_are_chosen_by_timestamp_across_files(self, tmp_path) -> None:
+        """A busy transcript cannot spend the whole budget when another holds newer rows."""
+        base = 1_800_000_000
+        busy, other = tmp_path / "busy.jsonl", tmp_path / "other.jsonl"
+
+        def _at(command: str, epoch: float) -> dict:
+            stamp = datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+            return {**_shell_row(command), "ts": stamp}
+
+        # Rows at base+0..9 in the busy file, one flagged row at base+7.5 in the other.
+        _write_rows(busy, [_at("echo busy", base + i) for i in range(10)])
+        _write_rows(other, [_at("rm -rf /", base + 7.5)])
+        # The busy file was written last, so a newest-file-first walk reads it first.
+        os.utime(other, (base + 7.5, base + 7.5))
+        os.utime(busy, (base + 9, base + 9))
+        findings, scanned = scan_history(tmp_path, last_n=5)
+        assert scanned == 5
+        assert [f["file"] for f in findings] == ["other.jsonl"]
+
+    def test_naive_legacy_timestamps_are_read_as_local_time(self, tmp_path) -> None:
+        """Rows with an offset-free ``ts`` keep their own time, not their file's mtime."""
+        base = 1_800_000_000
+        busy, other = tmp_path / "busy.jsonl", tmp_path / "other.jsonl"
+
+        def _naive(command: str, epoch: float) -> dict:
+            return {**_shell_row(command), "ts": datetime.fromtimestamp(epoch).isoformat()}
+
+        _write_rows(busy, [_naive("echo busy", base + i) for i in range(10)])
+        _write_rows(other, [_naive("rm -rf /", base + 7.5)])
+        os.utime(other, (base + 7.5, base + 7.5))
+        os.utime(busy, (base + 9, base + 9))
+        findings, scanned = scan_history(tmp_path, last_n=5)
+        assert scanned == 5
+        assert [f["file"] for f in findings] == ["other.jsonl"]
+
+    def test_a_row_stamped_after_its_file_mtime_is_still_read(self, tmp_path) -> None:
+        """A file's mtime is not an upper bound on its rows' ``ts``, so it is never skipped."""
+        base = 1_800_000_000
+        busy, ahead = tmp_path / "busy.jsonl", tmp_path / "ahead.jsonl"
+
+        def _at(command: str, epoch: float) -> dict:
+            stamp = datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+            return {**_shell_row(command), "ts": stamp}
+
+        _write_rows(busy, [_at("echo busy", base + i) for i in range(10)])
+        # Stamped ahead of the clock (base+50), but its file mtime is older (base+1).
+        _write_rows(ahead, [_at("rm -rf /", base + 50)])
+        os.utime(ahead, (base + 1, base + 1))
+        os.utime(busy, (base + 9, base + 9))
+        findings, scanned = scan_history(tmp_path, last_n=5)
+        assert scanned == 5
+        assert [f["file"] for f in findings] == ["ahead.jsonl"]
+
+    @pytest.mark.parametrize("stamp", ["0001-01-01T00:00:00", "9999-12-31T23:59:59"])
+    def test_a_boundary_year_stamp_does_not_stop_the_scan(self, tmp_path, stamp) -> None:
+        """A ``ts`` that parses but cannot convert falls back to the file mtime."""
+        _write_rows(tmp_path / "s.jsonl", [{**_shell_row("rm -rf /"), "ts": stamp}])
+        findings, scanned = scan_history(tmp_path)
+        assert scanned == 1
+        assert [f["snippet"] for f in findings] == ["rm -rf /"]
+
+    def test_a_cut_off_shell_input_is_audited_as_text(self, tmp_path) -> None:
+        """A shell input stored truncated is not JSON, but its text is still audited."""
+        cut = json.dumps({"command": "chmod 777 /srv/app # " + "x" * 50})[:60] + "… [truncated]"
+        shell = {"role": "tool", "content": "Run", "meta": {"kind": "execute", "input": cut}}
+        edit = {"role": "tool", "content": "Edit", "meta": {"kind": "edit", "input": "-rm -rf /"}}
+        _write_rows(tmp_path / "s.jsonl", [shell, edit])
+        findings, scanned = scan_history(tmp_path)
+        assert scanned == 2
+        assert len(findings) == 1 and "chmod 777 /srv/app" in findings[0]["snippet"]
+
+    def test_a_row_past_the_json_parser_limits_is_reported_not_raised(self, tmp_path) -> None:
+        """A 5,000-digit integer trips the parser's limit; that file is reported, not fatal."""
+        _write_rows(tmp_path / "ok.jsonl", [_shell_row("rm -rf /")])
+        row = {"role": "tool", "content": "Run", "meta": {"input": '{"n": ' + "9" * 5000 + "}"}}
+        _write_rows(tmp_path / "huge.jsonl", [row])
+        findings, scanned = scan_history(tmp_path)
+        assert scanned == 1
+        assert sorted(f["file"] for f in findings) == ["huge.jsonl", "ok.jsonl"]
+        assert "not audited" in next(f for f in findings if f["file"] == "huge.jsonl")["warning"]
+
+    def test_unreadable_transcript_is_a_finding(self, tmp_path) -> None:
+        """A transcript the scan cannot open is reported, not skipped as clean."""
+        _write_rows(tmp_path / "ok.jsonl", [_shell_row("echo ok")])
+        (tmp_path / "broken.jsonl").mkdir()
+        findings, scanned = scan_history(tmp_path)
+        assert scanned == 1
+        assert [f["file"] for f in findings] == ["broken.jsonl"]
+        assert "not audited" in findings[0]["warning"]
+
     def test_ignores_user_messages(self, tmp_path) -> None:
-        history_file = tmp_path / "session1.jsonl"
-        entries = [
-            json.dumps({"role": "user", "content": "rm -rf /"}),
-        ]
-        history_file.write_text("\n".join(entries))
-        findings = scan_history(tmp_path)
-        assert len(findings) == 0
+        _write_rows(tmp_path / "session1.jsonl", [{"role": "user", "content": "rm -rf /"}])
+        assert scan_history(tmp_path) == ([], 1)
 
     def test_empty_dir(self, tmp_path) -> None:
-        assert scan_history(tmp_path) == []
+        assert scan_history(tmp_path) == ([], 0)
 
     def test_nonexistent_dir(self, tmp_path) -> None:
-        assert scan_history(tmp_path / "nope") == []
+        assert scan_history(tmp_path / "nope") == ([], 0)
 
     def test_respects_last_n(self, tmp_path) -> None:
-        history_file = tmp_path / "session1.jsonl"
-        entries = [json.dumps({"role": "assistant", "content": "rm -rf /"}) for _ in range(200)]
-        history_file.write_text("\n".join(entries))
-        findings = scan_history(tmp_path, last_n=5)
-        assert len(findings) == 5
+        _write_rows(
+            tmp_path / "session1.jsonl", [{"role": "assistant", "content": "rm -rf /"}] * 200
+        )
+        findings, scanned = scan_history(tmp_path, last_n=5)
+        assert len(findings) == 5 and scanned == 5
+
+    def test_one_tool_call_over_several_rows_is_one_finding(self, tmp_path) -> None:
+        """The dispatch and approval rows of one call share a ``tool_call_id``."""
+
+        def call_row(call_id: str, command: str | None) -> dict:
+            row = _shell_row(command) if command else {"role": "tool", "content": "Run"}
+            row.setdefault("meta", {})["tool_call_id"] = call_id
+            return row
+
+        rows = [call_row("c1", None), call_row("c1", "rm -rf /"), call_row("c1", "rm -rf /")]
+        rows += [call_row("c2", "echo ok")]
+        _write_rows(tmp_path / "s.jsonl", rows)
+        findings, scanned = scan_history(tmp_path, last_n=2)
+        assert scanned == 2, "the folded call took more than one slot"
+        assert [f["snippet"] for f in findings] == ["rm -rf /"]
+
+    def test_a_call_approved_after_newer_rows_is_still_recent(self, tmp_path) -> None:
+        """A call's later row moves it to the tail with that row's time."""
+
+        def row(call_id: str, command: str, ts: str) -> dict:
+            out = _shell_row(command)
+            out["meta"]["tool_call_id"] = call_id
+            out["ts"] = ts
+            return out
+
+        # The call waits for approval while ANOTHER transcript gains newer rows.
+        dispatch = row("c1", "git clean -fdx", "2026-01-01T00:00:00+00:00")
+        approved = row("c1", "git clean -fdx", "2026-01-01T00:09:00+00:00")
+        newer = [row(f"n{i}", "echo ok", f"2026-01-01T00:0{i + 1}:00+00:00") for i in range(3)]
+        _write_rows(tmp_path / "waiting.jsonl", [dispatch, approved])
+        _write_rows(tmp_path / "busy.jsonl", newer)
+        findings, scanned = scan_history(tmp_path, last_n=2)
+        assert scanned == 2
+        assert [f["snippet"] for f in findings] == [
+            "git clean -fdx"
+        ], "the approved call kept its first-seen time and fell out of the newest rows"
+
+    def test_a_non_shell_tool_kind_is_not_audited_as_a_command(self, tmp_path) -> None:
+        """A ``read`` row's input is not a command; an ``other`` row still is."""
+        read = _shell_row("chmod 777 /srv/app")
+        read["meta"]["kind"] = "read"
+        other = _shell_row("chmod 777 /srv/app")
+        other["meta"]["kind"] = "other"
+        _write_rows(tmp_path / "read.jsonl", [read])
+        _write_rows(tmp_path / "other.jsonl", [other])
+        findings, scanned = scan_history(tmp_path)
+        assert scanned == 2
+        assert [f["file"] for f in findings] == ["other.jsonl"]
+
+    def test_a_transcript_removed_mid_scan_is_skipped_not_reported(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A file deleted between the listing and the read is gone, not unreadable."""
+        from kiro_crew.security import memory_audit
+
+        _write_rows(tmp_path / "gone.jsonl", [_shell_row("rm -rf /")])
+        _write_rows(tmp_path / "kept.jsonl", [_shell_row("echo ok")])
+        real = memory_audit._transcript_tail_rows
+
+        def vanish(path, max_rows, mtime):
+            if path.name == "gone.jsonl":
+                raise FileNotFoundError(path)
+            return real(path, max_rows, mtime)
+
+        monkeypatch.setattr(memory_audit, "_transcript_tail_rows", vanish)
+        assert scan_history(tmp_path) == ([], 1)
+
+    def test_a_tool_kind_of_the_wrong_type_does_not_stop_the_scan(self, tmp_path) -> None:
+        """A ``kind`` that is not text is read as unknown, never raised."""
+        odd = {"role": "tool", "content": "Run", "meta": {"kind": [], "input": "{}"}}
+        _write_rows(tmp_path / "odd.jsonl", [odd])
+        _write_rows(tmp_path / "next.jsonl", [_shell_row("chmod 777 /srv/app")])
+        findings, scanned = scan_history(tmp_path)
+        assert scanned == 2
+        assert [f["file"] for f in findings] == ["next.jsonl"]
+
+    def test_a_cut_off_use_aws_input_is_audited_as_text(self, tmp_path) -> None:
+        """A stored ``other``-kind input cut off mid-JSON still carries its command."""
+        cut = json.dumps({"parameters": {"commands": ["chmod 777 /srv/app"]}, "pad": "x" * 50})
+        row = {"role": "tool", "content": "Run", "meta": {"kind": "other", "input": cut[:-10]}}
+        _write_rows(tmp_path / "aws.jsonl", [row])
+        findings, scanned = scan_history(tmp_path)
+        assert scanned == 1
+        assert [f["file"] for f in findings] == ["aws.jsonl"]
+
+    def test_the_kept_tail_holds_bounded_text_only(self, tmp_path) -> None:
+        """A huge flagged row is kept as its 200-character snippet, not in full."""
+        from kiro_crew.security import memory_audit
+
+        huge = "chmod 777 /srv/app " + "x" * 100_000
+        _write_rows(tmp_path / "s.jsonl", [_shell_row(huge)])
+        rows = memory_audit._transcript_tail_rows(tmp_path / "s.jsonl", 100, 0.0)
+        assert len(rows) == 1 and rows[0][1]
+        assert all(len(str(part)) <= 200 for part in rows[0][1:])
 
 
 class TestStreamRedactor:
@@ -186,20 +436,21 @@ class TestStreamRedactor:
         return emits
 
     def test_credential_split_across_chunks(self) -> None:
-        emits = self._run(["The access key is AKIA", "IOSFODNN7", "EXAMPLE"])
+        emits = self._run(["The secret key is " + _TOKEN[:4], _TOKEN[4:20], _TOKEN[20:]])
         # No single emit leaks a raw fragment
         for e in emits:
-            assert "AKIAIOSFODNN7EXAMPLE" not in e
-            assert not ("AKIA" in e and "REDACTED" not in e)
+            assert _TOKEN not in e
+            assert _TOKEN[:4] not in e
+            assert _TOKEN[20:] not in e
         joined = "".join(emits)
-        assert joined == "The access key is [REDACTED: credential]"
+        assert joined == "The secret key is [REDACTED: credential]"
 
     def test_char_by_char_stream(self) -> None:
         from kiro_crew.security import StreamRedactor
 
         r = StreamRedactor()
-        out = "".join(r.feed(c) for c in "x AKIAIOSFODNN7EXAMPLE y") + r.flush()
-        assert "AKIAIOSFODNN7EXAMPLE" not in out
+        out = "".join(r.feed(c) for c in f"x {_TOKEN} y") + r.flush()
+        assert _TOKEN not in out
         assert "[REDACTED: credential]" in out
 
     def test_no_data_loss_benign(self) -> None:
@@ -207,13 +458,15 @@ class TestStreamRedactor:
         assert joined == "Hello world, this is fine."
 
     def test_single_chunk_credential(self) -> None:
-        joined = "".join(self._run(["key=AKIAIOSFODNN7EXAMPLE done"]))
-        assert "AKIAIOSFODNN7EXAMPLE" not in joined
+        joined = "".join(self._run([f"key={_TOKEN} done"]))
+        assert _TOKEN not in joined
         assert "REDACTED" in joined
 
     def test_github_token_split(self) -> None:
-        joined = "".join(self._run(["use ghp_ABCDEFGHIJ", "KLMNOPQRSTUVWXYZ", "abcdef1234567890"]))
-        assert "ghp_" "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef" not in joined
+        token = github_classic(seed=84)
+        joined = "".join(self._run(["use " + token[:14], token[14:30], token[30:]]))
+        assert token not in joined
+        assert token[4:30] not in joined
         assert "REDACTED" in joined
 
     def test_reset_discards_buffer(self) -> None:
@@ -233,10 +486,12 @@ class TestStreamRedactor:
         """A pathologically long unbroken credential-class run does not grow the
         held buffer without bound: the excess beyond the cap is committed, and
         no content is lost across feed+flush."""
-        from kiro_crew.security import _STREAM_HOLDBACK_MAX, StreamRedactor
+        from kiro_crew.security import _STREAM_HOLDBACK_JWT_MAX, StreamRedactor
 
         r = StreamRedactor()
-        blob = "a" * (_STREAM_HOLDBACK_MAX + 300)  # no terminator, all cred-class
+        # No terminator, all cred-class, and longer than the largest ceiling a run
+        # of this class is held to.
+        blob = "a" * (_STREAM_HOLDBACK_JWT_MAX + 300)
         emitted = r.feed(blob)
         # Some of the run was committed (not held forever) — held tail is capped.
         assert emitted, "cap did not release any of the oversized run"
@@ -271,15 +526,15 @@ class TestStreamRedactor:
         (
             ("open &amp", ";token=SECRET", " done"),
             ("open &amp;", "token=SECRET", " done"),
+            ("open ?token&#", "61;SECRET", " done"),
         ),
     )
-    def test_html_entity_token_separator_split_not_leaked(self, chunks) -> None:
-        joined = "".join(self._run(chunks))
-        assert joined == "open &amp;token=[REDACTED: credential] done"
-
-    def test_html_entity_token_equals_split_not_leaked(self) -> None:
-        joined = "".join(self._run(("open ?token&#", "61;SECRET", " done")))
-        assert joined == "open ?token&#61;[REDACTED: credential] done"
+    def test_stays_visible_known_gap_an_entity_spelled_token_parameter(self, chunks) -> None:
+        """The table reads a ``token`` parameter in a URL, by its plain spelling: an HTML
+        entity separator or ``=`` outside one stays, and the stream commits it as the
+        batch does."""
+        text = "".join(chunks)
+        assert "".join(self._run(chunks)) == text == security.redact(text)
 
     def test_canonical_tag_split_inside_token_value_is_fixed_point(self) -> None:
         tag = REDACTED_CREDENTIAL_TAG
@@ -310,13 +565,11 @@ class TestStreamRedactor:
         assert "".join(self._run((f"?token={tag}",))) == f"?token={tag}"
 
     def test_non_tag_bracket_value_is_still_redacted_normally(self) -> None:
-        joined = "".join(self._run(("?token=[NOTATAG: cr", "edential]")))
-        assert joined == f"?token={REDACTED_CREDENTIAL_TAG} credential]"
-
-    def test_flush_preserves_an_incomplete_canonical_tag_prefix(self) -> None:
-        tag = REDACTED_CREDENTIAL_TAG
-        prefix = tag[: tag.index("credential") + 2]
-        assert "".join(self._run((f"?token={prefix}",))) == f"?token={prefix}"
+        joined = "".join(self._run(("https://h.example?token=[NOTATAG: cr", "edential]")))
+        assert joined == (
+            # The URL ends at the blank and drops the ``:`` that ends a sentence.
+            f"https://h.example?token={REDACTED_CREDENTIAL_TAG}: credential]"
+        )
 
     def test_canonical_tag_holdback_never_authorizes_a_drop(self, monkeypatch) -> None:
         monkeypatch.setattr(security, "_STREAM_HOLDBACK_MAX", 4)
@@ -401,7 +654,8 @@ class TestStreamRedactor:
         """
         from kiro_crew.security import _STREAM_HOLDBACK_MAX, StreamRedactor
 
-        seg = _jose_header(_STREAM_HOLDBACK_MAX + 400)
+        # A JWE header names its content encryption (``enc``).
+        seg = _jose_header(_STREAM_HOLDBACK_MAX + 400, enc="A256GCM")
         jwe = f"{seg}.QW5rZXk.aXY.Y2lwaGVydGV4dA.dGFn"  # 5 compact JWE segments
         assert len(jwe) > _STREAM_HOLDBACK_MAX
         r = StreamRedactor()
@@ -549,14 +803,14 @@ class TestStreamRedactor:
         from kiro_crew.security import _STREAM_HOLDBACK_MAX, StreamRedactor
 
         marker = "rawtokensuffix"
-        value = "A" * 500 + marker + "B" * 6
+        value = "A" * 488 + marker + "B" * 6
         tail = " BEGIN PRIVATE KEY"
-        text = "open ?token=" + value + tail
+        text = "https://h.example?token=" + value + tail
         # The natural trailing run is only ``KEY`` (3 bytes); the partial-PEM
         # rule lowers the Phase-A cut to zero. The 550-byte buffer then forces a
-        # 512-byte floor cut at byte 38, which is 26 bytes into the token value.
+        # 512-byte floor cut at byte 38, which is 14 bytes into the token value.
         assert len(text) == 550
-        assert len(text) - _STREAM_HOLDBACK_MAX == len("open ?token=") + 26
+        assert len(text) - _STREAM_HOLDBACK_MAX == len("https://h.example?token=") + 14
         r = StreamRedactor()
         pieces = [r.feed(text), r.flush()]
         assert all(marker not in piece for piece in pieces)
@@ -572,9 +826,9 @@ class TestStreamRedactor:
         assert emitted == "safe "
         assert r._buf == "?to%6"
 
+        # Stays visible, known gap: the table reads a ``token`` parameter in a URL only.
         joined = emitted + r.feed("ben=weak-secret-value") + r.flush()
-        assert "weak-secret-value" not in joined
-        assert "?to%6ben=[REDACTED: credential]" in joined
+        assert joined == "safe ?to%6ben=weak-secret-value"
 
     def test_credential_anchored_tail_past_ceiling_fails_closed(self) -> None:
         """A credential-anchored tail past the 4096 ceiling fails closed.
@@ -710,8 +964,8 @@ class TestStreamRedactor:
         from kiro_crew.security import StreamRedactor
 
         redactor = StreamRedactor()
-        first = redactor.feed("?token=" + "T" * 5000 + " done")
-        assert first == "?token=[REDACTED: credential] "
+        first = redactor.feed("https://h.example?token=" + "T" * 5000 + " done")
+        assert first == "https://h.example?token=[REDACTED: credential] "
         assert not redactor._discarding
         assert redactor.flush() == "done"
 
@@ -746,16 +1000,20 @@ class TestStreamRedactor:
         assert "TTTT" not in remainder
 
     def test_drop_preserves_suffix_when_the_value_ended_inside_the_buffer(self) -> None:
-        """Fail-closed drops only the token region, never its benign suffix."""
-        from kiro_crew.security import REDACTED_CREDENTIAL_TAG, StreamRedactor
+        """Only the token value goes, never its benign suffix, and no drop is armed.
+
+        The whole feed is judged at once, so the output is the batch redactor's.
+        """
+        from kiro_crew.security import StreamRedactor
 
         value = "A" * 5000 + "!" + "B" * 100
         redactor = StreamRedactor()
-        first = redactor.feed(f"?token={value}&next=visible")
-        assert first == REDACTED_CREDENTIAL_TAG
+        first = redactor.feed(f"https://h.example?token={value}&next=visible")
+        assert "A" * 32 not in first
         assert not redactor._discarding
-        assert redactor._buf == "&next=visible"
-        assert first + redactor.flush() == REDACTED_CREDENTIAL_TAG + "&next=visible"
+        out = first + redactor.flush()
+        assert out == "https://h.example?token=[REDACTED: credential]&next=visible"
+        assert out == security.redact(f"https://h.example?token={value}&next=visible")
 
     def test_drop_arms_when_the_same_value_reaches_the_buffer_end(self) -> None:
         """The same oversized value remains sticky when its continuation is unknown."""
@@ -782,7 +1040,7 @@ class TestStreamRedactor:
         from kiro_crew import security
 
         value = "A" * 2000 + ";" + "A" * (security._STREAM_HOLDBACK_JWT_MAX - 1500)
-        text = f"?token={value}&tok"
+        text = f"https://h.example?token={value}&tok"
         assert ";" not in security._CRED_CLASS
         assert all(char in security._CRED_CLASS for char in "A&tok")
         assert len(text) > security._STREAM_HOLDBACK_JWT_MAX
@@ -794,39 +1052,44 @@ class TestStreamRedactor:
         The drop covers the completed value only; the WEAK prefix is HELD (the
         existing holdback), and its completion follows the weak-completion rules.
         """
-        from kiro_crew.security import REDACTED_CREDENTIAL_TAG, StreamRedactor
+        from kiro_crew.security import StreamRedactor
 
         redactor = StreamRedactor()
         first = redactor.feed(self._over_ceiling_crossing_with_weak_tail())
-        assert first == REDACTED_CREDENTIAL_TAG
         assert "A" * 32 not in first
-        assert redactor._buf == "&tok"
+        assert redactor._buf.endswith("&tok")
         joined = first + redactor.feed("en=secret&x=1") + redactor.flush()
         assert "secret" not in joined
-        assert joined == REDACTED_CREDENTIAL_TAG + "&token=[REDACTED: credential]&x=1"
+        assert (
+            joined
+            == "https://h.example?token=[REDACTED: credential]&token=[REDACTED: credential]&x=1"
+        )
 
     def test_weak_tail_never_arms_the_sticky_discard(self) -> None:
         """WEAK evidence holds bytes but never arms a drop or names a discard kind."""
-        from kiro_crew.security import REDACTED_CREDENTIAL_TAG, StreamRedactor
+        from kiro_crew.security import StreamRedactor
 
         redactor = StreamRedactor()
         first = redactor.feed(self._over_ceiling_crossing_with_weak_tail())
-        assert first == REDACTED_CREDENTIAL_TAG
+        assert "A" * 32 not in first
         assert not redactor._discarding
         assert redactor._discard_kind is None
         # Breaking the prefix releases it verbatim: nothing was dropped off it.
-        assert redactor.feed(" visible") + redactor.flush() == "&tok visible"
+        rest = redactor.feed(" visible") + redactor.flush()
+        assert first + rest == "https://h.example?token=[REDACTED: credential]&tok visible"
 
     def test_drop_ending_at_terminator_does_not_suppress_next_chunk(self) -> None:
         from kiro_crew.security import _STREAM_HOLDBACK_JWT_MAX, StreamRedactor
 
         redactor = StreamRedactor()
-        first = redactor.feed("?token=" + "T" * (_STREAM_HOLDBACK_JWT_MAX + 500) + " ")
-        assert first == "?token=[REDACTED: credential] "
+        first = redactor.feed(
+            "https://h.example?token=" + "T" * (_STREAM_HOLDBACK_JWT_MAX + 500) + " "
+        )
+        assert first == "https://h.example?token=[REDACTED: credential] "
         assert redactor._buf == ""
         assert not redactor._discarding
         assert first + redactor.feed("next ") + redactor.flush() == (
-            "?token=[REDACTED: credential] next "
+            "https://h.example?token=[REDACTED: credential] next "
         )
 
     def test_post_bound_continuation_never_resumes_raw(self) -> None:
@@ -913,6 +1176,31 @@ class TestStreamRedactor:
         r = StreamRedactor()
         emitted = r.feed(blob) + r.flush()
         assert emitted == blob  # committed in full, nothing dropped
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            'see password="Zq8vLm2 Kd9pRt4" ok',
+            "密码 password = 'Zq8vLm2 Kd9pRt4'",
+            'see password="Zq8v密Lm2 Kd9p" ok',
+        ],
+    )
+    def test_a_quoted_value_whose_label_already_streamed_is_still_redacted(self, text: str) -> None:
+        """A space inside a quoted value lets the label stream on its own, so
+        the value's open unit starts in text already sent. It still holds the
+        rest, and every split equals the whole-text redaction."""
+        from kiro_crew.security import StreamRedactor, redact
+
+        whole = redact(text)
+        assert "Kd9p" not in whole
+        n = len(text)
+        for a in range(1, n):
+            for b in range(a, n):
+                bounds = sorted({0, a, b, n})
+                r = StreamRedactor()
+                pieces = zip(bounds, bounds[1:], strict=False)
+                out = "".join(r.feed(text[x:y]) for x, y in pieces) + r.flush()
+                assert out == whole, (a, b, out)
 
 
 class TestScanMemoryImportGuard:

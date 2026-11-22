@@ -36,22 +36,25 @@ def _legacy_venv_entries(home: Path) -> list[str]:
 
 
 def _doctor_data_home_owner(issues: list[str]) -> None:
-    """Report data-home entries another account owns, with the line that fixes them.
+    """Report data-home entries another account owns, and where the docs explain them.
 
     Joins ``issues``: a home this account cannot read fails every config read and
     every Bot create, which is exactly what the doctor exists to catch.
     """
-    from kiro_crew.data_home_owner import check_data_home
+    from kiro_crew.data_home_owner import HELP_URL, check_data_home
 
     access = check_data_home(Path(cli_doctor.config_dir()))
     if access.ok:
         print("  owner:       ✅ this account owns its files")
         return
-    print("  owner:       ❌ some files belong to another user, so Kiro Crew can't read them:")
+    whose = f"belong to {access.owner}" if access.owner else "can't be used by this account"
+    print(f"  owner:       ❌ some files {whose}, so Kiro Crew can't read them:")
     for path in access.foreign:
         print(f"               {path}")
-    print(f"               fix: {access.fix_command}")
-    issues.append(f"data home files belong to another user; run: {access.fix_command}")
+    print("               Kiro Crew was probably started as root once (for example with sudo).")
+    print("               Stop running it as root, then give the files back to your account:")
+    print(f"               {HELP_URL}")
+    issues.append(f"data home files {whose}; see {HELP_URL}")
 
 
 def _doctor_data_home() -> None:
@@ -260,14 +263,38 @@ def _doctor_skill_currency(issues: list[str]) -> None:
 _TOOLBOX_DISPATCHER = "toolbox-exec"
 
 
-def _toolbox_launcher_runs_this_version(on_path: str) -> bool:
-    """Whether *on_path* is the Toolbox dispatcher and runs this install's version.
+def _is_toolbox_launcher(on_path: str) -> bool:
+    """Whether *on_path* is a Toolbox launcher rather than an install's own binary.
 
-    A path comparison cannot answer this for Toolbox: ``on_path`` resolves to the
-    one dispatcher every tool shares, never to this install's own binary. So when
-    THIS install is Toolbox-managed and ``on_path`` resolves to that dispatcher,
-    ask it: ``--version`` run through the PATH spelling (the dispatcher reads its
-    argv[0]) must print exactly this install's version line. Any other answer --
+    On POSIX every Toolbox tool name links to the shared ``toolbox-exec``
+    dispatcher. On Windows Toolbox puts a ``<tool>.exe`` launcher per tool in its
+    bin directory (``env._windows_toolbox_bin_dir``), so there it is the directory
+    the PATH entry sits in that identifies it.
+    """
+    from kiro_crew import env, platform_compat
+
+    if os.path.basename(os.path.realpath(on_path)) == _TOOLBOX_DISPATCHER:
+        return True
+    if not platform_compat.IS_WINDOWS:
+        return False
+    bin_dir = env._windows_toolbox_bin_dir(os.path.expanduser("~"), None)
+    if bin_dir is None:
+        return False
+
+    def canonical(path: str) -> str:
+        return os.path.normcase(os.path.realpath(path))
+
+    return canonical(os.path.dirname(os.path.abspath(on_path))) == canonical(bin_dir)
+
+
+def _toolbox_launcher_runs_this_version(on_path: str) -> bool:
+    """Whether *on_path* is a Toolbox launcher and runs this install's version.
+
+    A path comparison cannot answer this for Toolbox: ``on_path`` resolves to a
+    launcher Toolbox owns (:func:`_is_toolbox_launcher`), never to this install's
+    own binary. So when THIS install is Toolbox-managed and ``on_path`` is such a
+    launcher, ask it: ``--version`` run through the PATH spelling (the POSIX
+    dispatcher reads its argv[0]) must print exactly this install's version line. Any other answer --
     another version, a failed or timed-out run, unreadable output, a host that
     cannot build the sandbox -- is False, so the caller keeps its warning.
 
@@ -281,7 +308,7 @@ def _toolbox_launcher_runs_this_version(on_path: str) -> bool:
 
     from kiro_crew import env, version_line
 
-    if os.path.basename(os.path.realpath(on_path)) != _TOOLBOX_DISPATCHER:
+    if not _is_toolbox_launcher(on_path):
         return False
     if not env.is_toolbox_install():
         return False
@@ -321,8 +348,12 @@ def _doctor_path_launcher() -> None:
     Read-only: it resolves and compares paths, and never writes or relinks.
     """
     from kiro_crew.agent import _resolve_kirocrew_bin
+    from kiro_crew.env_own_kirocrew import forwarder_target
 
     on_path = shutil.which("kirocrew")
+    if on_path:
+        # An agent shell on Windows finds the crew home's forwarder first.
+        on_path = forwarder_target(on_path) or on_path
     if not on_path:
         # Not an error on its own: the desktop app runs its bundled backend
         # directly, and a user who never wanted a terminal command is fine.
@@ -334,8 +365,8 @@ def _doctor_path_launcher() -> None:
         print(f"  kirocrew CLI: ✅ {os.path.realpath(on_path)}")
         return
     if _toolbox_launcher_runs_this_version(on_path):
-        # The realpath is Toolbox's shared dispatcher, so the PATH spelling is the
-        # one that names the tool.
+        # The realpath can be Toolbox's shared dispatcher, so the PATH spelling is
+        # the one that names the tool.
         print(f"  kirocrew CLI: ✅ {on_path} (Toolbox launcher, same version)")
         return
     print("  ⚠ kirocrew CLI on PATH belongs to a different install than this one.")
@@ -621,12 +652,23 @@ def _doctor_project(issues: list[str]) -> str:
     if not proj:
         saved_proj = cli_doctor.config_dir() / "project_dir"
         if saved_proj.is_file():
-            saved = saved_proj.read_text(encoding="utf-8").strip()
+            try:
+                saved = saved_proj.read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeDecodeError) as exc:
+                # A file left root-owned by one ``sudo kirocrew setup``, or not
+                # UTF-8: report it as this row, so the sections after it still
+                # print (Data Home's owner row is the one that explains it).
+                print(f"  source dir:  ❌ {saved_proj} is unreadable ({type(exc).__name__})")
+                print(
+                    f"               Fix: rm {shlex.quote(str(saved_proj))}, then run kirocrew setup"
+                )
+                issues.append("unreadable project_dir")
+                return ""
             if saved and Path(saved).is_dir():
                 proj = saved
             else:
                 print(f"  source dir:  ❌ stale — points to deleted {saved}")
-                print(f"               Fix: rm {cli_doctor.config_dir() / 'project_dir'}")
+                print(f"               Fix: rm {shlex.quote(str(saved_proj))}")
                 issues.append("stale project_dir")
                 stale_project = True
     if proj and Path(proj).is_dir():
@@ -666,7 +708,7 @@ def _doctor_sqlite_fts5(issues: list[str]) -> None:
     build without FTS5 breaks memory init.
     """
     try:
-        from kiro_crew._sqlite_compat import fts5_available
+        from kiro_crew._sqlite_compat import PYSQLITE3_REQUIREMENT, fts5_available
 
         if fts5_available():
             print("  sqlite fts5: ✅ available")
@@ -677,7 +719,7 @@ def _doctor_sqlite_fts5(issues: list[str]) -> None:
             # exactly the case the gate hides the command.
             if cli_doctor.pip_install_channel_available():
                 print(
-                    f"{render._INDENT}Fix: {cli_doctor.pip_install_command_for('pysqlite3-binary')}"
+                    f"{render._INDENT}Fix: {cli_doctor.pip_install_command_for(PYSQLITE3_REQUIREMENT)}"
                 )
             print("               Or use a Python whose SQLite was built with FTS5.")
             issues.append("sqlite fts5")
@@ -745,7 +787,8 @@ def _doctor_tz_data(issues: list[str]) -> None:
         issues.append("timezone data missing")
         return
     if offset == _TZ_PROBE_OFFSET:
-        print("  tz data:     ✅ current (America/Vancouver stays UTC-7 in winter)")
+        print("  tz data:     ✅ current (IANA tzdb 2026b or later)")
+        print("               Sample check on America/Vancouver, not your configured zone.")
         return
     print("  tz data:     ⚠️  out of date (older than IANA tzdb 2026b)")
     print("               It still moves America/Vancouver back to UTC-8 on")

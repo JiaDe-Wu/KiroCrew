@@ -21,6 +21,7 @@ from typing import Any
 
 from kiro_crew.config.paths import data_home
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security.redaction import redact_credentials_and_spans
 
 # Well-known MCP config locations, tagged by scope.  Scope names match
 # the dashboard badges (kirocrew / kiroGlobal / ccGlobal) and are the
@@ -195,21 +196,22 @@ def redact_mcp_error(error: object, headers: object, extra_values: Iterable[str]
 
     Two layers, so every consumer (``to_dict``, the probe cache, the probe
     endpoints) satisfies one invariant — no credential-shaped text survives to
-    serialized output:
+    serialized output. Only the configured-value spans and the
+    ``redact_credentials`` plan are found on the original text and merged in
+    one write, so a short configured value cannot cut a credential;
+    ``redact_exfiltration_urls`` and the second ``redact_credentials`` pass
+    then run on that output:
 
-    1. The site-wide scanners (``redact_credentials`` /
+    1. The configured-value scrubber below catches the exact header values and
+       Authorization suffixes, including encoded spellings the generic
+       scanners cannot know about.
+    2. The site-wide scanners (``redact_credentials`` /
        ``redact_exfiltration_urls``) catch anything credential-SHAPED that a
        remote server reflects, whether or not it matches configured values —
        the same pass ``_sanitize_probe_error`` applies to probe exceptions.
-    2. The configured-value scrubber below catches the exact header values and
-       Authorization suffixes, including encoded spellings the generic
-       scanners cannot know about.
     """
     if not isinstance(error, str) or not isinstance(headers, dict):
         return error if isinstance(error, str) else ""
-
-    error, _ = redact_exfiltration_urls(error)
-    error, _ = redact_credentials(error)
 
     # Values map to whether they require lexical boundaries. Full header values
     # and long credentials are bare substring matches; only SHORT credentials
@@ -246,9 +248,22 @@ def redact_mcp_error(error: object, headers: object, extra_values: Iterable[str]
             continue
         values.setdefault(extra, len(extra) < _MCP_CREDENTIAL_UNANCHORED_MIN_LENGTH)
 
-    if not values:
-        return error
+    # Configured-value spans and generic credential spans are both found in the
+    # ORIGINAL text and written once: masking a short configured value first
+    # (``X-Api-Version: 1``) could cut a reflected token into pieces the generic
+    # scanners cannot recognise.
+    error, _ = redact_credentials_and_spans(
+        error, _configured_value_spans(error, values), MCP_REDACTED_HEADER_VALUE
+    )
+    error, _ = redact_exfiltration_urls(error)
+    error, _ = redact_credentials(error)
+    return error
 
+
+def _configured_value_spans(error: str, values: dict[str, bool]) -> list[tuple[int, int]]:
+    """Spans of *error* holding a configured value in *values* (value -> needs boundaries)."""
+    if not values:
+        return []
     # Check the characters outside a suffix instead of using \b: base64 padding
     # ends in a non-word "=", so \b would fail between that padding and ordinary
     # punctuation. Longest-first keeps a full header ahead of its own suffix.
@@ -262,12 +277,7 @@ def redact_mcp_error(error: object, headers: object, extra_values: Iterable[str]
             values.items(), key=lambda item: len(item[0]), reverse=True
         )
     )
-    return re.sub(
-        pattern,
-        MCP_REDACTED_HEADER_VALUE,
-        error,
-        flags=re.IGNORECASE,
-    )
+    return [m.span() for m in re.finditer(pattern, error, flags=re.IGNORECASE)]
 
 
 @dataclass
@@ -298,6 +308,10 @@ class McpServerInfo:
     # a client — it only refuses to lose these fields while syncing.
     scopes: list[str] = field(default_factory=list)
     client_id: str = ""
+    # The entry's own ``oauth`` block reaches no KAS engine
+    # (``mcp_oauth_projection.oauth_withheld``: it names a ``clientSecret``, or
+    # keeps nothing Crew sends). A flag only; the block itself never leaves here.
+    oauth_withheld: bool = False
     # unknown | ok | error | probing | outdated | disabled | needs_auth | registry
     # | routed (a secret:// server the running gateway starts; not probed here)
     status: str = "unknown"
@@ -386,16 +400,32 @@ class McpServerInfo:
     # None means the lookup could not answer. Only meaningful alongside
     # ``auth_challenge``; see :func:`_runtime_grant_present`.
     auth_grant_present: bool | None = None
+    # Crew holds this server's sign-in (``dashboard.feature_previews.crew_oauth`` on KAS), so
+    # ``auth_grant_present`` is Crew's vault, and a KAS chat uses it via Crew.
+    auth_crew_held: bool = False
     # Spec-declared temp keys the local probe refused, one dict per key:
     # ``key``, ``path`` (redacted like the WARNING) and ``cause`` (``sealed``,
     # ``unclassifiable`` or ``check-failed``). Same facts as the journal line,
     # so the dashboard row can say the probe ran with the managed temp instead.
     temp_refusals: list[dict[str, str]] = field(default_factory=list)
+    # The entry's ``type`` (``stdio``, ``http``, ``sse``), empty when it declares
+    # none. Read by ``is_remote`` only; never serialized.
+    declared_type: str = ""
 
     @property
     def is_remote(self) -> bool:
-        """True for Streamable HTTP servers (url-based, no command)."""
-        return bool(self.url) and not self.command
+        """True for url-based servers, by the rule every launch site shares.
+
+        :func:`kiro_crew.mcp_cleanup.mcp_transport_is_remote`: a url server is
+        remote when its ``type`` is ``http``/``sse`` or its ``command`` is blank.
+        """
+        # Imported here, not at module top, so the ``mcp_discovery`` facade does
+        # not serve it.
+        from kiro_crew.mcp_cleanup import mcp_transport_is_remote
+
+        return mcp_transport_is_remote(
+            url=self.url, command=self.command, declared_type=self.declared_type
+        )
 
     @property
     def redaction_headers(self) -> dict[str, str]:
@@ -439,6 +469,8 @@ class McpServerInfo:
                 d["scopes"] = list(self.scopes)
             if self.client_id:
                 d["clientId"] = self.client_id
+            if self.oauth_withheld:
+                d["oauthWithheld"] = True
             # Gated on ``auth_challenge`` being set, so an absent key means "this
             # probe learned nothing about authorization" and a present
             # ``authGrantPresent`` is always a real observation. A client that
@@ -451,6 +483,8 @@ class McpServerInfo:
                 # safe wording, a false would name an action.
                 if self.auth_grant_present is not None:
                     d["authGrantPresent"] = self.auth_grant_present
+                if self.auth_crew_held:
+                    d["authCrewHeld"] = True
         # Omitted when empty, like ``authChallenge``: absent means no refusal.
         if self.temp_refusals:
             d["tempRefusals"] = [dict(r) for r in self.temp_refusals]

@@ -206,8 +206,9 @@ METRIC_REFUSAL_OUTCOMES = frozenset(
 METRIC_OUTCOME_OTHER = "other"
 
 #: Every value ``outcome`` can carry on ``kirocrew.webhook.requests``: the
-#: recorded-run outcomes, the refusal outcomes, and the remainder. Pinned by a
-#: test, so widening either half without restating it in the metrics doc fails.
+#: recorded-run outcomes, the refusal outcomes, and the remainder. A test pins the
+#: union and the refusal half; the recorded-run half is ``VALID_OUTCOMES``, and no test
+#: checks it against the metrics doc.
 METRIC_OUTCOMES = frozenset(
     VALID_OUTCOMES | METRIC_REFUSAL_OUTCOMES | {METRIC_OUTCOME_OTHER}
 )
@@ -479,8 +480,8 @@ class WebhookTokenStore:
 
     def is_switch_on(self) -> bool:
         # The ``webhooks`` governance scope outranks the stored switch: a source the
-        # policy refuses reads as off (in an enterprise build, every source until a
-        # policy names it -- RFC enterprise edition, Red "Webhooks by source").
+        # policy refuses reads as off (in an LTS build, every source until a
+        # policy names it -- RFC LTS edition, Red "Webhooks by source").
         if source_refusal(SOURCE_AGENT):
             return False
         raw = _read_json(self.path, {})

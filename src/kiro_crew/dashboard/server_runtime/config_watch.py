@@ -7,16 +7,13 @@ once the listener serves.
 from __future__ import annotations
 
 import asyncio
+import functools
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
 if TYPE_CHECKING:
-    from kiro_crew.dashboard.server import (
-        DashboardState,
-        KiroCrewConfig,
-        logger,
-    )
+    from kiro_crew.dashboard.server import DashboardState, KiroCrewConfig, logger
 
 
 def _register_config_watch(
@@ -37,6 +34,7 @@ def _register_config_watch(
     from kiro_crew import model_registry
     from kiro_crew.config import live
     from kiro_crew.config.live import ConfigChange
+    from kiro_crew.dashboard.handlers.terminal import apply_terminal_enabled
     from kiro_crew.dashboard.handlers.updates import apply_log_level_from_config
 
     # Wiring only: optional producer import/construction belongs after bind.
@@ -47,6 +45,12 @@ def _register_config_watch(
     if initial is not None:
         model_registry.apply_operator_windows(initial.agent.model_context_tokens)
     live.bind("agent.model_context_tokens", model_registry.apply_operator_windows)
+
+    from kiro_crew.notifications import config_syntax_note
+
+    # A save that leaves a config file unparseable keeps the settings in force; the
+    # bell says so, and where the file breaks, until a later save parses.
+    live.watch().tear_reporter = functools.partial(config_syntax_note.publish_tear, state)
 
     async def _switch_provider(cfg: KiroCrewConfig) -> None:
         # Refresh agent artifacts so the target provider is immediately usable.
@@ -115,14 +119,21 @@ def _register_config_watch(
         # subagent role is read live at spawn and needs no rebuild.
         if not change.touched("agent.role_models.background"):
             return
-        try:
-            from kiro_crew.agent import rebuild_agent_config
+        from kiro_crew.agent import rebuild_agent_config_reporting
 
-            await asyncio.to_thread(rebuild_agent_config)
-            logger.info("agent.role_models.background changed -- background agent specs rebuilt")
-        except Exception:
-            # PlatformCompositionError too: boot enforces composition; the previous spec stays.
-            logger.warning("background-model rebuild failed", exc_info=True)
+        # Raised, never swallowed: ConfigWatch retries only an applier that
+        # raises, so a failed or unwritten rebuild would otherwise leave the
+        # specs on the previous background model until a restart. Same contract
+        # as the agent.model applier, a shared-home refusal (wrote=False)
+        # included. PlatformCompositionError raises here too; the previous spec
+        # stays.
+        _spec_path, wrote = await asyncio.to_thread(rebuild_agent_config_reporting)
+        if not wrote:
+            raise RuntimeError(
+                "background agent spec rebuild did not write (shared agent home "
+                "refused, or the existing spec could not be read)"
+            )
+        logger.info("agent.role_models.background changed -- background agent specs rebuilt")
 
     default_model_failure_notified = False
 
@@ -232,6 +243,16 @@ def _register_config_watch(
         crew_mode_migration.schedule_on_config_change(state, getattr(change, "new", None))
         state.push_refresh("agents")
 
+    async def _apply_terminal_enabled(change: ConfigChange) -> None:
+        # Off the applier, like the provider switch: ending a shell can wait seconds
+        # for it to exit, and the watcher cancels an applier after 10 s.
+        task = asyncio.create_task(
+            apply_terminal_enabled(state._terminal_sessions, change.new.dashboard.terminal),
+            name="terminal-enabled-applier",
+        )
+        state._background_tasks.add(task)
+        task.add_done_callback(state._background_tasks.discard)
+
     def _push_feature_previews(change: ConfigChange) -> None:
         # The Feature previews switches are read from the shared config query,
         # which never goes stale on its own; a refresh frame is what makes every
@@ -239,6 +260,58 @@ def _register_config_watch(
         # reaches the others without a reload.
         if change.touched("dashboard.feature_previews"):
             state.push_refresh("config")
+            # Connected computers has server behavior: switching it off ends its
+            # live sockets (scheduled off this cycle). A no-op while it stays off.
+            from kiro_crew.connected_computers import disable as connected_computers
+
+            connected_computers.apply(change)
+
+    def _push_command_bar(change: ConfigChange) -> None:
+        # What the quick-search shortcut opens is read from the shared config query
+        # too (the shell, its trigger labels and the Settings toggle), so a switch
+        # set from the CLI, $EDITOR or another dashboard reaches every open one only
+        # through a refresh frame.
+        if change.touched("dashboard.command_bar_enabled"):
+            state.push_refresh("config")
+
+    def _push_channels_switch(change: ConfigChange) -> None:
+        # Channels' sidebar row, its Search Everywhere result and its Settings row
+        # read the shared config query, so a switch set from the CLI, $EDITOR or
+        # another dashboard reaches every open one only through a refresh frame.
+        if change.touched("dashboard.channels_enabled"):
+            state.push_refresh("config")
+
+    async def _sync_stale_wake(change: ConfigChange) -> None:
+        # The `dashboard_stale_wake` preview's one cron job exists only while the
+        # preview is on, from whichever writer flipped it (dashboard, CLI, $EDITOR).
+        if not change.touched("dashboard.feature_previews"):
+            return
+        from kiro_crew.dashboard import stale_wake
+
+        # A failure propagates so the watcher retries the apply.
+        await stale_wake.sync_job(getattr(state, "crons", None))
+
+    def _count_chat_runtime_sharing_toggle(change: ConfigChange) -> None:
+        # Adoption telemetry: one count per on/off flip of the preview, from
+        # whichever writer flipped it. A synthesized change has no old document.
+        if change.old is None or not change.touched("dashboard.feature_previews"):
+            return
+        from kiro_crew.agent_sdk.chat_runtime_sharing import chat_runtime_sharing_enabled
+        from kiro_crew.metrics.chat_runtime_share import record_toggled
+
+        after = chat_runtime_sharing_enabled(change.new)
+        if chat_runtime_sharing_enabled(change.old) != after:
+            record_toggled(after)
+
+    def _stop_put_off_update(change: ConfigChange) -> None:
+        # "Remind me tomorrow" or "Skip this version" answered while an
+        # unattended build of that version runs: stop it now, not at the swap.
+        if change.old is None or not change.touched("dashboard.update_nudge"):
+            return
+        from kiro_crew.platform import wheel_apply
+
+        if wheel_apply.stop_put_off_applies(change.new):
+            logger.info("Stopped an unattended update the user put off")
 
     def _push_app_settings(change: ConfigChange) -> None:
         # The app session mute and the per-app model picker read ``apps`` off the
@@ -260,7 +333,28 @@ def _register_config_watch(
             return
         state.push_refresh("config")
 
+    async def _alarm_crewmate_harness_fallback(change: ConfigChange) -> None:
+        # A new Settings harness Crew bots cannot run on moves them onto KAS, and so
+        # does a cleared pin on a Crew bot whose worker tool limits that harness
+        # cannot apply; the bell says so, from whichever writer changed it
+        # (dashboard, CLI, $EDITOR).
+        from kiro_crew import crewmate_harness_notice
+
+        await crewmate_harness_notice.deliver(state, change.new)
+
+    async def _apply_voice_reply(change: ConfigChange) -> None:
+        from kiro_crew.slack.handler import apply_voice_reply_change
+
+        await apply_voice_reply_change(change)
+
     subs = [
+        live.subscribe(
+            "agent.acp_backend",
+            "agent.member_acp_backend",
+            "agents",
+            callback=_alarm_crewmate_harness_fallback,
+            name="crewmate.harness_fallback",
+        ),
         live.subscribe(
             "dashboard.browser_local_origins",
             "browser",
@@ -287,7 +381,40 @@ def _register_config_watch(
             callback=_push_feature_previews,
             name="dashboard.feature_previews",
         ),
+        live.subscribe(
+            "dashboard.feature_previews",
+            callback=_sync_stale_wake,
+            name="dashboard.stale_wake",
+        ),
+        live.subscribe(
+            "dashboard.feature_previews",
+            callback=_count_chat_runtime_sharing_toggle,
+            name="dashboard.chat_runtime_sharing_toggle",
+        ),
+        live.subscribe(
+            "dashboard.update_nudge",
+            callback=_stop_put_off_update,
+            name="dashboard.update_nudge",
+        ),
         live.subscribe("apps", callback=_push_app_settings, name="apps"),
+        live.subscribe(
+            "dashboard.command_bar_enabled",
+            callback=_push_command_bar,
+            name="dashboard.command_bar_enabled",
+        ),
+        live.subscribe(
+            "dashboard.channels_enabled",
+            callback=_push_channels_switch,
+            name="dashboard.channels_enabled",
+        ),
+        # Slack's live voice state follows the file, so a CLI or hand edit of
+        # voice_reply (enabled above all) reaches a running gateway.
+        live.subscribe("voice_reply", callback=_apply_voice_reply, name="voice_reply"),
+        live.subscribe(
+            "dashboard.terminal.enabled",
+            callback=_apply_terminal_enabled,
+            name="dashboard.terminal.enabled",
+        ),
     ]
     # Closures are held strongly by the registry; keep the handles on the app so
     # the registrations are visible (and cancellable) from tests.
@@ -302,12 +429,26 @@ def _register_config_watch(
     app["config_watch_initial"] = initial
 
     async def _config_watch_shutdown(app_: web.Application) -> None:
-        await live.watch().stop()
+        try:
+            await live.watch().stop()
+        except Exception:  # noqa: BLE001 — one cleanup hook must not suppress later hooks
+            logger.warning("Config watcher stop failed during shutdown", exc_info=True)
+        # Connected computers: close remote connector sockets; records are kept.
+        # Nothing to close (a no-op) unless the preview was on.
+        from kiro_crew.connected_computers.disable import shutdown as connected_shutdown
+
+        try:
+            await connected_shutdown()
+        except Exception:  # noqa: BLE001 — one cleanup hook must not suppress later hooks
+            logger.warning("Connected computers shutdown failed", exc_info=True)
         lifecycle = getattr(state, "_dynamic_cards", None)
         if lifecycle is not None:
-            # One call rather than reaching for a worker attribute: the producer owns two
-            # tasks, the model queue and the number refresher, and both must settle.
-            await lifecycle.shutdown()
+            try:
+                # One call rather than reaching for a worker attribute: the producer owns
+                # two tasks, the model queue and the number refresher, and both must settle.
+                await lifecycle.shutdown()
+            except Exception:  # noqa: BLE001 — one cleanup hook must not suppress later hooks
+                logger.warning("Dynamic cards shutdown failed", exc_info=True)
 
     app.on_cleanup.append(_config_watch_shutdown)
 

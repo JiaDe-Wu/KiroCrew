@@ -314,17 +314,17 @@ async def test_bot_messages_never_open_a_channel(env: Env) -> None:
 # ── Session settings for a new channel ───────────────────────────────────────
 
 
-async def test_zero_config_files_into_code_channels_led_by_the_conductor(env: Env) -> None:
+async def test_zero_config_files_into_code_channels_on_the_default_agent(env: Env) -> None:
     env.api.responses["agents.conversations.create"] = {"ok": True, "channel_id": "C0CODE"}
     assert await _open(env) is True
     spec = env.created_sessions[0]["spec"]
-    # No default folder: "Code channels" is created with the conductor as its
-    # agent, and the folder's agent applies (nothing set explicitly).
+    # No default folder: "Code channels" is created with no agent of its own, so
+    # the owner's default agent runs (not the conductor).
     assert env.folders_created == ["Code channels"]
     assert env.state is not None
     [folder] = env.state.folders
-    assert folder["default_agent"] == "kirocrew-conductor"
-    assert spec.folder_id == folder["id"] and spec.agent == "kirocrew-conductor"
+    assert not folder["default_agent"]
+    assert spec.folder_id == folder["id"] and spec.agent == "slack-default"
     assert spec.model == "" and spec.reasoning_effort == "" and spec.project_dir == ""
 
 
@@ -343,14 +343,14 @@ async def test_an_explicit_default_agent_still_wins_over_the_code_channels_folde
 
 
 async def test_a_saved_default_agent_that_is_gone_is_skipped(env: Env) -> None:
-    """Its spec was removed after it was saved: the channel runs the folder's
-    agent (here the auto folder's conductor), as the settings preview says."""
+    """Its spec was removed after it was saved: the channel runs the next agent
+    in the order (here the owner's default), as the settings preview says."""
     env.api.responses["agents.conversations.create"] = {"ok": True, "channel_id": "C0CODE"}
     env.defaults.update(agent="retired-template")
     env.missing_agents.add("retired-template")
     assert await _open(env) is True
     spec = env.created_sessions[0]["spec"]
-    assert spec.agent == "kirocrew-conductor" and spec.agent_kind == ""
+    assert spec.agent == "slack-default" and spec.agent_kind == "template"
 
 
 async def test_the_picked_default_is_resolved_as_a_template(env: Env) -> None:
@@ -382,9 +382,9 @@ async def test_no_default_folder_files_at_top_level_when_the_folder_cannot_be_ma
     env.api.responses["agents.conversations.create"] = {"ok": True, "channel_id": "C0CODE"}
     assert await _open(env) is True
     spec = env.created_sessions[0]["spec"]
-    # Unfiled, but still the agent the auto folder would have carried: the
-    # resolver answers for a not-yet-created auto folder as if it existed.
-    assert spec.folder_id == "" and spec.agent == features.AUTO_FOLDER_AGENT
+    # Unfiled, on the agent the auto folder would have given it: none of its
+    # own, so the owner's default.
+    assert spec.folder_id == "" and spec.agent == "slack-default"
 
 
 async def test_defaults_choose_folder_agent_model_and_effort(env: Env) -> None:
@@ -587,6 +587,31 @@ async def test_channel_opened_from_slacks_ui_is_adopted_on_first_message(env: En
     assert env.sel.ops("slack.code_channel.adopt")[0]["outcome"] == "allowed"
 
 
+async def test_a_reconnect_mid_route_does_not_lose_the_adopting_message(env: Env) -> None:
+    """A reconnect clears ``orch.slack`` after the gate admitted the message: the
+    dispatch still posts the kickoff, binds and routes with the client the
+    message was read with, instead of losing it to the cleared one."""
+    env.info("C0UI", origin=("C0ORIGIN", "1700000000.000100"), name="ui-task")
+    event = {"type": "message", "user": OWNER, "channel": "C0UI", "ts": "301.0", "text": "start"}
+    result = await _gate(env, event)
+    assert result.gate is Gate.DIRECTED
+    read_with = env.orch.slack
+    env.orch.slack = None
+    assert await routing.dispatch(
+        env.orch,
+        result,
+        event=event,
+        clean_text="start",
+        sender_id=OWNER,
+        was_mention=False,
+        slack=read_with,
+    )
+    binding = env.store.get_binding("C0UI")
+    assert binding is not None and binding.anchor_ts
+    assert [p for p in env.slack.posts if p[0] == "C0UI" and "one Kiro Crew session" in p[1]]
+    assert env.routed == [("C0UI", "start", OWNER)]
+
+
 async def test_another_agents_code_channel_is_not_ours(env: Env) -> None:
     env.info("C0THEIRS", bots=("UOTHERBOT",))
     event = {"type": "message", "user": OWNER, "channel": "C0THEIRS", "ts": "301.0", "text": "hi"}
@@ -597,6 +622,46 @@ async def test_assignment_is_revalidated_and_revocation_unbinds(env: Env) -> Non
     _bind(env)
     env.info("C0CODE", bots=("UOTHERBOT",))
     event = {"type": "message", "user": OWNER, "channel": "C0CODE", "ts": "301.0", "text": "hi"}
+    assert (await _gate(env, event)).gate is Gate.PASS
+    assert env.store.get_binding("C0CODE") is None
+
+
+async def test_a_revocation_takes_an_owed_code_tab_down_after_it_unbinds(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lead's row 20, GPT's race: the tab comes down once no send gate admits the board."""
+    from kiro_crew.slack.code_channels.board import source
+    from kiro_crew.slack.code_channels.workspace import core as workspace
+
+    taken: list[tuple[str, str, bool]] = []
+
+    async def take_down(team: str, channel: str) -> bool:
+        taken.append((team, channel, source._still_the_stored_binding(bound)))
+        return True
+
+    monkeypatch.setattr(workspace, "service", lambda: SimpleNamespace(_take_down_owed=take_down))
+    _bind(env)
+    bound = env.store.get_binding("C0CODE")
+    assert source._still_the_stored_binding(bound)  # a refresh's send gate admits it now
+    env.info("C0CODE", bots=("UOTHERBOT",))
+    event = {"type": "message", "user": OWNER, "channel": "C0CODE", "ts": "301.0", "text": "hi"}
+    assert (await _gate(env, event)).gate is Gate.PASS
+    assert taken and taken[0][1:] == ("C0CODE", False)  # no send gate admits it any more
+    assert env.store.get_binding("C0CODE") is None
+
+
+async def test_a_revocation_unbinds_even_when_the_takedown_raises(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from kiro_crew.slack.code_channels.workspace import core as workspace
+
+    async def take_down(team: str, channel: str) -> bool:
+        raise RuntimeError("slack down")
+
+    monkeypatch.setattr(workspace, "service", lambda: SimpleNamespace(_take_down_owed=take_down))
+    _bind(env)
+    env.info("C0CODE", bots=("UOTHERBOT",))
+    event = {"type": "message", "user": OWNER, "channel": "C0CODE", "ts": "302.0", "text": "hi"}
     assert (await _gate(env, event)).gate is Gate.PASS
     assert env.store.get_binding("C0CODE") is None
 
@@ -955,6 +1020,33 @@ async def test_a_stop_declined_by_compaction_says_so_and_a_fresh_press_can_escal
     assert calls == [True, True]
 
 
+async def test_a_typed_stop_with_no_client_stops_the_bound_session_from_a_thread(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The client-free stop the gateway uses after a failed reconnect: a typed
+    ``!stop`` in a thread of the channel still stops its one bound session,
+    under the Stop button's sender rule; the button's handler keeps reading a
+    thread as a thread session."""
+    _bind(env)
+    assert env.state is not None
+    env.state.linked["300.000001"].running = True
+    stopped: list[str] = []
+
+    async def stop_slot_turn(state: Any, slot: Any, **kwargs: Any) -> dict[str, Any]:
+        stopped.append(slot.key)
+        return {"info": "stopping"}
+
+    monkeypatch.setattr("kiro_crew.dashboard.chat_handlers.stop_slot_turn", stop_slot_turn)
+    monkeypatch.setattr("kiro_crew.slack.handler.is_allowed_user", lambda u: u == OWNER)
+    env.orch.slack = None
+    typed = {"type": "message", "channel": "C0CODE", "thread_ts": "1.0", "user": OWNER}
+    assert await routing.handle_session_stopped(env.orch, typed, OWNER) is None
+    assert await routing.stop_from_channel(env.orch, typed, "USTRANGER") == "denied"
+    assert stopped == []
+    assert await routing.stop_from_channel(env.orch, typed, OWNER) == "stopped"
+    assert stopped == ["chat-9-1"]
+
+
 async def test_native_stop_when_idle_clears_the_status(
     env: Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -967,6 +1059,25 @@ async def test_native_stop_when_idle_clears_the_status(
         {"channel_id": "C0CODE", "status": "active"},
     ) in env.api.calls
     assert env.slack.posts == []  # the button gets no "Nothing running." reply
+
+
+async def test_the_context_bar_stop_when_idle_settles_the_status(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bar's Stop runs the same stop as Slack's button: an idle channel settles."""
+    _bind(env)
+    monkeypatch.setattr("kiro_crew.slack.handler.is_allowed_user", lambda u: True)
+    event = {
+        "type": "agent_session_stopped",
+        "channel": "C0CODE",
+        "user": OWNER,
+        "event_ts": "code_channel_action:Ev1",
+    }
+    assert await routing.handle_session_stopped(env.orch, event, OWNER) == "stopped"
+    assert (
+        "agents.sessions.setStatus",
+        {"channel_id": "C0CODE", "status": "active"},
+    ) in env.api.calls
 
 
 async def test_native_stop_from_a_stranger_is_denied(
@@ -1035,6 +1146,26 @@ async def test_bang_stop_in_a_code_channel_stops_the_bound_session(env: Env) -> 
     assert env.slack.posts == [("C0CODE", "Nothing running.", None)]
 
 
+async def test_an_idle_stop_lets_the_watch_show_the_helper_agents_state_again(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GPT on 4bfd4f1556: Stop set ``active`` while the watch still thought it showed ``suspended``."""
+    from kiro_crew.slack.code_channels.board import links
+    from kiro_crew.slack.code_channels.workspace import core as workspace
+
+    forgot: list[str] = []
+    helpers = SimpleNamespace(
+        _forget_worker_status=lambda binding: forgot.append(binding.channel_id),
+    )
+    monkeypatch.setattr(workspace, "service", lambda: helpers)
+    monkeypatch.setattr(links, "link_builder", lambda: lambda key: "")
+    _bind(env)
+    env.info("C0CODE")
+    event = {"type": "message", "user": OWNER, "channel": "C0CODE", "ts": "301.0", "text": "!stop"}
+    assert (await _gate(env, event)).gate is Gate.DROP
+    assert forgot == ["C0CODE"]
+
+
 async def test_whole_channel_stop_reaches_us_through_the_agent_session_runtime(
     env: Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1100,6 +1231,7 @@ async def test_the_first_message_is_the_request_alone_with_the_framing_as_contex
         slot = await real_create(state, spec, **kwargs)
         slot._pending_context = queued
         slot._deferred_notes = []
+        slot._inflight_merge_contexts = []
         slot.append_pending_context = lambda entry: queued.append(entry) is None
         return slot
 
@@ -1451,6 +1583,16 @@ async def test_a_follow_up_is_classified_once_however_often_slack_delivers_it(en
     assert await _dispatch_reply(env, _reply()) is False  # re-delivered
     assert env.classified == ["grab an issue from the backlog"]
     assert len(env.slack.reactions) == 1  # acknowledged once, before the decision
+
+
+@pytest.mark.parametrize("subtype", ["file_share", "thread_broadcast"])
+async def test_a_persons_reply_with_a_file_or_sent_to_the_channel_is_classified(
+    env: Env, subtype: str
+) -> None:
+    env.orch.sessions = _Sessions(_ROOT)
+    env.decision = RouteDecision("stay")
+    assert await _dispatch_reply(env, _reply(subtype=subtype)) is False
+    assert env.classified == ["grab an issue from the backlog"]
 
 
 @pytest.mark.parametrize(

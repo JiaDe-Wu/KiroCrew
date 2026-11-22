@@ -1,12 +1,14 @@
 // The reactive token re-mint budget, the mc-switch-instance gate, the load-timeout
 // verdict, the iframe-mounted journal and mc-embedded-boot attribution are tested in
 // InstancesViewport.paneLoad.test.tsx; both suites share InstancesViewportTestUtils.tsx.
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from 'vitest'
 import { act, fireEvent, screen, waitFor } from '@testing-library/react'
+import { useLocation } from 'react-router-dom'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders, createTestStore } from './helpers'
 import InstancesViewport from '../components/InstancesViewport'
 import { removeWarm, setActiveId, setWarm } from '../store/instancesSlice'
+import { connectInstanceInto } from '../lib/connectInstance'
 import {
   consumeChatHandoff,
   installSoftNavigate,
@@ -15,6 +17,7 @@ import {
 } from '../utils/errorReport'
 import { __resetInstanceFailuresForTests } from '../utils/instanceFailureReport'
 import { mockConnectedCd1 } from './InstancesViewportTestUtils'
+import { CHAT_COMPLETE_NOTIFY_KEY, saveChatCompleteNotify } from '../hooks/chatCompleteNotify'
 import { namedCeiling } from './namedCeiling'
 
 // The postinstall patch (scripts/patch-happy-dom-iframe.mjs) makes happy-dom's
@@ -62,12 +65,17 @@ vi.mock('../api/client', () => ({
     addInstance: vi.fn().mockResolvedValue({ id: 'added-1' }),
     refreshInstanceToken: vi.fn().mockResolvedValue({ state: 'connected', local_port: 7778, token: 'tok' }),
     themes: vi.fn().mockResolvedValue({ themes: [] }), // unmocked, the theme catalog read retries forever
+    relayViewerCrews: vi.fn().mockResolvedValue({ crews: [] }),
   },
 }))
 import { api } from '../api/client'
 
+const defaultConnectInstance = vi.mocked(api.connectInstance).getMockImplementation()!
+
 beforeEach(() => {
   vi.clearAllMocks()
+  // clearAllMocks keeps implementations, so restore the connect default between tests.
+  vi.mocked(api.connectInstance).mockReset().mockImplementation(defaultConnectInstance)
   vi.mocked(isEmbeddedPane).mockReturnValue(false)
   // Module-level state in the failure recorder: without this the de-dup from an
   // earlier test would suppress the report a later one asserts on.
@@ -653,6 +661,109 @@ describe('InstancesViewport', () => {
     })
     expect(focusModeEnabled()).toBe(true)
     __resetFocusMode()
+  })
+
+  it('relays the chat-complete toast opt-in and re-sends it when Settings flips it (#20191)', async () => {
+    onTestFinished(() => { localStorage.removeItem(CHAT_COMPLETE_NOTIFY_KEY) })
+    mockConnectedCd1()
+    const store = createTestStore({
+      instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {}, ready: { 'cd-1': true } },
+    })
+    renderWithProviders(<InstancesViewport />, { store })
+    await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
+    const post = vi.fn()
+    Object.defineProperty(document.querySelector('iframe'), 'contentWindow', { get: () => ({ postMessage: post }) })
+    const lastModel = () => post.mock.calls.at(-1)?.[0]
+
+    act(() => { saveChatCompleteNotify(true) })
+    await waitFor(() => expect(lastModel()).toMatchObject({ type: 'mc-host-model', chatCompleteNotify: true }))
+    act(() => { saveChatCompleteNotify(false) })
+    await waitFor(() => expect(lastModel()).toMatchObject({ type: 'mc-host-model', chatCompleteNotify: false }))
+  })
+
+  it('relays an SSM crew to its pane under its instance id, the machine the local bar names (#34698)', async () => {
+    vi.mocked(api.listInstances).mockResolvedValue({
+      instances: [{
+        id: 'cd-1', name: 'ec2-ssm', ssh_host: '', connection_method: 'ssm', ssm_target: 'i-0abc123def4567890',
+        remote_port: 7777, local_port: 7778, ttl: '20h', remote_bin: '',
+        status: { instance_id: 'cd-1', state: 'connected', local_port: 7778, remote_port: 7777 },
+      }],
+      warm_set_cap: 5,
+    } as unknown as Awaited<ReturnType<typeof api.listInstances>>)
+    const store = createTestStore({
+      instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {}, ready: { 'cd-1': true } },
+    })
+    renderWithProviders(<InstancesViewport />, { store })
+    await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
+    const post = vi.fn()
+    Object.defineProperty(document.querySelector('iframe'), 'contentWindow', { get: () => ({ postMessage: post }) })
+
+    // Any warm write re-broadcasts the model; the list arriving later does too.
+    act(() => { store.dispatch(setWarm({ id: 'cd-1', conn: { port: 7778, token: 'tok' } })) })
+    await waitFor(() => expect(post.mock.calls.at(-1)?.[0]).toMatchObject({
+      type: 'mc-host-model', tabs: [{ id: 'cd-1', sshHost: 'i-0abc123def4567890' }],
+    }))
+  })
+
+  it('relays its Remote Crews to the SSH pane in front and opens a listed one it picks from the top bar (row 72)', async () => {
+    const openPane = vi.fn(async () => ({ ok: true }))
+    ;(window as { relayCrewAPI?: unknown }).relayCrewAPI = { open: vi.fn(), openPane, closePane: vi.fn(), setPaneInactive: vi.fn(), onPaneEvent: () => () => {} }
+    onTestFinished(() => { delete (window as { relayCrewAPI?: unknown }).relayCrewAPI })
+    vi.mocked(api.relayViewerCrews).mockResolvedValue({
+      crews: [{ endpointId: 'ep-1', name: 'Team Lab', crewType: 'TEAM', presence: 'CONNECTED', relayConnectionStatus: 'CONNECTED', crewUrl: 'https://secret.example/' }],
+    })
+    mockConnectedCd1()
+    const store = createTestStore({
+      instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {}, ready: { 'cd-1': true } },
+    })
+    const Search = () => <span data-testid="search">{useLocation().search}</span>
+    const { queryClient } = renderWithProviders(<><InstancesViewport /><Search /></>, { store })
+    await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
+    const post = vi.fn()
+    Object.defineProperty(document.querySelector('iframe'), 'contentWindow', { get: () => ({ postMessage: post }) })
+    act(() => { store.dispatch(setWarm({ id: 'cd-1', conn: { port: 7778, token: 'tok' } })) })
+    await waitFor(() => expect(post.mock.calls.at(-1)?.[0]).toMatchObject({
+      type: 'mc-host-model', relayCrews: [{ endpointId: 'ep-1', name: 'Team Lab', crewType: 'TEAM', open: false, current: false }],
+    }))
+    // Only what a row shows crosses: never the Crew's URL.
+    expect(JSON.stringify(post.mock.calls.at(-1)?.[0])).not.toContain('secret.example')
+    expect(post.mock.calls.at(-1)?.[0]?.relayCrewsFailed).toBe(false)
+    // A failed re-read keeps the rows the pane had, so the Remote Crews do not vanish.
+    vi.mocked(api.relayViewerCrews).mockRejectedValueOnce(new Error('down'))
+    await act(async () => { await queryClient.refetchQueries({ queryKey: ['relay-viewer', 'crews'] }).catch(() => {}) })
+    await waitFor(() => expect(queryClient.getQueryState(['relay-viewer', 'crews'])?.error).toBeTruthy())
+    act(() => { store.dispatch(setWarm({ id: 'cd-1', conn: { port: 7778, token: 'tok' } })) })
+    await act(async () => {})
+    expect(post.mock.calls.at(-1)?.[0]?.relayCrews).toHaveLength(1)
+    expect(post.mock.calls.some(c => c[0]?.type === 'mc-host-model' && c[0]?.relayCrews?.length === 0)).toBe(false)
+    // And says the read failed, as the top bar's group does (#40306).
+    expect(post.mock.calls.at(-1)?.[0]?.relayCrewsFailed).toBe(true)
+    await act(async () => { await queryClient.refetchQueries({ queryKey: ['relay-viewer', 'crews'] }) })
+    await waitFor(() => expect(post.mock.calls.at(-1)?.[0]?.relayCrews).toHaveLength(1))
+    await waitFor(() => expect(post.mock.calls.at(-1)?.[0]?.relayCrewsFailed).toBe(false))
+    const pick = (id: string) => act(() => {
+      window.dispatchEvent(new MessageEvent('message', { data: { type: 'mc-switch-instance', id }, origin: 'http://127.0.0.1:7778' }))
+    })
+    pick('relay:ghost')
+    expect(store.getState().instances.activeId).toBe('cd-1')
+    expect(screen.getByTestId('search').textContent).toBe('')
+    // Without the desktop pane calls a pane's pick does nothing (a browser could only pop up a tab).
+    delete (window as { relayCrewAPI?: unknown }).relayCrewAPI
+    pick('relay:ep-1')
+    expect(store.getState().instances.activeId).toBe('cd-1')
+    ;(window as { relayCrewAPI?: unknown }).relayCrewAPI = { open: vi.fn(), openPane, closePane: vi.fn(), setPaneInactive: vi.fn(), onPaneEvent: () => () => {} }
+    // Nor from a pane that is not in front: only the front one was sent the rows.
+    act(() => { store.dispatch(setActiveId(null)) })
+    pick('relay:ep-1')
+    expect(screen.getByTestId('search').textContent).toBe('')
+    act(() => { store.dispatch(setActiveId('cd-1')) })
+    // A listed one: Local comes forward and the top bar opens it (its cover, its refusal notice).
+    pick('relay:ep-1')
+    expect(store.getState().instances.activeId).toBeNull()
+    expect(screen.getByTestId('search').textContent).toBe('?relay_crew=ep-1')
+    expect(openPane).not.toHaveBeenCalled()
+    // A pane not in front gets no rows: its switcher is not on screen.
+    await waitFor(() => expect(post.mock.calls.at(-1)?.[0]).toMatchObject({ type: 'mc-host-model', relayCrews: [] }))
   })
 
   it('takes chrome visibility from the ACTIVE pane only', async () => {
@@ -1257,6 +1368,28 @@ describe('InstancesViewport', () => {
     await waitFor(() => expect(api.connectInstance).toHaveBeenCalledWith('cd-1'))
     expect(await screen.findByText(/rebuild refused: EPERM/i)).toBeInTheDocument()
     expect(screen.queryByText(/ssh unreachable/i)).toBeNull()
+  })
+
+  it('an auto-connect refusal for the active crew shows its reason on the panel (#29777)', async () => {
+    // The tunnel is up but the remote gateway is not: the poll says connected
+    // with no error, and every connect is refused. The refusal comes from the
+    // auto-connect fan-out, not this viewport's Retry.
+    mockConnectedCd1()
+    vi.mocked(api.connectInstance).mockRejectedValue(new Error('check that its remote gateway is running'))
+    const store = createTestStore({
+      instances: { warm: {}, activeId: 'cd-1', mru: ['cd-1'], unread: {}, ready: {} },
+    })
+    renderWithProviders(<InstancesViewport />, { store })
+    await act(async () => {
+      await connectInstanceInto(store.dispatch, 'cd-1', 'auto-connect').catch(() => {})
+    })
+    expect(await screen.findByTestId('instances-viewport-panel-error')).toHaveTextContent(
+      'check that its remote gateway is running',
+    )
+    // The reason the panel shows is the one the agent hand-off carries.
+    installSoftNavigate(() => {})
+    await userEvent.click(await screen.findByRole('button', { name: /agent/i }))
+    expect(consumeChatHandoff() ?? '').toContain('check that its remote gateway is running')
   })
 
 

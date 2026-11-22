@@ -161,7 +161,12 @@ def run_mcp_stdio_loop(
     declared :data:`INFLIGHT_CAPABILITY_KEY` in ``initialize``, the loop sends
     :data:`INFLIGHT_NOTIFICATION` every :data:`INFLIGHT_REPORT_SECS` naming the
     parked ids still progressing, so the gateway's wedge detector never reads a
-    parked call as a hung one.
+    parked call as a hung one. A parked call whose request carried a
+    ``_meta.progressToken`` also gets an MCP ``notifications/progress`` every
+    :data:`PROGRESS_HEARTBEAT_SECS` while it is progressing, with its current
+    phase (:meth:`DeferredTool.progress_phase`) as the message: the heartbeat
+    that keeps a client's per-call silence timer from reading a long wait as a
+    lost call.
 
     That report is opt-in per server (*reports_inflight*). It exists for a loop
     that parks ``DeferredTool`` calls; a server whose every tool is synchronous
@@ -234,6 +239,7 @@ _OWNERS = (
     "kiro_crew.mcp_shared_wire",
     "kiro_crew.mcp_shared_calls",
     "kiro_crew.mcp_shared_policy",
+    "kiro_crew.mcp_shared_listing",
     "kiro_crew.mcp_shared_dispatch",
 )
 for _owner in _OWNERS:
@@ -247,13 +253,19 @@ __all__ = sorted(n for n in set(globals()) | set(_EXPORTS) if not n.startswith("
 if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
     from kiro_crew.mcp_caller import set_current_tool_call_id  # noqa: F401
     from kiro_crew.mcp_shared_calls import (  # noqa: F401
+        _ANSWER_CODE_CHARS,
+        _ANSWER_CODE_MAX,
         CANCELLED_IDS_MAX,
         DEFERRED_PARKED_MAX,
         DEFERRED_STEP_STUCK_SECS,
         DEFERRED_STEP_WORKERS,
         INFLIGHT_REPORT_SECS,
         PENDING_CALLS_MAX,
+        PROGRESS_HEARTBEAT_SECS,
+        PROGRESS_NOTIFICATION,
+        PROGRESS_PHASE_MAX_CHARS,
         ToolCancelled,
+        _answer_code,
         _audit_safe_args,
         _AuditedDeferred,
         _declares_inflight_capability,
@@ -265,6 +277,8 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         call_tool_with_logging,
         drive_deferred,
         map_deferred,
+        progress_heartbeat,
+        request_progress_token,
     )
     from kiro_crew.mcp_shared_dispatch import (  # noqa: F401
         _POLL_SECS,
@@ -273,6 +287,21 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _approved_tool_call_id,
         _tool_call_name,
         _WakePipe,
+    )
+    from kiro_crew.mcp_shared_listing import (  # noqa: F401
+        _EARLY,
+        EARLY_FRAME_WAIT_SECS,
+        PROTOCOL_VERSION,
+        EarlyFrames,
+        StdioServer,
+        _answer_early,
+        _EarlyState,
+        caller_tool_policy,
+        initialize_result,
+        listable_tools,
+        serve_before_handlers,
+        take_early_frames,
+        within_policy,
     )
     from kiro_crew.mcp_shared_policy import (  # noqa: F401
         _EXCLUDED_TOOLS_CACHE_MAX,
@@ -283,6 +312,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _NO_INCLUDE,
         _PACKAGE_DIR,
         _POLICY_DETAIL_MAX_CHARS,
+        _RETIRED_POLICY_CACHE_MAX,
         _STARTUP_RACE_CACHE_TTL,
         _UNRESOLVED_REFUSES_CALL,
         REGISTRY_LOCAL_CONTROL_PLANE_FIELD,
@@ -300,9 +330,12 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _last_startup_race_time,
         _parse_policy_include,
         _path_is_under,
+        _policy_last_used,
         _policy_session_key,
         _resolve_excluded_tools,
         _resolve_tool_policy,
+        _retired_policy,
+        _retired_policy_by_session,
         external_client_identity_note,
         registry_identity_note,
         serves_managed_tools,
@@ -316,6 +349,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         SKIP,
         STDIN_PUMP_MAX_FRAMES,
         _answer_unparseable,
+        _frame_within,
         _framing,
         _NoFrame,
         _read_message,
@@ -332,3 +366,4 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     )
 if TYPE_CHECKING:  # names the owners import from elsewhere in kiro_crew, still served here
     from kiro_crew.install_liveness import is_pooled_backend  # noqa: F401
+    from kiro_crew.mcp_listing_relay import RelayedFrames  # noqa: F401

@@ -47,9 +47,10 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from kiro_crew import platform_compat
-from kiro_crew.atomic_write import atomic_write
+from kiro_crew.atomic_write import atomic_write, read_bytes_with_retry, replace_with_retry
 from kiro_crew.config.paths import data_home
 from kiro_crew.owner_only_files import owner_only_opener
+from kiro_crew.sqlite_quarantine import reserve_quarantine_name
 
 logger = logging.getLogger(__name__)
 
@@ -84,23 +85,63 @@ def self_arm_record_path() -> Path:
     return data_home() / "trust" / SELF_ARM_RECORD_NAME
 
 
-def _read_record() -> dict[str, dict[str, Any]]:
-    """Return the record's entries, or ``{}`` for absent/unreadable/malformed."""
+def _read_record(
+    *, set_aside_damaged: bool = False, raise_unreadable: bool = False
+) -> dict[str, dict[str, Any]]:
+    """Return the record's entries, or ``{}`` for absent/unreadable/malformed.
+
+    The read goes through :func:`read_bytes_with_retry`, so on Windows (off the
+    event loop) a sharing violation is waited out the way the rename's is.
+
+    With *set_aside_damaged*, as :func:`record_self_arm` reads before its rewrite,
+    a record that opens but is cut off or has the wrong shape is first moved to a
+    ``.corrupt-<utc>`` file, so its bytes are kept and one damaged file does not
+    stop every later self-arm. A set-aside that fails is logged, and does not
+    refuse an arm.
+
+    A record that exists but cannot be opened reads as empty, which is right for
+    a reader and wrong for a writer: rewriting from ``{}`` would publish only the
+    new entry over every other loop's. With *raise_unreadable* the ``OSError``
+    propagates instead, so the writer leaves the old record untouched.
+    """
+    path = self_arm_record_path()
     try:
-        raw = json.loads(self_arm_record_path().read_text(encoding="utf-8"))
+        raw = json.loads(read_bytes_with_retry(path).decode("utf-8"))
     except FileNotFoundError:
         return {}
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, OSError):
+            if raise_unreadable:
+                raise
+            logger.warning("autonudge self-arm record unreadable; treating as empty", exc_info=True)
+            # There are no bytes to keep from a record that could not be opened.
+            return {}
         logger.warning("autonudge self-arm record unreadable; treating as empty", exc_info=True)
-        return {}
+        raw = None
     entries = raw.get("loops") if isinstance(raw, dict) else None
     if not isinstance(entries, dict):
+        if set_aside_damaged:
+            _set_aside_damaged(path)
         return {}
     return {
         str(loop_id): entry
         for loop_id, entry in entries.items()
         if isinstance(entry, dict) and isinstance(entry.get("slot_key"), str)
     }
+
+
+def _set_aside_damaged(path: Path) -> None:
+    """Move a damaged record to a reserved ``.corrupt-<utc>`` name; a failure is logged."""
+    logger.warning("autonudge self-arm record is damaged; setting it aside")
+    target: Path | None = None
+    try:
+        target = reserve_quarantine_name(path)
+        replace_with_retry(path, target)
+    except OSError:
+        if target is not None:
+            with contextlib.suppress(OSError):
+                target.unlink(missing_ok=True)
+        logger.warning("autonudge self-arm record could not be set aside", exc_info=True)
 
 
 def _write_record(entries: dict[str, dict[str, Any]]) -> None:
@@ -134,9 +175,11 @@ def record_self_arm(loop_id: str, slot_key: str, *, default_patrol: bool = False
     (:func:`forget_self_arm`), reached from every path a loop leaves the store
     (``AutoNudgeService.remove_sync``), so the record cannot grow past the
     loops that were ever armed and not yet removed. Raises ``OSError`` on a
-    failed write: the caller (the authorizer) treats that as fail-closed -- a
-    self-armed loop that cannot be recorded would never be allowed to fire, so
-    it must not be reported as armed.
+    failed write, and on a record that exists but cannot be opened (after the
+    Windows sharing retry), which is then left untouched. The caller (the
+    authorizer) treats that as fail-closed -- a self-armed loop that cannot be
+    recorded would never be allowed to fire, so it must not be reported as
+    armed.
 
     *default_patrol* records the gateway's fixed default patrol on a crewmate's
     own thread (``autonudge_authz.admits_member_default_patrol``) instead of a
@@ -148,7 +191,7 @@ def record_self_arm(loop_id: str, slot_key: str, *, default_patrol: bool = False
     if default_patrol:
         entry["default_patrol"] = True
     with _record_lock():
-        entries = _read_record()
+        entries = _read_record(set_aside_damaged=True, raise_unreadable=True)
         entries[str(loop_id)] = entry
         _write_record(entries)
 

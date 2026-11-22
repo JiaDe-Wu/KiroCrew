@@ -11,29 +11,34 @@
  *  `useAgents`), which records them here. Until a catalog lands, and on a gateway
  *  whose catalog carries no Crew Mode fields, no template is a conductor.
  *
- *  Crew Mode is a feature preview (`PREVIEW_CREW_MODE`, default off).
- *  `crewModeEnabled()` is the one read of it: every helper here consults it, and
- *  every surface that reads a row's Crew Mode stamps reads them through
+ *  Conductor mode is on in every build but LTS, which keeps it off as it did while
+ *  conductor mode was a Feature Preview (RFC rfc-crew-lts-edition D12).
+ *  `crewModeEnabled()` is the one read of that: every helper here consults it, and
+ *  every surface that reads a row's conductor mode stamps reads them through
  *  `crewModeRoot` / `crewRootOf`. Off, this module answers as it does for a
- *  gateway without Crew Mode, and the stamps read as absent.
+ *  gateway without conductor mode, and the stamps read as absent.
  */
-import { PREVIEW_CREW_MODE, PREVIEW_MATE_SESSIONS, readPreviewFlag } from '../utils/previewFlags'
+import { previewFlagsLocked } from '../utils/previewFlags'
+import { featurePreviewLockKnown } from '../utils/editionLocks'
 import { tabStatus } from './sessionTabs'
+import type { ProfileTab } from '../pages/members/CrewProfilePanel'
 
-/** Whether the Crew Mode preview is on for this device. The one read of the flag:
- *  `useCrewMode` subscribes to the same key for a re-render. */
+/** Whether this build offers conductor mode: every build but LTS, the one that
+ *  turns every Feature Preview off. Off until the gateway's lock is known (a cached
+ *  list or the first schema read), so an LTS dashboard opened with no cache never
+ *  shows it. `useCrewMode` re-renders on the same lock. */
 export function crewModeEnabled(): boolean {
-  return readPreviewFlag(PREVIEW_CREW_MODE)
+  return featurePreviewLockKnown() && !previewFlagsLocked()
 }
 
-/** Whether `row` is a Crew Mode root, read through the flag: the server's
- *  `crew_mode_root` stamp, or `false` while the preview is off. */
+/** Whether `row` is a conductor mode root: the server's `crew_mode_root`
+ *  stamp, or `false` in a build without conductor mode (LTS). */
 export function crewModeRoot(row: { crew_mode_root?: boolean } | null | undefined): boolean {
   return !!row?.crew_mode_root && crewModeEnabled()
 }
 
-/** The Crew Mode root `row` is a crew member of, read through the flag: the
- *  server's `crew_root` stamp, or `''` while the preview is off, so a crew member
+/** The conductor mode root `row` is a crew member of: the server's `crew_root`
+ *  stamp, or `''` in a build without conductor mode (LTS), so a crew member
  *  lists, opens and alerts as an ordinary chat. */
 export function crewRootOf(row: { crew_root?: string | null } | null | undefined): string {
   return (row?.crew_root && crewModeEnabled()) ? row.crew_root : ''
@@ -48,24 +53,16 @@ export function mateRootOf(row: { mate_root?: string | null } | null | undefined
   return row?.mate_root || ''
 }
 
-/** Whether the mate sessions preview is on for this device (`PREVIEW_MATE_SESSIONS`):
- *  a mate's sessions leave the person's lists for the mate's Sessions tab.
- *  `useMateSessionsHidden` subscribes to the same key for a re-render. */
-export function mateSessionsHidden(): boolean {
-  return readPreviewFlag(PREVIEW_MATE_SESSIONS)
-}
-
-/** The mate thread whose Sessions tab lists `row` instead of the person's lists:
- *  its `mate_root`, read through the mate sessions preview (`''` while it is off). */
-export function hiddenMateRootOf(row: { mate_root?: string | null } | null | undefined): string {
-  return mateSessionsHidden() ? mateRootOf(row) : ''
-}
-
 /** Navigation state asking the Mates page to open the named member's Profile
- *  card on Sessions once that member is active (a mate session's breadcrumb). */
-export interface OpenMateSessionsState { openMateSessions: true }
+ *  card once that member is active: on Sessions (a mate session's breadcrumb)
+ *  unless the opener names a `tab` (the sidebar bot row menu's Profile). */
+export interface OpenMateSessionsState { openMateSessions: true; tab?: ProfileTab }
 export function wantsMateSessions(state: unknown): boolean {
   return !!state && typeof state === 'object' && (state as Partial<OpenMateSessionsState>).openMateSessions === true
+}
+/** The `tab` an `OpenMateSessionsState` names, unchecked: the page validates it against its own tabs. */
+export function requestedMateProfileTab(state: unknown): unknown {
+  return wantsMateSessions(state) ? (state as Partial<OpenMateSessionsState>).tab : undefined
 }
 
 /** The live mate threads among `rows` (slot `mode` `member`). Read over the FULL
@@ -98,8 +95,8 @@ export function busySlotKeys(
  *  (`mate_root`) that waits on the person marks its mate too, as a Crew Mode crew
  *  member's prompt badges its conductor: the mate chat is where it is answered.
  *  Keyed by the mate thread whether or not that tab is live, because the server
- *  keeps stamping a closed mate thread's sessions. The Mates page rows and the
- *  dock's mate rows both read this one map. */
+ *  keeps stamping a closed mate thread's sessions. The Mates page rows read
+ *  this map. */
 export function mateNeedsYouByKey(
   rows: readonly { key: string; mode?: string; mate_root?: string | null; running?: boolean; pending_approval?: boolean; needs_input?: boolean }[],
 ): Readonly<Record<string, boolean>> {
@@ -119,7 +116,7 @@ export function mateNeedsYouByKey(
 }
 
 /** The conductor Crew Mode runs while the gateway has not said otherwise. */
-export const DEFAULT_CREW_MODE_AGENT = 'kirocrew-team-lead'
+export const DEFAULT_CREW_MODE_AGENT = 'kirocrew-conductor'
 
 /** The longest steer a person may type into a worker: the server's
  *  `MAX_SEND_MESSAGE_CHARS`, which the steer route and the worker's own composer
@@ -132,6 +129,12 @@ let configuredAgent = DEFAULT_CREW_MODE_AGENT
 // is an ordinary chat, so no picker row, chord or memory switch treats it otherwise.
 let conductors: ReadonlySet<string> = new Set()
 let gatewayHasCrewMode = false
+// Whether any catalog has landed: `false` tells a catalog still on its way from one
+// that said the gateway runs no Crew Mode.
+let catalogKnown = false
+// The catalog's default agent (`default_agent`), read by `newChatCrewModeAgent`,
+// which runs outside any component.
+let catalogDefaultAgent = ''
 
 /** Record the catalog's Crew Mode facts. Called by `useAgents` on every load.
  *
@@ -145,8 +148,11 @@ let gatewayHasCrewMode = false
 export function setCrewModeCatalog(
   agent: string | undefined,
   conductorAgents: readonly string[] | undefined,
+  defaultAgent?: string,
 ): void {
   configuredAgent = agent || DEFAULT_CREW_MODE_AGENT
+  catalogKnown = true
+  catalogDefaultAgent = defaultAgent || ''
   if (agent === undefined && conductorAgents === undefined) {
     conductors = new Set()
     gatewayHasCrewMode = false
@@ -169,6 +175,13 @@ export function resetCrewModeCatalog(): void {
   configuredAgent = DEFAULT_CREW_MODE_AGENT
   conductors = new Set()
   gatewayHasCrewMode = false
+  catalogKnown = false
+  catalogDefaultAgent = ''
+}
+
+/** Whether an agent catalog has landed since load (or the last reset). */
+export function crewModeCatalogKnown(): boolean {
+  return catalogKnown
 }
 
 /** The agent a chat switches to when Crew Mode is turned on. */
@@ -195,6 +208,22 @@ export function runsCrewMode(agent: string | null | undefined, kind: string | nu
   return conductors.has(agent) || (!!stamp && stamp === agent)
 }
 
+/** Whether the composer shows `slot` as a conductor mode chat (the bolt, no agent
+ *  picker): it runs Crew Mode (`runsCrewMode`) and the gateway has not said it is
+ *  outside every crew. The gateway stamps `crew_mode_root` on every row it lists,
+ *  `false` on a session that is no root, and `crew_root` on a root's crew
+ *  members; a row that carries no stamp yet (a switch's own answer, before the
+ *  next slot frame) keeps the conductor's look. So a chat another session opened
+ *  on a conductor outside any crew (a Bot's or a plain chat's `session_create`),
+ *  stamped not-a-root and no crew member, keeps its agent picker: the gateway
+ *  does not lock its agent and nests nothing under it (#39260). */
+export function showsAsCrewMode(slot: {
+  agent?: string; agent_kind?: string; crew_mode_agent?: string; crew_mode_root?: boolean; crew_root?: string | null
+} | null | undefined): boolean {
+  if (!slot || !runsCrewMode(slot.agent, slot.agent_kind, slot.crew_mode_agent)) return false
+  return slot.crew_mode_root !== false || !!crewRootOf(slot)
+}
+
 /** Whether `name` is the default agent: the switch is offered only there. The
  *  literal `kirocrew` counts only while no default agent is configured; with
  *  one configured, a chat on the `kirocrew` template is that template. */
@@ -209,14 +238,42 @@ export function memoryModeAllowsCrewMode(memoryMode: string | undefined): boolea
   return (memoryMode ?? 'persistent') === 'persistent'
 }
 
+/** The conductor a just-created chat is switched to when the
+ *  `dashboard.new_chat_crew_mode` setting is on, or `null` to leave it plain.
+ *  Only a chat the composer would offer the conductor mode chip on
+ *  (`useCrewModeSwitch`'s `crewModeEligible`): a gateway that runs Crew Mode, no
+ *  chat mode, a local non-app Persistent chat, still on the default agent (so no
+ *  pick and no folder pin chose another one), and a default agent that is not
+ *  itself a conductor. */
+export function newChatCrewModeAgent(slot: {
+  agent?: string; agent_kind?: string; mode?: string; memory_mode?: string; instance_id?: string; origin?: string
+}): string | null {
+  if (!gatewayRunsCrewMode() || slot.mode || slot.instance_id || slot.origin === 'app') return null
+  if (!memoryModeAllowsCrewMode(slot.memory_mode) || runsConductor(catalogDefaultAgent, 'template')) return null
+  if (slot.agent_kind === 'member' || !isDefaultAgentName(slot.agent ?? '', catalogDefaultAgent)) return null
+  return configuredAgent
+}
+
+/** The fields `withoutConductors` and `agentCycleTarget` read off a row. */
+type ConductorFilterRow = { name: string; selection_kind?: string; kiro_agent?: string; source?: string; memory_store?: string }
+
+/** Whether a member row is the roster's copy of the template it is named after
+ *  rather than a crewmate the person created: it runs that template, and it is
+ *  not what the person's create path writes (`source` `kirocrew` with memory of
+ *  its own). The agents sync and the default-agent pick write such copies. */
+function rosterCopyOfTemplate(row: ConductorFilterRow): boolean {
+  if (row.selection_kind !== 'member' || row.kiro_agent !== row.name) return false
+  return row.source !== 'kirocrew' || (row.memory_store ?? 'default') === 'default'
+}
+
 /** Rows of a normal chat's agent picker: every conductor left out, since the
- *  composer's Crew Mode switch (this part) is the way onto one; crewmates kept
- *  whatever their name. The picker and the Split View pane picker read through
- *  this one function; the keyboard cycle (`agentCycleTarget`) skips conductors on
- *  its own. On a gateway without Crew Mode no template is a conductor, so every
- *  row passes. */
-export function withoutConductors<T extends { name: string; selection_kind?: string }>(choices: T[]): T[] {
-  return choices.filter(c => c.selection_kind === 'member' || !isConductorAgent(c.name))
+ *  composer's Crew Mode switch (this part) is the way onto one, and so is the
+ *  roster's copy of a conductor template; crewmates kept whatever their name.
+ *  The picker and the Split View pane picker read through this one function;
+ *  the keyboard cycle (`agentCycleTarget`) skips conductors on its own. On a
+ *  gateway without Crew Mode no template is a conductor, so every row passes. */
+export function withoutConductors<T extends ConductorFilterRow>(choices: T[]): T[] {
+  return choices.filter(c => (c.selection_kind === 'member' && !rosterCopyOfTemplate(c)) || !isConductorAgent(c.name))
 }
 
 /** Every surface that can show a session's pending tool approval. Listed so one
@@ -250,22 +307,39 @@ export function crewApprovalDecidableHere(
  *  it on. A worker whose root is closed keeps its row: no panel lists it, and its
  *  own approval or question must still reach the person. `rootsOnly` keeps just
  *  the roots, for the session filter's Crew Mode chip. */
-export function crewModeView<T extends { key?: string; mode?: string; crew_root?: string; crew_mode_root?: boolean; mate_root?: string }>(
-  rows: T[], rootsOnly = false, mateThreads?: ReadonlySet<string>,
+export function crewModeView<T extends { key?: string; mode?: string; crew_root?: string; crew_mode_root?: boolean; mate_root?: string; slack_list_hidden?: boolean; pending_approval?: boolean; needs_input?: boolean }>(
+  rows: T[], rootsOnly = false, mateThreads?: ReadonlySet<string>, activeKey?: string | null,
 ): T[] {
+  // With `slack.show_in_session_list` off, a conversation that started in Slack
+  // leaves the list (the server's `slack_list_hidden` stamp), except the open
+  // session and one waiting on the person (`slackRowHidden`).
+  if (rows.some(r => r.slack_list_hidden)) rows = rows.filter(r => !slackRowHidden(r, activeKey))
   if (rootsOnly) return rows.filter(r => crewModeRoot(r))
   // A mate's session leaves the list while its mate thread is live (the mate's
-  // Sessions tab lists it), behind its own preview, before the Crew Mode return so
-  // that branch is unchanged. `mateThreads` is the full store's
-  // (`liveMateThreads`); without it, the mate threads among `rows`.
-  if (mateSessionsHidden()) {
-    const mates = mateThreads ?? liveMateThreads(rows)
-    rows = rows.filter(r => { const mate = mateRootOf(r); return !mate || !mates.has(mate) })
-  }
+  // Sessions tab lists it), before the Crew Mode return so that branch is unchanged. `mateThreads` is the
+  // full store's (`liveMateThreads`); without it, those among `rows`.
+  const mates = mateThreads ?? liveMateThreads(rows)
+  if (mates.size) rows = rows.filter(r => { const mate = mateRootOf(r); return !mate || !mates.has(mate) })
   if (!crewModeEnabled()) return rows
   const listed = new Set<string>()
   for (const r of rows) if (r.key) listed.add(r.key)
   return rows.filter(r => !underListedRoot(r, key => listed.has(key)))
+}
+
+/** Whether the person's lists leave `row` out for `slack.show_in_session_list`:
+ *  the server stamped it (`slack_list_hidden`, a conversation that started in
+ *  Slack while the setting is off), it is not the open session (`activeKey`), so
+ *  the main pane always has its row, and it is not waiting on the person (a tool
+ *  approval or a question), so what needs them is never out of sight. A
+ *  person-list preference only: the slot stays in the store for every other
+ *  reader. */
+export function slackRowHidden(
+  row: { key?: string; slack_list_hidden?: boolean; pending_approval?: boolean; needs_input?: boolean } | null | undefined,
+  activeKey?: string | null,
+): boolean {
+  if (!row?.slack_list_hidden) return false
+  if (activeKey && row.key === activeKey) return false
+  return !row.pending_approval && !row.needs_input
 }
 
 /** A worker whose root is a row of the list: the one row `crewModeView` drops. */
@@ -285,30 +359,32 @@ export function openingHidesSessionList(row: { crew_root?: string } | null | und
 }
 
 /** The rows the page may open on its own (a first visit, or after the open chat
- *  closed): never a mate's session while the mate sessions preview is on, and never
+ *  closed): never a mate's session, which its Bot's Sessions tab lists, and never
  *  a crew member, which is its conductor's to show and is opened
  *  from its Crew panel or by the person. A crew member opened on purpose stays
- *  open; only the page's own pick skips it. */
-export function autoOpenRows<T extends { crew_root?: string; mate_root?: string }>(rows: T[]): T[] {
-  return rows.filter(s => !crewRootOf(s) && !hiddenMateRootOf(s))
+ *  open; only the page's own pick skips it. A conversation the Slack list setting
+ *  leaves out (`slack_list_hidden`) is skipped the same way. */
+export function autoOpenRows<T extends { crew_root?: string; mate_root?: string; slack_list_hidden?: boolean }>(rows: T[]): T[] {
+  return rows.filter(s => !crewRootOf(s) && !mateRootOf(s) && !s.slack_list_hidden)
 }
 
 /** The agent the keyboard cycle lands on from `current`, `step` places along
  *  (`1` next, `-1` previous). The cycle skips every gateway conductor template
- *  whatever the preview flag says (the gateway does not read it), so a chord can
+ *  in every build, LTS included (the gateway runs them either way), so a chord can
  *  never move a normal chat onto a conductor and turn Crew Mode on by accident;
  *  the picker is the way onto one. `null` when there is nothing to
  *  cycle: an empty list, a chat in Crew Mode (`runsCrewMode`), which has no agent
  *  picker to mirror, or a `locked` chat: the caller passes the row's RAW
  *  `crew_mode_root` stamp, set only on a chat the gateway refuses to move.
- *  Crewmates are kept whatever their name. */
-export function agentCycleTarget<T extends { name: string; selection_kind?: string }>(
+ *  Crewmates are kept whatever their name; the roster's copy of a conductor
+ *  template is skipped with it. */
+export function agentCycleTarget<T extends ConductorFilterRow>(
   agents: T[], current: string, currentKind: string | undefined, step: 1 | -1, crewStamp?: string, locked = false,
 ): string | null {
   // The raw `crew_mode_root` stamp is the gateway's own lock (`crew_mode_locked`),
-  // preview on or off; with the preview on, every Crew Mode chat has no picker.
+  // in every build; where conductor mode is offered, every such chat has no picker.
   if (locked || runsCrewMode(current, currentKind, crewStamp)) return null
-  const rows = agents.filter(a => a.selection_kind === 'member' || !conductors.has(a.name))
+  const rows = agents.filter(a => (a.selection_kind === 'member' && !rosterCopyOfTemplate(a)) || !conductors.has(a.name))
   if (rows.length === 0) return null
   const idx = rows.findIndex(a => a.name === current)
   const next = idx === -1 ? (step === 1 ? 0 : rows.length - 1) : (idx + step + rows.length) % rows.length

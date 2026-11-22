@@ -28,6 +28,7 @@ from kiro_crew.mcp_discovery import (
     MCP_REDACTED_HEADER_VALUE,
     McpServerInfo,
 )
+from kiro_crew.testing.synthetic_credentials import SAMPLE_AWS_SECRET
 
 
 def _request(state) -> object:
@@ -416,6 +417,22 @@ class TestMcpHeaderRedaction:
         assert redacted.count(MCP_REDACTED_HEADER_VALUE) == 1
         assert credential not in redacted
 
+    def test_a_configured_bearer_with_punctuation_is_redacted_whole(self) -> None:
+        """The configured value is masked before the generic scanners run, so a generic
+        match never masks only the part of it before a ``!``."""
+        import kiro_crew.mcp_discovery as disc
+
+        credential = "FakeS3cretPass!2024"
+        value = f"Bearer {credential}"
+        error = f"Remote reflected {value}; keep this context"
+
+        redacted = disc.redact_mcp_error(error, {"Authorization": value})
+
+        assert redacted == (
+            f"Remote reflected {MCP_REDACTED_HEADER_VALUE}; keep this context"
+        )
+        assert "2024" not in redacted
+
     def test_long_credential_glued_to_word_characters_is_redacted(self) -> None:
         """A long credential cannot occur inside prose by chance, so it is
         masked as a bare substring even when a server reflects it with no
@@ -563,14 +580,14 @@ class TestMcpHeaderRedaction:
         """The generic scanners run on every error, not only configured values.
 
         A remote server can reflect a credential the config never mentions
-        (an access-key id, a connection string); the site-wide scrubbers must
+        (an AWS secret key, a connection string); the site-wide scrubbers must
         catch it before serialization.
         """
         import kiro_crew.mcp_discovery as disc
 
-        fake_key = "AKIA" + "IOSFODNN7EXAMPLE"
+        fake_key = SAMPLE_AWS_SECRET
         redacted = disc.redact_mcp_error(
-            f"remote rejected key {fake_key} during handshake",
+            f"remote rejected aws_secret_access_key={fake_key} during handshake",
             {"Authorization": "Bearer unrelated-configured-value"},
         )
 

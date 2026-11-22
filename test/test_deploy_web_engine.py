@@ -765,6 +765,42 @@ def test_existing_refused_fallback_directory_warns_once(monkeypatch, tmp_path, c
     ]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="fallback branch is dead on Windows")
+def test_a_refused_tool_warns_once_however_often_it_is_walked(monkeypatch, tmp_path, caplog):
+    """Every ssh spawn walks the plugin, so its refusal is logged once, not per spawn."""
+    fallback, empty_bin = tmp_path / "fallback", tmp_path / "e"
+    fallback.mkdir()
+    empty_bin.mkdir()
+    plugin = fallback / "session-manager-plugin"
+    plugin.write_text("#!/bin/sh\n")
+    plugin.chmod(0o755)
+    monkeypatch.setenv("PATH", str(empty_bin))
+    monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(fallback),))
+    monkeypatch.setattr(engine, "_REFUSED_AWS_BIN_DIRS", set())
+    from kiro_crew import github_runner
+
+    def _refuse(_candidate):
+        raise ValueError("executable is owned by another user (uid 1501)")
+
+    monkeypatch.setattr(github_runner, "validate_provider_directory", lambda candidate: candidate)
+    monkeypatch.setattr(github_runner, "validate_provider_executable", _refuse)
+    caplog.set_level("WARNING", logger=engine.logger.name)
+
+    for _ in range(3):
+        engine.resolve_aws_tool_bin_with_refusals("session-manager-plugin")
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == engine.logger.name and record.levelname == "WARNING"
+    ]
+    assert warnings == [
+        f"refusing session-manager-plugin at {plugin}: failed provenance validation; "
+        "trying the remaining install dirs"
+    ]
+    assert engine._REFUSED_AWS_BIN_DIRS == {("session-manager-plugin", str(fallback))}
+
+
 def test_aws_spawn_env_excludes_a_never_checked_dir(monkeypatch, tmp_path):
     inherited = tmp_path / "sysbin"
     fallback = tmp_path / "fallback"
@@ -1188,6 +1224,39 @@ def test_run_aws_passes_the_widened_spawn_env_to_the_child(monkeypatch, tmp_path
     assert env is not None, "run_aws must pass env= so the child's PATH is widened"
     # The resolved absolute aws is the argv head; its install dir is on the env.
     assert str(pkg) in env["PATH"].split(os.pathsep)
+
+
+def test_run_aws_child_gets_no_python_interpreter_settings(monkeypatch):
+    """aws-cli v1 is Python: the gateway's PYTHONPATH/PYTHONHOME must not reach it.
+
+    Everything else ``aws_spawn_env`` builds, the widened PATH included, still does.
+    """
+    captured: dict[str, object] = {}
+
+    def fake_run_limited(argv, **kwargs):  # noqa: ANN001
+        captured["env"] = kwargs.get("env")
+
+        class _P:
+            returncode = 0
+            stdout = "{}"
+            stderr = ""
+
+        return _P()
+
+    spawn_env = {
+        "PATH": "<widened>",
+        "PYTHONPATH": "<gw>",
+        "PYTHONHOME": "<gw>",
+        "AWS_PROFILE": "k",
+    }
+    monkeypatch.setattr(engine, "wrap_argv", lambda argv, **kw: (list(argv), None))
+    monkeypatch.setattr(engine, "cgroup_scope_argv", lambda argv: argv)
+    monkeypatch.setattr(engine, "run_limited", fake_run_limited)
+    monkeypatch.setattr(engine, "aws_spawn_env", lambda head: dict(spawn_env))
+
+    engine.run_aws(["sts", "get-caller-identity"], "kauai")
+
+    assert captured["env"] == {"PATH": "<widened>", "AWS_PROFILE": "k"}
 
 
 def test_random_bucket_name_format():

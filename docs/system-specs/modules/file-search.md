@@ -17,6 +17,39 @@ File search backs the `@`-mention picker in the dashboard chat composer. A user 
 
 Results cover both **files** and **directories**. A file is an attachment whose content reaches the agent. A directory is a **path reference only**: the agent receives the path and explores it with its own glob/grep/read tools. No directory listing or recursive content is inlined.
 
+**Same-named rows disambiguate by their shortest distinguishing parent.** Search
+matches basenames, so one result set can hold several rows with the same name,
+and each row's path sub-line cuts at the END — right for a unique name, where
+the cut eats the shared prefix. For a same-named group the cut lands inside
+their common parent chain and the rows read identical down to size and age.
+`disambiguatedPaths` in `website/src/components/FilePickerMenu.tsx` gives every
+row of such a group the shortest trailing path that tells it apart, computed by
+`buildFileLabels` (`website/src/utils/fileTokens.ts`, the rule the attachment
+chips use, with the same Windows-separator handling as the preview strip),
+head-anchored with an ellipsis
+(`…/core/src/README.md`), so the distinguishing segment is the first thing
+after the cut and survives the menu's narrowest width; rows whose name is
+unique in the set keep the full path. Each row's tail is unique among the
+group's displayed tails by construction, and the full path stays on the row's
+tooltip. With `pathTail` (`ChatEmbed` and a split pane's composer) rows show their folder cut from the
+start instead, and this rule does not apply.
+`website/src/test/FilePickerMenu.sameName.test.tsx` pins the rule.
+
+**A spec pick lists the spec folders, not a fuzzy search.** An `@` query of
+`.kiro/specs/` or `.kiro/specs/<partial>` (`matchSpecQuery` in
+`website/src/components/composerTokens.ts`) asks for a spec, which is a folder
+under the project's `.kiro/specs/`. A fuzzy search would rank every spec's
+`tasks.md` above the spec folders and cut most of them off, so `FilePickerMenu`
+instead reads one listing of `./.kiro/specs/` from `/api/path-complete`, with the
+typed partial as the prefix. The listing puts folders first, so the specs lead
+and a loose file under `.kiro/specs/` stays reachable below them. Each row's second
+line names the project folder, as Kiro's own spec menu does, instead of a path
+every row would share. A picked row
+inserts the same `@.kiro/specs/<name>/` folder mention as any `@` folder, so it
+reaches the agent as a folder reference (see "Folder references" below). A query
+that goes inside a spec, or a host with no listing read or no project, stays an
+ordinary fuzzy search. `website/src/test/FilePickerMenu.specs.test.tsx` pins it.
+
 ## API
 
 ### `GET /api/file-search`
@@ -25,7 +58,7 @@ Results cover both **files** and **directories**. A file is an attachment whose 
 |---|---|---|
 | `q` | yes | Query string. Queries shorter than the accepted minimum return an empty result set; `test_short_query_returns_empty` pins the boundary. |
 | `project` | no | An existing, non-sensitive directory after `expanduser` and `realpath` canonicalization. It takes precedence over `workspace`; `api_file_search` enforces the root check and `test_project_scoping` pins its scope. |
-| `workspace` | no | Workspace name resolved through `workspace_dir_for` only when `project` is absent. A missing workspace does not establish scope, so `api_file_search` uses its fallback roots. |
+| `workspace` | no | Workspace name resolved through `workspace_dir_for` only when `project` is absent. A workspace whose directory does not exist is 404 `{"results": [], "error": "Workspace directory not found", "code": "workspace_not_found"}` rather than a fall-through to the fallback roots, which would return another directory's files. |
 | `kinds` | no | `all` (default), `files`, or `dirs`. Unrecognized values fall back to `all`. |
 | `limit` | no | Result page size. `api_file_search` normalizes it to a positive server ceiling; invalid input uses the default. The ceiling is load-bearing because candidate collection scales with the requested page size; `test_limit_clamped_at_server_ceiling`, `test_limit_non_integer_falls_back_to_default`, and `test_limit_negative_or_zero_clamped_to_floor` pin the contract. |
 
@@ -35,7 +68,7 @@ anyone else (403 `owner_only`, or 401 for a stale pre-owner session), because
 sensitive `project` is 403 `{"error": "Access denied", "code": "access_denied"}`; a
 `project` that is not a directory is 404
 `{"results": [], "error": "Project directory not found", "code": "project_not_found"}`.
-The short-query exit and the missing-project exit each write an `allowed` SEL
+The short-query exit and the missing-project and missing-workspace exits each write an `allowed` SEL
 record (`_audit_file_search_exit`), so a granted request never ends at the gate
 unrecorded; `test_file_search.py` and `test_owner_gate_file_readers.py` pin both.
 
@@ -182,7 +215,7 @@ this text", one row per file.
 
 Response: `{"results", "truncated", "engine", "skipped_docs", "root"}`. Each result
 is `{"file", "line", "preview", "label"}`; `line` is 0 for a document hit, which
-has no line to reveal, and `label` names a place inside the document (`p 2`,
+has no line to reveal, and `label` names a place inside the document (`page 2`,
 `slide 7`, `Costs · row 12`) or is empty where the format has none, as `.docx`
 does not.
 
@@ -240,7 +273,10 @@ drops.
 **Document extraction is deadline-bounded and re-parsed per request.** A
 document pass extracts `.docx`/`.pdf`/`.pptx`/`.xlsx`. The character cap bounds TEXT, not
 work: a workbook of empty rows produces none, so the worksheet row loop samples
-the deadline every `_GREP_ROW_DEADLINE_STRIDE` rows. A parse that did not see all
+the deadline every `_GREP_ROW_DEADLINE_STRIDE` rows, and as often in the cells of one row. The workbook row walk is
+`kiro_crew.workbook_rows.read_workbook_rows`, shared with the Knowledge Library's
+`.xlsx` reader: it skips chartsheets and resets each sheet's dimensions, so a
+stale dimension record cannot hide rows from the search. Each sheet title is redacted whole before the walk keeps its first 31 characters for the row labels, since a token cut short matches no credential pattern. A parse that did not see all
 of a document's text — deadline, mid-read failure, or the character cap — marks
 the answer `truncated`. There is no extraction cache: the shared 2 s budget
 already bounds what one keystroke can cost, and a cache keyed by content had to
@@ -279,7 +315,7 @@ slot because it holds its worker for the length of the search.
 Two paths produce results:
 
 1. **In-memory index fast path.** Used when the request resolves to one safe scoped root and that root's `FileIndex` is ready and untruncated. `api_file_search` selects it and `FileIndex.search` applies the `kinds` filter and ranking.
-2. **Per-request walk fallback.** Used otherwise. `api_file_search` gives files and directories independent scanned-entry and candidate budgets, scans files first at each level, and applies an independent directories-entered ceiling. The independent budgets prevent one kind from starving the other, while the traversal ceiling guarantees a narrow, deep tree terminates even after a kind's collector is done; `test_files_and_dirs_have_independent_scan_budgets`, `test_many_matching_dirs_do_not_starve_files`, and `test_walk_stops_at_overall_scan_ceiling` pin those invariants.
+2. **Per-request walk fallback.** Used otherwise. `api_file_search` gives files and directories independent scanned-entry and candidate budgets, scans files first at each level, and applies an independent directories-entered ceiling (`_WALK_MAX_DIRS_VISITED`) and a wall-clock budget (`_WALK_TIME_BUDGET_SECS`, sampled every `_WALK_DEADLINE_STRIDE` entries), so a slow store returns the partial set gathered before the deadline. The independent budgets prevent one kind from starving the other, while the traversal ceiling guarantees a narrow, deep tree terminates even after a kind's collector is done; `test_files_and_dirs_have_independent_scan_budgets`, `test_many_matching_dirs_do_not_starve_files`, and `test_walk_stops_at_overall_scan_ceiling` pin those invariants.
 
 ### Scope and containment
 
@@ -291,7 +327,7 @@ Both result paths exclude dot-prefixed **files**, directories named by shared `f
 
 ## Security
 
-Both file and directory candidates are resolved with `os.path.realpath` **before** the `is_sensitive_path` check, so a symlink pointing into a sensitive tree is rejected on its real path rather than its link path. `FileIndex._walk` and the fallback collector inside `api_file_search` must remain symmetric: a divergence would let a sensitive target be reachable as a file but not as a directory, or the reverse. Realpath here guards sensitive targets, not root containment; the scope rule above documents the deliberate boundary.
+Both file and directory candidates are resolved with `os.path.realpath` **before** the `is_sensitive_canonical_path` check, so a symlink pointing into a sensitive tree is rejected on its real path rather than its link path. `FileIndex._walk` and the fallback collector inside `api_file_search` must remain symmetric: a divergence would let a sensitive target be reachable as a file but not as a directory, or the reverse. Realpath here guards sensitive targets, not root containment; the scope rule above documents the deliberate boundary.
 
 ## FileIndex
 
@@ -310,7 +346,7 @@ per-request walk.
 
 ## Scope of this module
 
-This document covers discovery -- how the two endpoints and the index find
+This document covers discovery -- how the three endpoints and the index find
 files and directories by name and by content, and how the picker stages them in
 the composer -- and the folder reference lifecycle below.
 
@@ -414,7 +450,7 @@ shows literally — the same trade-off inline file mentions make.
 | `website/src/pages/chat/FileBrowserRail.tsx` | Files tab: Name/Content toggle, result rows, status row |
 | `website/src/api/fileGrep.ts` | `/api/file-grep` client and result types |
 | `src/kiro_crew/dashboard/file_index.py` | `FileIndex`, `FileIndexRegistry` |
-| `website/src/components/FilePickerMenu.tsx` | Picker UI, `kind` propagation, trailing-slash insertion, `pathMode`, `pathTail` (rows show their root-relative folder cut from the start, so same-named results stay distinguishable in a narrow menu; `ChatEmbed` and a split pane's composer opt in, the main chat keeps the full path cut at the end) |
+| `website/src/components/FilePickerMenu.tsx` | Picker UI, `kind` propagation, trailing-slash insertion, `pathMode`, `pathTail` (rows show their root-relative folder cut from the start, so same-named results stay distinguishable in a narrow menu; `ChatEmbed` and a split pane's composer opt in), and, without `pathTail` (the main chat), same-name path disambiguation (`disambiguatedPaths`, over `buildFileLabels`) |
 | `website/src/components/composerTokens.ts` | Caret-relative `@` / `$` / `./` token matchers and the shared token replace |
 | `website/src/components/ChatInput.tsx` | Composer wiring: mounts the trigger pickers and the preview strip |
 | `website/src/chat-core/composer/pickers.ts` | Which trigger picker the text at the caret opens (`@` / `$` / `./` / `/`), one rule for the textarea and the Lexical editor; store-free, shared by `ChatInput` and `ChatEmbed` |
@@ -448,9 +484,11 @@ shows literally — the same trade-off inline file mentions make.
 | `test/test_file_grep.py` | Engine parity, the stdin pattern channel, anchored exclusions, deadline-bounded extraction, row redaction |
 | `website/src/test/FileBrowserRail.test.tsx` | Toggle default and remount, request floor, status row, document note, project-switch invalidation |
 | `website/src/test/fileGrep.test.ts` | The wire call: path, URL-encoded `root`/`q`, body returned as-is, transport errors surface |
-| `test/test_file_index.py` | Index build, refresh, registry refcounting |
+| `test/test_file_index.py` | Index build, refresh, registry sharing, LRU eviction and walk-only verdicts |
 | `test/test_file_search_dirs.py` | Directory results, `kinds` filter, independent scan budgets, dirs-visited ceiling, symlink security |
 | `website/src/test/FilePickerMenu.dirs.test.tsx` | Folder rows, selection payloads, trailing slash |
+| `website/src/test/FilePickerMenu.specs.test.tsx` | Spec pick: lists `.kiro/specs/` (folders first, a loose file still pickable), names the project on each row, passes the typed prefix, inserts a folder mention, falls back to fuzzy search inside a spec or without a project |
+| `website/src/test/FilePickerMenu.sameName.test.tsx` | Same-named rows: shortest distinguishing parent, head-anchored cut, separator awareness, unique-named rows unchanged |
 | `website/src/test/ChatInput.dirStripHeight.test.tsx` | Preview-strip height compensation for a folders-only strip |
 | `website/src/test/fileTokens.dirs.test.ts` | Token parse/serialize/resolve units, label widening, lossless spaced paths |
 | `website/src/chat-core/composer/outgoingTurn.test.ts` | Send and steer serialization at the turn: `[attached_dir N]` + `meta.dirs[N-1]` resolved against the project on a send, `@rel/` kept on a steer |

@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +63,7 @@ from kiro_crew.apps.registry_pipeline.checkout import (
 from kiro_crew.apps.registry_pipeline.git_targets import (
     _entry_git_url,
     _git_target_is_unsupported,
+    _normalize_git_target,
     _strip_git_target_userinfo,
 )
 from kiro_crew.apps.registry_pipeline.indexes import _owner_tier_confirmed
@@ -95,6 +97,7 @@ from kiro_crew.apps.registry_pipeline.sources import (
 from kiro_crew.apps.registry_pipeline.subprocess_env import _detect_probe_env, minimal_env
 from kiro_crew.platform import redact_log_via_context as _redact_log_via_context
 from kiro_crew.sandbox import (
+    app_backend_secret_mask_targets,
     cgroup_scope_argv,
     create_subprocess_limited,
     sandboxed_spawn_argv,
@@ -103,6 +106,7 @@ from kiro_crew.sandbox import (
     wrap_argv_async,
 )
 from kiro_crew.sel import sel
+from kiro_crew.user_json import loads_user_json
 
 logger = logging.getLogger(_FACADE)
 
@@ -248,12 +252,36 @@ def _adoption_pending(name: str) -> str | None:
     return pending_install_refusal(pin)
 
 
+async def _clear_earlier_memory_consent(name: str) -> str:
+    """Remove memory consent an earlier app under *name* left, off the loop; the refusal.
+
+    Only for a new registration (no install record yet): an update keeps its consent.
+    A worker may wait for the consent lock, where the loop could only try it once;
+    ``register_external_app`` then finds nothing left to clear.
+    """
+
+    def clear() -> None:
+        from kiro_crew.apps.manager import _read_installed
+        from kiro_crew.memory_provider.consent import revoke_app
+
+        if _read_installed(name) is None:
+            revoke_app(name)
+
+    try:
+        await asyncio.to_thread(clear)
+    except (OSError, ValueError) as exc:
+        return f"could not clear earlier memory consent for {name!r}: {exc}"
+    return ""
+
+
 async def install_from_registry(
     name: str,
     log_lines: list[str] | None = None,
     *,
     resolved_entry: dict[str, Any] | None = None,
     start_disabled: bool = False,
+    before_replace: Callable[[], Awaitable[None]] | None = None,
+    via: str = "store",
 ) -> dict[str, Any]:
     """Clone an app from its git repo and install it.
 
@@ -284,6 +312,12 @@ async def install_from_registry(
         start_disabled: Create new self-managed records disabled for a caller
             that performs the guarded enable separately. Managed installs already
             start disabled. Existing records keep their enabled state.
+        before_replace: Awaited right before a managed app's files are copied in,
+            once every gate, the build and ``onInstall`` have passed. An update takes
+            the app down here; a self-managed app replaces no installed file.
+        via: How the install was asked for, the ``via`` of
+            ``kirocrew.app.installed`` and ``kirocrew.app.updated``: ``store`` (the
+            store routes, the default) or ``default`` (the default-apps pass).
 
     Steps:
     1. Validate the app exists in the trusted registry JSON
@@ -327,6 +361,26 @@ async def install_from_registry(
     adoption_refusal = await asyncio.to_thread(_adoption_pending, name)
     if adoption_refusal is not None:
         return {"ok": False, "name": name, "code": "adoption_pending", "error": adoption_refusal}
+
+    # A marketplace app is never replaced from the registry either: refuse it before
+    # any clone, and before ``before_replace`` takes the app down (``update_app`` only
+    # refuses after that, and the update would then be rolled back).
+    from kiro_crew.apps.market_source import MARKET_OVERWRITE_HINT, is_market_source
+
+    installed = await asyncio.to_thread(get_app, name)
+    if installed is not None and is_market_source(installed.get("source")):
+        error = f"{name!r} cannot be updated from the registry. {MARKET_OVERWRITE_HINT}"
+        try:
+            sel().log_api_access(
+                caller="app_install_from_registry",
+                operation="provenance",
+                outcome="rejected",
+                resources=f"name={name!r}",
+                error=error,
+            )
+        except Exception as exc:  # an audit failure must never mask the refusal
+            logger.debug("SEL audit failed for %s market refusal: %s", name, exc)
+        return {"ok": False, "name": name, "code": "app_update_market_source", "error": error}
 
     entry: dict[str, Any] | None
     if resolved_entry is not None:
@@ -396,15 +450,19 @@ async def install_from_registry(
         # the one case the consent dialog cannot fix: the grant endpoint binds to
         # the INSTALLED source, so granting again re-records a local grant and
         # this refusal repeats forever. Answer it with its own code, so the
-        # dialog does not open, and name the route that records a repository.
+        # dialog does not open, and carry the repository this update would
+        # install from. That coordinate is the consent proof the update route
+        # takes to switch the grant to the repository (``handle_update_app``).
+        # It is the normalized form, which the storefront rows already expose as
+        # ``trustRepository``; the clone URL itself stays out of the response.
+        trust_repository = ""
         if not granted_repository and _trust_grant_would_stay_local(name):
             code = "app_trust_local_only"
+            trust_repository = _normalize_git_target(git_url)
             reason = (
-                "this app is trusted for its local source only, and granting trust "
-                "again keeps it local-only, so it cannot be updated from a "
-                "repository. To switch to the repository version, uninstall the "
-                "app (its data is kept) and install it from the App Store, which "
-                "asks you to trust that repository"
+                "this app is trusted for its local source only, so that trust does "
+                "not cover the repository version this update installs. Trust the "
+                "repository to update the app from it; its data is kept"
             )
         audit_operation = (
             "trust_repository_mismatch"
@@ -421,12 +479,15 @@ async def install_from_registry(
             )
         except Exception as exc:  # an audit failure must never mask the refusal
             logger.debug("SEL audit failed for %s trust repository mismatch: %s", name, exc)
-        return {
+        trust_refusal: dict[str, Any] = {
             "ok": False,
             "name": name,
             "error": reason,
             "code": code,
         }
+        if trust_repository:
+            trust_refusal["trustRepository"] = trust_repository
+        return trust_refusal
 
     raw_repo = entry.get("repo", "")
     repo = _strip_git_target_userinfo(raw_repo) if isinstance(raw_repo, str) else ""
@@ -696,6 +757,9 @@ async def install_from_registry(
                 base_cmd,
                 mode="strict",
                 env=_detect_probe_env(),
+                # ``strict`` leaves run/ and .local_secret readable, and this shell string
+                # comes from a registry manifest.
+                extra_hidden_dirs=await asyncio.to_thread(app_backend_secret_mask_targets),
                 _prepare=sandboxed_spawn_argv,
             )
             proc = await create_subprocess_limited(
@@ -858,7 +922,7 @@ async def install_from_registry(
                 (app_source / "app.json").read_text,
                 "utf-8",
             )
-            parsed = json.loads(manifest_raw)
+            parsed = loads_user_json(manifest_raw)
             if isinstance(parsed, dict):
                 manifest_data = parsed
         except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
@@ -999,7 +1063,10 @@ async def install_from_registry(
 
             base_cmd = ["/bin/bash", "-c", safe_script]
             sandboxed_cmd, _cleanup = await wrap_argv_async(
-                base_cmd, mode="standard", _prepare=wrap_argv
+                base_cmd,
+                mode="standard",
+                _prepare=wrap_argv,
+                extra_hidden_dirs=await asyncio.to_thread(app_backend_secret_mask_targets),
             )
             sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
             proc = await create_subprocess_limited(
@@ -1134,7 +1201,7 @@ async def install_from_registry(
             # must pass the same fail-closed gates as the post-build read.
             manifest_data = None
             try:
-                parsed = json.loads(
+                parsed = loads_user_json(
                     await asyncio.to_thread((app_source / "app.json").read_text, "utf-8")
                 )
                 if isinstance(parsed, dict):
@@ -1405,6 +1472,12 @@ async def install_from_registry(
                 await _roll_back_refused()
                 outcome = {"ok": False, "name": name, "message": "", "error": version_refusal}
                 return outcome
+            consent_refusal = await _clear_earlier_memory_consent(name)
+            if consent_refusal:
+                log_lines.append(_refusal_line(verb, consent_refusal))
+                await _roll_back_refused()
+                outcome = {"ok": False, "name": name, "message": "", "error": consent_refusal}
+                return outcome
             reg_result = register_external_app(
                 name=name,
                 version=version,
@@ -1465,6 +1538,9 @@ async def install_from_registry(
                         install_receipt.KIND_UPDATE if was_installed else install_receipt.KIND_FRESH
                     ),
                 )
+            from kiro_crew.apps.store_origin import count_install
+
+            await count_install(name, via, was_installed=was_installed)
             outcome = {
                 "ok": True,
                 "name": name,
@@ -1483,6 +1559,8 @@ async def install_from_registry(
         # the whole transaction (clone/build → copy → register → backend
         # start); asyncio.Lock is not reentrant, so no acquisition here.
         existing = get_app(name)
+        if before_replace is not None:
+            await before_replace()
         # Off-loop: install_app/update_app do a blocking filesystem copy
         # that can take minutes on large source trees — on the loop it
         # would trip the loop-stall watchdog and kill the gateway.
@@ -1539,6 +1617,9 @@ async def install_from_registry(
                         install_receipt.KIND_UPDATE if was_installed else install_receipt.KIND_FRESH
                     ),
                 )
+            from kiro_crew.apps.store_origin import count_install
+
+            await count_install(result.name, via, was_installed=was_installed)
         # Install/update failed AFTER a successful clone+build: the checkout was
         # rolled back above, durable_success stays False, and the `finally`'s
         # reporter filters the restored stale out — no per-exit report is needed.

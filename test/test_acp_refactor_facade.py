@@ -30,6 +30,7 @@ from typing import Any, Callable
 from unittest import mock
 
 import pytest
+import source_corpus
 import test_acp_refactor_create_guard as create_guard
 
 import kiro_crew.acp as acp_package
@@ -239,6 +240,7 @@ _MOVED: dict[str, dict[str, tuple[str, ...]]] = {
             "_resolve_claude_acp_bin",
             "_resolve_claude_code_executable",
             "_claude_adapter_installed_version",
+            "_claude_adapter_known_version",
         ),
         "kiro_crew.acp.harness.opencode": (
             "_OPENCODE_LAUNCH",
@@ -716,20 +718,27 @@ _DARWIN = SimpleNamespace(platform="darwin")
 #: reads it, helper, arguments)``. Each helper reads the name from the facade its code
 #: came from, so the row fails if the helper ever binds its own copy again.
 _MODULE_SEAMS: list[tuple[str, str, dict[str, object], str, tuple[object, ...]]] = [
+    # The walk asks ``walk_observes_descendants`` for its platform, the one place
+    # that says whether a descendant can be seen, so that is the reader here.
+    ("kiro_crew.acp.client", "platform_compat", {}, "walk_observes_descendants", ()),
+    ("kiro_crew.acp.client", "sys", {"platform_compat": _POSIX}, "_direct_children", (1,)),
+    (
+        "kiro_crew.acp.client",
+        "subprocess_mod",
+        {"platform_compat": _POSIX, "sys": _DARWIN},
+        "_direct_children",
+        (1,),
+    ),
     *[
         row
-        for helper, ps in (
-            ("_direct_children", _POSIX),
-            ("_get_start_time", _POSIX_PS),
-            ("_read_basename", _POSIX_PS),
-        )
+        for helper in ("_get_start_time", "_read_basename")
         for row in (
             ("kiro_crew.acp.client", "platform_compat", {}, helper, (1,)),
             ("kiro_crew.acp.client", "sys", {"platform_compat": _POSIX}, helper, (1,)),
             (
                 "kiro_crew.acp.client",
                 "subprocess_mod",
-                {"platform_compat": ps, "sys": _DARWIN},
+                {"platform_compat": _POSIX_PS, "sys": _DARWIN},
                 helper,
                 (1,),
             ),
@@ -1170,6 +1179,7 @@ def test_the_runtime_star_import_is_the_declared_list(tmp_path: Path) -> None:
         "AcpRuntimeDead",
         "AcpRequestTimeout",
         "AcpRuntimeOverloaded",
+        "AcpScopeAdmissionTimeout",
         "SessionStartGate",
         "StartCollector",
         "AcpRuntimeProtocol",
@@ -1329,13 +1339,18 @@ def test_the_facade_import_scan_reads_every_spelling() -> None:
 #: Every function in an owner that imports from a facade: what it reads there, and
 #: from which facade -- always the one its code came from.
 _SEAM_IMPORTS: dict[tuple[str, str], tuple[str, tuple[str, ...]]] = {
-    **{
-        ("kiro_crew.acp.runtime_process_tree", helper): (
-            "kiro_crew.acp.client",
-            ("Path", "platform_compat", "subprocess_mod", "sys"),
-        )
-        for helper in ("_direct_children", "_read_basename")
-    },
+    ("kiro_crew.acp.runtime_process_tree", "walk_observes_descendants"): (
+        "kiro_crew.acp.client",
+        ("platform_compat",),
+    ),
+    ("kiro_crew.acp.runtime_process_tree", "_direct_children"): (
+        "kiro_crew.acp.client",
+        ("Path", "subprocess_mod", "sys"),
+    ),
+    ("kiro_crew.acp.runtime_process_tree", "_read_basename"): (
+        "kiro_crew.acp.client",
+        ("Path", "platform_compat", "subprocess_mod", "sys"),
+    ),
     ("kiro_crew.acp.runtime_process_tree", "_get_start_time"): (
         "kiro_crew.acp.client",
         ("platform_compat", "subprocess_mod", "sys"),
@@ -1422,6 +1437,15 @@ def test_an_owner_reads_a_facade_only_for_the_listed_seams() -> None:
     assert found == _SEAM_IMPORTS
 
 
+#: A helper split out of a moved one reads the binding that one read, so its origin is
+#: the helper it came out of: ``walk_observes_descendants`` is the platform test
+#: ``_direct_children`` made itself. The read lives in the new helper alone:
+#: ``_SEAM_IMPORTS`` lists ``platform_compat`` for it and not for ``_direct_children``.
+_SPLIT_FROM: dict[tuple[str, str], str] = {
+    ("kiro_crew.acp.runtime_process_tree", "walk_observes_descendants"): "_direct_children",
+}
+
+
 @pytest.mark.parametrize(("site", "seam"), list(_SEAM_IMPORTS.items()), ids=repr)
 def test_each_seam_is_a_binding_of_the_facade_the_helper_came_from(
     site: tuple[str, str], seam: tuple[str, tuple[str, ...]]
@@ -1433,7 +1457,7 @@ def test_each_seam_is_a_binding_of_the_facade_the_helper_came_from(
     came_from_the_facade = _MOVED[facade].get(owner, ()) + _MOVED_METHODS.get(facade, {}).get(
         owner, ()
     )
-    assert function.split(".", 1)[0] in came_from_the_facade
+    assert _SPLIT_FROM.get(site, function.split(".", 1)[0]) in came_from_the_facade
     module = _FACADES[facade]
     for name in names:
         assert name in vars(module) and name not in module._EXPORTS, name
@@ -1705,16 +1729,17 @@ def _facade_patches() -> tuple[tuple[str, int, str, str, str], ...]:
     repo = _SRC.parents[2]
     roots = [repo / "test", *sorted((repo / "src" / "kiro_crew").rglob("tests"))]
     patches: list[tuple[str, int, str, str, str]] = []
-    for root in roots:
-        for path in sorted(root.rglob("*.py")):
-            text = path.read_text(encoding="utf-8")
-            if not create_guard._worth_parsing(text):
-                continue
-            relative = path.relative_to(repo).as_posix()
-            patches.extend(
-                (relative, line, where, facade, name)
-                for line, where, facade, name in _monkeypatch_targets(ast.parse(text))
-            )
+    with source_corpus.untraced():
+        for root in roots:
+            for path in sorted(root.rglob("*.py")):
+                text = path.read_text(encoding="utf-8")
+                if not create_guard._worth_parsing(text):
+                    continue
+                relative = path.relative_to(repo).as_posix()
+                patches.extend(
+                    (relative, line, where, facade, name)
+                    for line, where, facade, name in _monkeypatch_targets(ast.parse(text))
+                )
     return tuple(patches)
 
 
@@ -1747,6 +1772,10 @@ _THIS_FILE = Path(__file__).resolve().relative_to(_SRC.parents[2]).as_posix()
 _UNRESOLVED_FACADE_PATCHES: dict[tuple[str, str], int] = {
     ("test/acp_launch_capture.py", "_capture_runtime_served"): 2,
     ("test/acp_launch_capture.py", "_stub_common"): 4,
+    # The floor's loops over its binding tables; naming ``kiro_crew.acp.client`` in
+    # ``_KIRO_CLI_DIR_BINDINGS`` brings the whole file into this scan.
+    ("test/conftest_floor_home.py", "_hide_the_operators_kiro_cli"): 1,
+    ("test/conftest_floor_home.py", "_isolate_shared_kiro_paths"): 1,
     ("test/test_acp_pod_home_remap.py", "_remap_calls"): 1,
     ("test/test_facade_mirror_guards.py", "patch_reach_failures"): 2,
     ("test/test_harness_parity.py", "test_is_kiro_cli_is_positive"): 2,

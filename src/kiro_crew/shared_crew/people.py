@@ -110,6 +110,11 @@ UsageSource = Callable[[], Mapping[str, Mapping[str, int]]]
 _usage_source: UsageSource | None = None
 
 
+class UsageOff(LookupError):
+    """Raised by a usage source when per-person work is not counted at all (fair
+    admission off), as opposed to a reader that failed."""
+
+
 def observe(principal: Principal, device: str = "") -> None:
     _REGISTRY.observe(principal, device)
 
@@ -151,7 +156,8 @@ def _fold_local_owner(rows: list[dict[str, Any]], local_ids: frozenset[str]) -> 
     configured owner id); they are one person at this machine, so they are one
     row. A row is matched by its principal id, because a session creator read
     back from public attribution carries no provenance. The viewer's own row
-    leads when it is among them.
+    leads when it is among them. Each row already reports the owner's whole
+    usage, so the head's is kept.
     """
     local = [r for r in rows if r["is_owner"] and r["principal"].get("id") in local_ids]
     if len(local) < 2:
@@ -167,11 +173,6 @@ def _fold_local_owner(rows: list[dict[str, Any]], local_ids: frozenset[str]) -> 
         head["devices"] += extra["devices"]
         head["sessions_created"] += extra["sessions_created"]
         head["is_viewer"] = head["is_viewer"] or extra["is_viewer"]
-        if head["usage"] is not None and extra["usage"] is not None:
-            head["usage"] = {
-                "active": head["usage"]["active"] + extra["usage"]["active"],
-                "queued": head["usage"]["queued"] + extra["usage"]["queued"],
-            }
         rows.remove(extra)
 
 
@@ -190,16 +191,25 @@ def people_view(
     are the people the local Tailscale daemon lists besides the owner; one
     whose principal is already a row adds none.
     """
-    from kiro_crew.shared_crew.owner import local_owner_principal_ids, owner_principal_ids
+    from kiro_crew.shared_crew.owner import (
+        local_owner_principal_ids,
+        owner_name,
+        owner_principal_ids,
+    )
 
     reg = reg or _REGISTRY
     creators = _creators(session_rows)
     owner_ids = owner_principal_ids(owner_id)
+    local_ids = local_owner_principal_ids(owner_id)
     viewer_is_owner = not viewer.is_unknown and viewer.id in owner_ids
     usage: Mapping[str, Mapping[str, int]] | None = None
+    # No counter at all is a setting, not a fault, so the page says nothing about it.
+    usage_off = _usage_source is None
     if _usage_source is not None:
         try:
             usage = _usage_source()
+        except UsageOff:
+            usage, usage_off = None, True
         except Exception:
             usage = None
     rows: list[dict[str, Any]] = []
@@ -208,8 +218,9 @@ def people_view(
     def _usage_of(pid: str) -> dict[str, int] | None:
         if usage is None:
             return None
-        raw = usage.get(pid) or {}
-        return {"active": int(raw.get("active", 0)), "queued": int(raw.get("queued", 0))}
+        # Admission charges the owner under one of several local ids, whichever row this is.
+        raws = [usage.get(i) or {} for i in (local_ids if pid in local_ids else (pid,))]
+        return {k: sum(int(raw.get(k, 0)) for raw in raws) for k in ("active", "queued")}
 
     def _row(
         principal: Principal,
@@ -297,12 +308,19 @@ def people_view(
                 sessions_created=0,
             ),
         )
-    _fold_local_owner(rows, local_owner_principal_ids(owner_id))
+    # The owner's local rows carry whatever label was stamped when they were seen
+    # (a session creator keeps the machine name); every reader gets the one name.
+    label = owner_name()
+    for r in rows:
+        if label and r["is_owner"] and r["principal"].get("id") in local_ids:
+            r["principal"]["display"]["name"] = label
+    _fold_local_owner(rows, local_ids)
     return {
         "schema_version": SCHEMA_VERSION,
         "viewer": viewer.to_public_dict(),
         "directory": {"state": "unavailable"},
         "observed_since": reg.started_at,
         "usage_available": usage is not None,
+        "usage_off": usage_off,
         "people": rows,
     }

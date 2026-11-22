@@ -244,6 +244,19 @@ async def api_file_search(request: web.Request) -> web.Response:
             return _probe_busy_response(resource=ws_path, operation="file_search", caller=caller)
         if ws_is_dir:
             search_roots.append(ws_path)
+        else:
+            # Same answer as a missing ``?project=`` root. Falling through to the
+            # default roots below would return another directory's files as if
+            # they belonged to the workspace the caller named.
+            await _audit_file_search_exit(caller, f"workspace={ws_name}", error="not a directory")
+            return web.json_response(
+                {
+                    "results": [],
+                    "error": "Workspace directory not found",
+                    "code": "workspace_not_found",
+                },
+                status=404,
+            )
 
     scoped = bool(search_roots)
 
@@ -304,7 +317,12 @@ async def api_file_search(request: web.Request) -> web.Response:
     # TCC-gated folders the scoped walk keeps), all of which take the walk.
     state: DashboardState = request.app["state"]
     if scoped and len(safe_roots) == 1:
-        idx = await state.file_indexes.ensure(safe_roots[0])
+        try:
+            idx = await state.file_indexes.ensure(safe_roots[0])
+        except _PathProbeBusy:
+            return _probe_busy_response(
+                resource=safe_roots[0], operation="file_search", caller=caller
+            )
         if idx and idx.usable:
             results = await asyncio.to_thread(idx.search, query, _fuzzy_score, max_results, kinds)
             trimmed = [{k: v for k, v in r.items() if k != "_score"} for r in results]

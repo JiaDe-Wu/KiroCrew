@@ -7,6 +7,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from kiro_crew.context import _neutralize_structural_markers
 from kiro_crew.dashboard import openai_compat
@@ -216,6 +217,7 @@ def _make_slot():
     slot.task = None
     slot.running = False
     slot.turn_running = False
+    slot.is_closing = False
     slot.event = asyncio.Event()
     slot._pending = []
 
@@ -270,6 +272,7 @@ def _make_state(slot):
     state.get_or_create_slot = MagicMock(return_value=slot)
     state._slots = {slot.key: slot}
     state._background_tasks = set()
+    state.session_still_loading = AsyncMock(return_value=False)
     return state
 
 
@@ -312,7 +315,11 @@ class TestApiCompletionsBlocking:
         assert await service.session_ready() is False
         request.app["kiro_prerequisite_service"] = service
 
-        response = await api_completions(request)
+        # The turn runs on a harness that signs in via kiro-cli.
+        with patch.object(
+            openai_compat, "rerun_signs_in_via_kiro_cli", new=AsyncMock(return_value=True)
+        ):
+            response = await api_completions(request)
         body = json.loads(response.text)
 
         assert response.status == 503
@@ -348,6 +355,29 @@ class TestApiCompletionsBlocking:
         assert data["model"] == "vanellope"
         assert data["choices"][0]["message"]["content"] == "hey there"
         assert data["choices"][0]["finish_reason"] == "stop"
+
+    async def test_turn_start_pushes_the_slot_list(self):
+        """The started turn is pushed while it holds the slot, so the
+        Sessions list shows it running instead of idle until it ends."""
+        slot = _make_slot()
+        state = _make_state(slot)
+        task_at_push: list[object] = []
+        state.push_slots_update = MagicMock(side_effect=lambda: task_at_push.append(slot.task))
+        request = _make_request(
+            {"model": "vanellope", "messages": [{"role": "user", "content": "hi"}]},
+            state,
+        )
+
+        async def fake_run_chat(s, sl, prompt, **_kwargs):
+            slot._pending.append({"role": "assistant", "content": "hey"})
+            slot._pending.append({"cls": "done"})
+            slot.event.set()
+
+        with patch("kiro_crew.dashboard.openai_compat._run_chat", side_effect=fake_run_chat):
+            resp = await api_completions(request)
+
+        assert resp.status == 200
+        assert task_at_push and task_at_push[0] is not None
 
     async def test_missing_messages_returns_400(self):
         slot = _make_slot()
@@ -749,7 +779,7 @@ class TestTurnErrorRow:
 
     @pytest.mark.parametrize("stream", [False, True])
     async def test_the_error_message_is_redacted(self, stream):
-        secret = "AKIA" + "IOSFODNN7EXAMPLE"
+        secret = github_classic(seed=52)
         row = {"role": "error", "content": f"❌ bad key {secret}", "meta": None}
         resp, text = await _complete([row], stream=stream)
 
@@ -1250,6 +1280,58 @@ class TestAgentMismatchFix:
         # No unsent turn recorded and no dispatch: refused ahead of the mutation.
         slot.append.assert_not_called()
         assert slot.task is None
+
+    async def test_a_read_only_cron_run_slot_is_refused_before_any_mutation(self):
+        """A cron run's transcript reopened read-only must 409, not hang the collector.
+
+        The turn chokepoint refuses it without a ``done`` row, so reaching it
+        would leave this HTTP caller waiting forever.
+        """
+        slot = _make_slot()
+        slot.agent = "vanellope"
+        slot.cron_run_read_only = True
+        state = _make_state(slot)
+
+        body = {
+            "id": "test-slot",
+            "model": "vanellope",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+        }
+        request = _make_request(body, state)
+
+        resp = await api_completions(request)
+
+        assert resp.status == 409
+        assert json.loads(resp.body)["code"] == "cron_run_read_only"
+        slot.append.assert_not_called()
+        assert slot.task is None
+
+    async def test_an_app_naming_a_read_only_cron_run_slot_gets_the_ownership_refusal(self):
+        """An app is refused a dashboard slot it cannot reach, read-only or not.
+
+        The read-only 409 is answered only after the ownership checks, so a
+        foreign app cannot learn that a private run transcript is reopened.
+        """
+        slot = _make_slot()
+        slot.agent = "vanellope"
+        slot._app = ""  # the dashboard user's own resume: unscoped
+        slot.cron_run_read_only = True
+        state = _make_state(slot)
+
+        body = {
+            "id": "test-slot",
+            "model": "vanellope",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+        }
+        request = _make_request(body, state, app="app-A")
+
+        resp = await api_completions(request)
+
+        assert resp.status == 403
+        assert json.loads(resp.body)["error"]["type"] == "forbidden"
+        slot.append.assert_not_called()
 
     async def test_null_model_returns_400(self):
         """model=null (None in JSON) returns 400."""

@@ -25,7 +25,8 @@ vi.mock('../../api/client', async (importOriginal) => {
 import { api, type BrowserStatusData } from '../../api/client'
 import { i18next } from '../../i18n/all'
 import { BrowserPanel } from './BrowserPanel'
-import { choiceFromHeadless, choiceFromPicker, pickerValueOf, primaryState } from './browserStatus'
+import { ISOLATIONS, choiceFromHeadless, choiceFromPicker, isolationValueOf, pickerValueOf, primaryState } from './browserStatus'
+import { viewOf } from './useBrowserSettings'
 
 function status(overrides: Partial<BrowserStatusData> = {}): BrowserStatusData {
   return {
@@ -96,6 +97,14 @@ describe('primaryState', () => {
       expect(primaryState(status({ connection: c }))).toBe(c)
     }
   })
+
+  it('reads an installed engine as not installed while Kiro’s Chromium is the browser and is not downloaded', () => {
+    const missing = { browser: { kind: 'kiro_chromium', headless: false }, chromium: { downloaded: false, version: null }, connection: 'disconnected' } as const
+    expect(primaryState(status(missing))).toBe('not_installed')
+    // The user's own Chrome needs no Chromium, and a gateway that omits the field changes nothing.
+    expect(primaryState(status({ ...missing, browser: { kind: 'user_chrome', headless: false } }))).toBe('disconnected')
+    expect(primaryState(status({ ...missing, chromium: null }))).toBe('disconnected')
+  })
 })
 
 describe('browser.choice across the picker and the no-window switch', () => {
@@ -116,6 +125,15 @@ describe('browser.choice across the picker and the no-window switch', () => {
   it('the switch writes headless on and Kiro’s Chromium (with a window) off', () => {
     expect(choiceFromHeadless(true)).toBe('headless')
     expect(choiceFromHeadless(false)).toBe('kiro_chromium')
+  })
+})
+
+describe('browser.isolation as the Browser isolation picker', () => {
+  it('reads every gateway value as itself and an unknown or absent one as shared, the gateway’s own resolution', () => {
+    for (const m of ISOLATIONS) expect(isolationValueOf(m)).toBe(m)
+    expect(isolationValueOf('nonsense')).toBe('shared')
+    expect(viewOf(config()).isolation).toBe('shared')
+    expect(viewOf(config({ browser: { isolation: 'per_session' } })).isolation).toBe('per_session')
   })
 })
 
@@ -187,6 +205,25 @@ describe('BrowserPanel - main card', () => {
     expect(within(notice).getByText('Ask the agent')).toBeTruthy()
     fireEvent.click(within(card).getByTestId('browser-primary-action'))
     await waitFor(() => expect(mocked.installBrowserHarness).toHaveBeenCalledWith({}))
+  })
+
+  it('a failed install, job or request, while Kiro’s Chromium is missing is the card’s, not the Engine row’s', async () => {
+    mocked.getBrowserStatus.mockResolvedValue(status({
+      browser: { kind: 'kiro_chromium', headless: false },
+      chromium: { downloaded: false, version: null },
+      connection: 'disconnected',
+      install_job: { status: 'failed', error_detail: 'downloading: 403 from storage.googleapis.com' },
+    }))
+    mocked.installBrowserHarness.mockRejectedValue(new Error('install request refused'))
+    renderWithProviders(<BrowserPanel />)
+    const card = await screen.findByTestId('browser-status-card')
+    expect(card.getAttribute('data-state')).toBe('install_failed')
+    expect(within(card).getByTestId('browser-status-error').textContent).toContain('403 from storage.googleapis.com')
+    fireEvent.click(within(card).getByTestId('browser-primary-action'))
+    await within(screen.getByTestId('browser-primary-card')).findByText('install request refused')
+    await openMore()
+    await screen.findByTestId('browser-engine-versions')
+    expect(screen.queryByTestId('browser-engine-install-error')).toBeNull()
   })
 
   it('an interrupted install on an uninstalled engine reads as failed, with its detail', async () => {
@@ -275,10 +312,12 @@ describe('BrowserPanel - main card', () => {
 })
 
 describe('BrowserPanel - controls and More', () => {
-  it('shows two controls up front and nothing of More until it opens', async () => {
+  it('shows three controls up front and nothing of More until it opens', async () => {
     renderWithProviders(<BrowserPanel />)
     await screen.findByTestId('browser-status-card')
     expect(document.querySelector('[data-setting-key="browser.choice"]')).not.toBeNull()
+    const isolation = document.querySelector('[data-setting-key="browser.isolation"]')
+    expect(isolation?.getAttribute('data-setting-label')).toBe('Browser isolation')
     expect(screen.getByRole('switch', { name: 'Show the live view in chat' })).toBeTruthy()
     const more = screen.getByRole('button', { name: 'More' })
     expect(more.getAttribute('aria-expanded')).toBe('false')

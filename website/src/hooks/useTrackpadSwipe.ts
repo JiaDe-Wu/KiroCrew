@@ -16,6 +16,11 @@
  *   block, a wide table, a sideways list) belongs to that scroller;
  * - horizontal-first in a direction `wants` declines is left to the browser
  *   (on macOS that is its back/forward swipe);
+ * - a run that `reveals` (brings a closed panel out) is read like a drag from
+ *   its first event, but starts only once the fingers' own travel (never its
+ *   tail) reaches {@link SWIPE_THRESHOLD_PX} its way, and moves from there: a
+ *   stray run shorter than that, such as a mouse's thumb wheel creeping a pixel
+ *   at a time, never moves a closed panel;
  * A new run right after a drag ended (even mid-settle) is a new drag: the
  * page continues it from wherever the panel is, as a phone's drag can grab a
  * settling panel. A momentum tail never starts one: it stays in its own run.
@@ -43,9 +48,17 @@
  * and, if it was a clear horizontal swipe past {@link SWIPE_THRESHOLD_PX},
  * `onSwipe(dir)` fires once when it ends.
  *
- * Directions name the FINGERS: `left` is a swipe toward the left, which a
- * trackpad reports as a positive `deltaX` (the content moves right to left,
- * the way a drag on a phone reveals a panel anchored on the right).
+ * Directions name the FINGERS: `left` is a swipe toward the left (the content
+ * moves right to left, the way a drag on a phone reveals a panel anchored on
+ * the right). `deltaX` is the scroll, not the fingers: with macOS Natural
+ * scrolling on (the default) fingers moving left report a positive `deltaX`,
+ * and with it off a negative one. Every sample is turned into finger travel
+ * where it enters the reader (lib/trackpadGesture `fingerSign`), so the reader,
+ * `onDragMove`'s sum and the pages only ever see the fingers. Whether content
+ * under the pointer can still scroll is asked with the raw `deltaX`. A wheel
+ * that does not carry WebKit's flag falls back to lib/scrollTouch
+ * `naturalScrolling`: the desktop shell, else the "Reverse trackpad swipe"
+ * switch, the only source in Chrome and Firefox.
  *
  * A frame inside the root swallows the wheel while the pointer is over it.
  * A frame built with `relayWheel` (lib/widgetSrcdoc) posts its unowned
@@ -55,13 +68,15 @@
  */
 import { useEffect, useRef, type RefObject } from 'react'
 import { WHEEL_LINE_PX } from './useWheelToHorizontal'
-import { hasScrollRoomX, SWIPE_GESTURE_IDLE_MS } from '../lib/trackpadGesture'
-import { subscribeScrollTouch } from '../lib/scrollTouch'
+import { fingerSign, hasScrollRoomX, SWIPE_GESTURE_IDLE_MS } from '../lib/trackpadGesture'
+import { naturalScrolling, REVERSE_TRACKPAD_SWIPE_KEY, subscribeScrollTouch } from '../lib/scrollTouch'
+import { SYNC_EVENT } from './usePersistedBool'
 import { isModalLayer } from './modalLayer'
 
 export type TrackpadSwipeDir = 'left' | 'right'
 
-/** Summed horizontal travel, in px, that commits a reduced-motion swipe. */
+/** Summed horizontal travel, in px, that commits a reduced-motion swipe, and
+ *  that a run must cover before it moves a closed panel. */
 export const SWIPE_THRESHOLD_PX = 80
 export { SWIPE_GESTURE_IDLE_MS }
 /** The live gap the reader and its quiet timer use. A page test that waits on
@@ -94,6 +109,9 @@ const MOMENTUM_RATIO_MIN = 0.5
 const MOMENTUM_RATIO_MAX = 0.98
 /** How far apart the ratios of one tail may lie. */
 const MOMENTUM_RATIO_SPREAD = 0.06
+/** The most moves a reveal keeps from before its start (a release reads only
+ *  the newest), so a long creep never grows it. */
+const LEAD_MAX = 32
 /** How much larger the summed |dx| must be than |dy| for a reduced-motion swipe. */
 const SWIPE_DOMINANCE = 2
 /** The message a relaying frame posts. */
@@ -138,6 +156,9 @@ export interface WheelVerdict {
   consume: boolean
   /** Set on the first event of a drag. */
   start?: TrackpadSwipeDir
+  /** With the `start` of a reveal: the fingers' sums before it, oldest first,
+   *  in `move`'s unit (so negative for a leftward reveal), with event times. */
+  lead?: { sum: number; at: number }[]
   /** The drag's summed `deltaX` after this event, px. */
   move?: number
   /** The drag ended on this event: its momentum tail was recognised. */
@@ -158,12 +179,14 @@ type RunOwner = 'drag' | 'held' | 'other'
 /**
  * The run reader on its own, with no DOM and no timer: feed it every wheel
  * sample in order and act on each verdict, and call `finish(at)` when the run
- * has gone quiet. `wants` is asked once per run, at its first event.
+ * has gone quiet. `wants` is asked once per run, at its first event, and
+ * `reveals` right after it for a run it accepts.
  */
 export function createTrackpadSwipeReader(
   wants: (dir: TrackpadSwipeDir, fromFrame: boolean) => boolean,
   /** True while the shell reports the fingers down. Unset: never known. */
   fingersDown: () => boolean = () => false,
+  reveals: (dir: TrackpadSwipeDir) => boolean = () => false,
 ) {
   let lastAt = -Infinity
   let owner: RunOwner | null = null
@@ -171,6 +194,12 @@ export function createTrackpadSwipeReader(
   let runNo = 0
   let sumX = 0
   let sumY = 0
+  /** A reveal still short of SWIPE_THRESHOLD_PX: read as a drag, reported as
+   *  nothing. `origin` is the sum where its drag started; moves count from it.
+   *  `lead`: its (sum, time) per applied event, handed over with the start. */
+  let waiting = false
+  let origin = 0
+  let lead: { sum: number; at: number }[] = []
   let dir: TrackpadSwipeDir = 'left'
   /** Step ratios of the shrinking streak that may be the tail, newest last. */
   let ratios: number[] = []
@@ -203,20 +232,39 @@ export function createTrackpadSwipeReader(
    *  back as a possible tail that was never recognised were the fingers: they
    *  are applied here (the momentum branch clears them before it finishes). */
   const finish = (_at?: number): boolean => {
-    const wasDrag = owner === 'drag'
+    const wasDrag = owner === 'drag' && !waiting
     if (wasDrag) {
       if (pendX !== 0 || pendY !== 0) {
         sumX += pendX
         sumY += pendY
         pendX = 0
         pendY = 0
-        flushed = sumX
+        flushed = sumX - origin
       }
     }
     owner = null
     return wasDrag
   }
   const takeFlush = () => { const f = flushed; flushed = undefined; return f }
+  /** The fingers moved the drag: report its sum, or start a waiting reveal once
+   *  their travel reaches SWIPE_THRESHOLD_PX. It starts AT that point, with this
+   *  event's move past it and the fingers' moves before it (for the release
+   *  speed, so a flick just past it is not read as standing still). */
+  const report = (out: WheelVerdict, at: number) => {
+    if (waiting) {
+      if ((dir === 'left' ? sumX : -sumX) < SWIPE_THRESHOLD_PX) {
+        lead.push({ sum: sumX, at })
+        if (lead.length > LEAD_MAX) lead.shift()
+        return
+      }
+      waiting = false
+      origin = dir === 'left' ? SWIPE_THRESHOLD_PX : -SWIPE_THRESHOLD_PX
+      out.start = dir
+      out.lead = lead.map((l) => ({ sum: l.sum - origin, at: l.at }))
+      lead = []
+    }
+    out.move = sumX - origin
+  }
   return {
     feed(s: WheelSample): WheelVerdict {
       const out: WheelVerdict = { consume: false }
@@ -259,8 +307,11 @@ export function createTrackpadSwipeReader(
         dir = dx > 0 ? 'left' : 'right'
         if (Math.abs(dx) <= Math.abs(dy) || s.owned || !wants(dir, !!s.fromFrame)) owner = 'other'
         else owner = 'drag'
+        waiting = owner === 'drag' && reveals(dir)
         sumX = 0
         sumY = 0
+        origin = 0
+        lead = []
         ratios = []
         lastAbs = 0
         lastDx = 0
@@ -268,7 +319,7 @@ export function createTrackpadSwipeReader(
         tinyRun = 0
         pendX = 0
         pendY = 0
-        if (owner === 'drag') out.start = dir
+        if (owner === 'drag' && !waiting) out.start = dir
       }
       if (owner === 'other') return out
       out.consume = true
@@ -295,7 +346,7 @@ export function createTrackpadSwipeReader(
         sumY += pendY + dy
         pendX = 0
         pendY = 0
-        out.move = sumX
+        report(out, s.at)
         return out
       }
       // The other shape of a tail: after a run that moved for real, a string of
@@ -318,9 +369,8 @@ export function createTrackpadSwipeReader(
           // Fingers off: decide here; what was held back is the tail.
           pendX = 0
           pendY = 0
-          finish(s.at)
+          out.end = finish(s.at)
           hold()
-          out.end = true
         }
         return out
       }
@@ -347,9 +397,8 @@ export function createTrackpadSwipeReader(
             // held back is the tail, so it is dropped, not applied.
             pendX = 0
             pendY = 0
-            finish(s.at)
+            out.end = finish(s.at)
             hold()
-            out.end = true
           }
           return out
         }
@@ -364,18 +413,19 @@ export function createTrackpadSwipeReader(
       sumY += pendY + dy
       pendX = 0
       pendY = 0
-      out.move = sumX
+      report(out, s.at)
       return out
     },
     finish,
     /** The fingers left (the shell's `end`). Ends a drag in progress the way a
      *  recognised tail does, but keeps what was held back (it was the fingers),
-     *  then holds the rest of the run. Returns whether a drag was in progress. */
+     *  then holds the rest of the run, as it does a reveal still short of its
+     *  distance. Returns whether a drag was in progress. */
     lift(): boolean {
       if (owner !== 'drag') return false
-      finish()
+      const was = finish()
       hold()
-      return true
+      return was
     },
     /** The page committed the drag mid-run (rule C): the rest of this run is
      *  held, as a recognised tail is, and ends the same ways. */
@@ -392,6 +442,8 @@ export function createTrackpadSwipeReader(
       owner = null
       return true
     },
+    /** A reveal still short of SWIPE_THRESHOLD_PX is open: a drag not yet started. */
+    waitingReveal: () => owner === 'drag' && waiting,
     /** The drag's run so far, for a reduced-motion read of the whole swipe. */
     summary: () => ({ dir, sumX, sumY }),
     /** The drag's new sum when the last `finish` applied held-back deltas. */
@@ -475,8 +527,15 @@ export interface TrackpadSwipeOptions {
   /** Whether a run this way may start now. `fromFrame` is true for a run a
    *  relaying frame reported. A declined run is left entirely to the browser. */
   wants: (dir: TrackpadSwipeDir, fromFrame: boolean) => boolean
-  /** A drag began. */
-  onDragStart: (dir: TrackpadSwipeDir) => void
+  /** Whether a run this way, which `wants` just accepted, would bring a closed
+   *  panel out (or another of its tabs forward): its drag then starts only
+   *  once it has travelled SWIPE_THRESHOLD_PX. Not asked under reduced motion.
+   *  Unset: never. */
+  reveals?: (dir: TrackpadSwipeDir) => boolean
+  /** A drag began. A reveal's start (at SWIPE_THRESHOLD_PX) hands over `lead`:
+   *  the fingers' sums before it, in `onDragMove`'s unit and clock, oldest
+   *  first, for the release speed. Unset for any other start. */
+  onDragStart: (dir: TrackpadSwipeDir, lead?: { sum: number; at: number }[]) => void
   /** The drag's summed `deltaX`, px (positive is the fingers moving left), at
    *  `at` on the event clock. Only the fingers' own deltas arrive here: a
    *  momentum tail never does. Return `true` when the page committed on this
@@ -507,6 +566,8 @@ export function useTrackpadSwipe(rootRef: RefObject<HTMLElement | null>, opts: T
     const reader = createTrackpadSwipeReader(
       (d, fromFrame) => optsRef.current.wants(d, fromFrame),
       () => fingers === true,
+      // Under reduced motion nothing moves, and the swipe's own threshold applies.
+      (d) => !prefersReducedMotion() && (optsRef.current.reveals?.(d) ?? false),
     )
     const docEl = document.documentElement
     let held = false
@@ -551,7 +612,7 @@ export function useTrackpadSwipe(rootRef: RefObject<HTMLElement | null>, opts: T
         // The fingers are still down: a pause, not a lift-off. Look again when
         // the hold cap runs out, unless an event or the `end` comes first.
         const paused = now - reader.lastEventAt()
-        if (fingers === true && live === 'drag' && paused < FINGER_HOLD_MAX_MS) {
+        if (fingers === true && (live === 'drag' || reader.waitingReveal()) && paused < FINGER_HOLD_MAX_MS) {
           quiet = window.setTimeout(onQuiet, Math.max(1, FINGER_HOLD_MAX_MS - paused))
           return
         }
@@ -588,7 +649,7 @@ export function useTrackpadSwipe(rootRef: RefObject<HTMLElement | null>, opts: T
       }
       if (v.start) {
         live = prefersReducedMotion() ? 'reduced' : 'drag'
-        if (live === 'drag') optsRef.current.onDragStart(v.start)
+        if (live === 'drag') optsRef.current.onDragStart(v.start, v.lead)
       }
       if (v.move !== undefined && live === 'drag' && optsRef.current.onDragMove(v.move, s.at) === true) {
         // The page committed on this move: the rest of the run is held, and a
@@ -618,7 +679,9 @@ export function useTrackpadSwipe(rootRef: RefObject<HTMLElement | null>, opts: T
       // slow frame arrive in a burst, and handling time would read that frame
       // as a gap in the fingers and end the drag under them.
       const when = e.timeStamp > 0 ? e.timeStamp : performance.now()
-      const sample = { dx: e.deltaX, dy: e.deltaY, mode: e.deltaMode, ctrl: e.ctrlKey, owned, at: when }
+      // The reader reads the fingers: undo Natural scrolling's sign here.
+      const sign = fingerSign((e as WheelEvent & { webkitDirectionInvertedFromDevice?: unknown }).webkitDirectionInvertedFromDevice, naturalScrolling())
+      const sample = { dx: sign * e.deltaX, dy: e.deltaY, mode: e.deltaMode, ctrl: e.ctrlKey, owned, at: when }
       if (run(sample)) e.preventDefault()
     }
     /** Tell a relaying frame whether this host is listening. A frame that is
@@ -627,9 +690,12 @@ export function useTrackpadSwipe(rootRef: RefObject<HTMLElement | null>, opts: T
     const arm = (frame: HTMLIFrameElement, on: boolean) => {
       try {
         // '*' because the frame is a sandboxed srcdoc document we built, with an
-        // opaque origin no target string can name; the payload is one boolean.
+        // opaque origin no target string can name; the payload is two booleans.
+        // `natural`: Natural scrolling as this page knows it (the shell, else
+        // the "Reverse trackpad swipe" switch), so the frame can tell which
+        // way the fingers moved when its own wheel does not say.
         // nosemgrep: javascript.browser.security.wildcard-postmessage-configuration.wildcard-postmessage-configuration
-        frame.contentWindow?.postMessage({ type: FRAME_WHEEL_ARMED, on }, '*')
+        frame.contentWindow?.postMessage({ type: FRAME_WHEEL_ARMED, on, natural: naturalScrolling() }, '*')
       } catch { /* gone */ }
     }
     /** Only frames whose document carries the relay (`data-wheel-relay`, set
@@ -638,7 +704,7 @@ export function useTrackpadSwipe(rootRef: RefObject<HTMLElement | null>, opts: T
     const frames = () => Array.from(root.querySelectorAll<HTMLIFrameElement>('iframe[data-wheel-relay]'))
     if (optsRef.current.acceptFrame) for (const f of frames()) arm(f, true)
     const onMessage = (event: MessageEvent) => {
-      const d = event.data as { type?: unknown; dx?: unknown; dy?: unknown; mode?: unknown; t?: unknown } | null
+      const d = event.data as { type?: unknown; dx?: unknown; dy?: unknown; mode?: unknown; t?: unknown; inv?: unknown } | null
       if (!d || (d.type !== FRAME_WHEEL_MESSAGE && d.type !== FRAME_WHEEL_HELLO)) return
       // A message with no source window names no frame, and must never match a
       // frame whose own window is not there yet.
@@ -657,7 +723,9 @@ export function useTrackpadSwipe(rootRef: RefObject<HTMLElement | null>, opts: T
       const mode = d.mode === 1 || d.mode === 2 ? d.mode : 0
       // The frame posts only wheels its own content does not own. The wheel's
       // own time, not the message's: it decides run gaps and the release speed.
-      run({ dx: d.dx, dy: d.dy, mode, ctrl: false, owned: false, at: relayedWheelTime(d.t, event.timeStamp), fromFrame: true })
+      // `inv` is the frame's own wheel's webkitDirectionInvertedFromDevice.
+      const sign = fingerSign(d.inv, naturalScrolling())
+      run({ dx: sign * d.dx, dy: d.dy, mode, ctrl: false, owned: false, at: relayedWheelTime(d.t, event.timeStamp), fromFrame: true })
     }
     let liftFrame: number | undefined
     let pendingLift: (() => void) | undefined
@@ -677,13 +745,13 @@ export function useTrackpadSwipe(rootRef: RefObject<HTMLElement | null>, opts: T
         return
       }
       fingers = false
-      if (!live) return
       // Wait one frame: wheels queued ahead of this message are the fingers'
       // last moves, and input is delivered before the next frame's callbacks.
+      // A reveal still short of its distance is lifted too: the rest is momentum.
       const lift = () => {
         liftFrame = undefined
         pendingLift = undefined
-        if (!live || !reader.lift()) return
+        if (!reader.lift() || !live) return
         const moved = reader.takeFlush()
         if (moved !== undefined && live === 'drag') optsRef.current.onDragMove(moved, reader.lastEventAt())
         endLive('lift', at)
@@ -694,11 +762,23 @@ export function useTrackpadSwipe(rootRef: RefObject<HTMLElement | null>, opts: T
     })
     root.addEventListener('wheel', onWheel, { passive: false })
     window.addEventListener('message', onMessage)
+    // A frame keeps the `natural` it was armed with: when the "Reverse trackpad
+    // swipe" switch changes, in this tab (usePersistedBool's broadcast) or in
+    // another (`storage`), re-arm every frame with the value it now reads.
+    const onSwitch = (e: Event) => {
+      const key = e.type === 'storage' ? (e as StorageEvent).key : (e as CustomEvent<{ key?: unknown }>).detail?.key
+      if (key !== REVERSE_TRACKPAD_SWIPE_KEY || !optsRef.current.acceptFrame) return
+      for (const f of frames()) arm(f, true)
+    }
+    window.addEventListener('storage', onSwitch)
+    window.addEventListener(SYNC_EVENT, onSwitch)
     return () => {
       stopTouch?.()
       if (liftFrame !== undefined) cancelAnimationFrame(liftFrame)
       root.removeEventListener('wheel', onWheel)
       window.removeEventListener('message', onMessage)
+      window.removeEventListener('storage', onSwitch)
+      window.removeEventListener(SYNC_EVENT, onSwitch)
       window.clearTimeout(quiet)
       if (quietFrame !== undefined) cancelAnimationFrame(quietFrame)
       // No longer listening: frames stop relaying and cancelling.

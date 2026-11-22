@@ -95,7 +95,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
@@ -122,6 +122,9 @@ logger = logging.getLogger(__name__)
 # the workspace/ tree, so deliberately none is registered.
 INSTALL_ID_FILE = "beacon_install_id"
 STAMP_FILE = "beacon_last_sent"
+#: The UTC day the daily ``kirocrew.app.present`` pass last recorded
+#: (``metrics/app_present.py``), so a restart the same day records no second row.
+APP_PRESENT_STAMP_FILE = "app_present_last_sent"
 
 # Schema version in the path, so a future payload change is a NEW route rather
 # than an ambiguous reinterpretation of historical rows.
@@ -136,6 +139,20 @@ HTTP_TIMEOUT_SECS = 5.0
 # in metrics/provider.py so operators only learn one spelling.
 DISABLE_ENV = "KIROCREW_TELEMETRY_DISABLED"
 _ENV_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+# The cross-tool opt-out convention (https://consoledonottrack.com). A truthy
+# value acts like BOTH of this product's own off switches: no heartbeat (here) and
+# no local metric recording (``metrics.provider.env_pin``). Off wins, so it
+# outranks an on value in either of the product's own variables.
+DO_NOT_TRACK_ENV = "DO_NOT_TRACK"
+
+# Version of the usage-data notice text. ``metrics/notice.py`` stamps the version
+# its one start-up line printed, so a bump prints that line once more. A stored
+# ``dashboard.privacy_ack_version`` at or above it (written by builds that showed
+# a dashboard notice) also counts as told. Bump it when the notice says something
+# new. Version 3 names the built-in Kiro telemetry destination
+# (metrics/kiro_export.py); version 4 names the apps it counts.
+PRIVACY_NOTICE_VERSION = 4
 
 # Env vars marking an automated environment. CI installs are not humans using
 # the product; counting them would inflate DAU with every pipeline run.
@@ -212,15 +229,30 @@ def _env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in _ENV_TRUTHY
 
 
+def do_not_track() -> bool:
+    """Return whether a truthy ``DO_NOT_TRACK`` turns all telemetry off."""
+    return _env_truthy(DO_NOT_TRACK_ENV)
+
+
 def is_env_opted_out() -> bool:
-    """Return whether ``KIROCREW_TELEMETRY_DISABLED`` pins the beacon off.
+    """Return whether an env var (``KIROCREW_TELEMETRY_DISABLED`` or ``DO_NOT_TRACK``) pins the beacon off.
 
     Public because the dashboard's privacy panel must distinguish "off because
     the stored flag is false" (a toggle can flip it) from "off because the
     environment says so" (a config write would be accepted and then have no
     effect — so the UI disables the control and says why instead).
     """
-    return _env_truthy(DISABLE_ENV)
+    return do_not_track() or _env_truthy(DISABLE_ENV)
+
+
+def opt_out_env_var() -> str:
+    """Name the env var that pins the beacon off, for the panel's note.
+
+    ``DO_NOT_TRACK`` first: it is checked first in :func:`telemetry_permitted`,
+    and telling a user to unset ``KIROCREW_TELEMETRY_DISABLED`` while
+    ``DO_NOT_TRACK`` still holds the switch off would be a dead end.
+    """
+    return DO_NOT_TRACK_ENV if do_not_track() else DISABLE_ENV
 
 
 def is_ci() -> bool:
@@ -478,19 +510,47 @@ def is_first_send() -> bool:
 
 def _mark_sent() -> None:
     """Record today's date so later starts today skip the send."""
+    _write_stamp(_stamp_path, _today())
+
+
+def _write_stamp(stamp_path: Callable[[], Path], day: str) -> None:
+    """Write the UTC date *day* to the stamp *stamp_path* resolves; never raises."""
     try:
-        path = _stamp_path()
+        path = stamp_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         # atomic_write, never path.write_text: write_text FOLLOWS a symlink, so a
         # symlink planted at beacon_last_sent would have its TARGET truncated and
         # overwritten with today's date. atomic_write renames a temp file over the
         # path, replacing the symlink itself and leaving the target untouched.
-        atomic_write(path, _today())
-    except OSError as exc:
+        atomic_write(path, day)
+    except (OSError, RuntimeError) as exc:
         # Worst case the beacon is re-sent later today. Query-time
         # COUNT(DISTINCT) makes that harmless for correctness (this throttle is
         # politeness, not a correctness requirement), so never raise.
         logger.debug("beacon stamp write failed: %s", exc)
+
+
+def _app_present_stamp_path() -> Path:
+    return config_dir() / APP_PRESENT_STAMP_FILE
+
+
+def app_present_due_day() -> str:
+    """Today's UTC date when the ``kirocrew.app.present`` pass has not recorded it, else "".
+
+    The caller stamps this same value with :func:`mark_app_present_recorded`, so a
+    pass that crosses UTC midnight never marks the new day as recorded.
+    """
+    today = _today()
+    try:
+        done = _read_state(_app_present_stamp_path()) == today
+    except (OSError, RuntimeError):
+        done = False
+    return "" if done else today
+
+
+def mark_app_present_recorded(day: str) -> None:
+    """Record that the ``kirocrew.app.present`` pass recorded UTC date *day*; never raises."""
+    _write_stamp(_app_present_stamp_path, day)
 
 
 def _fields(app_version: str) -> dict[str, str]:
@@ -643,21 +703,19 @@ class Verdict(NamedTuple):
 # outside this tuple (``install_receipt.should_send`` returns ``"unofficial"``).
 REASONS = (
     "ready",
+    "do_not_track",
     "env_opt_out",
     "governance",
     "disabled",
     "ci",
     "non_default_home",
-    "awaiting_privacy_ack",
     "already_sent_today",
     "no_endpoint",
     "unreadable_home",
 )
 
 
-def telemetry_permitted(
-    *, enabled: bool, acked: bool, audit_tool: str = ""
-) -> Verdict:
+def telemetry_permitted(*, enabled: bool, audit_tool: str = "") -> Verdict:
     """Return the send verdict for ANY outbound telemetry from this install.
 
     The consent gate, factored out of :func:`should_send` so a SECOND outbound
@@ -675,28 +733,35 @@ def telemetry_permitted(
     say — an admin debugging a managed host needs to see "policy", not
     "beacon_enabled is false".
 
-    ``acked`` is ``dashboard.privacy_acked``: whether the user has actually been
-    SHOWN the disclosure and its opt-out (the mandatory first-run Privacy
-    chapter, or an explicit ``kirocrew telemetry enable|disable``). It gates the
-    FIRST egress only (see :func:`is_first_send`). Sending before the offer is
-    made would reduce the opt-out to a formality: by the time the user could
-    decline, the ping they were declining had already gone. It is checked LAST
-    among the suppressions so a more specific and more actionable reason (a CI
-    host, a pod's data home) still wins the reported ``code``; ordering cannot
-    weaken the gate, because every check must pass to permit a send.
+    On by default: no acknowledgement is waited for. The payload identifies no
+    person (see :func:`payload`), and every off switch above still stops it.
 
     Pass ``audit_tool`` from an ENFORCEMENT call site so the governance decision
     lands a ``governance_decision`` SEL record naming which control refused;
     leave it empty for a read-only diagnostic probe (see
     :func:`is_governance_pinned_off`).
 
+    An LTS build refuses every route here (the heartbeat, the install
+    receipt, the feedback survey) with the ``governance`` code.
+
     Deliberately does NOT include the beacon's once-per-day throttle. That
     throttle is specific to a heartbeat: an install receipt is a per-EVENT
     signal, so a shared day stamp would silently drop the second app a user
     installs on any given day.
     """
+    if do_not_track():
+        return Verdict(False, f"opted out via {DO_NOT_TRACK_ENV}", "do_not_track")
     if _env_truthy(DISABLE_ENV):
         return Verdict(False, f"opted out via {DISABLE_ENV}", "env_opt_out")
+    from kiro_crew.edition_locks import LOCKED_REASON, audit_refusal, locked_off
+
+    if locked_off():
+        # The admin decides where usage data goes (``capabilities.telemetry.
+        # otlp_endpoint``), and these endpoints are not ones the admin chose. Also
+        reason = f"anonymous telemetry is {LOCKED_REASON}"
+        if audit_tool:
+            audit_refusal(audit_tool, "capabilities.telemetry", "", reason)
+        return Verdict(False, reason, "governance")
     if is_governance_pinned_off(audit_tool=audit_tool):
         return Verdict(
             False, "disabled by governance policy (capabilities.telemetry)", "governance"
@@ -711,19 +776,10 @@ def telemetry_permitted(
             "non-default KIROCREW_HOME (dev home / pod / preview)",
             "non_default_home",
         )
-    # First-egress only: once this install has sent once, the disclosure is
-    # behind the user and re-gating on the flag would silence an established
-    # install whose config predates the field.
-    if not acked and is_first_send():
-        return Verdict(
-            False,
-            "the first-run privacy disclosure has not been shown yet",
-            "awaiting_privacy_ack",
-        )
     return Verdict(True, "ready", "ready")
 
 
-def should_send(*, enabled: bool, acked: bool, audit: bool = True) -> Verdict:
+def should_send(*, enabled: bool, audit: bool = True) -> Verdict:
     """Return the heartbeat's send verdict; the reason explains a skip.
 
     The shared consent ladder plus the heartbeat's OWN once-per-day throttle,
@@ -735,15 +791,11 @@ def should_send(*, enabled: bool, acked: bool, audit: bool = True) -> Verdict:
     read-only diagnostic call (from :func:`status`, which the Privacy panel
     refetches; auditing an inspection would flood the SEL trail).
     """
-    verdict = telemetry_permitted(
-        enabled=enabled, acked=acked, audit_tool="beacon_send" if audit else ""
-    )
+    verdict = telemetry_permitted(enabled=enabled, audit_tool="beacon_send" if audit else "")
     if not verdict.ok:
         return verdict
     if already_sent_today():
-        return Verdict(
-            False, f"already sent today ({_today()})", "already_sent_today"
-        )
+        return Verdict(False, f"already sent today ({_today()})", "already_sent_today")
     return Verdict(True, "ready", "ready")
 
 
@@ -765,16 +817,12 @@ def beacon_url(endpoint: str, fields: dict[str, str]) -> str:
     return f"{base}/b/{BEACON_SCHEMA}/{ident}?{query}"
 
 
-def send(endpoint: str, app_version: str, *, enabled: bool, acked: bool) -> bool:
+def send(endpoint: str, app_version: str, *, enabled: bool) -> bool:
     """Send at most one heartbeat for today. Returns whether one was sent.
 
     Fully best-effort and SILENT on failure: an offline user, a firewall, a DNS
     failure, or a 5xx must never surface as an error or a delay the user
     notices. Telemetry that can break the product is worse than no telemetry.
-
-    ``acked`` is required rather than defaulted: this is the enforcement path for
-    the first-egress privacy gate, and a default would let a future call site
-    silently opt out of it (see :func:`telemetry_permitted`).
     """
     if not endpoint:
         return False
@@ -786,7 +834,7 @@ def send(endpoint: str, app_version: str, *, enabled: bool, acked: bool) -> bool
         # those propagate into the caller — for the gateway that means
         # threading.excepthook printing a traceback on every boot, and the
         # module's documented in-memory fallback never engaging.
-        if not should_send(enabled=enabled, acked=acked).ok:
+        if not should_send(enabled=enabled).ok:
             return False
         url = beacon_url(endpoint, payload(app_version))
     except (ValueError, OSError, RuntimeError) as exc:
@@ -819,9 +867,7 @@ def send(endpoint: str, app_version: str, *, enabled: bool, acked: bool) -> bool
         return False
 
 
-def status(
-    endpoint: str, *, enabled: bool, app_version: str, acked: bool
-) -> dict[str, object]:
+def status(endpoint: str, *, enabled: bool, app_version: str) -> dict[str, object]:
     """Return the exact state for ``kirocrew telemetry status``.
 
     Uses ``create=False`` so inspecting status never materializes an id.
@@ -836,7 +882,7 @@ def status(
     call in ``send`` is the one that carries the audit.
     """
     try:
-        ok, reason, code = should_send(enabled=enabled, acked=acked, audit=False)
+        ok, reason, code = should_send(enabled=enabled, audit=False)
     except (OSError, RuntimeError) as exc:
         ok, reason, code = (
             False,

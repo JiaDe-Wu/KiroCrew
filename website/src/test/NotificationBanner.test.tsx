@@ -8,13 +8,13 @@
  * `exitTarget` / `computeExitDelta` helpers instead, which is where the
  * reduced-motion "no travel" rule actually lives.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi, onTestFinished } from 'vitest'
 import { act, fireEvent, screen, waitFor } from '@testing-library/react'
-import { createRef, type ReactNode } from 'react'
+import { createRef, useEffect, useState, type ReactNode } from 'react'
 import { renderWithProviders, createTestStore } from './helpers'
 import NotificationBanner, { computeExitDelta, exitTarget } from '../components/notifications/NotificationBanner'
 import { SWIPE_CLICK_SWALLOW_MS } from '../components/notifications/SwipeToDismiss'
-import { dispatchLiveNotification } from '../hooks/notificationEvent'
+import { MC_LIVE_NOTIFICATION_EVENT, dispatchLiveNotification } from '../hooks/notificationEvent'
 import { BANNER_AUTO_HIDE_MS, BANNER_ENABLED_KEY, MEMBER_MESSAGE_CHANNEL, STOPPED_CHAT_CHANNEL, saveBannerEnabled, shouldBannerNote, targetsCurrentView } from '../hooks/notificationBanner'
 import { _resetViewedThreadForTests, setViewedThreadSlot } from '../lib/viewedThread'
 import { addNotification, dismissNotificationByTs } from '../store/notificationsSlice'
@@ -168,6 +168,15 @@ describe('NotificationBanner: arrival', () => {
     input.remove()
   })
 
+  it('only a critical card hides a relay Crew pane; a passing note leaves the Crew on screen', () => {
+    renderBanner()
+    arrive(mkN())
+    expect(cards()[0].hasAttribute('data-relay-pane-overlay')).toBe(false)
+    arrive(mkN({ priority: 'critical', kind: 'approval' }))
+    const critical = cards().find(c => c.getAttribute('data-priority') === 'critical')
+    expect(critical?.hasAttribute('data-relay-pane-overlay')).toBe(true)
+  })
+
   it('switches to an alert region while a critical card is pending', () => {
     renderBanner()
     arrive(mkN({ priority: 'critical', kind: 'approval' }))
@@ -278,6 +287,16 @@ describe('shouldBannerNote / targetsCurrentView (pure)', () => {
     expect(targetsCurrentView(mkN({ url: '/schedule?job=1' }), { pathname: '/schedule', activeSlot: null, windowFocused: true })).toBe(true)
     expect(targetsCurrentView(mkN({ url: '/schedule' }), { pathname: '/schedule', activeSlot: null, windowFocused: false })).toBe(false)
     expect(targetsCurrentView(mkN({ url: '/schedule' }), { pathname: '/settings', activeSlot: null, windowFocused: true })).toBe(false)
+  })
+  it('a relay Crew tab over the Notifications page lets a note banner', () => {
+    const onFeed = { enabled: true, popoverOpen: false, pathname: '/notifications', activeSlot: null, windowFocused: true }
+    expect(shouldBannerNote(mkN(), onFeed)).toBe(false)
+    expect(shouldBannerNote(mkN(), { ...onFeed, relayCovered: true })).toBe(true)
+  })
+  it('a relay Crew tab in front means no local view is on screen, so the note banners', () => {
+    expect(targetsCurrentView(mkN({ url: '/schedule' }), { pathname: '/schedule', activeSlot: null, windowFocused: true, relayCovered: true })).toBe(false)
+    expect(targetsCurrentView(mkN({ slot: 's1' }), { pathname: '/chat', activeSlot: 's1', windowFocused: true, relayCovered: true })).toBe(false)
+    expect(targetsCurrentView(mkN({ slot: 's1' }), { pathname: '/chat', activeSlot: 's1', windowFocused: true, relayCovered: false })).toBe(true)
   })
   it("treats a mate's message as on screen only while its own thread is", () => {
     const ada = mkN({ channel: MEMBER_MESSAGE_CHANNEL, kind: 'agent', slot: 'member-ada', url: '/members?member=Ada', member: { slug: 'ada', name: 'Ada' } })
@@ -621,6 +640,48 @@ describe('NotificationBanner: stack and interaction', () => {
     fireEvent.keyDown(document, { key: 'Escape' })
     expect(cards()).toHaveLength(1)
     expect(cards()[0].textContent).toContain('First')
+  })
+
+  it('an Escape pressed the moment a card appears still dismisses it', async () => {
+    // A live note lands from a window event, a default-priority update. When
+    // that render runs past the scheduler's 5 ms slice React yields before it
+    // runs passive effects, so a listener attached there would miss a press in
+    // that gap. A sibling that renders slowly on the same arrival forces it.
+    function SlowOnArrival() {
+      const [arrived, setArrived] = useState(false)
+      useEffect(() => {
+        const onLive = () => setArrived(true)
+        window.addEventListener(MC_LIVE_NOTIFICATION_EVENT, onLive)
+        return () => window.removeEventListener(MC_LIVE_NOTIFICATION_EVENT, onLive)
+      }, [])
+      if (arrived) {
+        const end = performance.now() + 20
+        while (performance.now() < end) { /* outlast the scheduler slice */ }
+      }
+      return null
+    }
+    renderBanner({ after: <SlowOnArrival /> })
+
+    const g = globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }
+    const prior = g.IS_REACT_ACT_ENVIRONMENT
+    let pressedEscape!: () => void
+    const pressed = new Promise<void>(resolve => { pressedEscape = resolve })
+    const watch = new MutationObserver(() => {
+      if (!document.querySelector('[data-testid="notification-banner-card"]')) return
+      watch.disconnect()
+      fireEvent.keyDown(document, { key: 'Escape' })
+      pressedEscape()
+    })
+    // Undone even when the test times out, so a failure cannot leak into the next test.
+    const restore = () => { watch.disconnect(); g.IS_REACT_ACT_ENVIRONMENT = prior }
+    onTestFinished(restore)
+    // Let React schedule the arrival as it does in the app, not flush it in act().
+    g.IS_REACT_ACT_ENVIRONMENT = false
+    watch.observe(document.body, { childList: true, subtree: true })
+    dispatchLiveNotification(mkN({ title: 'First' }))
+    await pressed
+    restore()
+    await waitFor(() => expect(cards()).toHaveLength(0))
   })
 
   it('leaves the cards alone when a focused surface already handled the Escape', () => {

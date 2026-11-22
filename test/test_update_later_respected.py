@@ -62,6 +62,10 @@ def gateway_logs(caplog):
         (_snoozed("9.9.9", _NOW - _DAY + 1), True),
         (_snoozed("9.9.9", _NOW - _DAY - 1), False),
         (_snoozed("9.9.8", _NOW + _DAY), False),
+        # A skip survives a later snooze of another version.
+        ({**_snoozed("9.9.10", _NOW + _DAY), "skipped_versions": ["9.9.9"]}, True),
+        ({**_snoozed("9.9.10", _NOW + _DAY), "skipped_versions": ["9.9.8"]}, False),
+        ({**_snoozed("9.9.10", _NOW + _DAY), "skipped_versions": "9.9.9"}, False),
         ({}, False),
         (None, False),
         ({"version": "9.9.9", "snoozed_until": "soon"}, False),
@@ -74,10 +78,75 @@ def test_the_record_defers_only_its_own_version_while_it_lasts(record, deferred)
     assert user_deferred_update(_cfg(record), "9.9.9", now=_NOW) is deferred
 
 
+def test_a_verdict_keeps_the_saved_skips_in_order_and_adds_its_own_last() -> None:
+    from kiro_crew.update_deferral import (
+        MAX_SKIPPED_VERSIONS,
+        SkipListFull,
+        merge_update_nudge_record,
+    )
+
+    saved = {"version": "99.1", "skipped": True, "skipped_versions": ["99.0"]}
+    snooze = {"version": "99.2", "snoozed_until": 5, "skipped": False}
+    assert merge_update_nudge_record(saved, snooze)["skipped_versions"] == ["99.0", "99.1"]
+    skip = {"version": "99.0", "snoozed_until": 0, "skipped": True}
+    assert merge_update_nudge_record(saved, skip)["skipped_versions"] == ["99.1", "99.0"]
+    # A skip past the cap is refused; none that still holds is evicted.
+    many = {"skipped_versions": [f"99.0.{i}" for i in range(MAX_SKIPPED_VERSIONS)]}
+    new = {"version": "99.1.0", "snoozed_until": 0, "skipped": True}
+    with pytest.raises(SkipListFull):
+        merge_update_nudge_record(many, new)
+    assert merge_update_nudge_record(many, snooze)["skipped_versions"] == many["skipped_versions"]
+
+
+def test_a_skip_of_the_running_version_is_kept() -> None:
+    # A git checkout can offer an update without a version bump, so a skip is
+    # never dropped by comparing it with this build.
+    from kiro_crew import __version__
+    from kiro_crew.update_deferral import merge_update_nudge_record
+
+    saved = {"skipped_versions": ["0.0.1", __version__]}
+    snooze = {"version": __version__, "snoozed_until": 5, "skipped": False}
+    assert merge_update_nudge_record(saved, snooze)["skipped_versions"] == ["0.0.1", __version__]
+
+
+def test_a_record_that_sends_the_list_is_stored_as_sent() -> None:
+    from kiro_crew.update_deferral import merge_update_nudge_record, with_skip_list
+
+    saved = {"version": "1.0", "snoozed_until": 0, "skipped": True}
+    whole = {"version": "1.0", "snoozed_until": 0, "skipped": False, "skipped_versions": []}
+    assert merge_update_nudge_record(saved, whole) == whole
+    assert with_skip_list(saved) == {**saved, "skipped_versions": ["1.0"]}
+    assert with_skip_list(whole) is whole
+
+
 def test_an_unknown_version_is_never_deferred() -> None:
     from kiro_crew.update_deferral import user_deferred_update
 
     assert user_deferred_update(_cfg(_snoozed("", _NOW + _DAY)), "", now=_NOW) is False
+
+
+@pytest.mark.parametrize(
+    ("browser_skew", "now", "deferred"),
+    [
+        # Two days behind: the snooze is already over by this host's clock, yet the
+        # stamp still holds for the snooze plus one prompt window.
+        (-2 * _DAY, _NOW, True),
+        (-2 * _DAY, _NOW + 2 * _DAY - 1, True),
+        (-2 * _DAY, _NOW + 2 * _DAY, False),
+        # Ahead: the later browser reading still holds, so a browser with a right clock,
+        # which stays quiet until then, is not installed over before it asks again.
+        (5 * _DAY, _NOW + 6 * _DAY, True),
+    ],
+)
+def test_the_hold_counts_from_when_the_gateway_stored_the_snooze(
+    browser_skew, now, deferred
+) -> None:
+    from kiro_crew.update_deferral import user_deferred_update
+
+    # What "Remind me tomorrow" writes from a browser clock off by browser_skew,
+    # stamped by the gateway's PATCH at _NOW.
+    record = {**_snoozed("9.9.9", _NOW + browser_skew + _DAY), "stored_at": _NOW}
+    assert user_deferred_update(_cfg(record), "9.9.9", now=now) is deferred
 
 
 # ── the coordinator ─────────────────────────────────────────────────────────
@@ -215,21 +284,21 @@ def _run_provider(cfg: SimpleNamespace):
     return orch, apply
 
 
-def test_a_snoozed_provider_update_is_not_applied_or_restarted(gateway_logs) -> None:
+def test_a_snoozed_provider_update_is_only_announced(gateway_logs) -> None:
     orch, apply = _run_provider(_cfg(_snoozed("2.0.0", _FAR_FUTURE)))
     apply.assert_not_awaited()
     orch._restart_after_update.assert_not_awaited()
     orch._prepare_auto_update_apply.assert_not_awaited()
-    assert f"Update 2.0.0 {_NOT_INSTALLED}" in gateway_logs()
 
 
-def test_a_provider_update_nobody_put_off_still_applies(gateway_logs) -> None:
+def test_a_provider_update_nobody_put_off_is_announced_too(gateway_logs) -> None:
+    """The policy command rewrites the running install, so no unattended path runs it."""
     orch, apply = _run_provider(_cfg(_snoozed("1.9.0", _FAR_FUTURE)))
-    apply.assert_awaited_once()
-    orch._restart_after_update.assert_awaited_once()
+    apply.assert_not_awaited()
+    orch._restart_after_update.assert_not_awaited()
+    orch._prepare_auto_update_apply.assert_not_awaited()
     logs = gateway_logs()
-    assert "Auto-update enabled — applying update via provider" in logs
-    assert not [m for m in logs if _NOT_INSTALLED in m]
+    assert not [m for m in logs if "applying update via provider" in m]
 
 
 # ── the git route ───────────────────────────────────────────────────────────
@@ -242,36 +311,12 @@ def test_a_snoozed_git_update_is_not_pulled_unattended(gateway_logs) -> None:
     assert f"Update 9.9.9 {_NOT_INSTALLED}" in gateway_logs()
 
 
-def test_a_git_update_nobody_put_off_still_pulls_and_queues_an_unheld_restart() -> None:
+def test_a_git_update_nobody_put_off_is_announced_not_pulled() -> None:
+    """A reset rewrites the tree the gateway serves from, so a person applies it."""
     orch = _run_legacy(_cfg(_snoozed("9.9.8", _FAR_FUTURE)), info=_GIT_UPDATE, route="git")
-    orch._auto_apply_update.assert_awaited_once_with()
-    # The git apply reloads `kiro_crew`; its queued restart must never be held.
-    assert orch._pending_update_version == ""
-
-
-def test_a_provider_update_queues_an_unheld_restart() -> None:
-    orch, _apply = _run_provider(_cfg(_snoozed("1.9.0", _FAR_FUTURE)))
-    assert orch._pending_update_version == ""
-
-
-def test_a_reloaded_git_restart_still_restarts_after_skip_and_a_raised_floor() -> None:
-    """After a git apply the floor check reads the reloaded `__version__`, so it
-    cannot see the old code is below a raised floor; the queued restart is the
-    only way onto the new code, and a skip of that version must not hold it."""
-    orch = _run_legacy(_cfg({}), info=_GIT_UPDATE, route="git")
-    orch._pending_update_respawn = lambda: "/venv/bin/python"
-    orch._pending_update_mandatory = False
-    orch._restart_after_update = AsyncMock()
-    orch._check_for_updates = AsyncMock()
-    with (
-        patch("kiro_crew.config.KiroCrewConfig.load", return_value=_cfg(_SKIPPED_999)),
-        # The raised floor reads as met against the reloaded version.
-        patch("kiro_crew.platform.update_governance.update_required", return_value=False),
-        _stop_after_one_cycle(),
-        pytest.raises(_OneCycle),
-    ):
-        asyncio.run(orch._run_update_checks())
-    orch._restart_after_update.assert_awaited_once()
+    orch._auto_apply_update.assert_not_awaited()
+    orch._restart_after_update.assert_not_awaited()
+    orch.dashboard_state.push_refresh.assert_called_with("update_available")
 
 
 # ── a restart already queued ────────────────────────────────────────────────
@@ -304,37 +349,6 @@ def _run_one_pending_cycle(cfg: SimpleNamespace, *, mandatory: bool = False):
     ):
         asyncio.run(orch._run_update_checks())
     return orch
-
-
-def test_a_queued_restart_waits_while_the_user_put_it_off() -> None:
-    orch = _run_one_pending_cycle(_cfg(_snoozed("9.9.9", _FAR_FUTURE)))
-    orch._restart_after_update.assert_not_awaited()
-    orch._prepare_auto_update_apply.assert_not_awaited()
-    assert orch._pending_update_respawn is not None
-    orch.dashboard_state.push_refresh.assert_called_with("update_available")
-
-
-@pytest.mark.parametrize(
-    "record",
-    [_snoozed("9.9.8", _FAR_FUTURE), _snoozed("9.9.9", _LONG_AGO), {}],
-    ids=["other-version", "reprompt-over", "no-record"],
-)
-def test_a_queued_restart_nobody_put_off_still_restarts(record) -> None:
-    orch = _run_one_pending_cycle(_cfg(record))
-    orch._restart_after_update.assert_awaited_once()
-
-
-def test_a_held_restart_still_runs_the_update_check(gateway_logs) -> None:
-    orch = _run_one_pending_cycle(_cfg({"version": "9.9.9", "snoozed_until": 0, "skipped": True}))
-    orch._restart_after_update.assert_not_awaited()
-    orch._check_for_updates.assert_awaited_once()
-    assert f"Update 9.9.9 {_NOT_RESTARTED}" in gateway_logs()
-
-
-def test_a_restart_nobody_held_does_not_also_run_the_check() -> None:
-    orch = _run_one_pending_cycle(_cfg({}))
-    orch._restart_after_update.assert_awaited_once()
-    orch._check_for_updates.assert_not_awaited()
 
 
 def _run_held_cycle_through_the_real_check(
@@ -376,72 +390,155 @@ def _run_held_cycle_through_the_real_check(
 _SKIPPED_999 = {"version": "9.9.9", "snoozed_until": 0, "skipped": True}
 
 
-def test_a_floor_raised_while_a_skipped_restart_is_held_is_still_applied(gateway_logs) -> None:
-    orch = _run_held_cycle_through_the_real_check(
-        _cfg(_SKIPPED_999), _MANAGED_UPDATE, AutoUpdateEffect("mandatory", "wheel"), floor=True
+# ── an answer given while the unattended build runs ─────────────────────────
+#
+# The prompt opens when the check finds the update, which is the same cycle that
+# starts the unattended build, so "Remind me tomorrow" usually lands mid-build.
+
+
+@pytest.fixture
+def _no_applies_in_flight(monkeypatch):
+    from kiro_crew.platform import wheel_apply
+
+    monkeypatch.setattr(wheel_apply, "_IN_FLIGHT", set())
+
+
+async def _run_wheel_apply(apply, monkeypatch, *, refuse_if_unattended_off: bool = True):
+    from kiro_crew.platform import wheel_apply, wheel_engine
+
+    monkeypatch.setattr(wheel_engine, "apply_wheel_update", apply)
+    return await wheel_apply.run_wheel_apply(
+        channel="stable",
+        version="9.9.9",
+        feed_base="https://feed.example",
+        artifact_base="https://bytes.example",
+        refuse_if_unattended_off=refuse_if_unattended_off,
     )
-    orch._restart_after_update.assert_not_awaited()
-    orch._auto_apply_wheel_update.assert_awaited_once()
-    assert orch._auto_apply_wheel_update.await_args.kwargs["mandatory"] is True
-    logs = gateway_logs()
-    assert f"Update 9.9.9 {_NOT_RESTARTED}" in logs
-    assert [m for m in logs if "applying mandatory update beside the managed venv" in m]
 
 
-def test_a_newer_release_is_still_found_while_a_skipped_restart_is_held(gateway_logs) -> None:
-    newer = {**_MANAGED_UPDATE, "latest_version": "9.9.10"}
-    orch = _run_held_cycle_through_the_real_check(
-        _cfg(_SKIPPED_999), newer, AutoUpdateEffect("install", "wheel"), floor=False
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_no_applies_in_flight")
+@pytest.mark.parametrize(
+    ("refuse", "answer", "status"),
+    [
+        pytest.param(True, _snoozed("9.9.9", _FAR_FUTURE), "deferred", id="snoozed"),
+        pytest.param(True, _SKIPPED_999, "deferred", id="skipped"),
+        pytest.param(True, _snoozed("9.9.8", _FAR_FUTURE), "promoted", id="other-version"),
+        pytest.param(False, _snoozed("9.9.9", _FAR_FUTURE), "promoted", id="person-approved"),
+    ],
+)
+async def test_an_answer_saved_during_the_build_is_read_at_the_swap(
+    monkeypatch, tmp_path, refuse, answer, status
+) -> None:
+    import kiro_crew.memory_backup as backup
+    from kiro_crew.platform import wheel_apply
+
+    saved = {"cfg": _cfg({})}
+    promoted: list[int] = []
+
+    def apply(**kwargs: object):
+        saved["cfg"] = _cfg(answer)  # the click, while the tree builds
+        kwargs["before_promote"]()  # type: ignore[operator]
+        promoted.append(1)
+        return tmp_path / "crew-venv-9.9.9"
+
+    monkeypatch.setattr(wheel_apply, "snapshot_memory_before_update", lambda: (1, ""))
+    monkeypatch.setattr(backup, "newest_backup", lambda *a: None)
+    monkeypatch.setattr(
+        "kiro_crew.platform.update_governance.unattended_apply_allowed", lambda: True
     )
-    orch._restart_after_update.assert_not_awaited()
-    orch._auto_apply_wheel_update.assert_awaited_once_with("stable", "9.9.10")
-    logs = gateway_logs()
-    assert f"Update 9.9.9 {_NOT_RESTARTED}" in logs
-    assert _BUILDING in logs
+    monkeypatch.setattr("kiro_crew.config.KiroCrewConfig.load", lambda *a, **k: saved["cfg"])
+    outcome = await _run_wheel_apply(apply, monkeypatch, refuse_if_unattended_off=refuse)
+    assert outcome.status == status
+    assert len(promoted) == (status == "promoted")
 
 
-def test_a_policy_floor_restart_does_not_wait_for_a_snooze() -> None:
-    orch = _run_one_pending_cycle(_cfg(_snoozed("9.9.9", _FAR_FUTURE)), mandatory=True)
-    orch._restart_after_update.assert_awaited_once()
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_no_applies_in_flight")
+async def test_saving_the_answer_stops_the_unattended_build_at_once(monkeypatch) -> None:
+    import threading
+
+    from kiro_crew.platform import wheel_apply, wheel_engine
+    from kiro_crew.platform import wheel_engine_contract as wheel_contract
+    from kiro_crew.testing.wait import async_wait_until, await_until
+
+    started = threading.Event()
+    reasons: list[str] = []
+
+    def apply(**kwargs: object):
+        cancel: wheel_engine.ApplyCancel = kwargs["cancel"]  # type: ignore[assignment]
+        fired = threading.Event()
+        cancel.on_set(fired.set)
+        started.set()
+        assert fired.wait(30), "the build was never stopped"
+        reasons.append(cancel.reason)
+        raise wheel_engine.WheelUpdateCancelled("cancelled", reason=cancel.reason)
+
+    task = asyncio.ensure_future(_run_wheel_apply(apply, monkeypatch))
+    try:
+        await async_wait_until(started.is_set, describe=lambda: "the build never started")
+        assert wheel_apply.stop_put_off_applies(_cfg(_snoozed("9.9.8", _FAR_FUTURE))) == 0
+        assert wheel_apply.stop_put_off_applies(_cfg(_snoozed("9.9.9", _FAR_FUTURE))) == 1
+        outcome = await await_until(task)
+    finally:
+        wheel_apply.cancel_wheel_applies()
+    assert outcome.status == "cancelled"
+    assert outcome.status in wheel_apply.RETRY_SOON
+    assert reasons == [wheel_contract._PUT_OFF_REASON]
+    # The gateway keeps running after this stop, so the engine must delete the
+    # partial tree at once rather than leave a tombstone for a later sweep.
+    assert wheel_contract._PUT_OFF_REASON in wheel_contract._REMOVE_PARTIAL_TREE_REASONS
 
 
-def test_a_managed_venv_build_then_later_keeps_the_restart_queued() -> None:
-    """The build starts on first detection; "Later" clicked while its restart
-    waits on a busy gateway still holds the restart back."""
-    orch = _orchestrator()
-    del orch._auto_apply_wheel_update  # the real apply, not the helper's stub
-    orch._pending_update_respawn = None
-    orch._pending_update_mandatory = False
-    orch._pending_update_mandatory_key = ""
-    orch._pending_update_version = ""
-    # Busy on the first attempt, so the promoted build's restart stays queued.
-    orch._prepare_auto_update_apply = AsyncMock(return_value=False)
-    orch._finish_auto_update_apply = AsyncMock()
-    orch._check_for_updates = AsyncMock()
-    with (
-        patch("kiro_crew.platform.wheel_engine.check_release_version"),
-        patch("kiro_crew.platform.wheel_apply.preflight_bases", return_value=("f", "a")),
-        patch("kiro_crew.platform.wheel_apply.userns_reattach_needed", return_value=False),
-        patch("kiro_crew.platform.wheel_apply.relaunch_before_apply", return_value=False),
-        patch(
-            "kiro_crew.platform.wheel_apply.run_wheel_apply",
-            AsyncMock(return_value=SimpleNamespace(status="promoted")),
-        ),
-        patch("kiro_crew.platform.wheel_apply.restart_reaches", return_value=True),
-        patch("kiro_crew.config.KiroCrewConfig.load", return_value=_cfg({})),
-    ):
-        asyncio.run(orch._auto_apply_wheel_update("stable", "9.9.9"))
-    assert orch._pending_update_respawn is not None
-    assert orch._pending_update_version == "9.9.9"
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_no_applies_in_flight")
+async def test_saving_the_answer_leaves_a_person_approved_apply_running(monkeypatch) -> None:
+    import threading
 
-    orch._prepare_auto_update_apply = AsyncMock(return_value=True)
-    with (
-        patch(
-            "kiro_crew.config.KiroCrewConfig.load",
-            return_value=_cfg(_snoozed("9.9.9", _FAR_FUTURE)),
-        ),
-        _stop_after_one_cycle(),
-        pytest.raises(_OneCycle),
-    ):
-        asyncio.run(orch._run_update_checks())
-    orch._restart_after_update.assert_not_awaited()
+    from kiro_crew.platform import wheel_apply, wheel_engine
+    from kiro_crew.testing.wait import async_wait_until, await_until
+
+    started = threading.Event()
+
+    def apply(**kwargs: object):
+        cancel: wheel_engine.ApplyCancel = kwargs["cancel"]  # type: ignore[assignment]
+        fired = threading.Event()
+        cancel.on_set(fired.set)
+        started.set()
+        assert fired.wait(30)
+        raise wheel_engine.WheelUpdateCancelled("cancelled", reason=cancel.reason)
+
+    task = asyncio.ensure_future(
+        _run_wheel_apply(apply, monkeypatch, refuse_if_unattended_off=False)
+    )
+    try:
+        await async_wait_until(started.is_set, describe=lambda: "the build never started")
+        assert wheel_apply.stop_put_off_applies(_cfg(_snoozed("9.9.9", _FAR_FUTURE))) == 0
+    finally:
+        wheel_apply.cancel_wheel_applies()
+    await await_until(task)
+
+
+def test_the_dashboard_stops_a_put_off_build_when_the_answer_is_saved() -> None:
+    from aiohttp import web
+
+    from kiro_crew.config.live import ConfigChange
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.dashboard.server import _register_config_watch
+
+    app = web.Application()
+    state = SimpleNamespace(
+        workflow_service=None, channel_manager=None, set_dynamic_cards_enabled=MagicMock()
+    )
+    _register_config_watch(app, state, None)
+    subs = {s.name: s for s in app["config_watch_subscriptions"]}
+    apply = subs["dashboard.update_nudge"].callback()
+    assert apply is not None
+    old, new = KiroCrewConfig(), KiroCrewConfig()
+    new.dashboard.update_nudge = _snoozed("9.9.9", _FAR_FUTURE)
+    with patch("kiro_crew.platform.wheel_apply.stop_put_off_applies", return_value=1) as stop:
+        apply(ConfigChange(old=old, new=new, changed=frozenset({"agent.model"})))
+        stop.assert_not_called()
+        apply(ConfigChange(old=old, new=new, changed=frozenset({"dashboard.update_nudge"})))
+        stop.assert_called_once()
+        assert stop.call_args.args[0] is new

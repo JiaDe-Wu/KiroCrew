@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
-import time
 from unittest.mock import patch
 
 import pytest
@@ -282,16 +281,44 @@ class TestMemberBriefing:
         assert read_member_briefing_bounded(CREW) == ("", None, False)
 
     @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are POSIX-only")
-    def test_fifo_briefing_is_refused_without_blocking(self):
+    def test_fifo_briefing_is_refused_without_blocking(self, monkeypatch):
         """An agent-planted FIFO must not hang the member's turn: a plain open
         on a writerless FIFO blocks forever. O_NONBLOCK + the fstat regularity
-        check make it read as 'no briefing yet' immediately."""
+        check make it read as 'no briefing yet' immediately.
+
+        Asserted as the calls this thread makes on the FIFO: every open of it
+        asks for O_NONBLOCK (one without it is refused on the spot instead of
+        hanging) and nothing reads from it."""
         path = member_briefing_path(CREW)
         path.parent.mkdir(parents=True, exist_ok=True)
         os.mkfifo(path)
-        start = time.monotonic()
-        assert read_member_briefing(CREW) == ""
-        assert time.monotonic() - start < 5.0  # returned, not blocked
+        real_open, real_read = os.open, os.read
+        this_thread = threading.get_ident()
+        fifo_fds: list[int] = []
+        fifo_reads: list[int] = []
+
+        def recorded_open(name, flags, *args, **kwargs):
+            # The pinned-parent walk opens the leaf by its bare name under a dir_fd.
+            if threading.get_ident() == this_thread and os.path.basename(name) == path.name:
+                assert flags & os.O_NONBLOCK, "the briefing FIFO was opened without O_NONBLOCK"
+                fd = real_open(name, flags, *args, **kwargs)
+                fifo_fds.append(fd)
+                return fd
+            return real_open(name, flags, *args, **kwargs)
+
+        def recorded_read(fd, n):
+            if threading.get_ident() == this_thread and fd in fifo_fds:
+                fifo_reads.append(n)
+            return real_read(fd, n)
+
+        with monkeypatch.context() as mp:
+            mp.setattr(os, "open", recorded_open)
+            # The pinned walk opens by dir_fd only where os.open is listed as taking one.
+            mp.setattr(os, "supports_dir_fd", os.supports_dir_fd | {recorded_open})
+            mp.setattr(os, "read", recorded_read)
+            assert read_member_briefing(CREW) == ""
+        assert fifo_fds, "the briefing was never opened"
+        assert fifo_reads == [], "the FIFO was read instead of refused by its shape"
 
     def test_without_o_nofollow_the_read_fails_closed(self):
         """No O_NOFOLLOW (Windows) means no race-free symlink refusal on an
@@ -843,7 +870,7 @@ class TestMemberSectionInjection:
         for needle in (
             "not a Q&A bot",
             "front desk",
-            "escalate ONLY at a true wall",
+            "escalate ONLY for an ask case",
             "ZERO context",
             "quiet cycle is a successful cycle",
             "Every word you write as text is shown to the user",
@@ -874,6 +901,35 @@ class TestMemberSectionInjection:
         assert "write your first briefing" not in ctx
         assert "You own the [CURRENT ASSIGNMENT] section below" not in ctx
         assert "This week: crash issues." not in ctx
+
+    @pytest.mark.parametrize("path", ["fresh", "slim_resume", "post_compaction"])
+    def test_temporary_session_withholds_the_briefing(self, tmp_path, path):
+        """A temporary chat promises no memory reads, so the agent-writable
+        briefing is withheld on every legacy path that delivers the section."""
+        bp = member_briefing_path(CREW)
+        bp.parent.mkdir(parents=True, exist_ok=True)
+        bp.write_text("This week: crash issues.", encoding="utf-8")
+        key = "dashboard:member-code-reviewer"
+        builder = _builder(tmp_path)
+        with patch("kiro_crew.context.KiroCrewConfig.load", return_value=_fake_config()):
+            if path == "fresh":
+                text = builder.build_session_context(
+                    session_key=key, agent=CREW, member=CREW, blocks_reads=True
+                )
+            else:
+                text, _ = builder.build_message(
+                    "status?",
+                    path == "slim_resume",
+                    key,
+                    agent=CREW,
+                    member=CREW,
+                    blocks_reads=True,
+                    resumed=path == "slim_resume",
+                    needs_reinjection=path == "post_compaction",
+                )
+        # ASCII only: build_message folds the header's em dash to "--".
+        assert "withheld by this turn's memory/privacy scope" in text
+        assert "This week: crash issues." not in text
 
 
 def _make_rules_app() -> web.Application:

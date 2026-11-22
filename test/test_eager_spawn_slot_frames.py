@@ -5,7 +5,8 @@ slot-focused intent frame, and the cross-window slot-read relay.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+import threading
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from eager_spawn_helpers import (  # noqa: F401 -- fixtures are used by name
@@ -18,7 +19,10 @@ from eager_spawn_helpers import (  # noqa: F401 -- fixtures are used by name
 )
 
 from kiro_crew.dashboard import chat_runner
+from kiro_crew.dashboard import slot_read_state as srs
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
+from kiro_crew.dashboard.ws import _handle_slot_read
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 
 class TestResumableHint:
@@ -81,6 +85,25 @@ class TestSlotFocusedFrame:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+    def test_the_focus_prefetch_is_the_owners_return_to_the_chat(self):
+        """It is the one eager start that says a person is about to wait on a re-open."""
+        from kiro_crew.dashboard.ws import _handle_slot_focused
+
+        slot = _ChatSlot("t1")
+        state = self._state(slot)
+        with patch.object(chat_runner, "schedule_eager_spawn") as schedule:
+            _handle_slot_focused(state, "t1", None, owner=True)
+        schedule.assert_called_once_with(state, slot, allow_resume=True, focus_resume=True)
+
+    def test_a_focus_frame_from_anyone_else_arms_nothing(self):
+        from kiro_crew.dashboard.ws import _handle_slot_focused
+
+        slot = _ChatSlot("t1")
+        state = self._state(slot)
+        with patch.object(chat_runner, "schedule_eager_spawn") as schedule:
+            assert _handle_slot_focused(state, "t1", None, owner=False) is None
+        schedule.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_focus_change_cancels_previous_prefetch(self):
@@ -202,6 +225,91 @@ class TestSlotFocusedFrame:
             pending.result()
 
     @pytest.mark.asyncio
+    async def test_resumable_focus_keeps_a_pending_reload_respawn(self):
+        """The composer sends this frame when the person clicks into it or
+        types, which after a reload is the moment before they send. Re-arming
+        would cancel the reload's respawn (mid-load, possibly) and restart it at
+        the debounce as a BACKGROUND prefetch with no outcome row."""
+        from kiro_crew.dashboard.ws import _handle_slot_focused
+        from kiro_crew.start_priority import StartPriority
+
+        slot = _ChatSlot("t1")
+        state = self._state(slot)
+        _prime(True)
+        # Reload-shaped: a resume start whose reload waits on its end.
+        respawn = chat_runner.schedule_eager_spawn(
+            state,
+            slot,
+            allow_resume=True,
+            start_priority=StartPriority.FOREGROUND,
+            on_ended=lambda _failure: None,
+        )
+        assert respawn is not None
+        try:
+            # A frame from a socket with no prefetch of its own, then a repeat.
+            first = _handle_slot_focused(state, "t1", None, owner=True)
+            again = _handle_slot_focused(state, "t1", first, owner=True)
+            assert (first, again) == (None, None)
+            assert slot._eager_spawn_task is respawn
+            assert not respawn.cancelled()
+            # Not this socket's: its blur leaves the respawn alone too.
+            assert _handle_slot_focused(state, None, again, owner=True) is None
+            assert not respawn.cancelled()
+        finally:
+            respawn.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await respawn
+
+    @pytest.mark.asyncio
+    async def test_a_second_windows_focus_rearms_the_first_windows_prefetch(self):
+        """Two windows on one slot. Window B's focus re-arms the prefetch window
+        A's focus armed, and B tracks it. A's blur then cancels only the task A
+        armed, so the slot B shows keeps one pending load. Keeping A's prefetch
+        instead would leave B tracking nothing, and A's blur would cancel the
+        slot's only load with none re-armed."""
+        from kiro_crew.dashboard.ws import _handle_slot_focused
+
+        slot = _ChatSlot("t1")
+        state = self._state(slot)
+        _prime(True)
+        window_a = _handle_slot_focused(state, "t1", None, owner=True)
+        assert window_a is not None
+        window_b = _handle_slot_focused(state, "t1", None, owner=True)
+        try:
+            assert window_b is not None and window_b is not window_a
+            assert slot._eager_spawn_task is window_b
+            assert _handle_slot_focused(state, None, window_a, owner=True) is None
+            with pytest.raises(asyncio.CancelledError):
+                await window_a
+            assert slot._eager_spawn_task is window_b
+            assert not window_b.done()
+        finally:
+            if window_b is not None:
+                window_b.cancel()
+                await asyncio.gather(window_b, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_resumable_focus_replaces_a_pending_fresh_spawn(self):
+        """Only a pending RESUME start is kept: an agent switch arms a fresh
+        start, which a resumable key refuses, so the focus still re-arms it as
+        the resume prefetch."""
+        from kiro_crew.dashboard.ws import _handle_slot_focused
+
+        slot = _ChatSlot("t1")
+        state = self._state(slot)
+        _prime(True)
+        fresh = chat_runner.schedule_eager_spawn(state, slot)
+        assert fresh is not None
+        prefetch = _handle_slot_focused(state, "t1", None, owner=True)
+        assert prefetch is not None and prefetch is not fresh
+        assert slot._eager_spawn_task is prefetch
+        with pytest.raises(asyncio.CancelledError):
+            await fresh
+        prefetch.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await prefetch
+
+    @pytest.mark.asyncio
     async def test_running_turn_schedules_nothing(self):
         from kiro_crew.dashboard.ws import _handle_slot_focused
 
@@ -258,16 +366,14 @@ class TestSlotFocusedFrame:
 
 
 class TestSlotReadFrame:
-    """ws._handle_slot_read: the cross-window unread-badge read relay.
-
-    A window that read a slot tells the gateway; the gateway rebroadcasts to
-    every owner window so their bubbles retire too. Pure relay — no server
-    read-state — so the contract under test is small: owner-gated, validated
-    slot key, one owner-scoped broadcast.
+    """ws._handle_slot_read: relay the read to every owner window at once, as
+    before the store, then send a ``stored`` echo once the disk holds it.
     """
 
     def _state(self):
         return MagicMock(spec=DashboardState)
+
+    _relay = staticmethod(lambda ts, **kw: call("slot_read", {"slot": "t1", "read_ts": ts, **kw}))
 
     def test_owner_read_broadcasts_to_owner_clients(self):
         from kiro_crew.dashboard.ws import _handle_slot_read
@@ -276,14 +382,103 @@ class TestSlotReadFrame:
         assert _handle_slot_read(state, "t1", owner=True) is True
         state.broadcast_ws_owners.assert_called_once_with("slot_read", {"slot": "t1"})
 
-    def test_read_watermark_is_relayed_opaquely(self):
-        from kiro_crew.dashboard.ws import _handle_slot_read
-
+    def _loaded_state(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.config.paths.data_home", lambda: tmp_path)
+        monkeypatch.setattr(srs, "SAVE_DELAY_SECONDS", 0)
         state = self._state()
+        reads = srs.read_state_of(state)
+        reads.adopt("2026-09-01T00:00:00Z", {})
+        return state, reads
+
+    @pytest.mark.asyncio
+    async def test_the_relay_goes_out_at_once_and_the_stored_echo_after_the_write(
+        self, tmp_path, monkeypatch
+    ):
+        state, reads = self._loaded_state(tmp_path, monkeypatch)
         assert _handle_slot_read(state, "t1", "2026-09-10T00:00:00Z", owner=True) is True
-        state.broadcast_ws_owners.assert_called_once_with(
-            "slot_read", {"slot": "t1", "read_ts": "2026-09-10T00:00:00Z"}
-        )
+        assert state.broadcast_ws_owners.call_args_list == [self._relay("2026-09-10T00:00:00Z")]
+        assert reads.row_read_ts("t1") is None
+        await await_until(reads._save_task)
+        assert srs.load_stored(srs.store_path(tmp_path))[1] == {"t1": "2026-09-10T00:00:00Z"}
+        assert state.broadcast_ws_owners.call_args_list == [
+            self._relay("2026-09-10T00:00:00Z"),
+            self._relay("2026-09-10T00:00:00Z", stored=True),
+        ]
+        assert reads.row_read_ts("t1") == "2026-09-10T00:00:00Z"
+
+    @pytest.mark.asyncio
+    async def test_an_older_read_relays_as_sent_and_echoes_the_newer_stored_time(
+        self, tmp_path, monkeypatch
+    ):
+        state, reads = self._loaded_state(tmp_path, monkeypatch)
+        _handle_slot_read(state, "t1", "2026-09-10T00:00:05+00:00", owner=True)
+        await await_until(reads._save_task)
+        state.broadcast_ws_owners.reset_mock()
+        _handle_slot_read(state, "t1", "2026-09-10T00:00:01+00:00", owner=True)
+        assert state.broadcast_ws_owners.call_args_list == [
+            self._relay("2026-09-10T00:00:01+00:00"),
+            self._relay("2026-09-10T00:00:05+00:00", stored=True),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_write_still_relays_but_sends_no_stored_echo_until_the_resend(
+        self, tmp_path, monkeypatch
+    ):
+        state, reads = self._loaded_state(tmp_path, monkeypatch)
+        real_save = srs.save
+        monkeypatch.setattr(srs, "save", MagicMock(side_effect=OSError("disk full")))
+        _handle_slot_read(state, "t1", "2026-09-10T00:00:00Z", owner=True)
+        await await_until(reads._save_task)
+        assert state.broadcast_ws_owners.call_args_list == [self._relay("2026-09-10T00:00:00Z")]
+        assert reads.row_read_ts("t1") is None
+
+        monkeypatch.setattr(srs, "save", real_save)
+        state.broadcast_ws_owners.reset_mock()
+        _handle_slot_read(state, "t1", "2026-09-10T00:00:00Z", owner=True)
+        await await_until(reads._save_task)
+        assert state.broadcast_ws_owners.call_args_list == [
+            self._relay("2026-09-10T00:00:00Z"),
+            self._relay("2026-09-10T00:00:00Z", stored=True),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_read_during_a_write_gets_its_own_write(self, tmp_path, monkeypatch):
+        state, reads = self._loaded_state(tmp_path, monkeypatch)
+        entered, release = threading.Event(), threading.Event()
+        writes: list[dict[str, str]] = []
+
+        def held_save(path, epoch, saved):
+            writes.append(dict(saved))
+            if len(writes) == 1:
+                entered.set()
+                assert release.wait(30)
+
+        monkeypatch.setattr(srs, "save", held_save)
+        _handle_slot_read(state, "t1", "2026-09-10T00:00:00Z", owner=True)
+        await async_wait_until(entered.is_set)
+        _handle_slot_read(state, "t1", "2026-09-10T00:00:09Z", owner=True)
+        release.set()
+        await await_until(reads._save_task)
+        assert writes == [{"t1": "2026-09-10T00:00:00Z"}, {"t1": "2026-09-10T00:00:09Z"}]
+        assert state.broadcast_ws_owners.call_args_list == [
+            self._relay("2026-09-10T00:00:00Z"),
+            self._relay("2026-09-10T00:00:09Z"),
+            self._relay("2026-09-10T00:00:09Z", stored=True),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_read_before_the_load_relays_at_once_and_echoes_after_it(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr("kiro_crew.config.paths.data_home", lambda: tmp_path)
+        state = self._state()
+        _handle_slot_read(state, "t1", "2026-09-10T00:00:00Z", owner=True)
+        assert state.broadcast_ws_owners.call_args_list == [self._relay("2026-09-10T00:00:00Z")]
+        await srs.load_read_state_after_listen(state)
+        assert state.broadcast_ws_owners.call_args_list == [
+            self._relay("2026-09-10T00:00:00Z"),
+            self._relay("2026-09-10T00:00:00Z", stored=True),
+        ]
 
     def test_junk_read_watermark_is_dropped_but_frame_relays(self):
         """A bad watermark degrades to a watermark-less relay (receivers apply
@@ -294,6 +489,14 @@ class TestSlotReadFrame:
             state = self._state()
             assert _handle_slot_read(state, "t1", junk, owner=True) is True
             state.broadcast_ws_owners.assert_called_once_with("slot_read", {"slot": "t1"})
+
+    def test_an_unparseable_watermark_relays_as_sent_and_is_never_stored(self):
+        state = self._state()
+        assert _handle_slot_read(state, "t1", "not a time", owner=True) is True
+        state.broadcast_ws_owners.assert_called_once_with(
+            "slot_read", {"slot": "t1", "read_ts": "not a time"}
+        )
+        assert srs.read_state_of(state).reads == {}
 
     def test_non_owner_frame_is_ignored(self):
         """An app-scoped socket must not clear the user's badges."""

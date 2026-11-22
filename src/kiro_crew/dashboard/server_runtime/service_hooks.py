@@ -1,12 +1,11 @@
 """Hooks for the gateway-scoped services an entrypoint wires before ``runner.setup()``.
 
 The pull-request status-delta sink, the shutdown of the Kiro prerequisite and KAS
-login services, and the start and stop of the remote-dispatch report puller.
+login services, and the boot-time close of retired remote worker slots.
 """
 
 from __future__ import annotations
 
-import sys
 from typing import TYPE_CHECKING
 
 from aiohttp import web
@@ -14,6 +13,7 @@ from aiohttp import web
 if TYPE_CHECKING:
     from kiro_crew.dashboard.server import (
         DashboardState,
+        logger,
         register_status_delta_sink,
         unregister_status_delta_sink,
     )
@@ -46,7 +46,10 @@ def _register_kiro_service_shutdown(app: web.Application) -> None:
     """
 
     async def _kiro_prerequisite_shutdown(app_: web.Application) -> None:
-        await app_["kiro_prerequisite_service"].close()
+        try:
+            await app_["kiro_prerequisite_service"].close()
+        except Exception:  # noqa: BLE001 — one cleanup hook must not suppress later hooks
+            logger.warning("Kiro prerequisite service close failed", exc_info=True)
 
     app.on_cleanup.append(_kiro_prerequisite_shutdown)
 
@@ -56,25 +59,22 @@ def _register_kiro_service_shutdown(app: web.Application) -> None:
         # KAS request has nothing to close.
         service = app_.get("kas_login_service")
         if service is not None:
-            await service.close()
+            try:
+                await service.close()
+            except Exception:  # noqa: BLE001 — one cleanup hook must not suppress later hooks
+                logger.warning("KAS login service close failed", exc_info=True)
 
     app.on_cleanup.append(_kas_login_shutdown)
 
 
-async def _start_remote_puller(state: DashboardState) -> None:
-    """Post-bind: start the hub's background report puller when remote dispatch is on.
+async def _sweep_remote_closes(state: DashboardState) -> None:
+    """Boot: close retired remote worker slots once, when remote dispatch is on.
 
-    Run as a fire-and-forget task after the listener is up, so the module is never
-    imported on the boot path; with ``work_ledger.remote_dispatch`` off it starts
-    nothing.
+    Called by the startup tunnel revive once it has finished
+    (``instances_lifecycle._retake_hops_then_revive``), so the crews it brought
+    back already read connected; the sweep reads the switch itself. Patrol ticks
+    repeat it; nothing here runs on a timer. Never raises.
     """
     from kiro_crew.dashboard.handlers import remote_puller
 
-    await remote_puller.start_if_enabled(state)
-
-
-async def _stop_remote_puller(_app: web.Application) -> None:
-    """Cleanup: stop the puller. Imports nothing when it was never loaded."""
-    module = sys.modules.get("kiro_crew.dashboard.handlers.remote_puller")
-    if module is not None:
-        await module.stop()
+    await remote_puller.sweep_closes(state)

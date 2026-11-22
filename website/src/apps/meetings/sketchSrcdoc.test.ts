@@ -31,6 +31,7 @@
 // structural argument, not an observed one, and each assertion below was verified
 // to FAIL when the strip is reverted to the old `recloneScripts(fragment, doc)`.
 
+import { createHash } from 'node:crypto'
 import { describe, it, expect } from 'vitest'
 
 import { buildSketchSrcdoc } from './lib/sketchSrcdoc'
@@ -195,8 +196,7 @@ describe('buildSketchSrcdoc — Mermaid is same-origin and offline', () => {
     // Same least-privilege shape as widgetSrcdoc pinning Tailwind: a script URL
     // is itself an egress channel, so the whole origin must not be allowed.
     const value = directive(buildSketchSrcdoc('<p>x</p>', ORIGIN), 'script-src')
-    expect(value).toBe(`'unsafe-inline' ${ORIGIN}${MERMAID_RUNTIME_PATH}`)
-    expect(value).not.toBe(`'unsafe-inline' ${ORIGIN}`)
+    expect(value.split(' ').slice(1)).toEqual([`${ORIGIN}${MERMAID_RUNTIME_PATH}`])
   })
 
   it('initializes mermaid with suppressErrorRendering', () => {
@@ -234,7 +234,7 @@ describe('buildSketchSrcdoc — Mermaid is same-origin and offline', () => {
     // A path-only script source matches nothing, so an empty origin denies the
     // script rather than widening the policy.
     const value = directive(buildSketchSrcdoc('<p>x</p>', ''), 'script-src')
-    expect(value).toBe(`'unsafe-inline' ${MERMAID_RUNTIME_PATH}`)
+    expect(value.split(' ').slice(1)).toEqual([MERMAID_RUNTIME_PATH])
   })
 })
 
@@ -635,5 +635,69 @@ describe('buildSketchSrcdoc — model HTML never enters a template literal', () 
   it('escapes a raw </head> attempt instead of restructuring the document', () => {
     const out = buildSketchSrcdoc('<p>a &lt;/head&gt; b</p>', ORIGIN)
     expect(out.match(/<head>/g)!.length).toBe(1)
+  })
+})
+
+describe('buildSketchSrcdoc — only our own scripts may run, by hash', () => {
+  // The scrub is a denylist; this is the allowlist behind it. `script-src`
+  // grants no 'unsafe-inline', so markup the scrub misses (an inline <script>,
+  // an on*= handler, a javascript: URL) is refused by the browser. Every inline
+  // script that IS in the document must hash to a source in the policy, or our
+  // own Mermaid would be refused too. Hashes are recomputed with node:crypto
+  // over the text the frame will parse, independently of the code under test.
+  const sha = (js: string) => `'sha256-${createHash('sha256').update(js, 'utf8').digest('base64')}'`
+  // CRLF, a </script> and non-ASCII (é, an astral emoji): the parser rewrites the
+  // first two and the hash is over UTF-8 bytes, so each could break the pin.
+  const runtime = 'window.mermaid = {run(){}, initialize(){}};\r\nvar s = "</script> é 😀";'
+  for (const [label, out] of [
+    ['the live frame', () => buildSketchSrcdoc('<p>x</p>', ORIGIN)],
+    ['the exported file', () => buildSketchSrcdoc('<p>x</p>', '', runtime)],
+  ] as const) {
+    it(`grants no 'unsafe-inline' and pins every inline script in ${label}`, () => {
+      const doc = out()
+      const sources = directive(doc, 'script-src').split(' ')
+      expect(sources).not.toContain("'unsafe-inline'")
+      expect(sources).not.toContain("'unsafe-hashes'")
+      const inline = Array.from(new DOMParser().parseFromString(doc, 'text/html').querySelectorAll('script'))
+        .filter(s => !s.hasAttribute('src'))
+      expect(inline.length).toBeGreaterThan(0)
+      for (const script of inline) expect(sources).toContain(sha(script.textContent ?? ''))
+    })
+  }
+
+  it('drops integrity, so a hash source cannot admit a model script URL', () => {
+    // Defense in depth for a scrub miss: a hash in script-src also admits an
+    // external script whose integrity names it, and its request leaves first.
+    const body = buildSketchSrcdoc('<p integrity="sha256-x">a</p><svg><a integrity="sha256-y"></a></svg>', ORIGIN)
+    expect(body).not.toContain('integrity=')
+  })
+})
+
+describe('buildSketchSrcdoc with an inlined runtime — the exported file', () => {
+  it('keeps the frame policy first in <head> and names no script origin', () => {
+    const out = buildSketchSrcdoc('<p>x</p>', '', 'window.mermaid = {}')
+    expect(directive(out, 'script-src')).toMatch(/^'sha256-[A-Za-z0-9+/]{43}=' 'sha256-[A-Za-z0-9+/]{43}='$/)
+    expect(directive(out, 'img-src')).toBe('data:')
+    expect(directive(out, 'connect-src')).toBe("'none'")
+    expect(directive(out, 'default-src')).toBe("'none'")
+    const head = new DOMParser().parseFromString(out, 'text/html').head
+    expect(head.firstElementChild?.getAttribute('http-equiv')).toBe('Content-Security-Policy')
+    expect(out).not.toContain(MERMAID_RUNTIME_PATH)
+  })
+
+  it('inlines the runtime so a </script> in it, any casing, cannot end the element', () => {
+    const runtime = 'var a = "</SCRIPT><img src=x>"; var b = "</script>";'
+    const doc = new DOMParser().parseFromString(buildSketchSrcdoc('<p>x</p>', '', runtime), 'text/html')
+    const scripts = Array.from(doc.querySelectorAll('script'))
+    expect(scripts).toHaveLength(2) // the inlined runtime + our bootstrap
+    expect(scripts[0].textContent).toBe('var a = "<\\/SCRIPT><img src=x>"; var b = "<\\/script>";')
+    expect(doc.querySelector('img')).toBeNull()
+  })
+
+  it("leaves model text that looks like the frame's script placeholder as it is", () => {
+    const decoy = '<meta name="x-script-placeholder" data-src="https://x.example/a.js">'
+    const out = buildSketchSrcdoc(`<style>/*${decoy}*/</style>`, '', 'window.mermaid = {}')
+    expect(out).toContain(decoy)
+    expect(out).not.toContain('x.example/a.js" crossorigin')
   })
 })

@@ -54,10 +54,12 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from kiro_crew import asset_downloader  # noqa: F401 - re-export
 from kiro_crew.config.paths import data_home  # noqa: F401 - re-export
 from kiro_crew.platform.tree_liveness import LIVENESS_LOCK, TREE_MARKER
 from kiro_crew.platform_compat import (  # noqa: F401 - re-export
     IS_POSIX,
+    flock_owner_pid,
     kill_popen_tree,
     make_owner_only_dir,
     open_create_or_existing,
@@ -115,7 +117,12 @@ from kiro_crew.platform.wheel_engine_layout import (
     _realpath,
     managed_venv_layout,
 )
-from kiro_crew.platform.wheel_engine_transfer import _download_to_file, _fetch_bytes, _staging_dir
+from kiro_crew.platform.wheel_engine_transfer import (
+    _download_to_file,
+    _fetch_bytes,
+    _legacy_staging_dir,
+    _staging_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +164,9 @@ def _openssl_bin() -> str:
     if openssl is None:
         raise WheelUpdateError(
             "openssl is required to verify the signed manifest and was not "
-            "found in a trusted system directory"
+            "found in a trusted system directory. Install the openssl package "
+            "(Debian/Ubuntu: 'sudo apt-get install -y openssl'; Fedora/RHEL/"
+            "Amazon Linux: 'sudo dnf install -y openssl'), then retry the update."
         )
     return openssl
 
@@ -339,11 +348,23 @@ def _verify_over_nofollow_files(
         raise WheelUpdateError("manifest signature verification failed — refusing to install")
 
 
+def wheel_filename(channel: str, version: str, tag: str = "any") -> str:
+    """The wheel a channel publishes: the LTS edition's own distribution on lts.
+
+    publish-cli.yml, ``packaging/signing/cli-manifest.py`` and ``cli.sh`` pair
+    the same stem with the same channel. *tag* is ``any`` for the pure wheel, or
+    a platform wheel's tag (:mod:`wheel_engine_platform`).
+    """
+    stem = "kirocrew_lts" if channel == "lts" else "kirocrew"
+    return f"{stem}-{version}-py3-none-{tag}.whl"
+
+
 def parse_and_validate_manifest(
     raw: bytes,
     *,
     channel: str,
     artifact_base: str,
+    platform_tag: str = "any",
 ) -> tuple[dict[str, str], bytes, bytes]:
     """Structural validation + canonicalization, PURE (no I/O).
 
@@ -353,7 +374,8 @@ def parse_and_validate_manifest(
     values, oversized payloads, and a wheel URL that is not the ONE canonical
     URL implied by the byte host + channel + signed version are all refused.
     Nothing in the payload is acted on until the signature over the canonical
-    bytes verifies.
+    bytes verifies. *platform_tag* names the wheel a platform manifest
+    (``latest-cli-<tag>.json``) must point at; ``any`` is ``latest-cli.json``'s.
     """
     if len(raw) > _MANIFEST_MAX_BYTES:
         raise WheelUpdateError("manifest exceeds the size ceiling")
@@ -390,7 +412,7 @@ def parse_and_validate_manifest(
     requires = manifest["python_requires"]
     if len(requires) > 128 or any(not (0x20 <= ord(c) <= 0x7E) for c in requires):
         raise WheelUpdateError("manifest python_requires fails validation")
-    wheel_name = f"kirocrew-{version}-py3-none-any.whl"
+    wheel_name = wheel_filename(channel, version, platform_tag)
     expected_url = f"{artifact_base}/cli/{channel}/{version}/{wheel_name}"
     if manifest["wheel_url"] != expected_url:
         raise WheelUpdateError("manifest wheel_url is not the canonical artifact URL")
@@ -419,15 +441,42 @@ def fetch_verified_manifest(
     workdir: Path,
     ctx: _BuildContext = _NO_CONTEXT,
 ) -> dict[str, str]:
-    """Fetch the channel manifest and return its AUTHENTICATED payload."""
-    url = f"{feed_base}/feed/{channel}/latest-cli.json"
-    raw = _fetch_bytes(url, _MANIFEST_MAX_BYTES, _FETCH_TIMEOUT_SECS, cancel=ctx.cancel)
-    payload, canonical, signature = parse_and_validate_manifest(
-        raw, channel=channel, artifact_base=artifact_base
-    )
-    _raise_if_cancelled(ctx.cancel)
-    _verify_signature(canonical, signature, workdir, ctx=ctx)
-    return payload
+    """Fetch the channel manifest and return its AUTHENTICATED payload.
+
+    ``latest-cli.json`` is read and verified first: it names the channel's
+    version. On a host a platform wheel is published for (``host_wheel_tag``),
+    that platform's ``latest-cli-<tag>.json`` is then read too, and its payload
+    is returned only when it names the same version, so the update installs the
+    wheel that carries the pinned KAS engine with the code. A platform manifest
+    that is absent (403 or 404) or names another version (a promoted stable or
+    a mirrored insider that published no platform wheels) leaves the pure
+    wheel's payload; one that fails validation or its signature is refused.
+    """
+    from kiro_crew.platform import wheel_engine_platform as plat
+
+    def _verified(url: str, tag: str) -> dict[str, str]:
+        raw = _fetch_bytes(url, _MANIFEST_MAX_BYTES, _FETCH_TIMEOUT_SECS, cancel=ctx.cancel)
+        payload, canonical, signature = parse_and_validate_manifest(
+            raw, channel=channel, artifact_base=artifact_base, platform_tag=tag
+        )
+        _raise_if_cancelled(ctx.cancel)
+        # One scratch directory per verification: the no-/dev/fd fallback creates
+        # its fixed input names O_EXCL, so a second check in the same one fails.
+        scratch = Path(tempfile.mkdtemp(prefix=f"verify-{tag}-", dir=str(workdir)))
+        _verify_signature(canonical, signature, scratch, ctx=ctx)
+        return payload
+
+    pure = _verified(f"{feed_base}/feed/{channel}/latest-cli.json", "any")
+    tag = plat.host_wheel_tag()
+    if tag is None:
+        return pure
+    try:
+        platform = _verified(plat.platform_manifest_url(feed_base, channel, tag), tag)
+    except WheelUpdateError as exc:
+        if plat.is_absent(exc):
+            return pure
+        raise
+    return platform if platform["version"] == pure["version"] else pure
 
 
 def download_verified_wheel(
@@ -436,7 +485,8 @@ def download_verified_wheel(
     """Download the wheel the SIGNED payload names and verify its SHA-256."""
     url = payload["wheel_url"]
     expected_sha = payload["sha256"]
-    wheel_path = dest_dir / f"kirocrew-{payload['version']}-py3-none-any.whl"
+    # The validated canonical URL ends in the wheel's own name, pure or platform.
+    wheel_path = dest_dir / url.rsplit("/", 1)[-1]
     _download_to_file(
         url,
         wheel_path,
@@ -957,10 +1007,13 @@ def _sweep_layout_debris(layout: ManagedVenvLayout, cancel: ApplyCancel | None =
         if match and entry.is_symlink() and not _pid_alive(int(match.group(1))):
             with contextlib.suppress(OSError):
                 entry.unlink()
-    try:
-        staging = list(_staging_dir().iterdir())
-    except OSError:
-        staging = []
+    staging: list[Path] = []
+    # The legacy root too: a build that staged under trust/ may have left a run there.
+    for root in (_staging_dir(), _legacy_staging_dir()):
+        try:
+            staging.extend(root.iterdir())
+        except OSError:
+            continue
     now = time.time()
     for entry in staging:
         try:
@@ -1049,6 +1102,9 @@ def hold_update_lock() -> int:
     filesystem that cannot lock is never mistaken for a busy one). The caller
     owns the descriptor: pass it to :func:`apply_wheel_update` as ``held_lock_fd``
     and close it afterwards (closing releases the lock).
+
+    The holder's pid is written into the lock file while it is held, so a
+    caller that loses the lock can tell who has it (:func:`update_lock_holder_pid`).
     """
     path = _update_lock_path(managed_venv_layout())
     try:
@@ -1065,14 +1121,52 @@ def hold_update_lock() -> int:
         raise WheelUpdateBusy(
             "another kirocrew update is already in progress — wait for it to finish and re-run"
         )
+    with contextlib.suppress(OSError):
+        # Only into the file this name holds, never through a link to another file.
+        held = os.fstat(fd)
+        if held.st_nlink == 1 and os.path.samestat(held, os.lstat(path)):
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, _holder_stamp())
     return fd
 
 
+def _holder_stamp() -> bytes:
+    return f"{os.getpid()}\n".encode()
+
+
 def release_update_lock(fd: int) -> None:
-    """Release and close a descriptor :func:`hold_update_lock` returned."""
+    """Release and close a descriptor :func:`hold_update_lock` returned.
+
+    This holder's pid is cleared first, while the lock is still held, so a
+    later holder that records none (``cli.sh``) is not named as this one.
+    """
+    with contextlib.suppress(OSError):
+        os.lseek(fd, 0, os.SEEK_SET)
+        if os.read(fd, 64) == _holder_stamp():
+            os.ftruncate(fd, 0)
     with contextlib.suppress(OSError):
         release_lock(fd)
     os.close(fd)
+
+
+def update_lock_holder_pid() -> int | None:
+    """The pid holding the update lock, or ``None`` when it cannot be named.
+
+    The kernel's record of who took the lock comes first (Linux). Elsewhere it
+    is the pid the holder wrote into the file: ``cli.sh`` writes none, and an
+    exec that skipped :func:`release_update_lock` leaves its own behind.
+    """
+    path = _update_lock_path(managed_venv_layout())
+    owner = flock_owner_pid(path)
+    if owner is not None:
+        return owner
+    try:
+        with open(path, "rb") as lock_file:
+            text = lock_file.read(64).decode("ascii").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return int(text) if text.isdigit() else None
 
 
 # ── The apply ───────────────────────────────────────────────────────────────
@@ -1413,6 +1507,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     )
     from kiro_crew.platform.wheel_engine_contract import (  # noqa: F401
         _PIP_BINARY_ONLY,
+        _PUT_OFF_REASON,
         _VERSION_RE,
         _WHEEL_FETCH_TOTAL_SECS,
         WheelUpdateNotReady,
@@ -1431,6 +1526,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         stable_launch_path,
     )
     from kiro_crew.platform.wheel_engine_transfer import (  # noqa: F401
+        _UPDATE_STAGING_LEAF,
         _read_bounded,
         _response_socket,
         _SinkWriteError,

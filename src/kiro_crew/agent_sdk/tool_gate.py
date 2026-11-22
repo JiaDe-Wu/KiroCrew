@@ -63,6 +63,7 @@ from pathlib import PurePosixPath
 from kiro_crew import platform_compat
 from kiro_crew.agent_sdk import host_auth
 from kiro_crew.agent_sdk.backends import (
+    ACP_BACKEND_ANTIGRAVITY,
     ACP_BACKEND_CODEX,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_LAUNCH,
@@ -126,6 +127,7 @@ UNENFORCED_CONTROLS = (
 #: their own: neither has a launch record, and the name an operator knows the harness
 #: by is not its adapter's package name.
 _LABELS: dict = {
+    ACP_BACKEND_ANTIGRAVITY: "Google Antigravity",
     ACP_BACKEND_CODEX: "OpenAI Codex",
     ACP_BACKEND_PI: "Pi",
     **{backend: record.label for backend, record in sorted(ACP_BACKEND_LAUNCH.items())},
@@ -262,6 +264,13 @@ ADAPTER_EXPOSED_CREDENTIAL_LEAVES: dict = {
     ACP_BACKEND_CODEX: (".aws/config",),
 }
 
+#: Re-exposed READ-ONLY for EVERY enforced harness, home-relative, beside the table
+#: above: the public host keys the launcher's ``GIT_SSH_COMMAND`` names as
+#: ``UserKnownHostsFile``. Without them ssh cannot verify a host under the ``~/.ssh``
+#: mask, even with the ssh-agent forward consented. The strict tier keeps the same
+#: file inside its own ``~/.ssh`` mask; private keys and ``config`` stay hidden.
+ADAPTER_EXPOSED_HOST_TRUST_LEAVES = (".ssh/known_hosts",)
+
 
 class Verdict(str, Enum):
     """Whether a harness's tool decisions reach Kiro Crew's gate.
@@ -322,11 +331,12 @@ def adapter_hidden_credential_dirs(backend: str) -> tuple:
     file tools from each leaf, so the controls cover different readers rather than
     cancelling each other.
 
-    ``.ssh`` arrives through the floor and it has a cost: git-over-SSH inside such
-    a session stops working, because the private key is unreadable to the child.
-    That is accepted rather than worked around -- leaving private keys readable would
-    not close what this exists to close, and a harness landing new has no
-    established workflow to break.
+    ``.ssh`` arrives through the floor and it has a cost: the private key is
+    unreadable to the child, so git-over-SSH works only through the ssh-agent forward
+    the operator consents to. That is accepted rather than worked around -- leaving
+    private keys readable would not close what this exists to close. ``known_hosts``
+    comes back read-only through :func:`adapter_expose_files`, so a forwarded agent
+    can still verify the host.
 
     Empty for a harness this core does not enforce, so the first-class path and
     every unenforced harness keep byte-identical sandbox arguments. Returns
@@ -393,11 +403,13 @@ def adapter_expose_files(backend: str, hidden: tuple) -> tuple:
     """Absolute files to re-expose READ-ONLY inside *backend*'s masked dirs.
 
     The companion to :func:`adapter_hidden_credential_dirs`: that mask hides a
-    whole credential directory, and this names the one file inside it the
-    adapter must still read to authenticate. Both sandbox backends carry the
-    primitive -- the Linux launcher restores a 0444 copy into the empty bind
-    mount, the Seatbelt profile carves a ``require-not (literal ...)`` out of
-    the subpath deny -- so the posture is the same on every platform:
+    whole credential directory, and this names the files inside it the child
+    must still read: the one the adapter authenticates with, and
+    ``~/.ssh/known_hosts`` (:data:`ADAPTER_EXPOSED_HOST_TRUST_LEAVES`) for every
+    enforced harness. Both sandbox backends carry the primitive -- the Linux
+    launcher restores a 0444 copy into the empty bind mount, the Seatbelt profile
+    carves a ``require-not (literal ...)`` out of the subpath deny -- so the
+    posture is the same on every platform:
     ``~/.aws/config`` readable, ``~/.aws/credentials`` and the SSO cache not.
 
     *hidden* is the mask :func:`adapter_hidden_credential_dirs` already resolved
@@ -423,7 +435,10 @@ def adapter_expose_files(backend: str, hidden: tuple) -> tuple:
     # exposes a file silently.
     home = os.path.expanduser("~")
     exposed = []
-    for leaf in ADAPTER_EXPOSED_CREDENTIAL_LEAVES.get(backend, ()):
+    for leaf in (
+        *ADAPTER_EXPOSED_CREDENTIAL_LEAVES.get(backend, ()),
+        *ADAPTER_EXPOSED_HOST_TRUST_LEAVES,
+    ):
         full = os.path.join(home, *PurePosixPath(leaf).parts)
         if _sits_under_any(full, hidden):
             exposed.append(full)
@@ -491,8 +506,23 @@ def enforce_sandbox_floor(backend: str, mode: str) -> None:
     hosts where a backend can exist. Neither message consults
     ``sandbox_allow_unsandboxed_exec``.
     """
+    reason = sandbox_floor_refusal(backend, mode)
+    if reason:
+        raise ToolGateUnroutable(reason)
+
+
+def sandbox_floor_refusal(backend: str, mode: str) -> str:
+    """The sentence :func:`enforce_sandbox_floor` refuses *backend* with at *mode*, or ``""``.
+
+    The launch's verdict without the launch, for the surfaces that offer or save a
+    harness before any session starts (the Agent Harness rows, the
+    ``agent.acp_backend`` PATCH, a crewmate's harness pin save): reading this one
+    predicate is what keeps the rows from offering, and the saves from storing, a
+    choice every session start then refuses. Blocking -- the mask question can
+    probe for a sandbox backend.
+    """
     if not is_enforced(backend):
-        return
+        return ""
     # Local import for the same reason as the mask builder: this is a leaf that
     # ``acp/client.py`` imports at import time.
     from kiro_crew.sandbox import credential_mask_applies
@@ -503,18 +533,18 @@ def enforce_sandbox_floor(backend: str, mode: str) -> None:
     # and ``sandbox_allow_unsandboxed_exec`` opted in resolves to a non-``off`` tier,
     # passes that guard, and still spawns the adapter with its credential mask dropped.
     if credential_mask_applies(mode):
-        return
+        return ""
     # Platform copy only: the verdict above already decided the session cannot
     # start. Recommending standard/strict is advice that cannot succeed on native
     # Windows, where Crew has no OS sandbox backend to apply the mask.
     if platform_compat.IS_WINDOWS:
-        raise ToolGateUnroutable(
+        return (
             "{} cannot run on native Windows because Kiro Crew has no supported OS "
             "sandbox backend here to protect credential files; changing agent.sandbox "
             "cannot enable it. Select Kiro CLI in Settings → Agent Harness and start "
             "a new session.".format(label_for(backend))
         )
-    raise ToolGateUnroutable(
+    return (
         "{} routes tool calls through an enforced permission route whose "
         "compensating control is an OS-level credential mask, but this session would "
         "spawn it unsandboxed -- either agent.sandbox is 'off', or no sandbox backend "
@@ -1213,6 +1243,7 @@ __all__ = [
     "label_for",
     "remediation_for",
     "routing_verdict",
+    "sandbox_floor_refusal",
     "seeded_setting_issue",
     "session_config_issue",
 ]

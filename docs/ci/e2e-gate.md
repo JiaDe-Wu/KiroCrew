@@ -9,8 +9,8 @@ packaged fake model backend, then shells the in-tree Playwright suite at it. No
 model, no credentials, no network, no cost.
 
 The main browser job is Linux-only: it uses the CodeBuild fleet where eligible,
-otherwise the `kirocrew-runners` larger-runner group when the run executes in
-this repository, and `ubuntu-latest` in a fork running its own CI. It cannot
+otherwise the `kirocrew-linux-4-core` runner when the run executes in this
+repository, and `ubuntu-latest` in a fork running its own CI. It cannot
 rely on an unprivileged
 user namespace (CodeBuild refuses `unshare(CLONE_NEWUSER)`, and this job does not
 alter the hosted runner's namespace policy). Its disposable fake-backend gateway
@@ -21,7 +21,8 @@ must succeed before scenarios run, and the model backend remains the packaged fa
 executable.
 
 The real private-workflow MCP test runs separately in the
-`e2e-private-namespace` job on `ubuntu-latest`. That job enables unprivileged user
+`e2e-private-namespace` job on a hosted Linux runner (`kirocrew-linux-4-core` in
+this repository, `ubuntu-latest` in a fork). That job enables unprivileged user
 namespaces, requires `unshare --mount --map-root-user true` to succeed, and fails
 if either the precondition or the test fails.
 
@@ -115,10 +116,10 @@ Config facts worth knowing before you touch a spec:
 | `testDir` | `./playwright` | Specs live at `website/playwright/*.spec.ts`. |
 | `baseURL` | `process.env.PLAYWRIGHT_BASE_URL` or `http://localhost:5476` | 5476 is the default dashboard port, so an ad-hoc local run against a normal gateway works. |
 | `locale` | `en-US` | Most specs assert English prose. The app resolves language from `navigator.languages` when nothing is stored, and the harness storage state carries no `mc-lang`, so a `zh-*` runner would render the zh-CN catalog and fail those assertions. Pinning makes that an explicit dependency. |
-| `workers` | 1 under `CI` | The harness sets `CI=1`, so the browser leg is serial. |
+| `workers` | 1 under `CI` | The harness sets `CI=1`, so the browser leg is serial. Specs rely on being the only worker against their gateway, so CI shortens the suite with more gateways, not more workers ([shards](#the-suite-runs-as-shards-each-with-its-own-gateway)). |
 | `retries` | 2 under `CI` | A detector, not a fix. A spec that passes only on a retry is counted under `flaky` in the JSON report (the HTML report lists it too), and `MAX_FLAKY_SPECS` then fails the run: fix the spec, never raise `retries`. |
 | `timeout` | 30s per test | Assertion (`expect`/`poll`) timeout stays at Playwright's 5s default so a genuine slowdown surfaces instead of passing inside a wide window. |
-| `grepInvert` | excludes `@needs-agent` unless `PLAYWRIGHT_RUN_AGENT_SPECS` | The default run is the credential-less green set. The harness wires the fake backend, so it opts the agent specs back in. `@needs-live-agent` stays excluded either way and currently tags nothing. `@shared-crew` (two verified principals) is excluded unless `PLAYWRIGHT_RUN_SHARED_CREW`. |
+| `grepInvert` | excludes `@needs-agent` unless `PLAYWRIGHT_RUN_AGENT_SPECS` | The default run is the credential-less green set. The harness wires the fake backend, so it opts the agent specs back in. `@needs-live-agent` stays excluded either way and currently tags nothing. `@shared-crew` (two verified principals) is excluded unless `PLAYWRIGHT_RUN_SHARED_CREW`, and `@memory-evidence` unless `PLAYWRIGHT_RUN_MEMORY_EVIDENCE` ([below](#memory-embedding-states-one-dedicated-gateway-per-state)). |
 | browser | Playwright's own bundled Chromium | This fork vends no browser binary; CI installs it with `npx playwright install chromium`, restored from an `actions/cache` entry keyed on the exact `@playwright/test` version. `--with-deps` is deliberately NOT used — see [what CI does](#what-ci-does-around-the-command). |
 
 ### Auth flow
@@ -183,8 +184,9 @@ darkening rather than at the reported failure):
   `area: tests`, as the `kirocrew-prepare-pr` skill describes) and rerun the job once.
   Never raise the ceiling or `retries` for it.
 
-The run itself is bounded by `PLAYWRIGHT_RUN_CEILING_SECS` (17 min, so the stop, the
-report and the summary fit inside the job's 25), and the harness stops Playwright as
+The run itself is bounded by `PLAYWRIGHT_RUN_CEILING_SECS`: the job's
+`timeout-minutes` less a 300 s reserve for the steps around the run,
+capped at 1500 s, which both routes' budgets reach. The harness stops Playwright as
 soon as the gateway it drives exits, quoting the gateway's own output, so a dead
 gateway is reported as one, not as every remaining spec timing out on retries. A
 stopped run first gets SIGINT so it writes its report, and the failure quotes
@@ -195,18 +197,88 @@ evidence. The floor helper has its own unit tests in the same file, deliberately
 **ungated** so they run in the default pytest pass: an unverified guard against
 silent darkening is no guard.
 
+### The suite runs as shards, each with its own gateway
+
+`ci.yml` runs the `e2e` job as a matrix over `shard: [1, 2]`. The job name is
+`E2E (stub ACP backend, offline, <i>/<K>)`. Each leg boots its own gateway, keeps
+`workers: 1` and `retries: 2`, and runs one part of the suite: the test step sets
+`KIROCREW_E2E_SHARD=<i>/<K>` and the harness adds `--shard=<i>/<K>` to the
+`playwright test` command. K is `strategy.job-total`, so the length of that list
+is the only place the shard count is written. With the variable unset, which is
+every run outside this job, the command and the floor are the unsharded ones
+above.
+
+A leg cannot see the other legs, so each one proves the whole division before
+it runs a spec, in `_shard_share()`:
+
+1. It lists the whole suite (`playwright test --list --reporter=json`) and each
+   of the K shards (`--list --shard=<j>/<K>`), in the environment the run uses.
+   The listings run one at a time: Playwright processes that start together on a
+   runner with no transform cache race to write it, and the loser lists a spec
+   file short while exiting 0.
+2. The whole suite's list must hold at least `MIN_EXECUTED_SPECS` tests.
+3. Every listed test must be in exactly one shard. A test in no shard, in two
+   shards, or in a shard but not in the suite fails the leg before it runs. The
+   one exception is the `setup` project, which `chromium` depends on: Playwright
+   runs a dependency project in every shard, so its test must be in all K.
+4. It lists the K shards again under `LC_ALL=C`, and that division must be the
+   same one.
+
+After the run, `_assert_shard_ran_its_share()` requires the JSON report to hold
+exactly this leg's list, with every test run, and `MAX_SKIPPED_SPECS` and
+`MAX_FLAKY_SPECS` apply to each leg as they do to an unsharded run. A leg that
+passes therefore ran each test on its list once, and the lists of the K legs
+cover the suite once.
+
+Step 4 is what lets two machines rely on each other. Playwright derives a shard
+from the ordered test list alone (`packages/playwright/src/runner/testGroups.ts`
+at the pinned version): `createTestGroups` puts each test in a group, and
+`filterForShard` gives a group to the shard whose index range holds the group's
+first test. Nothing in it reads a clock, a random number or the host. The one
+machine input is the order of the spec files, which `collectFiles` sorts with
+`localeCompare`, the collation of the process locale. A leg that passes step 4
+holds the division of the `C` locale, so two legs that both pass hold the same
+one.
+
+The same grouping keeps serial tests together. `fullyParallel: true` makes each
+test of an ordinary file its own group, so such a file can be divided between
+two legs. A file that calls `test.describe.configure({ mode: 'serial' })` at the
+top, or a `describe` block in serial mode, is one group and goes whole to one
+leg. A spec that needs state from another file is not protected by this: it has
+to seed that state itself, which is also what a reordering of the suite requires
+of it.
+
+Each leg uploads its JSON report as `e2e-playwright-report-<i>` on every
+outcome. The report lists each test's id and status, so the division can be
+checked from outside the job: the ids of the K reports together are the ids of
+`playwright test --list`, and no id of the `chromium` project is in two reports.
+
+Leg 1 also carries everything that runs once per pull request: the four
+asserting harness steps before the suite and the memory UI lane of
+`scripts/ci_e2e_parallel.py`. Every other leg runs the smoke lane only. Artifact
+names end in the leg number (`voice-recovery-evidence-<i>`,
+`member-memory-ui-evidence-<i>`, `e2e-playwright-failures-<i>`,
+`e2e-host-pressure-<i>`), because one run can use an artifact name once; an
+artifact is empty or absent on a leg whose part of the suite did not write it.
+
+On a fork pull request both legs run on the hosted route
+(`kirocrew-linux-4-core`, or `ubuntu-latest` in a fork's own CI) with the same
+40-minute budget each. The split takes two of those runners for about half the
+suite each instead of one for all of it.
+
 ## What CI does around the command
 
-`ci.yml`'s `e2e` job (`E2E (stub ACP backend, offline)`) installs the backend
+Each leg of `ci.yml`'s `e2e` job (`E2E (stub ACP backend, offline, <i>/<K>)`) installs the backend
 with `--group dev`, runs `npm ci` and `npm run build` in `website/`, stages
 `website/dist` into `src/kiro_crew/static/dist` so the specs render the real
 bundled dashboard rather than a 404, installs Chromium, then runs
-`python scripts/ci_e2e_parallel.py`. The separate `e2e-private-namespace` job
+`python scripts/ci_e2e_parallel.py`, which on leg 1 runs both lanes below and on
+every other leg the `test_e2e` lane alone. The separate `e2e-private-namespace` job
 owns the real private-workflow MCP test and does not serialize the browser job.
 The CI-only helper overlaps the unchanged `python setup.py test_e2e` command and
 the dedicated Memory UI pytest command. Both outcomes are awaited; no failure
 cancels or hides the other lane. Both helper outcomes remain mandatory, with the
-same browser-job ceiling (25 minutes on the CodeBuild fleet, 40 off it; see
+same browser-job ceiling (30 minutes on the CodeBuild fleet, 40 off it; see
 "The browser install is budgeted" below). The private namespace coverage is a
 separate mandatory CI job instead of a serial prerequisite, so it does not
 consume the browser lane's critical path.
@@ -215,7 +287,7 @@ The head+base i18n render gate is its own `i18n-render` job rather than a third
 lane here, for the same reason: it needs no gateway, and on the hosted 4-vCPU
 runner a fork PR gets, its two DEV builds plus a two-tree Chromium render ran
 about 13 minutes alongside the suite and pushed `test_dashboard_playwright_suite`
-past its 1020 s ceiling on 27% of fork-PR runs (2.5% on the fleet's large
+past the 1020 s ceiling it then had on 27% of fork-PR runs (2.5% on the fleet's large
 instance, where the same overlap fit). The suite's ceiling is sized for this step
 to hold two browser lanes, not three. [i18n-gates.md](i18n-gates.md) describes
 that job.
@@ -254,8 +326,9 @@ failure propagation and cancellation cleanup, not private-MCP or browser proof.
 
 ### The browser install is budgeted, and installs no apt packages
 
-The job's ceiling is route-aware, like `backend-test`'s: 25 minutes when the run
-is admitted to the CodeBuild fleet, 40 when it is not and the job falls back to
+The job's ceiling is route-aware, like `backend-test`'s: 30 minutes when the run
+is admitted to the CodeBuild fleet, the smallest budget whose derived Playwright
+run ceiling reaches the 1500 s cap, and 40 when it is not and the job falls back to
 `kirocrew-linux-4-core`, where the slowest observed fork run took 23.9 of the
 old 25. The browser install is the step that historically consumed that budget.
 It carries three constraints, all in service of leaving the specs enough of it
@@ -293,14 +366,14 @@ and photographs the highlighted Text-to-speech provider field.
 These tests reuse the suite's authenticated page/browser fixtures and production
 dashboard, with fixture API responses and injected `voice-error` events; they
 neither record the microphone nor prove audible speech. After E2E, the
-`voice-recovery-evidence` artifact retains six PNGs on a successful run plus
+`voice-recovery-evidence-<i>` artifact of the leg that ran the spec retains six PNGs on a successful run plus
 per-attempt provenance: checkout, PR-head, source-file, build, served-document
 and frame hashes, viewport and browser version. Playwright owns retries and
 timeouts; each attempt writes its own output directory, including partial
 evidence if a later assertion fails.
 
 `website/playwright/member-memory.spec.ts` also captures the real dashboard
-with synthetic member and memory data in ten focused scenarios. The `member-memory-ui-evidence` artifact
+with synthetic member and memory data in ten focused scenarios. The `member-memory-ui-evidence-<i>` artifact of the leg that ran the spec
 retains its PNGs and focused-spec WebM recordings on successful and failed attempts: desktop/mobile records,
 copy selection, record details, proposals, restore confirmation and pending
 restore, a working legacy V1 member and creation of a separate empty V2 member, plus V1/V2 bulk
@@ -344,18 +417,27 @@ never builds the link itself. `standup` is not the default page, so a tab still
 showing the live page fails. The spec guards against a person being asked to approve
 a page they could not open.
 
-When the job fails, a final `if: failure()` step uploads
+When the job fails, an `if: failure()` step uploads
 `website/test-results/` and `website/playwright-report/` as the
-`e2e-playwright-failures` artifact (7-day retention). `test-results/` holds one
+`e2e-playwright-failures-<i>` artifact of that leg (7-day retention). `test-results/` holds one
 directory per failed attempt: `error-context.md` (the ARIA snapshot of the page
 at the failing assertion — the thing that says whether a locator matched the
 wrong row or no row), the `on-first-retry` trace, and any screenshot. The html
 report next to it is the one `--reporter=html` writes.
 
+A failed job also uploads `e2e-host-pressure-<i>` (7-day retention): a log a
+background step writes every 5 s while the suite runs, with a UTC timestamp,
+`/proc/pressure/{cpu,io,memory}`, the `cpu ` line of `/proc/stat` (steal),
+`/proc/loadavg`, and the job cgroup's `cpu.stat` and `memory.events`. It exists
+to tell a runner that stopped scheduling the gateway from a stall inside it when
+the loop-stall watchdog ends the gateway with -14. Inside the container
+`/proc/pressure` and `/proc/stat` are host-wide, and a gap in the log's own
+timestamps means the sampler was frozen too.
+
 The job's log alone is not enough to triage a spec failure: it names
-`error-context.md` and prints nothing from it. #8526 (a ghost transcript from the
-previous session rendering for a few hundred ms after the first send) was
-narrowed for hours from that one line before a local run produced the snapshot.
+`error-context.md` and prints nothing from it. A failure such as a ghost
+transcript from the previous session rendering for a few hundred ms after the
+first send cannot be narrowed from that one line; the snapshot can.
 Download the artifact first; bisect second.
 
 `if-no-files-found: ignore`, deliberately: a run that fails before the specs
@@ -451,7 +533,7 @@ are excluded from proxies for this scenario.
 
 Dedicated outputs land under the runner's temporary
 `memory-embedding-evidence/<scenario>/` directory, or `tmp_path/evidence/<scenario>`
-without the CI override. The `member-memory-ui-evidence` uploader collects
+without the CI override. Leg 1's `member-memory-ui-evidence-1` uploader collects
 `memory-v2-embedding-*.png` and `memory-v2-embedding-evidence.json` from that
 explicit temporary root. These files do not live under `website/test-results`;
 the ordinary shared suite's output paths remain unchanged. The
@@ -526,8 +608,10 @@ so the file on disk still says `KiroCrew` while the artifact says otherwise.
 
 There is no `PATH` edit to assert. The `nsis` block in
 `website/electron/package.json` declares no PATH handling and
-`website/electron/build/installer.nsh` touches only shortcuts and the
-electron-updater cache, so a desktop install puts no `kirocrew` on `PATH`. The
+`website/electron/build/installer.nsh` touches only shortcuts, the
+electron-updater cache and installed files too deep for the previous
+uninstaller to move (`KiroClearUnmovableFiles`), so a desktop install puts no
+`kirocrew` on `PATH`. The
 bundled CLI is exercised at its packaged path
 (`resources\backend-dist\kirocrew-backend\bin\kirocrew.cmd`) as its own new
 process instead, which is the path
@@ -539,12 +623,16 @@ managed-server invocation resolves.
 `build.yml`'s `build-windows-installer` job compiles an NSIS installer on every
 qualifying PR (one that changed a Windows-packaging input, per `desktop-matrix`'s
 `windows_installer` filter; a merge group always qualifies, and so does a push
-to main unless `MERGE_QUEUE_ENABLED` is `'true'`),
+to main unless the merge queue landed it with `MERGE_QUEUE_ENABLED` `'true'`),
 installs it silently, and runs
 `.github/scripts/test-windows-installer.ps1` with NO `-SkipGatewayValidation`.
 The script starts the just-installed bundled interpreter against an isolated data
 home and requires `/api/ready` within 50 seconds, so an artifact that installs
 but cannot boot fails at review time.
+It also plants an over-budget bytecode cache and an over-budget ordinary file in
+the installed tree and re-runs the installer over each: the cache must be deleted
+and the update go through, and the other file must stop the installer with exit
+code 2 before any file is moved.
 
 Its backend payload is a real python-build-standalone runtime carrying the wheel
 `build-wheel` produced (the job `needs` it, so the bundled bytes are the ones
@@ -599,15 +687,15 @@ states:
 | Event | OS legs | `needs` |
 |---|---|---|
 | `pull_request`, `merge_group` | `ubuntu-latest`, `windows-latest` | must succeed (`lint-gate` too) |
-| push to `main`, `MERGE_QUEUE_ENABLED == 'true'` | `macos-15` alone | skipped (including `lint-gate`); the condition admits the push |
-| push to `main`, variable not `'true'` | `ubuntu-latest`, `macos-15`, `windows-latest` | must succeed (`lint-gate` too) |
+| push to `main` the merge queue landed (`MERGE_QUEUE_ENABLED == 'true'`, `github.actor == 'github-merge-queue[bot]'`) | `macos-15` alone | skipped (including `lint-gate`); the condition admits the push |
+| any other push to `main` | `ubuntu-latest`, `macos-15`, `windows-latest` | must succeed (`lint-gate` too) |
 
 The mac leg is event-conditional for the queue, not the runtime: a `macos-15`
 runner waits about 200 minutes, so a mac leg on every pull request would hold
-every PR behind it, while on main the wait costs nobody a merge. With the queue
-on, the merge group already booted Linux and Windows on the same tree, so the
-push runs mac alone. The real-Darwin boot is covered twice: that leg, and
-`nightly.yml`'s `pod-scenarios`, which boots a real service-managed pod on
+every PR behind it, while on main the wait costs nobody a merge. On a
+queue-landed push the merge group already booted Linux and Windows on the same
+tree, so the push runs mac alone. The real-Darwin boot is covered twice: that
+leg, and `nightly.yml`'s `pod-scenarios`, which boots a real service-managed pod on
 `macos-15`.
 
 ### Why it exists
@@ -615,7 +703,7 @@ push runs mac alone. The real-Darwin boot is covered twice: that leg, and
 Outside this job, no macOS or Windows job starts a gateway: the whole E2E
 surface is gated on `KIROCREW_E2E`, which only `setup.py test_e2e` sets, and
 only the Linux `e2e` job runs that. A unit test cannot close that gap.
-[#8117](https://github.com/kirodotdev/KiroCrew/pull/8117) is the defining case:
+The defining case:
 a settings-file probe in `sandbox.wrap_argv`'s Windows delegation branch made
 the Kiro ACP spawn on a fresh Windows host (where that file does not exist) fall
 through to the no-backend fail-closed path, so the gateway never became usable.
@@ -644,7 +732,7 @@ and Windows that tail is the only evidence a maintainer without that OS gets.
 | `test_prompt_returns_the_fake_backend_reply` | One session create plus one prompt returns the fake backend's reply. `/api/health` can answer while the ACP spawn is refused, so this is the load-bearing one. |
 | `test_tool_marker_prompt_completes_the_turn` | A `[[TOOL]]` prompt still completes its turn. |
 | `test_seeded_sandbox_mode_boots_and_runs_a_turn[minimal]` | `agent.sandbox: "off"` boots and serves. |
-| `test_seeded_sandbox_mode_boots_and_runs_a_turn[rich]` | The shipped `auto` default boots and serves. **This is the #8117 pin.** |
+| `test_seeded_sandbox_mode_boots_and_runs_a_turn[rich]` | The shipped `auto` default boots and serves. **This pins the Windows sandbox-delegation case above.** |
 | `test_shutdown_leaves_no_gateway_child_alive` | Teardown reaps the tree: the pid is gone (via `platform_compat.pid_exists`, never `os.kill(pid, 0)`) and the port refuses connections. |
 
 The tier is expressed as a SEED FIXTURE rather than a post-boot config write,
@@ -696,7 +784,7 @@ Linux user namespaces) must complete the turn; a host that genuinely has none
 must FAIL CLOSED with a named sandbox refusal and stay healthy. `ubuntu-latest`
 is that second host: its unprivileged user namespaces are AppArmor-restricted,
 which is why `backend-test-sandbox` has to clear a sysctl to get one. On Windows
-the expectation is unconditionally the first, so a #8117-style regression cannot
+the expectation is unconditionally the first, so a regression like the sandbox-delegation case above cannot
 hide in the fail-closed branch.
 
 ### `KIROCREW_E2E_REQUIRE=1` on the boot matrix
@@ -831,8 +919,7 @@ any run made under it.
   Windows. It lives in the job env, not the test, so a slow runner is retunable
   without a code change. Windows needs the widest window: subprocess spawn and
   filesystem latency there are measurably slower, the conditions
-  [#9172](https://github.com/kirodotdev/KiroCrew/pull/9172) addressed when a slow
-  disk killed the gateway.
+  under which a slow disk can kill the gateway.
 - **`-n0` with `--timeout=420`**: the module spawns a real process per test, and
   under xdist a block takes the worker with it, which on Windows aborts the run.
   The cap sits above the widest readiness window plus the per-turn reply ceiling,
@@ -841,7 +928,8 @@ any run made under it.
   `pytest` exits 0 on a fully skipped module, so the exit code cannot tell seven
   booted gateways from a module that was never collected. Raise the number when
   you add a test to that file.
-- **`shell: bash` on every leg**, so one command text serves all three; the
+- **bash on every leg** (`shell: bash` on macOS and Windows, the
+  `/usr/local/bin/ci-shell` bash wrapper on Ubuntu), so one command text serves all three; the
   Windows default is pwsh, where `tee` and `grep` are not these tools.
 
 `pr-readiness.yml` needs no entry: it resolves lanes by WORKFLOW FILE
@@ -1021,7 +1109,7 @@ session can reach, and the pod's `require_backend()` probes it by creating a tas
 
 ### The canary
 
-Copied from `ci.yml`'s macOS peer-identity step: run by path with `-v -n0`, tee
+Copied from `platform-tests.yml`'s macOS peer-identity step: run by path with `-v -n0`, tee
 to `pod-scenarios.log`, then `grep -qE '(^|[^0-9])55 passed'` and fail the step
 otherwise. 55 is six user-flow scenarios plus the 49 fixture-isolation checks in
 `test/e2e/scenarios/test_conftest.py`, which run in the same invocation. An exit

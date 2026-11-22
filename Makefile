@@ -5,7 +5,7 @@
 #   make wheel     — self-contained pip wheel (dashboard bundled)
 #   make backend-bin — standalone backend tree (bundled interpreter, no system Python)
 #   make desktop   — double-clickable desktop app (universal DMG on macOS / AppImage on Linux)
-# All three take EDITION=oss|enterprise (else $KIROCREW_BUILD_EDITION, else oss).
+# All three take EDITION=oss|lts (else $KIROCREW_BUILD_EDITION, else oss).
 .PHONY: all build frontend backend test clean wheel backend-bin desktop check-edition
 
 PY ?= python3
@@ -13,12 +13,12 @@ PY ?= python3
 # packaging targets pass it to setup.py's build_py as KIROCREW_BUILD_EDITION;
 # the source tree always stays oss. Keep EDITIONS equal to edition.EDITIONS.
 # EDITION comes from `EDITION=`, else from KIROCREW_BUILD_EDITION, else oss, so
-# `KIROCREW_BUILD_EDITION=enterprise make wheel` cannot quietly build oss.
+# `KIROCREW_BUILD_EDITION=lts make wheel` cannot quietly build oss.
 # check-edition refuses the two when both are set and differ.
 # `override` on each edition variable: under `make -e` (or `e` in MAKEFLAGS)
 # an environment variable of the same name beats a plain assignment, which
 # would let an ambient EDITION, EDITIONS or helper pick or widen the edition.
-override EDITIONS := oss enterprise
+override EDITIONS := oss lts
 override _EDITION_ENV := $(strip $(KIROCREW_BUILD_EDITION))
 # Only a command-line EDITION= counts: an exported shell EDITION is a generic
 # name something else may have set, so it is ignored.
@@ -67,7 +67,7 @@ frontend:
 	  NBD="$$(cat "$${KIROCREW_HOME:-$$HOME/.kiro/crew}/node-bin-dir" 2>/dev/null || true)"; \
 	  { [ -z "$$NBD" ] || export PATH="$$NBD:$$PATH"; }; \
 	  if ! command -v npm >/dev/null 2>&1; then \
-	    echo "ERROR: npm not found. Install Node >= 18 (see ensure-node.sh) and re-run." >&2; \
+	    echo "ERROR: npm not found. Install Node 22.12 or newer (24 LTS recommended; see ensure-node.sh) and re-run." >&2; \
 	    exit 1; \
 	  fi; \
 	  if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi && \

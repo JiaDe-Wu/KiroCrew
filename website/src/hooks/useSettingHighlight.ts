@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { useLocation, useSearchParams } from 'react-router-dom'
 import { SETTINGS_REGISTRY } from '../components/commandPalette/settingsRegistry.gen'
 import { setSettingsDeepLinkTarget } from '../components/settings'
@@ -47,6 +47,29 @@ const LEGACY_ID_EXACT: Record<string, string> = {
   // labelled by what it does.
   'about.auto-update-on-restart': 'about.install-app-updates-automatically',
   'about.update-notifications': 'about.update-the-gateway-automatically',
+  // WeChat's access select took WhatsApp's "agent" wording in place of "bot".
+  'channels.who-can-message-the-bot-wechat': 'channels.who-can-message-the-agent-wechat',
+  // The Crew-owned sign-in preview covers every MCP server, not only GitHub.
+  'developer.github-sign-in-by-kiro-crew': 'developer.mcp-sign-in-by-kiro-crew',
+  // The six Google products' OAuth apps became one Google entry.
+  'connections.oauth-client-gmail': 'connections.oauth-client-google',
+  'connections.oauth-client-google-drive': 'connections.oauth-client-google',
+  'connections.oauth-client-google-calendar': 'connections.oauth-client-google',
+  'connections.oauth-client-google-sheets': 'connections.oauth-client-google',
+  'connections.oauth-client-google-docs': 'connections.oauth-client-google',
+  'connections.oauth-client-google-slides': 'connections.oauth-client-google',
+  // The Decisions card dropped the provider name from its title, shifting the
+  // derived id with it.
+  'developer.decisions-jev': 'developer.decisions',
+  // The banner switch is labelled by when it fires.
+  'notifications.show-a-banner-for-new-notifications': 'notifications.show-a-banner-while-this-window-is-open',
+  // The engine-memory switch is labelled by the product name, Kiro Memory.
+  'agent.orchestrator-memory': 'agent.kiro-memory',
+  // The Kiro sign-in card left the Agent Harness tab for a Kiro account tab.
+  'agent.kiro-sign-in': 'kiro-account.kiro-sign-in',
+  // The engine switch left Developer > Feature previews for the KAS row on
+  // Agent Harness, as a two-way choice.
+  'developer.run-kas-on-kiro-crew-s-own-engine': 'agent.engine',
 }
 
 /** The ids `LEGACY_ID_EXACT` rewrites, for the test that none is live. */
@@ -126,12 +149,12 @@ export const SETTINGS_TURN_TIME_LIMIT_KEY = 'agent.chat_turn_timeout_secs'
 export const SETTINGS_TURN_TIME_LIMIT_HIGHLIGHT = `key:${SETTINGS_TURN_TIME_LIMIT_KEY}`
 
 /**
- * `data-setting-key` anchor of the Kiro sign-in card on Settings → Agent
- * Harness, the target of the chat error row's "Sign in to Kiro" link
+ * `data-setting-key` anchor of the Kiro sign-in card on Settings → Kiro
+ * account, the target of the chat error row's "Sign in to Kiro" link
  * (`KIRO_SIGN_IN_PATH` in `pages/developer/kiroSignInLink.ts`). A pseudo key,
  * not a config path: nothing reads it as a setting. Declared HERE, beside the
  * other deep-link ids, because the hook has to know it: the card mounts LATE
- * (its pane renders it only after the Agent Harness tab's config read), so
+ * (its tab loads it as a lazy chunk), so
  * the probe waits for this anchor the way it waits for a declared UI identity
  * instead of stripping it as unknown on the first tick. Every other `key:`
  * value with no registry entry and no element is still stripped at once, so
@@ -146,8 +169,8 @@ export const DEFAULT_CREWMATE_HIGHLIGHT_ANCHOR = 'default-crewmate'
  *  (`KiroCrewCfgTab`), keyed on the config path it writes. Settings → Session
  *  Environments links here when the strict tier withholds git logins. */
 export const AGENT_SANDBOX_HIGHLIGHT_ANCHOR = 'agent.sandbox'
-/** Anchors whose card mounts AFTER its page: the sign-in card waits on the
- *  backend probe, the Default crewmate and Sandbox rows on the config query. A
+/** Anchors whose card mounts AFTER its page: the sign-in card waits on its
+ *  lazy chunk, the Default crewmate and Sandbox rows on the config query. A
  *  `key:` link to one of these waits for the element instead of stripping the param. */
 const LATE_MOUNT_ANCHORS: ReadonlySet<string> = new Set([
   KIRO_SIGN_IN_HIGHLIGHT_ANCHOR,
@@ -187,6 +210,43 @@ export function settingAnchorSelector(
   return `[${attr}="${CSS.escape(value)}"]`
 }
 
+/** How long the outline shows before it fades, and how long the fade takes. */
+const HIGHLIGHT_HOLD_MS = 2000
+const HIGHLIGHT_FADE_MS = 300
+
+function clearHighlightStyles(el: HTMLElement): void {
+  el.style.outline = ''
+  el.style.outlineOffset = ''
+  el.style.borderRadius = ''
+  el.style.transition = ''
+}
+
+/** Outline *el* for a moment, tracking its fade in *pending*. A second flash of
+ *  the same element restarts the hold instead of letting the first flash's fade
+ *  cut it short. */
+function flashSetting(pending: Map<HTMLElement, ReturnType<typeof setTimeout>>, el: HTMLElement): void {
+  clearTimeout(pending.get(el))
+  // A row that sits beside selectable options marks itself `data-setting-flash=
+  // "neutral"`: there an accent ring reads as the option being selected.
+  if (el.closest('[data-setting-flash="neutral"]') !== null) {
+    el.style.outlineWidth = '2px'
+    el.style.outlineStyle = 'dashed'
+    el.style.outlineColor = 'var(--text)'
+  } else {
+    el.style.outline = '2px solid var(--accent)'
+  }
+  el.style.outlineOffset = '4px'
+  el.style.borderRadius = '8px'
+  el.style.transition = 'outline-color 0.3s ease'
+  pending.set(el, setTimeout(() => {
+    el.style.outlineColor = 'transparent'
+    pending.set(el, setTimeout(() => {
+      pending.delete(el)
+      clearHighlightStyles(el)
+    }, HIGHLIGHT_FADE_MS))
+  }, HIGHLIGHT_HOLD_MS))
+}
+
 /**
  * @param owns Whether the mounting page currently owns the URL's `highlight`.
  *   Default `true` (Settings, which is the only element under its route). A
@@ -198,6 +258,23 @@ export function useSettingHighlight(owns: boolean = true): void {
   const [params, setParams] = useSearchParams()
   const location = useLocation()
   const rawHighlightId = params.get('highlight')
+
+  /* The pending fade of each outlined element. Kept outside the probe effect on
+   * purpose: that effect re-runs as soon as it strips `?highlight`, so its own
+   * cleanup would cancel every fade the moment the outline appeared. */
+  const fades = useRef(new Map<HTMLElement, ReturnType<typeof setTimeout>>())
+
+  // On unmount, cancel every pending fade and take the outline down now.
+  useEffect(() => {
+    const pending = fades.current
+    return () => {
+      for (const [el, timer] of pending) {
+        clearTimeout(timer)
+        clearHighlightStyles(el)
+      }
+      pending.clear()
+    }
+  }, [])
 
   // Resolve key: prefix to a registry id via configKey lookup
   let highlightId: string | null = null
@@ -271,20 +348,7 @@ export function useSettingHighlight(owns: boolean = true): void {
           if (!el) return false
           observer?.disconnect()
           el.scrollIntoView({ block: 'center', behavior: 'smooth' })
-          el.style.outline = '2px solid var(--accent)'
-          el.style.outlineOffset = '4px'
-          el.style.borderRadius = '8px'
-          el.style.transition = 'outline-color 0.3s ease'
-
-          setTimeout(() => {
-            el.style.outlineColor = 'transparent'
-            setTimeout(() => {
-              el.style.outline = ''
-              el.style.outlineOffset = ''
-              el.style.borderRadius = ''
-              el.style.transition = ''
-            }, 300)
-          }, 2000)
+          flashSetting(fades.current, el)
 
           setParams(prev => {
             const next = new URLSearchParams(prev)
@@ -332,21 +396,7 @@ export function useSettingHighlight(owns: boolean = true): void {
       if (el) {
         el.scrollIntoView({ block: 'center', behavior: 'smooth' })
         // Apply a temporary ring highlight using existing Tailwind tokens
-        const htmlEl = el as HTMLElement
-        htmlEl.style.outline = '2px solid var(--accent)'
-        htmlEl.style.outlineOffset = '4px'
-        htmlEl.style.borderRadius = '8px'
-        htmlEl.style.transition = 'outline-color 0.3s ease'
-
-        setTimeout(() => {
-          htmlEl.style.outlineColor = 'transparent'
-          setTimeout(() => {
-            htmlEl.style.outline = ''
-            htmlEl.style.outlineOffset = ''
-            htmlEl.style.borderRadius = ''
-            htmlEl.style.transition = ''
-          }, 300)
-        }, 2000)
+        flashSetting(fades.current, el as HTMLElement)
       }
 
       // Strip the highlight param

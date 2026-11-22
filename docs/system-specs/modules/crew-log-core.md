@@ -42,15 +42,15 @@ The `crew-log` root is established EAGERLY, and that is what makes the mask non-
 
 | Owner | Holds |
 |---|---|
-| `crew_log/store_paths.py` | the data-home root of each kind and its checked form, a unit's directory and file, segment naming and ordering (`segment_paths`, `oldest_segment`, `newest_segment`), the lock beside the log, `_mkdir_private`, `now_ms`, and the store's one logger with `log_exception_text` |
-| `crew_log/store_segment_reads.py` | reading one segment: the bounded tail window (`_scan_tail`, `_TAIL_WINDOW`), entry iteration, the header line, `read_head`, and `_anchor_exists` |
+| `crew_log/store_paths.py` | the data-home root of each kind and its checked form, a unit's directory and file, segment naming and ordering (`segment_paths`, `oldest_segment`, `newest_segment`), the lock beside the log, the data home resolved once per fold pass (`resolved_home_for_pass`), `_mkdir_private`, `now_ms`, and the store's one logger with `log_exception_text` |
+| `crew_log/store_segment_reads.py` | reading one segment: the bounded tail window (`_scan_tail`, `_TAIL_WINDOW`), entry iteration, the digest of the records a walk framed that the savepoint write re-checks (`ConsumedSpan`), the header line, `read_head`, and `_anchor_exists` |
 | `crew_log/store_cuts.py` | the `.cuts` seqlock (`read_cuts`, `_open_cut`, `_close_cut`) and its durable writes |
 | `crew_log/store_segment_writes.py` | one durable append (`_append_line`, `_append_lines`), its rollback, and the one allowed truncation (`_truncate`) |
 | `crew_log/store_tail_repair.py` | the closers `open(repair=True)` appends to an interrupted tail (`_close_interrupted_tail`, `_open_tail`, `_closer_entries`) and the orphan chunk group it drops |
 | `crew_log/store_results.py` | what a read returns: `Page`, `Resolution` and its `STATUS_*` outcomes, `ReadCursor`, `ResumePoint`, and the page limits |
 | `crew_log/store_units.py` | proving a unit's header, the unit listings (`unit_ids`, `unit_dirs`, `unit_dir_for`), the header reads, and the slot index (`session_units_by_slot`, `session_units_for_slot`) |
 | `crew_log/store_removal.py` | `remove_unit` and its `REMOVE_*` outcomes, trash holds, and staging a unit out of and back into the live tree |
-| `crew_log/store_retention.py` | `sweep_expired`, and the session tree's reads of a unit's log: `read_last_tree_edge` (the tail window the sweep reads), `find_last_tree_edge` (every segment), `tree_edge_scan_identity` (when an earlier complete answer still holds) and `find_spawned_entries` (the whole log) |
+| `crew_log/store_retention.py` | `sweep_expired`, and the session tree's reads of a unit's log: `read_last_tree_edge` (the tail window the sweep reads), `find_last_tree_edge` (every segment) and `find_spawned_entries` (the whole log) |
 | `crew_log/store_handle.py` | `CrewLog`, the handle on one unit's log |
 
 `test/test_store_crew_log_facade.py` pins the owner set and its layer order, the names the facade binds and serves, the patch reach of every name the test trees patch through the facade, and the names served from outside the family.
@@ -137,7 +137,7 @@ Two of these families carry a contract with REQUIRED fields. **Required here is 
 **`crew/report`** -- the answer to a dispatch.
 
 ```json
-{"type":"crew/report","seq":388,"time":1789000000000,"src":"crew:qa","thread":120,
+{"type":"crew/report","seq":388,"time":1789000000000,"src":"gateway","thread":120,
  "ref":{"unit":"session","id":"s-7f3a","from":40,"to":96},
  "data":{"item":"pr-4127","status":"done","credits":0.21,"summary":"merged"}}
 ```
@@ -145,7 +145,7 @@ Two of these families carry a contract with REQUIRED fields. **Required here is 
 | Field | Required | Meaning |
 |---|---|---|
 | `data.item` | yes | The item being reported on. |
-| `data.status` | yes | One of `done`, `blocked`, `failed`, `progress`, `question`. The last is the work board's, and the enum is derived from that writer's own tuple so a status it gains cannot become a refused entry; [crew-types.md](../../reference/crew-log/crew-types.md#crewreport) states why `question` is not folded into `blocked`. |
+| `data.status` | yes | One of `done`, `blocked`, `failed`, `progress`, `question`, `reply`. The last two are the work board's, and the enum is derived from that writer's own tuple so a status it gains cannot become a refused entry; [crew-types.md](../../reference/crew-log/crew-types.md#crewreport) states why `question` is not folded into `blocked`. |
 | `data.credits` | no | Credits the child spent. Absent is not zero. |
 | `data.summary` | no | One sentence. |
 | `ref` | yes | A segment of the child's crew log: the evidence. |
@@ -161,7 +161,7 @@ That choice has a real cost and this is where it is written down: an unthreaded 
 
 The refusal that remains is the evidence one: a report with no citable unit is not written at all, because a claim nothing can check is not a record.
 
-Both of these are one type each, not one per writer. The child's identity is `src`, so two children reporting on one item write the same `type` into one file and are told apart by who signed them.
+Both of these are one type each, not one per writer. The writer signs a report `gateway` and the reporting session is the unit its `ref` cites, so two children reporting on one item write the same `type` into one file and are told apart by that citation.
 
 `ref` on a report is **the one cross-kind bridge a writer takes**: from a crew's log into a session's segment, one level down, in the direction a conductor reads. The pair is symmetric with `subagent/spawned` (section 5): the child's header `thread` points up at the entry that caused it, and that entry's `ref` points down into the child's record.
 
@@ -214,10 +214,12 @@ its types render.
 ### Session, turn
 | Type | `data` | Emitter |
 |---|---|---|
-| `session/opened` | header echo + `resumed`; `model_requested` when a tier resolved one; `previous {sid}` on a crew log created while its slot already had one; `parent {slot, sid?}` on a session another session made through `session_create` | yes |
+| `session/opened` | header echo + `resumed`; `model_requested` when a tier resolved one; `previous {sid}` on a crew log created while its slot already had one; `parent {slot, sid?}` on a session another session made through `session_create`; `class {memory, app?, channel?, workspace?}` | yes |
 | `session/closed` | `{reason}` | yes |
 | `session/adopted` | `{parent, previous_parent?}` — the session was adopted under a new parent, replacing the `session/opened` parent edge | yes |
 | `session/released` | `{previous_parent?}` — the session was released from its parent, retracting the edge | yes |
+| `session/class` | `{memory, app?, channel?, workspace?}` — the session's class changed after its log was opened; written only when it differs from the last one recorded | yes |
+| `session/unrestored` | `{listed, restored, kept}` — the session's tab was listed as open at startup and did not come back | yes |
 | `session/spawned` | `{child {slot}}` — written on the CREATOR's log when `session_create` or `session_fork` commits, so the creating edge is durable before the child's first turn opens its own log | yes |
 | `turn/started` | `{turn, actor, depth, message_seq?, attempt?}` | yes |
 | `turn/refused` | `{turn, actor, reason, depth}` | yes |
@@ -246,28 +248,30 @@ opposite handling. The pair `(turn, attempt)` is therefore the identity a fold g
 
 | Type | `data` | Emitter |
 |---|---|---|
-| `message/received` | `{turn, role, text, source, attachments:[ref]}` | yes |
+| `message/received` | `{turn, role, source, text?, attachments?:[ref], attachments_omitted?, chunks?:[seq], chars?}` | yes |
 | `message/sent` | `{turn, step?, text?, interrupted?, chunks?:[seq], chars?}` — usage rides on `turn/completed` | yes |
-| `message/chunk` | `{turn, step, delta}` — an oversize body's slice | overflow only |
+| `message/chunk` | `{turn, step?, delta}` — an oversize body's slice | overflow only |
 | `message/queued` | `{source, bytes, queued_seq}` — arrived while a turn ran | yes |
 | `request/configured` | `{turn, model, provider, context_window, system?, system_bytes?}` — written on change only | yes |
-| `context/composed` | `{turn, step?, sources:[{kind, chars, tokens}], chars, tokens, tokens_estimated, phase?}` — `phase` is `session_start` or `per_turn` | yes |
+| `context/composed` | `{turn, step?, sources:[{kind, chars, tokens}], chars, tokens, tokens_estimated, phase?, omitted?}` — `phase` is `session_start` or `per_turn` | yes |
 | `context/measured` | `{turn, turn_id?, breakdown?: {schema, categories, model_calls?, total_chars?, compacted?, history?}, ttft?: {total_ms, setup_ms?, model_ms?}}` -- the agent engine's own measurement of the turn, in characters | yes |
 | `step/started` | `{turn, step}` — one model call | yes |
 | `step/completed` | `{turn, step, ms}` | yes |
 
 `context/composed` is where the per-turn bill for what the gateway injects lands: `sources` names
-every block put in front of the model — `system`, `memory`, `lessons`, `skills_index`, `steering`,
-`project`, `tool_specs`, `ledger_context` — each with its `tokens`.
+every block put in front of the model by its `src/kiro_crew/context_blocks.py` label (for example
+`agent_instructions`, `memory`, `lessons`, `skill_index`, `steering`, `working_folder`,
+`your_message`), each with its `tokens`.
 
 ### Tool, approval
 
 | Type | `data` | Emitter |
 |---|---|---|
-| `tool/called` | `{turn, step, call_id, name, server, kind, args_hash?, args_bytes?}` | yes |
-| `tool/completed` | `{turn, step, call_id, status, is_error?, elapsed_ms, result_hash?, result_bytes?}` | yes |
+| `tool/called` | `{turn, step?, call_id, call_index?, name, server, kind, args_hash?, args_bytes?}` | yes |
+| `tool/completed` | `{turn, step?, call_id, call_index?, name, server, status, is_error?, elapsed_ms?, result_hash?, result_bytes?}` | yes |
 | `approval/requested` | `{turn, approval_id, tool?, reason?}` | yes |
 | `approval/decided` | `{turn, approval_id, decision, by?, cause?}` — `decision: "unknown"` is written only by the interrupted-tail repair | yes |
+| `approval/bridged` | `{turn?, approval_id, transport, outcome, reason?, channel?, actor?, owner?}` — one per action a chat app took through the notification bridge, refused ones included; never replaces `approval/decided` | yes |
 
 Arguments and results are DIGESTED, never recorded: `args_hash` / `result_hash` are the sha256 of
 the serialized payload and `args_bytes` / `result_bytes` its length. That answers "same arguments as
@@ -289,7 +293,7 @@ and naming a guess is worse than naming nobody.
 | Type | `data` | Emitter |
 |---|---|---|
 | `model/selected` | `{turn?, model, source}` | yes |
-| `compaction/applied` | `{turn, pct_before, pct_after, freed_pct}` | yes |
+| `compaction/applied` | `{pct_before, pct_after, freed_pct}` | yes |
 | `plan/updated` | `{turn, items:[{id, text, state: done \| open}], total?}` — the session's own task list | yes |
 
 ### Ledger
@@ -309,11 +313,11 @@ slot (`session-work-ledger.md`).
 
 | Type | `data` | Emitter |
 |---|---|---|
-| `object/observed` | `{producer: probe, kind, target, fingerprint, facts, facts_omitted?, observed_at}` — the state of an object outside the session, as one named producer observed it | yes |
+| `object/observed` | `{producer: probe \| warm_brief, kind, target, fingerprint, facts, facts_omitted?, observed_at}` — the state of an object outside the session, as one named producer observed it | yes |
 
 One entry per CHANGE of the producer's fingerprint for one subject, never one per
 poll, appended into the log of the session the producer works for. `producer` is a
-CLOSED vocabulary (`probe`, the structured monitor's provider probe) and the emitter
+CLOSED vocabulary (`probe`, the structured monitor's provider probe; `warm_brief`, the warm welcome's pull-request read) and the emitter
 refuses a value outside it rather than coercing it: the value is what lets a reader
 tell a measured record from a sentence an agent typed, and a coerced producer would
 attribute the record to a mechanism that did not make it. `facts` is the probe's
@@ -323,6 +327,8 @@ line is recorded short by a NAMED member in `facts_omitted` rather than dropped 
 trimmed silently. No `turn`: a probe runs without a model turn, so the observation
 belongs to no turn. The monitor's state document still holds no history of the
 subject -- this entry is that history (`monitor-architecture.md`).
+
+The `objects` slot fold (`crew_log/projection_objects.py`) keeps the newest record per subject (`target`) and producer, `{latest: {target: {producer: {kind, facts, observed_at}}}, omitted}`, at most 64 subjects with the least recently observed evicted first, and facts over 2,048 bytes dropped whole. The conductor mode Board (`/api/crew-board`, owner-gated) reads it as `pr_facts`, so a pull request's state shows with its read time and no network read on page load.
 
 ### Cards and guides
 
@@ -336,10 +342,13 @@ subject -- this entry is that history (`monitor-architecture.md`).
 
 A proposal is part of the conversation, so it is recorded twice in one step: a
 `card` row in the slot's transcript (display-only, drawn where it was proposed) and
-the opener here. `mid` is that row's id and is what joins the two. Every outcome
-patches the row in place and appends a closer, so the conversation with each card in
-its final state is reconstructible from this log alone -- the openers say where and
-what, the newest closer per id says how it ended. Only names are recorded: no card
+the opener here. `mid` is that row's id and is what joins the two. The opener's
+`mid` names the row the card was first drawn at; a repeated proposal can draw the
+waiting card again at a later row without a new entry. Every outcome
+patches the card's newest row in place and appends a closer, so the conversation with
+each card in its final state is reconstructible from this log alone -- the openers say
+where each card was first drawn and what it was, the newest closer per id says how it
+ended. Only names are recorded: no card
 parameter, no edited field and no typed value reaches either record. The live state
 -- revisions, apply steps, the tab driving a guide -- stays the card and guide
 stores', and a re-preview writes nothing here. `card/finished` may repeat for one id
@@ -354,11 +363,11 @@ reader pass them cleanly anyway; they are declared like every other fact.
 | Type | `data` | Emitter |
 |---|---|---|
 | `background/completed` | `{kind: title \| memory_consolidation \| summary \| dynamic_card, model?, provider?, tokens?, credits?, ms?}` | yes |
-| `subagent/spawned` | `{turn?, agent_id, agent?, model?, task?, scope:{memory, lessons, project}}` — no `ref` yet, see below | yes |
+| `subagent/spawned` | `{turn?, attempt?, agent_id, agent?, model?, task?, scope?:{memory, lessons, project}}` — no `ref` yet, see below | yes |
 | `subagent/steered` | `{agent_id, mode: interrupt \| follow_up}` | yes |
 | `subagent/dismissed` | `{agent_id}` — the user cleared that child's card; neither an opener nor a closer | yes |
-| `subagent/completed` | `{agent_id, ms?, credits?}` — no `tokens`, see below | yes |
-| `subagent/failed` | `{agent_id, reason?, outcome: failed \| stopped \| unknown, ms?, credits?}` — `unknown` is written only by the interrupted-tail repair | yes |
+| `subagent/completed` | `{agent_id, ms?, credits?, child_sid?}` — no `tokens`, see below | yes |
+| `subagent/failed` | `{agent_id, reason?, outcome: failed \| stopped \| unknown, ms?, credits?, child_sid?}` — `unknown` is written only by the interrupted-tail repair | yes |
 
 These are the families a single-agent runtime never needs and a gateway does: every token spent on a
 session's behalf, whether a person asked for it or not, is a fact in that session's log attributed to
@@ -509,6 +518,8 @@ Only the writer can make that promise, since only it knows whether the entry sam
 
 The gate is on `iter_from` alone. `page` and `resolve` render history for a person or drill into a citation, where displaying an unfamiliar line is a missing detail rather than a corrupted fold, so neither takes a vocabulary and neither refuses.
 
+**A raw prefilter skips the decode, never the check that decides.** `iter_from(contains=b'...')` does not decode a record whose bytes lack the given bytes, for a caller that filters by entry type itself and so loses nothing (`_seed_attempts` passes `b'"turn/started"'`: its decode cost follows the turns, not the file). It is refused with `strict_seq=True`, whose advancing-seq check reads every record, and a log with more than one segment ignores it so the cross-segment boundary still compares each segment's last entry.
+
 ## 7. Append-only guarantee and damage
 
 A line is never rewritten. Exactly one mutation exists: on `open`, trailing bytes that are not a complete line are dropped. Termination decides which those are, so the rule needs no heuristic. Every append writes `line + "\n"` and fsyncs, so unterminated bytes that fail to parse are a crash artifact and go; unterminated bytes that *do* parse lost only their newline, so the record stays and the next append re-supplies the separator. A terminated line that does not parse is damage inside history: reads skip it, the file keeps it. Two readers of the same bytes therefore always agree.
@@ -523,7 +534,7 @@ If the rollback ALSO fails -- likely, since whatever broke the write is often st
 
 The header is the exception, and only at creation: `CrewLog.create()` publishes it with `atomic_write` (temp file, fsync, rename), so the file is either complete or absent and a crash or ENOSPC mid-header cannot leave a fragment. Without that, a fragment would be read as a torn tail, truncated to an empty file, and then refused by `open` while `create` refused the very file it had produced -- a unit wedged with no automated recovery. For the same reason all three of `create`, `open` and `exists` read a **zero-byte file as absent**: it carries no header and no entries, so there is nothing to protect and one shared meaning is what keeps the paths from disagreeing. After the rename the file is append-only for the rest of its life.
 
-Decoding is **strict and per line**, on bytes read in binary mode. Replacement-decoding would be the wrong tolerance: invalid bytes inside a JSON string can decode into still-valid JSON, so a damaged line would be yielded with `U+FFFD` substituted into its values rather than skipped -- handing a consumer altered data as authority, which a record that calls itself the authority must never do. Byte damage is this machinery's expected input, so an undecodable line is damage and is skipped exactly like unparseable JSON; an undecodable header is `bad_header`.
+Decoding is **strict and per line**, on bytes read in binary mode. Replacement-decoding would be the wrong tolerance: invalid bytes inside a JSON string can decode into still-valid JSON, so a damaged line would be yielded with `U+FFFD` substituted into its values rather than skipped -- handing a consumer altered data as authority, which a record that calls itself the authority must never do. Byte damage is this machinery's expected input, so an undecodable line is damage and is skipped exactly like unparseable JSON; an undecodable header is `bad_header`. A line nested past the interpreter's stack limit is damage too: it fits far under `MAX_ENTRY_BYTES`, and `json` raises `RecursionError` for it, which is not a `ValueError`, so the line readers, the holds scan, the listing's header read and the session tree checkpoint load name it beside the decode errors (`test_a_line_nested_past_the_stack_limit_is_skipped_like_any_damage`).
 
 Both reads are FRAMED by `jsonl_util`, so one planted line cannot cost more memory than the format's own write limit (`MAX_ENTRY_BYTES`) however long it is -- the tree is agent-writable, so an unbounded read is a memory bound an attacker chooses. The two use different postures on purpose. Entries take the SKIP posture (`bounded_raw_records`), matching the rule above: an over-cap line is not something this writer produced, so it is damage and costs that one line. The header takes the ABORT posture (`strict_raw_records`), because skipping an over-cap line 1 would hand back line 2 -- an entry -- as though it were the header. That is a wrong answer rather than a missing one, so an unreadable line 1 becomes `bad_header` and the unit's identity fails closed.
 
@@ -535,7 +546,7 @@ A session log can be left holding an opener open by a crash, a `SIGKILL` or a po
 
 Two of those three are TURN-SCOPED and the third deliberately is not. A call completes within its turn, and an approval is decided in the same `finally` the turn's own path runs through, so an unmatched one is collected only from inside the open turn -- an unmatched call or approval in a turn that DID complete is a different anomaly, and inventing an outcome for it here would be the repair editing history it was not asked about. A child is the opposite: `subagent/spawned` is matched across the WHOLE file, because a subagent's whole point is that it starts, steers and reports long after its asking turn ended. Scoping its closer to the open turn would close only the rare child that died inside its own turn and leave every ordinary one open forever. It follows that closing a child can fire on a file whose newest turn completed normally, and in that case NO `turn/completed` is appended -- that turn closed itself, and a second closer would be a turn closing twice.
 
-The child closer needs a STRONGER precondition than the other two, and it is the caller's live subagent registry rather than any fact about the file. What a repair knows is that the WRITER is gone, which settles a turn-scoped opener because the turn died with its writer. It does not settle a child: a child outlives its asking turn by design, so a writer torn down inside a live process can leave one still running and still able to file its own real terminal, and a closer written here would put two outcomes for one `agent_id` in a file nothing rewrites. An unmatched opener is what a finished-but-unreported child and a still-running one both look like, so no flag can stand in for the answer -- including "a resume", which is raised for an in-process `session/load` too and therefore does not even imply a different writer. `CrewLog.open` and `repair_interrupted_turn` take `child_gone`, a predicate over `agent_id` that the gateway backs with its subagent manager; omitted, or raising, no child is closed. What backs it has to live for the PROCESS, not for a session: the manager's run map is pruned only when a run COMPLETES, so it still lists a running child across the idle teardown and session reset that clear the emitter's own per-session maps -- which is the case that makes a session-scoped source report a live child as finished. A source that is also bounded, and so can evict a live entry under load, is wrong for the same reason. The registry answers whether a child is still RUNNING, which is not the question of whether its outcome is RECORDED: a terminal outcome reaches the file through the writer and the emitter's submit returns before the entry lands, so a child that has just reported leaves the running set while its own closer is still owed -- and being done, its run record is by then inside the reach of the completed-run bound as well. So the emitter refuses to report any child of a session gone while it still owes an entry for THAT session. The debt set answers this exactly and carries no such bound: it holds a queued entry, one the writer has CLAIMED out of the queue and not yet attempted, a retained one, and an owed loss marker alike. The claimed case is the one a reader would miss on their own, because claiming a session's entries takes them out of the queue while they are still owed. The entry being appended at this instant is deliberately NOT among them: the caller asking is itself a job of that batch, and a job that counted itself would refuse every child on the resume path this repair exists for. An entry a hard ceiling refuses is absent from it, which is the wanted answer, because that closer is never coming and the opener is the repair's to close. That default is the direction that loses nothing: a reader treating an open child as unknown is behind, while a fabricated outcome in an append-only file cannot be corrected.
+The child closer needs a STRONGER precondition than the other two, and it is the caller's live subagent registry rather than any fact about the file. What a repair knows is that the WRITER is gone, which settles a turn-scoped opener because the turn died with its writer. It does not settle a child: a child outlives its asking turn by design, so a writer torn down inside a live process can leave one still running and still able to file its own real terminal, and a closer written here would put two outcomes for one `agent_id` in a file nothing rewrites. An unmatched opener is what a finished-but-unreported child and a still-running one both look like, so no flag can stand in for the answer -- including "a resume", which is raised for an in-process `session/load` too and therefore does not even imply a different writer. `CrewLog.open` and `repair_interrupted_turn` take `child_gone`, a predicate over `agent_id` that the gateway backs with its subagent manager; omitted, or raising, no child is closed. What backs it has to live for the PROCESS, not for a session: the manager's run map is pruned only when a run COMPLETES, so it still lists a running child across the idle teardown and session reset that clear the emitter's own per-session maps -- which is the case that makes a session-scoped source report a live child as finished. A source that is also bounded, and so can evict a live entry under load, is wrong for the same reason. The registry answers whether a child is still RUNNING, which is not the question of whether its outcome is RECORDED: a terminal outcome reaches the file through the writer and the emitter's submit returns before the entry lands, so a child that has just reported leaves the running set while its own closer is still owed -- and being done, its run record is by then inside the reach of the completed-run bound as well. So the emitter refuses to report any child of a session gone while it still owes an entry for THAT session. The debt set answers this exactly and carries no such bound: it holds a queued entry, one the writer has CLAIMED out of the queue and not yet attempted, a retained one, and an owed loss marker alike, except a PARKED one: a marker no pass will write until the session's next entry (crew-log-emitter.md), which is no closer still coming. The claimed case is the one a reader would miss on their own, because claiming a session's entries takes them out of the queue while they are still owed. The entry being appended at this instant is deliberately NOT among them: the caller asking is itself a job of that batch, and a job that counted itself would refuse every child on the resume path this repair exists for. An entry a hard ceiling refuses is absent from it, which is the wanted answer, because that closer is never coming and the opener is the repair's to close. That default is the direction that loses nothing: a reader treating an open child as unknown is behind, while a fabricated outcome in an append-only file cannot be corrected.
 
 `"unknown"` is the same word in all three, and it is written by the repair alone. A live writer always knows what a human decided and how a child ended, so a reader that sees it knows it is reading a reconstruction rather than an observation.
 
@@ -775,7 +786,10 @@ history-delete funnel (`dashboard/handlers/sessions_parts/slot_teardown.py` `_re
 the teardown SUCCEEDED, because `destroy_if` refuses when the session was replaced by a successor
 generation, is busy, or still has a live slot owner, and in each of those cases the session may be
 writing right now. It flushes the emitter first, so the teardown entry lands and releases the cached
-handle's lease. The candidates are the units `store.session_units_by_slot` lists for the deleted row's
+handle's lease, then waits (`eager.drain`, its own 2 s bound) for the eager folder to settle, which
+covers the fold that entry woke: that fold seals the unit's savepoints under a shared hold of the
+same lease, and a removal claiming it mid-seal answers `owned`.
+The candidates are the units `store.session_units_by_slot` lists for the deleted row's
 slots that are also in the set of ids the delete claim PROVED. A candidate is kept when it is
 protected (a live slot or a running session serves it), when another conversation's session-map key
 still maps it or the map cannot be read, when a writer holds its lease, or when a fresh read of what is

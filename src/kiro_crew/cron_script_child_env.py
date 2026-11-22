@@ -58,12 +58,28 @@ def _clean_cron_env() -> dict[str, str]:
     key of it that is present is re-pointed at :func:`_default_temp_dir`, so a
     child never inherits a temp directory that has vanished under this
     process (see that function). Absent keys stay absent.
+
+    ``PATH`` is composed the way an agent session's is, so a cron child resolves
+    the same tools an agent child does. Blocking: a ``~user`` contributed dir is
+    expanded through a directory-service lookup, so call it off the event loop
+    (every caller runs on the cron worker thread or in the script child).
     """
     env = {
         k: v
         for k, v in os.environ.items()
         if k not in _CRON_ENV_DENY and k not in _GRANTED_ENV_KEYS
     }
+    if "PATH" in env:
+        # The PATH an agent session child gets (``acp.launch``): the well-known
+        # user tool dirs, then the contributed MCP dirs trailing. A gateway
+        # started from the Dock or a service unit carries a bare system PATH, so
+        # without this a command cron, a script's bare subprocess and the MCP
+        # servers ``ctx.call_tool`` starts cannot find ``node`` or a tool in
+        # ``~/.local/bin``. An absent PATH stays absent. Imported here,
+        # as ``_publish_script_session_token`` does, so the facade serves no new name.
+        from kiro_crew.env import append_mcp_path_dirs, augmented_path
+
+        env["PATH"] = append_mcp_path_dirs(augmented_path(env["PATH"]))
     present = [k for k in CANONICAL_TEMP_KEYS if k in env]
     if present:
         temp_dir = _default_temp_dir()
@@ -105,7 +121,8 @@ def _record_cron_scratch_owner(scratch: Path | None, proc: subprocess.Popen) -> 
     unsandboxed write) and ``stale`` (the marker still names the gateway, which
     the sweep would read as a dead owner over a live child) both fail the run,
     as they fail an agent spawn. ``unwritable`` is fail-open: an unowned dir is
-    kept, never swept.
+    never deleted in place, only moved into the quarantine after a week with no
+    write.
     """
     if scratch is None:
         return True
@@ -126,7 +143,9 @@ def _discard_unused_cron_scratch(scratch: Path | None) -> None:
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-_SCRATCH_OWNER_ERROR = "❌ Cron run stopped: its temp dir owner marker could not be recorded safely"
+_SCRATCH_OWNER_ERROR = (
+    "Error: Cron run stopped: its temp dir owner marker could not be recorded safely"
+)
 
 
 def _default_temp_dir() -> str:
@@ -148,7 +167,8 @@ def _default_temp_dir() -> str:
     file in it, so the dead ``TMPDIR`` is skipped and the platform default
     wins). It is never recreated: a bare ``makedirs`` under the managed scratch
     root would put back a directory with no owner record, which the sweep
-    never deletes on purpose -- a permanent leak in place of a skipped run.
+    leaves in place for a week and then moves into its quarantine -- a leak in
+    place of a skipped run.
     Nothing in this process can be using a directory that does not exist, so
     the re-resolution takes nothing from any other ``tempfile`` caller.
     """
@@ -170,7 +190,7 @@ def _default_temp_dir() -> str:
 #: environment is wrong, not the script). Only "non-zero" is load-bearing.
 CHILD_PERSISTENCE_EXIT_CODE = 78
 
-CHILD_PERSISTENCE_PREFIX = "❌ Cron child cannot persist state: "
+CHILD_PERSISTENCE_PREFIX = "Error: Cron child cannot persist state: "
 
 
 def child_persistence_preflight() -> None:

@@ -179,7 +179,6 @@ _FACADE_IMPORTS: dict[str, tuple[str, str]] = {
     "read_member_briefing": ("kiro_crew.members", "read_member_briefing"),
     "read_member_rules": ("kiro_crew.members", "read_member_rules"),
     "redact_credentials": ("kiro_crew.security", "redact_credentials"),
-    "redact_exfiltration_urls": ("kiro_crew.security", "redact_exfiltration_urls"),
     "render_essentials": ("kiro_crew.member_essential_context", "render_essentials"),
     "render_folder_steering": ("kiro_crew.folder_steering", "render_folder_steering"),
     "render_omission_notice": ("kiro_crew.folder_steering", "render_omission_notice"),
@@ -225,6 +224,10 @@ _BUILDER_MEMBERS: dict[str, tuple[str, str]] = {
     "_load_agent_prompt": (
         "static",
         "(agent: 'str', project: 'str | None' = None, *, owner_template: 'str' = '') -> 'str'",
+    ),
+    "_read_tab_notices": (
+        "method",
+        "(self, session_key: 'str | None', settles: 'list[Callable[[bool], None]]') -> 'str'",
     ),
     "_remember_startup_lessons": ("method", "(self, session_key: 'str', block: 'str') -> 'None'"),
     "_resolve_agent_prompt": (
@@ -273,7 +276,7 @@ _BUILDER_MEMBERS: dict[str, tuple[str, str]] = {
 
 #: Public functions defined on the facade, and their signatures.
 _PUBLIC_SIGNATURES = {
-    "build_cancelled_turn_preamble": "(conversation_log: \"'ConversationLog'\", session_key: 'str', *, user_cap: 'int' = 2000, assist_cap: 'int' = 2000) -> 'str'",
+    "build_cancelled_turn_preamble": "(conversation_log: \"'ConversationLog'\", session_key: 'str', *, user_cap: 'int' = 2000, assist_cap: 'int' = 2000, newest_request: 'bool' = False) -> 'str'",
     "build_interrupted_turn_preamble": "(messages: 'list[dict]', current: 'dict | None' = None, *, opener_inject_kinds: 'AbstractSet[str]' = frozenset(), user_cap: 'int' = 8000, assist_cap: 'int' = 4000) -> 'str'",
     "build_session_replay": "(conversation_log: \"'ConversationLog | None'\", session_key: 'str', *, exclude_last_n: 'int' = 0, model_window: 'int | None' = None, pending_messages: 'list[dict] | None' = None, current_message: 'dict | None' = None) -> 'str | None'",
     "cached_vector_store_entries": "() -> \"tuple[tuple[str, 'VectorMemoryStore'], ...]\"",
@@ -304,7 +307,7 @@ FACADE_LOGGER = "kiro_crew.context"
 #: The owners the facade composes. A module added or removed changes the
 #: composition, so the set is spelled out rather than globbed.
 OWNER_MODULES = frozenset(
-    """agent_spec budget delivery_records inclusion markers member member_gates
+    """agent_spec budget delivery_records inclusion markers mcp_servers member member_gates
     output_contract replay sections session_start store_admission tool_names turn
     turn_message""".split()
 )

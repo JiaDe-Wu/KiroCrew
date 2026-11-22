@@ -5,6 +5,7 @@ import { DisplayPanel } from '../pages/settings/DisplayPanel'
 import { renderWithProviders } from './helpers'
 import { api } from '../api/client'
 import { experiencePack, readExperience, saveExperienceChoice } from '../utils/themeConsent'
+import { registerThemeBranding } from '../themeBranding'
 
 // The rail mounts one item at a time; each describe sets the item it exercises
 // in its beforeEach and renders through this helper.
@@ -664,6 +665,72 @@ describe('DisplayPanel – desktop app tray icon row', () => {
   })
 })
 
+// Settings > Display > View > Desktop app > Minimize to tray (#21924). Offered
+// only where a tray can bring the window back, and locked off while the tray
+// icon is hidden; the row reads its state again whenever the icon changes.
+describe('DisplayPanel – desktop app minimize to tray row', () => {
+  const TRAY_LABEL = 'Show tray icon'
+  const MINIMIZE_LABEL = 'Minimize to tray'
+  const BRIDGES = ['closeActionAPI', 'trayIconAPI', 'minimizeToTrayAPI'] as const
+
+  // A stand-in for the main process whose close button quits, so the icon can be hidden.
+  function fakeMain(offered: boolean) {
+    const state = { show: true, on: false }
+    const minimize = () => ({ on: state.show && state.on, offered, canEnable: offered && state.show })
+    const minimizeToTrayAPI = {
+      get: vi.fn(async () => minimize()),
+      set: vi.fn(async (on: boolean) => {
+        if (!on || minimize().canEnable) state.on = on
+        return minimize()
+      }),
+    }
+    const w = window as unknown as Record<(typeof BRIDGES)[number], unknown>
+    w.closeActionAPI = { get: vi.fn(async () => 'quit'), set: vi.fn(async (value: string) => value) }
+    w.trayIconAPI = {
+      get: vi.fn(async () => ({ show: state.show, canHide: true })),
+      set: vi.fn(async (show: boolean) => { state.show = show; return { show, canHide: true } }),
+    }
+    w.minimizeToTrayAPI = minimizeToTrayAPI
+    return minimizeToTrayAPI
+  }
+
+  beforeEach(() => {
+    displaySub = 'view'
+    vi.clearAllMocks()
+    localStorage.clear()
+  })
+  afterEach(() => {
+    const w = window as unknown as Record<string, unknown>
+    for (const bridge of BRIDGES) delete w[bridge]
+  })
+
+  it('turns on, and is locked off with its reason while the tray icon is hidden', async () => {
+    const minimizeToTrayAPI = fakeMain(true)
+    renderPanel()
+
+    fireEvent.click(await screen.findByRole('switch', { name: MINIMIZE_LABEL }))
+    expect(minimizeToTrayAPI.set).toHaveBeenCalledWith(true)
+    await waitFor(() => expect(screen.getByRole('switch', { name: MINIMIZE_LABEL })).toHaveAttribute('aria-checked', 'true'))
+
+    fireEvent.click(await screen.findByRole('switch', { name: TRAY_LABEL }))
+    await waitFor(() => expect(screen.getByRole('switch', { name: MINIMIZE_LABEL })).toHaveAttribute('aria-disabled', 'true'))
+    const minimize = screen.getByRole('switch', { name: MINIMIZE_LABEL })
+    expect(minimize).toHaveAttribute('aria-checked', 'false')
+    const note = screen.getByText(/Turn on Show tray icon to use this/)
+    expect(minimize.getAttribute('aria-describedby')).toContain(note.id)
+  })
+
+  it('is not offered where no tray can bring the window back', async () => {
+    const minimizeToTrayAPI = fakeMain(false)
+    renderPanel()
+
+    await screen.findByRole('switch', { name: TRAY_LABEL })
+    await waitFor(() => expect(minimizeToTrayAPI.get).toHaveBeenCalled())
+    await act(async () => { await minimizeToTrayAPI.get.mock.results[0]?.value })
+    expect(screen.queryByRole('switch', { name: MINIMIZE_LABEL })).toBeNull()
+  })
+})
+
 describe('DisplayPanel – zoom setting', () => {
   beforeEach(() => {
     displaySub = 'zoom'
@@ -888,6 +955,23 @@ describe('DisplayPanel – Experience parts of the active Level-2 pack', () => {
     expect(record()).toEqual({ sounds: true, overlays: true, persona: false })
     expect(screen.queryByText(SAVE_FAILED)).not.toBeInTheDocument()
   })
+
+  registerThemeBranding({ 'registered-overlay-panel': { overlays: [() => null] } })
+  it("lists a registered theme's branding overlays as Overlays alone, on until it is turned off", () => {
+    mockUseTheme.mockImplementation(() => ({ ...DEFAULT_THEME, colorTheme: 'registered-overlay-panel' }))
+    renderPanel()
+    expect(screen.getByRole('group', { name: 'Experience' })).toBeInTheDocument()
+    expect(part('Sounds')).not.toBeInTheDocument()
+    expect(part('Persona')).not.toBeInTheDocument()
+    expect(part('Overlays')).toHaveAttribute('aria-checked', 'true')
+    fireEvent.click(part('Overlays') as HTMLElement)
+    expect(JSON.parse(localStorage.getItem('mc-theme-experience-registered-overlay-panel') ?? 'null')).toEqual({
+      sounds: false,
+      overlays: false,
+      persona: false,
+    })
+    expect(part('Overlays')).toHaveAttribute('aria-checked', 'false')
+  })
 })
 
 describe('DisplayPanel – theme load-error notice', () => {
@@ -1020,5 +1104,53 @@ describe('DisplayPanel – sidebar session colors', () => {
     expect(defaults.getByRole('radio', { name: 'Color 2' })).toHaveAttribute('aria-checked', 'true')
     fireEvent.click(defaults.getByRole('radio', { name: 'No color' }))
     expect(state().sessionDefaultColor).toBeNull()
+  })
+})
+
+describe('DisplayPanel – Scheduled mode times', () => {
+  beforeEach(() => {
+    displaySub = 'theme'
+    vi.clearAllMocks()
+  })
+
+  // A time field reports each segment it edits, and '' while one is cleared:
+  // saving per edit would re-theme and write the workspace once per keystroke.
+  it('saves a time once on blur, and keeps the saved one when the field is cleared', () => {
+    const setSchedule = vi.fn()
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      preference: 'schedule',
+      schedule: { light: '07:00', dark: '19:00' },
+      setSchedule,
+    }))
+    renderPanel()
+    const light = screen.getByLabelText('Light from')
+    fireEvent.change(light, { target: { value: '02:00' } })
+    fireEvent.change(light, { target: { value: '21:00' } })
+    expect(setSchedule).not.toHaveBeenCalled()
+    fireEvent.blur(light)
+    expect(setSchedule).toHaveBeenCalledTimes(1)
+    expect(setSchedule).toHaveBeenCalledWith({ light: '21:00', dark: '19:00' })
+
+    const dark = screen.getByLabelText('Dark from')
+    fireEvent.change(dark, { target: { value: '' } })
+    fireEvent.blur(dark)
+    expect(setSchedule).toHaveBeenCalledTimes(1)
+    expect(dark).toHaveValue('19:00')
+  })
+
+  it('shows a refused save under the times, and leaving a field saves the same pair again', () => {
+    const setSchedule = vi.fn()
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      preference: 'schedule',
+      schedule: { light: '07:00', dark: '19:00' },
+      setSchedule,
+      scheduleSaveFailed: true,
+    }))
+    renderPanel()
+    expect(screen.getByText("Couldn't save these times. This device uses them; other devices keep the old ones. Try again.")).toBeInTheDocument()
+    fireEvent.blur(screen.getByLabelText('Light from'))
+    expect(setSchedule).toHaveBeenCalledWith({ light: '07:00', dark: '19:00' })
   })
 })

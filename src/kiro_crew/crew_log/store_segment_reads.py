@@ -10,6 +10,7 @@ writes. A new read of a segment's raw records goes here.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -108,7 +109,9 @@ def _parses_to_object(blob: bytes) -> dict[str, Any] | None:
     """*blob* as a JSON object, or ``None``. Never raises."""
     try:
         parsed = json.loads(blob.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        # RecursionError: a record nested past the stack limit fits well under
+        # MAX_ENTRY_BYTES, and it is a RuntimeError, so ValueError misses it.
         return None
     return parsed if isinstance(parsed, dict) else None
 
@@ -217,6 +220,51 @@ def _full_scan_last_seq(path: Path) -> int:
     return highest
 
 
+#: The span a seq bisect stops narrowing at; the walk then reads at most this much
+#: below the wanted seq: about 36 records at the busy host's mean of 450 bytes, and
+#: under ``read_budget.K`` for records down to 64 bytes.
+_SEEK_SPAN = 16 * 1024
+
+
+def _offset_below(path: Path, seq: int, end: int) -> int:
+    """A record start in *path* below its first entry at or above *seq*, or 0.
+
+    Bisects the bytes: a probe skips to the next newline and decodes that one record,
+    so a seek costs about log2(size / ``_SEEK_SPAN``) decodes instead of every record
+    below *seq*. Only a COMPLETE record whose seq is below *seq* moves the low end, so
+    a damaged, torn or over-cap probe only makes the walk start earlier. 0 means "read
+    from the top", which is also the answer to any read error.
+
+    shortcut: assumes seq rises through the file, which the append-only writer
+    guarantees; a file damaged out of order can lose an entry to a seek. Only the
+    rendering reads (``strict_seq=False``, ``get``, ``page``) use it.
+    """
+    try:
+        with open(path, "rb") as source:
+            if not source.readline(MAX_ENTRY_BYTES + 1).endswith(b"\n"):
+                return 0  # an over-cap or torn header: no boundary to start from
+            first = low = source.tell()
+            high = end
+            while high - low > _SEEK_SPAN:
+                mid = (low + high) // 2
+                source.seek(mid)
+                # The record *mid* falls inside. A capped read that stops short of its
+                # newline is inside an over-cap line, so ``at`` is no record start.
+                skipped = source.readline(MAX_ENTRY_BYTES + 1)
+                at = source.tell()
+                raw = source.readline(MAX_ENTRY_BYTES + 1)
+                found = None
+                if skipped.endswith(b"\n") and raw.endswith(b"\n") and at + len(raw) <= high:
+                    found = _seq_of(raw.strip())
+                if found is not None and found < seq:
+                    low = at
+                else:
+                    high = mid
+    except OSError:
+        return 0
+    return 0 if low == first else low
+
+
 def _has_content(path: Path) -> bool:
     """Whether *path* holds any bytes. A zero-byte file reads as absent.
 
@@ -254,6 +302,82 @@ class _Bounded:
         return bytes(self._source.readline(left if size < 0 else min(size, left)))
 
 
+def _frame_digest_update(digest: Any, start: int, end: int, frame: "bytes | None") -> None:
+    digest.update(start.to_bytes(8, "big") + end.to_bytes(8, "big"))
+    digest.update(b"\0" if frame is None else b"\1" + frame)
+
+
+class ConsumedSpan:
+    """A digest of exactly the records a walk framed, per segment, to re-check later.
+
+    The savepoint write's (size, mtime) fingerprint cannot see a same-size rewrite
+    that lands inside one mtime tick, and the extent's fixed tail digest cannot see
+    one further back than its tail. This covers the whole range the pass consumed
+    and nothing else: each framed record's offsets and bytes are hashed as the walk
+    reads them, so nothing is read twice on the way in, and :meth:`holds` frames the
+    same range from disk again and compares. Bytes below the first framed record or
+    past the last one are outside the range and never change the answer.
+    """
+
+    def __init__(self) -> None:
+        self._spans: "dict[str, list[Any]]" = {}
+        self._spoiled = False
+
+    def spoil(self) -> None:
+        """Make :meth:`holds` refuse: the state was not folded from the recorded walk."""
+        self._spoiled = True
+
+    def tap(self, segment: str, start: int, end: int, frame: "bytes | None") -> None:
+        """Record one framed record of *segment*."""
+        span = self._spans.get(segment)
+        if span is None:
+            span = self._spans[segment] = [start, end, hashlib.sha256()]
+        span[1] = end
+        _frame_digest_update(span[2], start, end, frame)
+
+    @property
+    def consumed_bytes(self) -> int:
+        """How many bytes :meth:`holds` re-reads: the framed range of every segment."""
+        return sum(end - start for start, end, _digest in self._spans.values())
+
+    def holds(self, directory: Path, unit_id: str) -> bool:
+        """Whether every recorded range under *directory* still frames to the same digest.
+
+        Counted in the read budget under *unit_id*, as the same records the pass folded:
+        they are its own delta, read a second time, never a walk of the prefix.
+        """
+        from kiro_crew.crew_log import read_budget
+
+        if self._spoiled:
+            return False
+        framed = [0]
+        try:
+            return self._holds(directory, framed)
+        finally:
+            read_budget.count_read(unit_id, "span", framed[0], framed[0])
+
+    def _holds(self, directory: Path, framed: "list[int]") -> bool:
+        for segment, (start, end, digest) in self._spans.items():
+            again = hashlib.sha256()
+            try:
+                with open(directory / segment, "rb") as raw_source:
+                    raw_source.seek(start)
+                    bounded: Any = _Bounded(raw_source, end)
+                    for at, stop, frame in bounded_raw_records_with_offsets(
+                        bounded,
+                        directory / segment,
+                        cap=MAX_ENTRY_BYTES,
+                        label="crew log",
+                    ):
+                        framed[0] += 1
+                        _frame_digest_update(again, at, stop, frame)
+            except OSError:
+                return False
+            if again.digest() != digest.digest():
+                return False
+        return True
+
+
 def _iter_entries(path: Path, end: int | None = None) -> Iterator[Entry]:
     """Every parseable entry in *path*, oldest first, header excluded.
 
@@ -267,11 +391,19 @@ def _iter_entries(path: Path, end: int | None = None) -> Iterator[Entry]:
 
 
 def _iter_entries_located(
-    path: Path, end: int | None = None, *, start: int = 0
+    path: Path,
+    end: int | None = None,
+    *,
+    start: int = 0,
+    contains: bytes | None = None,
+    span: "ConsumedSpan | None" = None,
 ) -> "Iterator[tuple[Entry, int]]":
     """Every parseable entry in *path* and the byte offset its record begins at.
 
     *end*, when given, is the byte offset the read stops at (see :class:`_Bounded`).
+
+    *span*, when given, is told every framed record, skipped ones included (see
+    :class:`ConsumedSpan`).
 
     *start* is where the read BEGINS, and it is how a reader resumes at a record it
     has already located instead of walking to it. Zero reads the file from the top,
@@ -308,11 +440,13 @@ def _iter_entries_located(
             if start:
                 raw_source.seek(start)
             source: Any = raw_source if end is None else _Bounded(raw_source, end)
-            for index, (at, _stop, raw) in enumerate(
+            for index, (at, stop, raw) in enumerate(
                 bounded_raw_records_with_offsets(
                     source, path, cap=MAX_ENTRY_BYTES, label="crew log"
                 )
             ):
+                if span is not None:
+                    span.tap(path.name, at, stop, raw)
                 if index == 0 and not start:
                     continue  # the header
                 if raw is None:
@@ -320,6 +454,8 @@ def _iter_entries_located(
                 stripped = raw.strip()
                 if not stripped:
                     continue
+                if contains is not None and contains not in stripped:
+                    continue  # the caller's prefilter: never decoded (``CrewLog.iter_from``)
                 parsed = _parses_to_object(stripped)
                 if parsed is None:
                     continue

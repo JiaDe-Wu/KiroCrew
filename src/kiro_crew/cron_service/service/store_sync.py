@@ -11,8 +11,9 @@ patch of the member on the class or on an instance reaches every caller. A name
 tests patch on :mod:`kiro_crew.cron`, or one that module defines, is read through
 it on each call (``seams``).
 
-Instance fields written: ``_jobs``, ``_last_digest``, ``_last_mtime``,
-``_last_mtime_ns``, ``_last_size``, ``_load_failed``.
+Instance fields written: ``_announced_pauses``, ``_auto_pause_alert``, ``_jobs``,
+``_last_digest``, ``_last_mtime``, ``_last_mtime_ns``, ``_last_size``,
+``_load_failed``.
 
 Instance fields read: ``_dir``, ``_held_run_records_guard``, ``_path``, ``_running``.
 """
@@ -20,6 +21,7 @@ Instance fields read: ``_dir``, ``_held_run_records_guard``, ``_path``, ``_runni
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -198,10 +200,12 @@ def _record_fingerprint(self: CronService) -> None:
 
 
 def _keep_store_document(self: CronService, document: StoreDocument) -> None:
-    """Hold what a newer build added to the store just loaded, for :meth:`_save`."""
+    """Hold what a newer build added to the store just loaded, and the records no job
+    could be built from, for :meth:`_save` to write back."""
     self._store_version = document.version
     self._store_extra = MappingProxyType(dict(document.extra))
     self._unknown_fields = MappingProxyType(dict(document.unknown_fields))
+    self._skipped_records = document.skipped
 
 
 def _forget_store_document(self: CronService) -> None:
@@ -209,6 +213,7 @@ def _forget_store_document(self: CronService) -> None:
     self._store_version = _STORE_VERSION
     self._store_extra = MappingProxyType({})
     self._unknown_fields = MappingProxyType({})
+    self._skipped_records = ()
 
 
 def _reset_fingerprint(self: CronService) -> None:
@@ -246,11 +251,13 @@ def _sync(self: CronService) -> None:
         # "move the unreadable file aside" never unblocks a live gateway.
         # Not a call to _load(): it empties _jobs, losing a reaper update made
         # in memory but not yet saved (test_reaper_persists_state). Empty the
-        # list only when the latch was set: those jobs came from a failed load
-        # and writing them back could resurrect an external removal. The
-        # fingerprint was already reset by that failed load.
+        # list and forget the store document (its kept records and newer-build
+        # keys) only when the latch was set: they came from the store that was
+        # moved aside, and writing them back could resurrect an external removal.
+        # The fingerprint was already reset by that failed load.
         if self._load_failed:
             self._jobs = []
+            self._forget_store_document()
         self._load_failed = False
         return
     try:
@@ -269,8 +276,13 @@ def _sync(self: CronService) -> None:
         self._load(_preread=raw)
 
 
-def _keep_unzoned_jobs_on_utc(jobs: list[CronJob], extra: Mapping[str, Any]) -> bool:
+def _keep_unzoned_jobs_on_utc(
+    jobs: list[CronJob], extra: Mapping[str, Any], skipped: tuple[Any, ...]
+) -> bool:
     """Stamp UTC on an older store's unzoned jobs that fired in UTC (``zone_default_migration``).
+
+    The *skipped* records the save keeps get the same stamp: they are written under
+    the new version too, so a record fixed by hand later keeps its wall clock.
 
     ``False`` when the config cannot be read: the zone those jobs inherited is
     unknown, so nothing is stamped, they run in UTC in memory meanwhile, and the
@@ -283,6 +295,7 @@ def _keep_unzoned_jobs_on_utc(jobs: list[CronJob], extra: Mapping[str, Any]) -> 
         follows_default_ids,
         hold_jobs_on_utc_in_memory,
         pin_jobs_read_in_utc,
+        pin_records_read_in_utc,
     )
 
     follows_default = follows_default_ids(extra)
@@ -298,6 +311,7 @@ def _keep_unzoned_jobs_on_utc(jobs: list[CronJob], extra: Mapping[str, Any]) -> 
         hold_jobs_on_utc_in_memory(jobs, follows_default)
         return False
     pin_jobs_read_in_utc(jobs, zone, follows_default)
+    pin_records_read_in_utc(skipped, zone, follows_default)
     return True
 
 
@@ -333,9 +347,10 @@ def _load(self: CronService, _preread: bytes | None = None) -> None:
             self._load_failed = True
             return
         settled = not document.predates_local_default or _keep_unzoned_jobs_on_utc(
-            document.jobs, document.extra
+            document.jobs, document.extra, document.skipped
         )
-        # decode_jobs skips a malformed record with a warning; only a file
+        # decode_store skips a malformed record with a warning and keeps an
+        # object a snapshot restore accepts for _save to write back; only a file
         # with nothing parseable resets the whole store.
         # Fingerprint from the stat taken BEFORE the read: a writer racing in
         # between costs one redundant reload, never a lost update. The digest
@@ -349,9 +364,17 @@ def _load(self: CronService, _preread: bytes | None = None) -> None:
         # list while this reload runs (the timer's due check on the loop,
         # with the reload on a worker thread) never sees a copy without it.
         # Under the guard, as the hold's lookup and apply are.
+        # The DISK's pause states, read before the held-record applies below
+        # re-land a pause in memory: a pause read from disk is not this
+        # process's transition — it was announced by the save that landed it
+        # (here or in another process), or predates this boot — but a held
+        # pause re-applied over a fresh copy is still unannounced, and the
+        # save that persists it must see the edge. Only a SAVE announces.
+        disk_pauses = {job.id: job.auto_paused for job in document.jobs}
         with self._held_run_records_guard:
             self._apply_held_run_records_to(document.jobs)
             self._jobs = document.jobs
+        self._announced_pauses = disk_pauses
         self._keep_store_document(document)
         if not settled:
             # Saves keep the older version, so a load that can read the config
@@ -473,9 +496,13 @@ def _save(self: CronService, jobs: list[CronJob] | None = None) -> None:
         written,
         version=self._store_version,
         extra=store_extra_for_save(
-            self._store_extra, written, deferred=self._store_version == DEFERRED_STORE_VERSION
+            self._store_extra,
+            written,
+            deferred=self._store_version == DEFERRED_STORE_VERSION,
+            skipped=self._skipped_records,
         ),
         unknown_fields=self._unknown_fields,
+        skipped=self._skipped_records,
     )
     # Atomic write: unique tmp → fsync → rename, then sync the directory so
     # the rename itself survives a sudden host restart. Without both syncs a
@@ -491,3 +518,93 @@ def _save(self: CronService, jobs: list[CronJob] | None = None) -> None:
     # Refresh the (mtime_ns, size) fingerprint so _sync recognizes this as
     # our own write and does not reload it back over the in-memory state.
     self._record_fingerprint()
+    self._announce_saved_pause_edges(written, document)
+
+
+def set_auto_pause_alert(self: CronService, cb: Any) -> None:
+    """Set the sync callback ``cb(job, streak, reason)`` for a persisted auto-pause.
+
+    The gateway sets its auto-pause notice here, as it sets the timeout and
+    interrupt alerts. The save that detects the rising edge runs on a worker
+    thread under the store lock, so the callback must be thread-safe, must not
+    block, and hands delivery to the gateway loop itself. ``streak`` and
+    ``reason`` are read from the serialized document the save wrote; ``job``
+    carries the stable routing identity. A one-shot's pause is never handed
+    over — its failure alert is already unconditional. Without one, the pause
+    reaches the audit trail and the Schedule page and no one is told.
+    """
+    self._auto_pause_alert = cb
+
+
+def _announce_saved_pause_edges(self: CronService, written: list[CronJob], document: str) -> None:
+    """Announce each auto-pause this save's *document* newly persisted.
+
+    The auto-pause notice, on the ``_announced_pauses`` snapshot's RISING
+    edge, after the write has published: the one owner for every pause writer
+    (the merge, the terminal reap/cancel, the held-record flush, the
+    loop-stall breaker), all serialized by the store lock the save runs
+    under. It never outruns the disk — a pause a failed save rolled back
+    never reached here — and never doubles: whichever save lands the pause
+    first advances the snapshot, and the next save sees no edge. ``_load``
+    rebuilds the snapshot silently, so a pause read from disk (boot, a reload
+    of another process's write) is never announced by this one. The falling
+    edge only advances the snapshot: a clear has its own delivery. Everything
+    — the edge, the streak, the reason — is read from the DOCUMENT just
+    written, never from the live objects: a concurrent ``record_failure`` on
+    a shared job between serialization and this loop could otherwise announce
+    a pause the disk does not hold (persist-before-you-publish). The live job
+    supplies only routing identity. Best-effort: a failing callback logs.
+    """
+    # Notification bookkeeping must never fail a COMMITTED save: the write and
+    # the fingerprint are already published, so an exception past this point
+    # would report failure for a save that happened, and the caller's rollback
+    # would diverge from disk. Hence the blanket except, and the defensive
+    # reads: ``encode_store`` appends RETAINED MALFORMED records after the
+    # valid jobs, one of which can share a valid job's id and carry fields of
+    # any shape — only the first record per ``written`` id (the valid job,
+    # serialized first) is read, and its fields are type-checked, not cast.
+    cb = self._auto_pause_alert
+    if cb is None:
+        # No gateway registered (CLI, MCP, tests): the snapshot still
+        # advances, so a later registration sees no stale edges.
+        self._announced_pauses = {
+            job.id: job.auto_paused for job in written if isinstance(job.id, str)
+        }
+        return
+    try:
+        by_id = {job.id: job for job in written}
+        snapshot = self._announced_pauses
+        current: dict[str, bool] = {}
+        for rec in json.loads(document).get("jobs", []):
+            if not isinstance(rec, dict):
+                continue
+            jid = rec.get("id")
+            if not isinstance(jid, str) or jid not in by_id or jid in current:
+                continue
+            paused = bool(rec.get("auto_paused"))
+            current[jid] = paused
+            live = by_id[jid]
+            if (
+                paused
+                and not snapshot.get(jid, False)
+                and not live.delete_after_run
+                and live.schedule.kind != "at"
+            ):
+                # The streak is the CAUSE only when it reached the stored
+                # limit; the loop-stall breaker pauses jobs whose incidental
+                # failures sit below it, and a notice blaming those failures
+                # would misattribute the stall (its explanation is the written
+                # last_error). The limit is config, read from the live job:
+                # the written record omits it at its default.
+                raw_cnt = rec.get("consecutive_failures")
+                cnt = raw_cnt if isinstance(raw_cnt, int) else 0
+                raw_reason = rec.get("last_error")
+                reason = raw_reason if isinstance(raw_reason, str) else ""
+                limit = live.auto_pause_limit()
+                try:
+                    cb(live, cnt if (limit is not None and cnt >= limit) else 0, reason)
+                except Exception:
+                    logger.debug("Cron '%s': auto-pause alert failed", live.name, exc_info=True)
+        self._announced_pauses = current
+    except Exception:
+        logger.warning("auto-pause notice bookkeeping failed after a committed save", exc_info=True)

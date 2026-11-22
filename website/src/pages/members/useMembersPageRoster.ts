@@ -28,6 +28,7 @@ import { countByFilter, hasNoCrewmates, matchesSource, narrowRoster, queryNarrow
 import { useMemberRosterViews } from '../../state/useMemberProjection'
 import type { RosterView } from '../../state/memberProjectionTypes'
 import { type MembersPageRosterView } from './MembersPageRoster'
+import { queryReadFailed } from '../../utils/queryReadFailed'
 
 /** Stable empty roster for the not-yet-answered read, so the memos keyed on
  *  `members` do not recompute on every render while the first fetch is out. */
@@ -52,8 +53,11 @@ export function useMembersPageRoster() {
     () => rows.flatMap((r) => (r.display_name ? [r.name, r.display_name] : [r.name])),
     [rows],
   )
-  const loaded = rosterQuery.data !== undefined || rosterQuery.isError
-  const loadError = rosterQuery.data === undefined && rosterQuery.isError
+  // queryReadFailed, not `isError`: a retry with nothing cached clears `error`,
+  // which would unmount the failure notice and its Retry under the reader's focus.
+  const readFailed = queryReadFailed(rosterQuery)
+  const loaded = rosterQuery.data !== undefined || readFailed
+  const loadError = rosterQuery.data === undefined && readFailed
   // ONE source of truth for the roster fields the page derives from (starred
   // count, the Starred filter, search, sort, source chips): the react-query
   // rows merged with each member's pushed `roster` projection, projection
@@ -270,7 +274,7 @@ export function useMembersPageRosterSignals({ rosterRead, rosterView, slotKeyOf 
   // who does not remember a crewmate's name still knows what to type: the ones
   // the user made come first (origin Mine, or created on the dashboard), so a
   // crewmate just created is named rather than counted behind package and app
-  // rows, then roster order. Past that the line counts the rest ("A, B, C and 4
+  // rows, then roster order. Past that the line counts the rest ("A, B, C, and 4
   // more"): the hidden set is often dozens of package and app crewmates, and
   // naming them all is no help.
   const hiddenNames = useMemo(() => {

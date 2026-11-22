@@ -136,6 +136,28 @@ class TestExport:
         assert any("2026-05-17.md" in n for n in names)
         zf.close()
 
+    @pytest.mark.skipif(
+        not platform_compat.IS_WINDOWS, reason="only ntpath has the \\\\?\\ spelling"
+    )
+    def test_export_includes_files_under_extended_length_home(self, patched_config_dir):
+        # The SQLite backup builds a file URI that rejects this spelling; it is a separate path.
+        for db in ("memory.db", "memory_index.db"):
+            (patched_config_dir / db).unlink()
+        # A fenced credential under the workspace must stay out under this spelling too.
+        pat = patched_config_dir / "workspace" / "md-notebook" / "pat"
+        pat.parent.mkdir(parents=True, exist_ok=True)
+        pat.write_text("secret")
+        prefixed = "\\\\?\\" + os.path.realpath(patched_config_dir)
+        with patch.dict(os.environ, {"KIROCREW_HOME": prefixed}):
+            zip_bytes, manifest = create_export_zip()
+        assert manifest["contents"]["workspace_files"] >= 4
+        assert manifest["contents"]["plan_memory_files"] == 1
+        assert manifest["contents"]["skill_count"] == 1
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            names = zf.namelist()
+        assert any("preferences.md" in n for n in names)
+        assert not any(n.endswith("md-notebook/pat") for n in names)
+
     def test_export_includes_skills(self, patched_config_dir):
         zip_bytes, manifest = create_export_zip()
         assert manifest["contents"]["skill_count"] >= 1
@@ -143,6 +165,24 @@ class TestExport:
         names = zf.namelist()
         assert any("SKILL.md" in n for n in names)
         zf.close()
+
+    def test_export_skill_count_counts_skill_directories_not_files(self, patched_config_dir):
+        # The import preview shows this number as "Skills:", and the CLI backup
+        # manifest counts skill directories for the same key. The fixture already
+        # holds one single-file skill, my-skill.
+        skills = patched_config_dir / "skills"
+        one = skills / "deploy-helper"
+        (one / "scripts").mkdir(parents=True)
+        (one / "SKILL.md").write_text("---\nname: deploy-helper\ndescription: d\n---\n")
+        (one / "scripts" / "run.py").write_text("print('hi')\n")
+        (one / "README.md").write_text("notes\n")
+        two = skills / "notes"
+        two.mkdir()
+        (two / "SKILL.md").write_text("---\nname: notes\ndescription: d\n---\n")
+
+        _zip_bytes, manifest = create_export_zip()
+
+        assert manifest["contents"]["skill_count"] == 3
 
     def test_export_includes_plan_memory(self, patched_config_dir):
         zip_bytes, manifest = create_export_zip()
@@ -175,6 +215,39 @@ class TestExport:
         names = zf.namelist()
         assert not any(".pid" in n for n in names)
         zf.close()
+
+    def test_export_leaves_out_folders_tools_rebuild(self, patched_config_dir):
+        proj = patched_config_dir / "workspace" / "proj"
+        for folder in ("node_modules/pkg", ".venv/lib", ".mypy_cache/3.12"):
+            (proj / folder).mkdir(parents=True)
+            (proj / folder / "blob.bin").write_bytes(b"x" * 64)
+        (proj / "notes.md").write_text("keep me")
+        zip_bytes, _ = create_export_zip()
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            names = zf.namelist()
+        assert any(n.endswith("workspace/proj/notes.md") for n in names)
+        assert not any("blob.bin" in n for n in names)
+
+    def test_export_keeps_a_store_or_skill_named_like_a_rebuildable_folder(
+        self, patched_config_dir
+    ):
+        # The rebuildable-folder rule is for the workspace only: a memory store
+        # or a skill may be named ``venv``, and its files are user data.
+        store = patched_config_dir / "memory_stores" / "venv"
+        store.mkdir(parents=True)
+        (store / "notes.md").write_text("store note")
+        skill = patched_config_dir / "skills" / "venv"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("skill body")
+        modules = patched_config_dir / "workspace" / "proj" / "node_modules"
+        modules.mkdir(parents=True)
+        (modules / "blob.bin").write_bytes(b"x" * 64)
+        zip_bytes, _ = create_export_zip()
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            names = zf.namelist()
+        assert any(n.endswith("memory_stores/venv/notes.md") for n in names)
+        assert any(n.endswith("skills/venv/SKILL.md") for n in names)
+        assert not any("node_modules" in n for n in names)
 
     def test_export_skips_symlinks(self, patched_config_dir):
         link = patched_config_dir / "workspace" / "memory" / "evil_link.md"
@@ -1130,6 +1203,33 @@ class TestImportMerge:
             assert "user.name" in keys  # from import
             assert "user.team" in keys  # pre-existing
             conn.close()
+        finally:
+            os.unlink(str(zip_path))
+
+    def test_import_merge_reports_a_refused_memory_merge(self, patched_config_dir, tmp_path):
+        """A refused memory merge imported nothing, so the summary must not call it merged.
+
+        The dashboard handler turns the summary into the result an API caller sees, so
+        ``memory (merged)`` over a refused source database reports a success that brought
+        no row back. It is flagged in ``refused_merges``, as a refused crons merge is.
+        """
+        zip_path = self._make_export(patched_config_dir)
+        try:
+            target = tmp_path / "target_mc"
+            target.mkdir()
+            conn = sqlite3.connect(str(target / "memory.db"))  # live db: the merge branch runs
+            conn.execute("CREATE TABLE semantic_memory (key TEXT PRIMARY KEY)")
+            conn.commit()
+            conn.close()
+
+            with patch("kiro_crew.portability.config_dir", return_value=target):
+                with patch.dict(os.environ, {"KIROCREW_HOME": str(target)}):
+                    # _merge_memory refuses a corrupt or unreadable source by returning False.
+                    with patch("kiro_crew.portability._merge_memory", return_value=False):
+                        summary = apply_import_zip(zip_path, mode="merge")
+
+            assert "memory (merged)" not in summary["items"], summary
+            assert "memory" in (summary.get("refused_merges") or []), summary
         finally:
             os.unlink(str(zip_path))
 

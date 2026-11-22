@@ -501,7 +501,7 @@ class TestScenarioReviewWithDiff:
 
         captured_prompt = []
 
-        async def _capture_json(client, prompt):
+        async def _capture_json(client, prompt, **_kw):
             captured_prompt.append(prompt)
             return {"ok": True}
 
@@ -536,7 +536,7 @@ class TestScenarioReviewWithDiff:
 
         captured_prompt = []
 
-        async def _capture_json(client, prompt):
+        async def _capture_json(client, prompt, **_kw):
             captured_prompt.append(prompt)
             return {"ok": True}
 
@@ -695,7 +695,6 @@ class TestScenarioIndexBasedLookup:
         s2 = Step(index=2, title="Replanned", description="d")
         run.tasks.append(s2)
 
-        # Execute with index-based lookup
         pending = [s for s in run.tasks if s.status == StepStatus.PENDING]
         groups = TaskRunner._group_parallel_tasks(pending, set())
 

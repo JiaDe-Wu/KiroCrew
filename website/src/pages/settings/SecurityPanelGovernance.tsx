@@ -7,7 +7,7 @@
 import React, { useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
-  ShieldCheck, Lock, Terminal, Globe, AlertTriangle, Clock, Gavel, Building2, Gauge, ToggleRight,
+  ShieldCheck, Lock, Terminal, Globe, AlertTriangle, Clock, Building2, Gauge, ToggleRight,
   MessageSquare, ListChecks, Network, Package,
 } from 'lucide-react'
 import { Badge } from '../../components/ui'
@@ -18,6 +18,7 @@ import {
   type GovernanceScopeDetail,
 } from '../../api/client'
 import { i18nT } from '../../i18n/t'
+import { Trans } from 'react-i18next'
 import { fmtDuration, fmtList, fmtUnit, compareText } from '../../i18n/format'
 import ErrorNotice from '../../components/ErrorNotice'
 import { PINNED_TOOLTIP_KEY } from './SecurityPanelDeniedCommands'
@@ -505,14 +506,14 @@ export function GovernancePolicyViewer() {
       <SettingsCard>
         {/* data-setting-label: deep-link anchor for the manual registry entry
             (settingsManual.ts) — the highlight hook queries the rendered label. */}
-        <div className="flex items-start gap-3 pb-1" data-setting-label={i18nT('pages.settings.securityPanel.governance_policy')}>
-          <div className="mt-0.5 shrink-0 w-7 h-7 rounded-md bg-accent-subtle flex items-center justify-center text-accent">
-            <Gavel size={14} className="lucide-inline" />
-          </div>
+        <div className="flex items-start gap-3" data-setting-label={i18nT('pages.settings.securityPanel.governance_policy')}>
           <div className="flex-1 min-w-0">
             <div className="text-[13px] font-semibold text-text-strong">{i18nT('pages.settings.securityPanel.effective_security_ceiling')}</div>
             <div className="text-[12px] text-muted mt-0.5 leading-relaxed">
-              {i18nT('pages.settings.securityPanel.the_strictest_boundary_in_effect_for_each_govern')} <strong>{i18nT('pages.settings.securityPanel.host_surface')}</strong>{i18nT('pages.settings.securityPanel.resolved_as_your_organization_s_policy_intersect')} <code className="font-mono text-[11px]">{i18nT('pages.settings.securityPanel.security_policy_json')}</code> {i18nT('pages.settings.securityPanel.and_cannot_be_changed_here')}
+              <Trans
+                i18nKey="pages.settings.securityPanel.strictest_boundary_on_host_surface"
+                components={{ strong: <strong />, file: <code className="font-mono text-[11px]">{i18nT('pages.settings.securityPanel.security_policy_json')}</code> }}
+              />
             </div>
           </div>
         </div>
@@ -552,11 +553,11 @@ export function GovernancePolicyViewer() {
               the scope rows instead, which say every scope is unrestricted, and the
               distribution block above says why. */
           !data?.has_policy && !data?.profile && unknownScopeRows.length === 0 && !distributionConfigured ? (
-          <div className="flex items-start gap-2.5 py-3 mt-1 rounded-md bg-bg-elevated border border-border px-3">
+          <div className="flex items-start gap-2.5">
             <ShieldCheck size={16} className="lucide-inline text-ok shrink-0 mt-0.5" />
             <div>
               <div className="text-[13px] font-semibold text-text">{i18nT('pages.settings.securityPanel.no_enterprise_policy_in_effect')}</div>
-              <div className="text-[12px] text-muted mt-0.5 leading-relaxed">{i18nT('pages.settings.securityPanel.no_policy_or_host_profile_restricts_the_host_sur')} <code className="font-mono text-[11px]">{i18nT('pages.settings.securityPanel.kiro_crew_security_policy_json')}</code> {i18nT('pages.settings.securityPanel.and_per_surface')} <code className="font-mono text-[11px]">{i18nT('pages.settings.securityPanel.profiles_json')}</code>.</div>
+              <div className="text-[12px] text-muted mt-0.5 leading-relaxed"><Trans i18nKey="pages.settings.securityPanel.no_policy_author_ceiling" components={{ policy: <code className="font-mono text-[11px]">{i18nT('pages.settings.securityPanel.kiro_crew_security_policy_json')}</code>, profiles: <code className="font-mono text-[11px]">{i18nT('pages.settings.securityPanel.profiles_json')}</code> }} /></div>
             </div>
           </div>
         ) : (

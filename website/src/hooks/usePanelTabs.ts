@@ -283,10 +283,6 @@ function localiseTitles(tabs: PanelTab[]): PanelTab[] {
  *  re-creates the tab and re-renders it. Only in-app edit state is lost. */
 export const MAX_APP_TABS_PER_CHAT = 3
 
-/** Max concurrent terminal tabs per chat (each is a live PTY). At the cap,
- *  openTerminal focuses/reuses the most-recent terminal instead of spawning. */
-export const MAX_TERMINALS_PER_CHAT = 4
-
 /** Monotonic id for reveal requests — see `PanelTab.revealLine`. Module-level so
  *  it is unique across slots and across tab identities, which is all the
  *  consumer's effect needs to tell one request from the next. */
@@ -525,8 +521,8 @@ const tabChoices = new Map<string, number>()
  *  checked but did not land. No entry means the strip has not been shown in
  *  this page session, which is a plain open. */
 const stoppedAt = new Map<string, number | 'landed' | null>()
-/** Per strip, a view opened with `openPanelView(..., { hold: true })` that a
- *  discovery open may not take the focus from (see there). */
+/** Per strip, a tab opened with `hold: true` (`openPanelView`, or a folder via
+ *  `openFolder`) that a discovery open may not take the focus from (see there). */
 const heldViews = new Map<string, string>()
 /** Ends the show of `slot`'s strip: the panel closed, or it shows another chat
  *  (see `notePanelShown`). */
@@ -647,13 +643,13 @@ export function offerPanelView(slotKey: string | null, kind: ViewKind): void {
 }
 
 /** What *slotKey*'s strip holds now: its tab ids and the tab in front. Read
- *  before a change that may have to be undone (a failed Ultra Mode turn-on). */
+ *  before a change that may have to be undone (a failed conductor mode turn-on). */
 export function panelStripOf(slotKey: string | null): { ids: readonly string[], activeId: string | null } {
   const b = store[bucketKey(slotKey)] ?? EMPTY_BUCKET
   return { ids: b.tabs.map(t => t.id), activeId: b.activeId }
 }
 
-/** remove views a turned-off (or failed) Ultra Mode put on a strip. When the tab
+/** remove views a turned-off (or failed) conductor mode put on a strip. When the tab
  *  in front goes, or is one of `restore.over` (a tab the caller itself put in
  *  front), `restore.focus` comes back to the front if it is still there; a tab
  *  in front that went falls back to the first tab. */
@@ -673,7 +669,7 @@ export function openPanelView(slotKey: string | null, kind: ViewKind, opts?: { h
   mutateSlot(key, b => upsertInBucket(b, { id: kind, kind, title: viewTitle(kind) }), null, { choice: true })
   // `hold`: a discovery open (Changes for a link the chat's history turns out
   // to hold) keeps this view in front until the next tab choice or the end of
-  // this show. The Ultra Mode board opens a worker with Workers in front, and
+  // this show. The conductor mode board opens a worker with Workers in front, and
   // the worker's history loads after it: without the hold, its PR link took
   // the focus and hid the panel's way back to the root.
   if (opts?.hold) heldViews.set(key, kind)
@@ -706,8 +702,17 @@ export function openPanelView(slotKey: string | null, kind: ViewKind, opts?: { h
 let documentBodyEpoch = 0
 export function documentBodyEpochNow(): number { return documentBodyEpoch }
 
+/** Bodies held outside the tab store (the file pop-out window's own copy) drop a
+ *  clean copy on every `evictDocumentBodies`, by the same rule as a file tab. */
+const evictionListeners = new Set<() => void>()
+export function onDocumentBodiesEvicted(listener: () => void): () => void {
+  evictionListeners.add(listener)
+  return () => { evictionListeners.delete(listener) }
+}
+
 export function evictDocumentBodies(): number {
   documentBodyEpoch++
+  for (const listener of evictionListeners) listener()
   let touched = 0
   for (const key of Object.keys(store)) {
     mutateSlot(key, b => {
@@ -967,7 +972,7 @@ export function usePanelTabs(
      *  for not being a stored tab. Pass a module constant: the array is a
      *  dependency of the strip callbacks. */
     leadingIds?: readonly string[]
-    /** An Ultra Mode chat (a crew root or one of its workers): the Board leads
+    /** A conductor mode chat (a crew root or one of its workers): the Board leads
      *  the strip and only a person moves the focus. An `automatic` open (a PR
      *  or issue link found, Pin Summary's landing, an app render opening on its
      *  own, the Git tab) adds or updates its tab and leaves the focus where it
@@ -1120,7 +1125,7 @@ export function usePanelTabs(
     })
   }, [update, leadingIds])
 
-  const openFile = useCallback((path: string, content: string, slot: string | null = null, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean; binary?: boolean; partial?: PartialCause | false; placeholder?: boolean }) => {
+  const openFile = useCallback((path: string, content: string, slot: string | null = null, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean; binary?: boolean; partial?: PartialCause | false; placeholder?: boolean; hold?: boolean }) => {
     // `revealLine` is always present in the object, `undefined` when absent:
     // `upsert` merges onto an existing tab with a spread, which only overwrites
     // keys the incoming object HAS. Omitting it would leave a previous chip's
@@ -1172,6 +1177,9 @@ export function usePanelTabs(
         ...(opts?.diffMode != null ? { diffMode: opts.diffMode } : {}),
       }, opts?.replaceId)
     }, target === key ? defaultLeadingId : null, { choice: true })
+    // `hold`: as in `openFolder` — a split pane opens this in its own chat's
+    // strip while the panel switches to that chat, whose history loads after.
+    if (opts?.hold) heldViews.set(target, `file:${path}`)
   }, [key, defaultLeadingId])
 
   /** Open (and focus) a file's WORKING-TREE DIFF as its own tab, keyed
@@ -1219,9 +1227,17 @@ export function usePanelTabs(
   /** Open a directory listing as its own tab. Keyed `folder:${path}` so a
    *  directory and a same-named file never collide on id, and so re-opening the
    *  same directory focuses the existing tab instead of stacking duplicates. */
-  const openFolder = useCallback((path: string, slot: string | null = null) => {
-    upsert({ id: `folder:${path}`, kind: 'folder', title: basename(path), path, slot })
-  }, [upsert])
+  const openFolder = useCallback((path: string, slot: string | null = null, opts?: { hold?: boolean }) => {
+    // Same slot/bucket routing as openFile (see its note).
+    const target = slot !== null ? bucketKey(slot) : key
+    const id = `folder:${path}`
+    mutateSlot(target, b => upsertInBucket(b, {
+      id, kind: 'folder', title: basename(path), path, slot,
+    }), target === key ? defaultLeadingId : null, { choice: true })
+    // `hold`: as in `openPanelView` — a split pane opens this in its own chat's
+    // strip just before switching to it, and that chat's history loads after.
+    if (opts?.hold) heldViews.set(target, id)
+  }, [key, defaultLeadingId])
 
   /** Open (or refocus) the app tab hosting one MCP App render. Keyed by
    *  tool-call id, so a re-render of the same app reuses its tab instead of
@@ -1235,7 +1251,7 @@ export function usePanelTabs(
    *  (belt-and-braces: focus stamping already sorts it last). */
   const openApp = useCallback((toolCallId: string, title: string, slot: string | null = null, opts?: { automatic?: boolean }) => {
     const id = `app:${toolCallId}`
-    // An Ultra Mode chat keeps its focus when a render opens on its own (see `boardFirst`).
+    // A conductor mode chat keeps its focus when a render opens on its own (see `boardFirst`).
     const keepFocus = !!opts?.automatic && boardFirst
     update(b => {
       const now = Date.now()
@@ -1357,20 +1373,10 @@ export function usePanelTabs(
 
   /** Open a NEW terminal tab (its own PTY session). Unlike singleton views,
    *  every call mints a fresh session so a chat can hold several shells; the
-   *  per-slot bucketing makes those sessions chat-specific automatically. At
-   *  the per-chat cap we focus (reuse) the most-recent terminal instead of
-   *  spawning another. Returns the session id to connect / run against. */
+   *  per-slot bucketing makes those sessions chat-specific automatically.
+   *  No per-chat cap: the gateway's ceiling refuses a shell past it, and that
+   *  tab says so. Returns the session id to connect / run against. */
   const openTerminal = useCallback((opts?: { cwd?: string; remoteSlot?: string; title?: string }): string => {
-    const terms = tabs.filter(t => t.kind === 'terminal')
-    if (terms.length >= MAX_TERMINALS_PER_CHAT) {
-      // Reuse only a terminal on the same machine: a remote request must never
-      // land in a gateway shell, nor a local one in a workspace. None: refuse.
-      const same = terms.filter(t => (t.remoteSlot ?? '') === (opts?.remoteSlot ?? ''))
-      const last = same[same.length - 1]
-      if (!last) return ''
-      setActive(last.id)
-      return last.sessionId ?? ''
-    }
     // Cryptographically-strong id — a terminal session id is a security token
     // that addresses a live PTY, so it must not come from Math.random().
     // secureRandomId() uses crypto.randomUUID in a secure context and a
@@ -1385,7 +1391,7 @@ export function usePanelTabs(
       ...(opts?.remoteSlot ? { remoteSlot: opts.remoteSlot } : {}),
     })
     return sessionId
-  }, [tabs, upsert, setActive])
+  }, [upsert])
 
   const activeTab = useMemo(() => tabs.find(t => t.id === effectiveActiveId) ?? null, [tabs, effectiveActiveId])
 

@@ -95,9 +95,15 @@ class _StubService(KasLoginService):
         if provider_str == "facebook":
             raise ValueError(provider_str)
         if start_url == "malformed":
-            raise InvalidStartUrlError("Start URL must use https.")
+            malformed = InvalidStartUrlError("Start URL must use https.")
+            malformed.reason = "not_https"
+            raise malformed
         if start_url == "refused-by-aws":
             raise StartUrlRejectedError("AWS did not accept the start URL.")
+        if start_url == "refused-in-region":
+            bare = StartUrlRejectedError("AWS refused the sign-in.")
+            bare.names_start_url = False
+            raise bare
         return {
             "login_id": "lid-1",
             "user_code": "ABCD",
@@ -221,18 +227,33 @@ async def test_begin_device_missing_and_unknown_provider():
     assert _body(resp)["code"] == "invalid_provider"
 
 
-@pytest.mark.parametrize("start_url", ["malformed", "refused-by-aws"])
+@pytest.mark.parametrize(
+    "start_url, reason", [("malformed", "not_https"), ("refused-by-aws", "aws_rejected")]
+)
 @pytest.mark.asyncio
-async def test_begin_device_bad_start_url_is_a_coded_400_with_the_reason(start_url):
+async def test_begin_device_bad_start_url_is_a_coded_400_with_the_reason(start_url, reason):
     """Whether Crew or AWS refuses the start URL, the form gets a 400 it can fix
-    with the reason as the message, not a 502 that reads as an outage."""
+    with the reason as the message, not a 502 that reads as an outage, and the
+    reason's name, which the form says in the user's language."""
     resp = await api_kas_login_begin_device(
         _FakeRequest(_StubService(), {"provider": "idc", "start_url": start_url})
     )
     assert resp.status == 400
     body = _body(resp)
     assert body["code"] == "invalid_start_url"
+    assert body.get("reason") == reason
     assert "start url" in body["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_begin_device_bare_aws_refusal_names_the_start_url_or_the_region():
+    """AWS's bare "Invalid request" names neither field, so the form is told either
+    may be wrong instead of having the start URL blamed alone."""
+    resp = await api_kas_login_begin_device(
+        _FakeRequest(_StubService(), {"provider": "idc", "start_url": "refused-in-region"})
+    )
+    assert resp.status == 400
+    assert _body(resp)["code"] == "start_url_or_region_rejected"
 
 
 @pytest.mark.asyncio
@@ -270,6 +291,18 @@ async def test_poll_answers_a_sign_out_during_the_login_as_the_begin_409():
     resp = await api_kas_login_poll(_FakeRequest(_SignedOut(), {"login_id": "lid-1"}))
     assert resp.status == 409
     assert _body(resp)["code"] == "signed_out_during_login"
+
+
+@pytest.mark.parametrize("code", ["no_kiro_profile", "profile_lookup_failed"])
+@pytest.mark.asyncio
+async def test_poll_passes_a_profile_failure_code_through_to_the_card(code):
+    class _NoProfile(_StubService):
+        async def poll_device(self, login_id):
+            return {"status": "error", "code": code}
+
+    resp = await api_kas_login_poll(_FakeRequest(_NoProfile(), {"login_id": "lid-1"}))
+    assert resp.status == 200
+    assert _body(resp) == {"status": "error", "code": code}
 
 
 @pytest.mark.asyncio
@@ -491,6 +524,10 @@ def _bound_loopback() -> tuple[socket.socket, int]:
     return sock, sock.getsockname()[1]
 
 
+async def _echo(callback: dict) -> dict:
+    return callback
+
+
 async def _hit(port: int, path: str, params: dict) -> None:
     async with aiohttp.ClientSession() as client:
         async with client.get(f"http://127.0.0.1:{port}{path}", params=params) as resp:
@@ -500,7 +537,7 @@ async def _hit(port: int, path: str, params: dict) -> None:
 @pytest.mark.asyncio
 async def test_wait_for_callback_returns_query_fields():
     sock, port = _bound_loopback()
-    task = asyncio.create_task(wait_for_callback(sock, port, "st-1", timeout_secs=10))
+    task = asyncio.create_task(wait_for_callback(sock, port, "st-1", _echo, timeout_secs=10))
     await asyncio.sleep(0.05)  # let the listener start
     await _hit(port, "/oauth/callback", {"login_option": "google", "code": "c1", "state": "st-1"})
     result = await await_until(task, timeout=5)
@@ -513,7 +550,7 @@ async def test_wait_for_callback_returns_query_fields():
 @pytest.mark.asyncio
 async def test_wait_for_callback_accepts_signin_path():
     sock, port = _bound_loopback()
-    task = asyncio.create_task(wait_for_callback(sock, port, "st-2", timeout_secs=10))
+    task = asyncio.create_task(wait_for_callback(sock, port, "st-2", _echo, timeout_secs=10))
     await asyncio.sleep(0.05)
     await _hit(port, "/signin/callback", {"login_option": "github", "code": "c2", "state": "st-2"})
     result = await await_until(task, timeout=5)
@@ -523,7 +560,7 @@ async def test_wait_for_callback_accepts_signin_path():
 @pytest.mark.asyncio
 async def test_wait_for_callback_state_mismatch_raises():
     sock, port = _bound_loopback()
-    task = asyncio.create_task(wait_for_callback(sock, port, "expected", timeout_secs=10))
+    task = asyncio.create_task(wait_for_callback(sock, port, "expected", _echo, timeout_secs=10))
     await asyncio.sleep(0.05)
     await _hit(port, "/oauth/callback", {"login_option": "google", "code": "c", "state": "evil"})
     with pytest.raises(PortalAuthError, match="state mismatch"):
@@ -533,7 +570,7 @@ async def test_wait_for_callback_state_mismatch_raises():
 @pytest.mark.asyncio
 async def test_wait_for_callback_portal_error_raises():
     sock, port = _bound_loopback()
-    task = asyncio.create_task(wait_for_callback(sock, port, "st", timeout_secs=10))
+    task = asyncio.create_task(wait_for_callback(sock, port, "st", _echo, timeout_secs=10))
     await asyncio.sleep(0.05)
     await _hit(port, "/oauth/callback", {"error": "access_denied", "state": "st"})
     with pytest.raises(PortalAuthError, match="access_denied"):
@@ -544,7 +581,7 @@ async def test_wait_for_callback_portal_error_raises():
 async def test_wait_for_callback_times_out():
     sock, port = _bound_loopback()
     with pytest.raises(PortalAuthError, match="timed out"):
-        await wait_for_callback(sock, port, "st", timeout_secs=0.2)
+        await wait_for_callback(sock, port, "st", _echo, timeout_secs=0.2)
 
 
 def test_handlers_package_does_not_import_kas_at_boot():

@@ -1,9 +1,11 @@
 """Owner-only worker-kit routes: ``/api/agents/{name}/worker-kit``.
 
-``GET`` reads the crewmate's own file revision; ``POST .../preview`` says what
-adding another agent's abilities would add to that file, and what it skips as
-already present; ``PUT`` adds them, once, after that preview. All disk work
-runs off the event loop through :mod:`kiro_crew.mate_worker_kit`.
+``GET`` reads the crewmate's own file revision, or answers 503
+``capabilities_unavailable`` when that read has not finished in time;
+``POST .../preview`` says what adding another agent's abilities would add to
+that file, and what it skips as already present; ``PUT`` adds them, once,
+after that preview. All disk work runs off the event loop through
+:mod:`kiro_crew.mate_worker_kit`.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ from aiohttp import web
 
 from kiro_crew.dashboard.agent_name_segment import agent_route_name, invalid_agent_name_response
 from kiro_crew.dashboard.chat_utils import drained_to_thread
+from kiro_crew.dashboard.handlers._bounded_read import TIMED_OUT, bounded_read
 from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 from kiro_crew.mate_worker_kit import WorkerKitError
 
@@ -28,7 +31,21 @@ async def api_member_worker_kit(request: web.Request) -> web.Response:
         return invalid_agent_name_response()
     try:
         if request.method == "GET":
-            return web.json_response(await drained_to_thread(mate_worker_kit.view, name))
+            # Not ``drained_to_thread``: a GET mutates nothing, so a read still
+            # blocked at the deadline is left to its thread and answered 503.
+            try:
+                view = await bounded_read(mate_worker_kit.view, name, what="Worker-kit")
+            except TimeoutError:
+                return web.json_response(
+                    {
+                        "error": "capabilities_unavailable",
+                        "code": "capabilities_unavailable",
+                        "detail": "",
+                        "reason": TIMED_OUT,
+                    },
+                    status=503,
+                )
+            return web.json_response(view)
         try:
             body = await request.json()
         except ValueError:

@@ -487,6 +487,10 @@ _OWNED_NAMES: dict[str, tuple[str, ...]] = {
         "unresolve_pull_request_thread",
         "_validated_comment_body",
     ),
+    # Holds no re-exported name; listed so the import-order checks cover it.
+    "issue_search": (),
+    # Likewise; importing it installs Linear into issue search and the issue read.
+    "linear": (),
     "review": (
         "_branch_pattern_matches",
         "_flatten_paginated",
@@ -668,6 +672,48 @@ async def api_issue_source(request: web.Request) -> web.Response:
     except SourceProviderError as exc:
         return _provider_error_response(request, "source.issue.read", exc)
     _audit_source_api(request, "source.issue.read", "completed")
+    return web.json_response(data)
+
+
+async def api_issue_search(request: web.Request) -> web.Response:
+    """Owner-only POST ``/api/source/issues``: list or search one scope's issues.
+
+    Same authorization, audit and error mapping as :func:`api_issue_source`. The
+    body is validated by ``source_providers.issue_search``; a refused field is a
+    400 whose ``code`` is ``invalid_request``, or ``provider_not_supported`` for a
+    provider the contract names but the gateway does not serve yet.
+    """
+    operation = "source.issues.list"
+    denied = _authorize_owner_request(request, operation)
+    if denied is not None:
+        return denied
+    try:
+        body = await request.json()
+    except asyncio.CancelledError:
+        _audit_source_api(request, operation, "failed", "request_cancelled")
+        raise
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    try:
+        data = await _submodule("issue_search").search_issues(body, refresh=_body_refresh(body))
+    except asyncio.CancelledError:
+        _audit_source_api(request, operation, "failed", "request_cancelled")
+        raise
+    except ValueError as exc:
+        if not isinstance(exc, _submodule("issue_search").IssueQueryError):
+            # Not a refusal issue_search wrote, so it came from reading provider
+            # output: never echo its text.
+            return _provider_error_response(
+                request, operation, SourceProviderError("provider returned an invalid issue list")
+            )
+        code = exc.code if exc.code == "provider_not_supported" else "invalid_request"
+        _audit_source_api(request, operation, "failed", code)
+        return web.json_response({"error": str(exc), "code": code}, status=400)
+    except SourceProviderError as exc:
+        return _provider_error_response(request, operation, exc)
+    _audit_source_api(request, operation, "completed")
     return web.json_response(data)
 
 
@@ -896,7 +942,8 @@ def stale_owner_session_response(request: web.Request) -> web.Response | None:
 def owner_view_for_request(request: web.Request) -> bool:
     """Whether the owner's credential-redaction switch may apply to THIS request.
 
-    :func:`is_owner_dashboard_request` with the fail direction spelled out: any
+    :func:`is_host_owner_dashboard_request` (the machine owner alone; a Shared Crew
+    teammate reads redacted) with the fail direction spelled out: any
     request the owner predicate cannot evaluate (no ``state`` on the app, an
     unexpected shape) is NOT an owner view, so the caller falls back to the
     unconditional redaction pass. Used only by the owner-view seams
@@ -904,13 +951,18 @@ def owner_view_for_request(request: web.Request) -> bool:
     calling the predicate directly.
     """
     try:
-        return is_owner_dashboard_request(request)
+        return is_host_owner_dashboard_request(request)
     except Exception:
         return False
 
 
-def is_owner_dashboard_request(request: web.Request) -> bool:
-    """Return whether request has a configured or implicit local owner identity."""
+def is_host_owner_dashboard_request(request: web.Request) -> bool:
+    """Return whether request has a configured or implicit local owner identity.
+
+    The machine owner and nobody else. Ask :func:`is_owner_dashboard_request`
+    to gate a route; this form only tells the owner apart from a teammate who
+    already passed that gate.
+    """
     state = request.app["state"]
     owner_id = str(getattr(state, "owner_id", "") or "")
     caller = str(request.get("user") or "")
@@ -919,6 +971,20 @@ def is_owner_dashboard_request(request: web.Request) -> bool:
     if owner_id:
         return caller == owner_id
     return caller in _LOCAL_DASHBOARD_OWNER_SUBJECTS
+
+
+def is_owner_dashboard_request(request: web.Request) -> bool:
+    """Return whether request may use the owner's dashboard.
+
+    The machine owner (:func:`is_host_owner_dashboard_request`), or a Shared Crew
+    teammate on every route but the Terminal
+    (:mod:`kiro_crew.shared_crew.teammate_access`).
+    """
+    if is_host_owner_dashboard_request(request):
+        return True
+    from kiro_crew.shared_crew.teammate_access import teammate_passes_owner_gate
+
+    return teammate_passes_owner_gate(request)
 
 
 def _audit_source_api(
@@ -979,7 +1045,7 @@ def _authorize_owner_request(request: web.Request, operation: str) -> web.Respon
     if not caller:
         _audit_source_api(request, operation, "denied", "non_owner")
         return web.json_response({"error": "forbidden"}, status=403)
-    if caller != owner_id:
+    if caller != owner_id and not is_owner_dashboard_request(request):
         _audit_source_api(request, operation, "denied", "non_owner")
         # Deny decision made above; the helper only relabels the response for a
         # signed pre-owner bootstrap subject. Every other caller stays generic.

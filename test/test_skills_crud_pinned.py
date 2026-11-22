@@ -359,6 +359,58 @@ def test_a_failed_create_leaves_nothing_behind_so_a_retry_can_succeed(loader, mo
     assert (loader._dir / "halfmade" / "SKILL.md").read_text(encoding="utf-8") == "second try"
 
 
+def test_a_failed_by_name_create_leaves_nothing_behind_so_a_retry_can_succeed(loader, monkeypatch):
+    """The by-name floor rolls back the leaf and the directory it made, as the pinned
+    branch does.
+
+    A lone surrogate fails the encode after the exclusive open has created
+    ``SKILL.md``, which is the window ``write_text`` left an empty body in. The
+    ``os.write`` injection of the pinned test does not reach a text-mode write.
+    """
+    import kiro_crew.skills as skills_mod
+
+    monkeypatch.setattr(skills_mod, "_DIR_FD_SUPPORTED", False)
+
+    with pytest.raises(UnicodeEncodeError):
+        loader.create_skill("halfmade", "BODY \ud800")
+
+    assert not (loader._dir / "halfmade").exists(), "the directory the create made survived"
+    assert [p.name for p in loader._dir.iterdir()] == []
+    assert loader.create_skill("halfmade", "second try") is True
+    assert (loader._dir / "halfmade" / "SKILL.md").read_text(encoding="utf-8") == "second try"
+
+
+def test_the_by_name_rollback_does_not_delete_a_rivals_replacement_leaf(loader, monkeypatch):
+    """The by-name rollback removes the inode it created, not whatever holds the name.
+
+    The rival replaces our leaf after the failed write closed it, just before the
+    verified unlink runs: Windows refuses to replace a file that is still open. The
+    rival is created first and renamed over the name, so it can never reuse our inode.
+    """
+    import kiro_crew.skills as skills_mod
+
+    monkeypatch.setattr(skills_mod, "_DIR_FD_SUPPORTED", False)
+    real_unlink_verified = pinned_fs.unlink_verified_by_name
+    skill_dir = loader._dir / "rivalled"
+    swapped = []
+
+    def swap_the_leaf_then_unlink(parent, name, expect, **kwargs):
+        rival = parent / "rival.tmp"
+        rival.write_text("RIVAL", encoding="utf-8")
+        os.replace(rival, parent / name)
+        swapped.append(True)
+        return real_unlink_verified(parent, name, expect, **kwargs)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(pinned_fs, "unlink_verified_by_name", swap_the_leaf_then_unlink)
+        with pytest.raises(UnicodeEncodeError):
+            loader.create_skill("rivalled", "MINE \ud800")
+
+    assert swapped, "the rollback never reached the verified unlink"
+    # The directory removal is refused too: it is not empty.
+    assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == "RIVAL"
+
+
 def test_update_replaces_content_and_returns_true(loader):
     assert loader.create_skill("edit", "before") is True
     assert loader.update_skill("edit", "after") is True
@@ -462,6 +514,49 @@ def test_delete_removes_the_skill(loader):
     assert loader.create_skill("gone", "x") is True
     assert loader.delete_skill("gone") is True
     assert not (loader._dir / "gone").exists()
+
+
+@pytest.mark.parametrize(
+    "pinned", [pytest.param(True, marks=needs_pinned_walk), pytest.param(False)]
+)
+def test_delete_refuses_a_folder_that_is_not_a_skill(loader, monkeypatch, pinned):
+    """A directory without its own SKILL.md holds skills; deleting it by name is refused."""
+    from kiro_crew import skills as skills_mod
+
+    monkeypatch.setattr(skills_mod, "_DIR_FD_SUPPORTED", pinned)
+    assert loader.create_skill("team/a", "a") is True
+    assert loader.create_skill("team/b", "b") is True
+
+    assert loader.delete_skill("team") is False
+    assert (loader._dir / "team" / "a" / "SKILL.md").read_text(encoding="utf-8") == "a"
+    assert (loader._dir / "team" / "b" / "SKILL.md").read_text(encoding="utf-8") == "b"
+    # A real skill inside it is still deletable by its own name.
+    assert loader.delete_skill("team/a") is True
+    assert not (loader._dir / "team" / "a").exists()
+
+
+@pytest.mark.parametrize(
+    "pinned", [pytest.param(True, marks=needs_pinned_walk), pytest.param(False)]
+)
+def test_delete_still_removes_a_skill_whose_skill_md_is_a_link(
+    loader, monkeypatch, tmp_path, pinned
+):
+    """A linked SKILL.md still names a skill; the delete removes the link, not its target."""
+    from kiro_crew import skills as skills_mod
+
+    monkeypatch.setattr(skills_mod, "_DIR_FD_SUPPORTED", pinned)
+    target = tmp_path / "shared-skill.md"
+    target.write_text("shared", encoding="utf-8")
+    skill_dir = loader._dir / "linked-md"
+    skill_dir.mkdir(parents=True)
+    try:
+        os.symlink(target, skill_dir / "SKILL.md")
+    except (OSError, NotImplementedError):
+        pytest.skip("file symlinks are not available on this host")
+
+    assert loader.delete_skill("linked-md") is True
+    assert not skill_dir.exists()
+    assert target.read_text(encoding="utf-8") == "shared"
 
 
 def test_delete_refuses_a_symlinked_skill_dir(loader, tmp_path):

@@ -12,11 +12,14 @@ failure) is honoured here per slot and reported back by code instead of
 aborting the whole run.
 
 Candidates are the slots the sidebar itself counts: idle (``slot.turn_running``
-is False, the fact the projection serializes as ``running``), ``is_turn_interrupted`` on the transcript, no live sub-agents, not
+is False, the fact the projection serializes as ``running``), ``is_turn_interrupted``
+on the transcript, not ``is_interruption_stale`` (a turn cut short more than a
+week ago is left to the session's own Resume button), no live sub-agents, not
 under construction, not a relay archive, and no Crew Mode worker whose root is
 listed (the sidebar's ``crewModeView`` drop) -- the facts the slots projection
-feeds into the row's ``interrupted`` and ``subagents_running`` fields, so the
-count on the button and the ``total`` the server answers are the same number.
+feeds into the row's ``interrupted``, ``interrupted_stale`` and
+``subagents_running`` fields, so the count on the button and the ``total`` the
+server answers are the same number.
 
 Owner-only. ``require_owner_dashboard_request`` refuses app tokens AND
 non-owner dashboard sessions: a Slack-allowlisted ``!dashboard`` user carries
@@ -67,6 +70,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
@@ -78,10 +82,11 @@ from kiro_crew.dashboard.chat_delivery import BACKGROUND_START_TASKS, START_BACK
 from kiro_crew.dashboard.chat_handlers import SlotContinueRefusal
 from kiro_crew.dashboard.chat_utils import effective_session_key
 from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
-from kiro_crew.dashboard.relay_archive import is_relay_archive
+from kiro_crew.dashboard.relay_archive import is_cron_run_read_only, is_relay_archive
 from kiro_crew.dashboard.slot_projection import summary_rows
 from kiro_crew.dashboard.state import (
     _log_task_exception,
+    is_interruption_stale,
     is_turn_interrupted,
     load_window_off_loop,
 )
@@ -145,14 +150,17 @@ def collect_interrupted_idle(
 
     The same facts the slots projection serializes for the row: a slot under
     construction is not in the payload at all, ``running`` (``turn_running``)
-    and ``subagents_running`` must both be false, and ``interrupted`` is
-    ``is_turn_interrupted`` on the transcript. Relay archives are skipped
-    first: they never run, and the sidebar leaves remote rows out of its count.
+    and ``subagents_running`` must both be false, ``interrupted`` is
+    ``is_turn_interrupted`` on the transcript and ``interrupted_stale`` is
+    ``is_interruption_stale``. Relay archives and read-only cron run
+    transcripts are skipped first: they never run, and the sidebar leaves them
+    out of its count (``slotIsRemoteBound``).
 
     *crew_mode* is whether the pressing tab has the Crew Mode preview on
     (``crewModeEnabled``). Only then does the sidebar's ``crewModeView`` drop a
     worker whose root is listed, so only then is that worker left out here.
     """
+    now = time.time()
     subs = getattr(state, "subagents", None)
     under_construction = getattr(state, "_slots_under_construction", None) or ()
     picked: list[tuple[str, _ChatSlot]] = []
@@ -169,7 +177,7 @@ def collect_interrupted_idle(
     }
     crew_roots = _crew_roots(state) if crew_mode else {}
     for name, slot in slots:
-        if slot.key in under_construction or is_relay_archive(slot):
+        if slot.key in under_construction or is_relay_archive(slot) or is_cron_run_read_only(slot):
             continue
         # The chat page's own sessions only, as the sidebar lists them
         # (``isChatPageSurface``): a member's DM thread or a sub-agent row lives
@@ -192,7 +200,12 @@ def collect_interrupted_idle(
         # window is still pending answers from its tail and nothing is read from
         # disk on the loop here. Each candidate's window loads off the loop in
         # its own dispatch, before its Continue.
-        if not is_turn_interrupted(summary_rows(slot)):
+        rows = summary_rows(slot)
+        if not is_turn_interrupted(rows):
+            continue
+        # An interruption older than the bulk-Resume window is left to the
+        # session's own Resume button: the sidebar's ``interrupted_stale``.
+        if is_interruption_stale(rows, now):
             continue
         picked.append((name, slot))
     return picked
@@ -335,36 +348,24 @@ async def _resume_candidates(
         )
 
 
-#: How often a candidate looks for the memory preparation task while startup
-#: is preparing it but has not published it on the state yet.
-_MEMORY_TASK_POLL_SECONDS = 0.1
-
-
 async def _memory_preparation_settled(state: DashboardState) -> None:
-    """Return once the gateway's memory preparation has ended.
+    """Return once the gateway's memory preparation has ended, or raise.
 
     The task the queue drain parks on (``_memory_preparation_pending``). Startup
     publishes it on the state only after the listener is up, so while this
-    process is still preparing (``memory_startup_preparing``) and nothing is
-    published yet, the candidate waits for the task to appear, as a restored
-    send does (``slot_queue_repository``); a turn started then would be refused
-    by the memory barrier. A failed or cancelled preparation counts as ended:
-    the turn refuses on its own then, as it does for any send.
+    process is still preparing and nothing is published yet, the candidate waits
+    for the task to appear; a turn started then would be refused by the memory
+    barrier. The wait is the single-turn one (``wait_for_memory_preparation``),
+    which also re-reads the fence: the backstop fails a wedged pass but cannot
+    cancel its worker thread, so the task may never end. A recorded failure
+    raises ``MemoryStartupUnavailable``, so ``_one`` reports the slot as failed
+    instead of queueing a recovery entry the drain would park behind that task.
     """
-    from kiro_crew.memory_startup import memory_startup_preparing
+    from kiro_crew.memory_startup import wait_for_memory_preparation
 
-    while getattr(state, "memory_startup_task", None) is None and memory_startup_preparing():
-        await asyncio.sleep(_MEMORY_TASK_POLL_SECONDS)
-    task = getattr(state, "memory_startup_task", None)
-    if task is None or task.done():
-        return
-    try:
-        await asyncio.shield(task)
-    except asyncio.CancelledError:
-        if not task.done():
-            raise
-    except Exception:
-        pass
+    await wait_for_memory_preparation(
+        lambda: getattr(state, "memory_startup_task", None), bounded=False
+    )
 
 
 def _claims(request: web.Request) -> dict[str, Any]:

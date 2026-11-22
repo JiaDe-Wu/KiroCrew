@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 from kiro_crew.messaging.link import canonical_key
-from kiro_crew.session_lifecycle_parts.parked_queue import _park_queue
+from kiro_crew.session_lifecycle_parts.parked_queue import _park_queue, allocation_identity
 from kiro_crew.session_lifecycle_parts.stop_decline import StopOutcome, _compaction_waits_for_turn
 
 if TYPE_CHECKING:
@@ -108,6 +108,18 @@ def open_replay_gap(self: SessionLifecycleService, key: str) -> None:
     gap_key = canonical_key(key)
     if gap_key not in self.state.replay_gaps:
         self.state.replay_gaps[gap_key] = _ReplayGap(owner=asyncio.current_task())
+
+
+def has_open_replay_gap(self: SessionLifecycleService, key: str) -> bool:
+    """Whether *key* is held in a reset-to-reacquire window right now.
+
+    While the gap is open the live session is popped, so ``is_busy`` reads
+    False even though a turn is mid-reprojection on the key. The dashboard
+    Stop probe reads this too, so a Stop pressed during the gap routes through
+    :meth:`stop_turn` (which records it via :meth:`note_stop`) instead of
+    returning idle and letting the re-claimed turn run.
+    """
+    return canonical_key(key) in self.state.replay_gaps
 
 
 def close_replay_gap(self: SessionLifecycleService, key: str) -> None:
@@ -421,9 +433,11 @@ async def stop_turn(
         key,
         elapsed,
     )
-    # Retain the task strongly until completion; the event loop alone keeps
-    # only a weak reference.
-    task = asyncio.create_task(owner._eager_respawn(key))
+    # The successor starts under the stopped session's own identity, as the
+    # reset successor does: a later claim takes a live session as-is, so the
+    # chat runs on the agent it is set to. Retain the task strongly until
+    # completion; the event loop alone keeps only a weak reference.
+    task = asyncio.create_task(self._respawn_as(key, allocation_identity(owner, key, session)))
     owner._background_tasks.add(task)
     task.add_done_callback(owner._background_tasks.discard)
     if on_hard:
@@ -594,8 +608,9 @@ async def _eager_respawn(self: SessionLifecycleService, key: str) -> None:
 async def _respawn_as(self: SessionLifecycleService, key: str, identity: dict[str, Any]) -> None:
     """Start a successor for *key* under *identity* and release its lease.
 
-    The reset's counterpart of :meth:`_eager_respawn`: registration adopts the
-    entries the reset parked, and the release wakes their channels' drains.
+    The reset's and the hard Stop's counterpart of :meth:`_eager_respawn`:
+    registration adopts the entries the reset parked, and the release wakes
+    their channels' drains.
     The successor's first-turn observation belongs to the first queued turn,
     not to this call: a non-speculative creator registers its session with
     nothing armed and keeps the observation for itself, so it is re-armed

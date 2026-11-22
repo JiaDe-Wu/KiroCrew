@@ -14,6 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import git_repo_templates
 import pytest
 from git_maintenance_helpers import git_maintenance_off_entries
 from skill_script_helpers import load_skill_script
@@ -27,6 +28,8 @@ SKILL = PREPARE_PR / "SKILL.md"
 REFERENCE = PREPARE_PR / "references" / "split-and-regen.md"
 
 rs = load_skill_script("prepare_pr_regen_shared_under_test", SCRIPT)
+
+repo_templates = git_repo_templates.repo_templates  # the fixture, bound for this module
 
 
 def _env() -> dict[str, str]:
@@ -83,10 +86,12 @@ def _entry(
 
 
 @pytest.fixture
-def repo(tmp_path: Path) -> Path:
+def repo(tmp_path: Path, repo_templates) -> Path:
     """``origin/main`` is one commit; HEAD adds a commit that edits nothing shared."""
-    root = tmp_path / "repo"
-    root.mkdir()
+    return repo_templates.copy(_build_repo, tmp_path / "repo")
+
+
+def _build_repo(root: Path) -> None:
     _git(root, "init", "-q", "-b", "main")
     _write(root / "gen" / "out.txt", "stale\n")
     _write(root / "src.txt", "1\n")
@@ -95,7 +100,6 @@ def repo(tmp_path: Path) -> Path:
     _git(root, "update-ref", "refs/remotes/origin/main", "HEAD")
     _write(root / "src.txt", "2\n")
     _git(root, "commit", "-q", "-am", "mine")
-    return root
 
 
 REWRITE = "open('gen/out.txt','w').write('fresh\\n')"
@@ -170,6 +174,18 @@ def test_an_uncommitted_edit_counts_as_the_branchs_own(repo: Path) -> None:
 def test_a_changed_generator_input_makes_the_output_stale(repo: Path) -> None:
     """``src.txt`` changed on the branch; the generated file itself did not."""
     entry = _entry(["gen/out.txt"], REWRITE, inputs=["src.*"])
+    code, lines = rs.regen(str(repo), "main", [entry])
+    assert code == 20
+    assert "  rewrote: gen/out.txt" in lines
+
+
+def test_a_changed_input_with_a_non_ascii_name_makes_the_output_stale(repo: Path) -> None:
+    """Line output C-quotes ``site/src/fé.ts`` with a leading double quote, which
+    matches no ``site/src/*`` pattern, so reading it that way leaves the output stale."""
+    _write(repo / "site" / "src" / "fé.ts", "export const x = 1\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "a non-ASCII generator input")
+    entry = _entry(["gen/out.txt"], REWRITE, inputs=["site/src/*"])
     code, lines = rs.regen(str(repo), "main", [entry])
     assert code == 20
     assert "  rewrote: gen/out.txt" in lines
@@ -286,6 +302,7 @@ def test_the_generator_is_launched_by_the_path_which_found(
     found = str(repo / "bin" / "npm.CMD")
     launched: list[list[str]] = []
     real_run = subprocess.run
+    real_which = rs._tool_argv.which
 
     def fake_run(args, *rest, **kwargs):
         if args and args[0] == found:
@@ -293,13 +310,49 @@ def test_the_generator_is_launched_by_the_path_which_found(
             return subprocess.CompletedProcess(args, 0, "", "")
         return real_run(args, *rest, **kwargs)
 
-    monkeypatch.setattr(rs.shutil, "which", lambda name: found if name == "npm" else None)
+    monkeypatch.setattr(
+        rs._tool_argv, "which", lambda name: found if name == "npm" else real_which(name)
+    )
     monkeypatch.setattr(rs.subprocess, "run", fake_run)
     entry = _entry(["gen/out.txt"], NOOP)
     entry["argv"] = ["npm", "--prefix", "website", "run", "gen:ui"]
     code, lines = rs.regen(str(repo), "main", [entry])
     assert code == 0, lines
     assert launched == [[found, "--prefix", "website", "run", "gen:ui"]]
+
+
+def test_a_generator_in_the_current_directory_is_not_launched(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-named file where the script runs must not stand in for PATH's tool.
+
+    Windows searches the current directory for a bare name; POSIX does through a
+    relative PATH entry, so ``.`` is put on PATH to reach the same lookup here.
+    """
+    name = "kc-regen-planted-tool"
+    planted = repo / (name + (".exe" if os.name == "nt" else ""))
+    planted.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    planted.chmod(0o755)
+    real_run = subprocess.run
+    launched: list[str] = []
+
+    def fake_run(args, *rest, **kwargs):
+        if args and Path(args[0]).name.startswith(name):
+            launched.append(str(args[0]))
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return real_run(args, *rest, **kwargs)
+
+    monkeypatch.setattr(rs.subprocess, "run", fake_run)
+    monkeypatch.chdir(repo)
+    empty = tmp_path / "empty-bin"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", os.pathsep.join([".", str(empty), os.environ.get("PATH", "")]))
+    entry = _entry(["gen/out.txt"], NOOP)
+    entry["argv"] = [name, "run"]
+    error, changed = rs.run_entry(str(repo), entry)
+    assert launched == []
+    assert error == f"stub: tool `{name}` not found on PATH"
+    assert changed == []
 
 
 def test_an_entry_whose_generator_is_absent_is_skipped(repo: Path) -> None:
@@ -327,6 +380,16 @@ def test_missing_base_and_non_repo_are_environment_errors(tmp_path: Path, repo: 
     plain = tmp_path / "plain"
     plain.mkdir()
     assert rs.regen(str(plain), "main", [])[0] == 2
+
+
+def test_a_remote_ref_as_the_base_names_the_branch_to_pass(repo: Path) -> None:
+    """``upstream/main`` from a fork clone: the fetch hint cannot work, the branch name does."""
+    _git(repo, "update-ref", "refs/remotes/upstream/main", "HEAD")
+    code, lines = rs.regen(str(repo), "upstream/main", [])
+    assert code == 2
+    assert "pass the branch name instead: main" in lines[0]
+    assert "git fetch origin upstream/main" not in lines[0]
+    assert "run: git fetch origin release/1" in rs.regen(str(repo), "release/1", [])[1][0]
 
 
 def _cli(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:

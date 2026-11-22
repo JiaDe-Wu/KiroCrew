@@ -4,8 +4,9 @@
 import type { PayloadAction } from '@reduxjs/toolkit'
 import type { ChatMessage } from '../../types'
 import type { ChatState } from './state'
+import { messageAuthor } from '../../api/sharedCrewUi'
 import { quoteBlock } from '../../chat-core/composer/messageQuote'
-import { isUnsafeKey, queueEntryAttachments, queueEntryBanner, queueEntryPastes, queueEntryQuote, queueEntryRelay, queueEntrySendId, safeKey, type QueueEntryAttachments, type SlotQueueItem } from './wire'
+import { isUnsafeKey, queueEntryAttachments, queueEntryBanner, queueEntryDecisionStrip, queueEntryKnowledgeEnvelope, queueEntryPastes, queueEntryQuote, queueEntryRelay, queueEntrySendId, safeKey, type QueueEntryAttachments, type SlotQueueItem } from './wire'
 import type { PasteBlock } from '../../utils/pasteTokens'
 
 /** A queued row's paste blocks (`queueEntryPastes` put them there): what the
@@ -88,16 +89,27 @@ export function hydrateQueuedBubbles(
   const pinned = (m: ChatMessage) => m.role === 'queued' && !!m.meta?.responsiveSend
     && (preserveLiveQueue || listed.has(m.meta?.queueId as string))
   const live = preserveLiveQueue ? list.filter(m => m.role === 'queued' && !pinned(m)) : []
-  const base = list.filter((m) => m.role !== 'queued' || pinned(m))
+  // A pinned row keeps its place but takes the listing's marks, which a drain,
+  // an edit or a reorder may have changed since its push: its durable verdict
+  // and its restored, held and written marks (a held entry waits for the
+  // person, so the chat must draw it as a card they can act on).
+  const listing = new Map((queue ?? []).map(q => [q.queueId, q]))
+  const base = list.filter((m) => m.role !== 'queued' || pinned(m)).map((m) => {
+    const entry = listing.get(m.meta?.queueId as string)
+    if (m.role !== 'queued' || !entry) return m
+    const meta = { ...m.meta }
+    for (const key of ['durable', 'restored', 'held', 'written'] as const) delete meta[key]
+    return { ...m, meta: { ...meta, ...(entry.durable === false ? { durable: false } : {}), ...(entry.restored ? { restored: true } : {}), ...(entry.held ? { held: true } : {}), ...(entry.written ? { written: true } : {}) } }
+  })
   const liveIds = new Set([...live, ...base.filter(m => m.role === 'queued')].map(m => m.meta?.queueId))
-  for (const { content, queueId, ts, kind, appLabel, quote, restored, ...attachments } of queue ?? []) {
+  for (const { content, queueId, ts, kind, appLabel, quote, restored, held, written, ...attachments } of queue ?? []) {
     if (liveIds.has(queueId)) continue
     // The lists ride the row's meta under the same keys a user row carries
     // them, so a cancel on THIS tab restores a spaced path exactly even
     // though the send happened on another tab or before a reload. The paste
     // blocks ride the same way, so the card draws the `[ Paste #N ]` token
     // the sent bubble draws, not the expanded wire text.
-    appendCorrelatedQueue(base, { role: 'queued', content, cls: 'msg msg-queued', ts, meta: { queueId, ...(kind ? { kind } : {}), ...(appLabel ? { appLabel } : {}), ...(restored ? { restored } : {}), ...(quote ? { quote } : {}), ...attachments, ...queueEntryPastes(content) } })
+    appendCorrelatedQueue(base, { role: 'queued', content, cls: 'msg msg-queued', ts, meta: { queueId, ...(kind ? { kind } : {}), ...(appLabel ? { appLabel } : {}), ...(restored ? { restored } : {}), ...(held ? { held } : {}), ...(written ? { written } : {}), ...(quote ? { quote } : {}), ...attachments, ...queueEntryPastes(content, attachments.sendId) } })
   }
   for (const row of live) appendCorrelatedQueue(base, row)
   return base
@@ -155,10 +167,14 @@ export const queueReducers = {
       // (no chat_message echo follows for a user row).
       if (drain_writes_row) return
       if (sendId) {
-        // A persisted steer row is not this drain's row: a requeued steer runs as
-        // its own new row. Matching it here would skip the rebuild, and with it
-        // the landed mark below. An optimistic steer bubble is still this send's
-        // placeholder, so it is matched and replaced as before.
+        // A steer row is never this drain's row: a requeued steer runs as its
+        // own NEW row, and the server marks the old one `superseded` once that
+        // row lands. Matching it here would skip the rebuild, and with it the
+        // landed mark below, and then hide the only copy, so the text would
+        // show zero times.
+        // An optimistic steer bubble IS still this send's placeholder (the
+        // steer raced the turn's end before any row was persisted), so it is
+        // matched and replaced as before.
         const existing = msgs.find(m => m.role === 'user' && m.meta?.sendId === sendId && !(m.meta?.steer && !m.meta?.optimistic))
         if (existing && !existing.meta?.optimistic) return
         if (existing) {
@@ -177,8 +193,11 @@ export const queueReducers = {
       // A peer's queued `session_send` names its sender (`meta.relay`) on the
       // frame, so the rebuilt row draws the incoming session-message card. Read
       // from the FRAME only: the gateway drops the sender when the entry is
-      // edited, and only the frame says so.
-      const rowMeta: Record<string, unknown> = { ...queueEntryAttachments(queued?.meta), ...queueEntryQuote(queued?.meta), ...queueEntryBanner(queued?.meta), ...queuedRowPastes(queued?.meta), ...queueEntryAttachments(meta), ...queueEntryQuote(meta), ...queueEntryBanner(meta), ...queueEntrySendId(meta), ...queueEntryRelay(meta) }
+      // edited, and only the frame says so. The author follows the same rule.
+      // messageAuthor validates and normalizes the server-stamped principal
+      // before it reaches the rebuilt row.
+      const author = messageAuthor(meta)
+      const rowMeta: Record<string, unknown> = { ...queueEntryAttachments(queued?.meta), ...queueEntryQuote(queued?.meta), ...queueEntryBanner(queued?.meta), ...queuedRowPastes(queued?.meta), ...queueEntryAttachments(meta), ...queueEntryQuote(meta), ...queueEntryBanner(meta), ...queueEntryDecisionStrip(meta), ...queueEntrySendId(meta), ...queueEntryRelay(meta), ...(author ? { author } : {}) }
       if (queue_id && sendId) rowMeta.queueId = queue_id
       if (at >= 0 && clientTs) rowMeta.clientTs = clientTs
       delete rowMeta.optimistic
@@ -227,16 +246,23 @@ export const queueReducers = {
    *  nothing from them. An empty object clears the lists (the frame carries
    *  no `meta` once every marker is gone). Omitted by the optimistic local
    *  edit, which cannot know how the server pruned them. */
-  editQueuedMessage(state: ChatState, action: PayloadAction<{ slot: string; queue_id: string; content: string; attachments?: QueueEntryAttachments; pastes?: PasteBlock[] }>) {
-    const { slot, queue_id, content, attachments, pastes } = action.payload
+  editQueuedMessage(state: ChatState, action: PayloadAction<{ slot: string; queue_id: string; content: string; attachments?: QueueEntryAttachments; pastes?: PasteBlock[]; editRev?: number }>) {
+    const { slot, queue_id, content, attachments, pastes, editRev } = action.payload
     if (isUnsafeKey(slot)) return
     const msgs = slot === state.activeSlot ? state.messages : state.slotMessages[slot]
     if (!msgs) return
     const idx = msgs.findIndex(m => m.role === 'queued' && (m.meta?.queueId as string) === queue_id)
     if (idx < 0) return
+    const applied = msgs[idx].meta?.editRev
+    if (typeof editRev === 'number' && typeof applied === 'number' && editRev < applied) return
     if (msgs[idx].content !== content && msgs[idx].meta?.banner !== undefined) {
       // The server drops the label when an edit changes the text; so does the row.
       const { banner: _b, ...rest } = msgs[idx].meta ?? {}
+      msgs[idx].meta = rest
+    }
+    if (msgs[idx].meta?.automationSteer !== undefined) {
+      // An edited entry holds the editor's words; the server drops its automation origin too.
+      const { automationSteer: _a, ...rest } = msgs[idx].meta ?? {}
       msgs[idx].meta = rest
     }
     msgs[idx].content = content
@@ -265,6 +291,7 @@ export const queueReducers = {
       const { quote: _q, ...rest } = msgs[idx].meta ?? {}
       msgs[idx].meta = rest
     }
+    if (typeof editRev === 'number') msgs[idx].meta = { ...msgs[idx].meta, editRev }
   },
   /** Reorder queued messages to match the given queue-id sequence (from the
    *  backend queue_reorder WS event or an optimistic local update). Queued
@@ -300,8 +327,10 @@ export const queueReducers = {
       // blocks so the card shows the token.
       // `kind` and `appLabel` too, as hydration keeps them: a cron or app card
       // classifies by them (not editable, not restored into the composer).
+      // `durable: false` too: the card's "won't survive a restart" label, and
+      // `written`, so a requeued send whose row is written offers only Send now.
       const tags = (meta ?? {}) as Record<string, unknown>
-      appendCorrelatedQueue(msgs, { role: 'queued', content, cls: 'msg msg-queued', ts, meta: { queueId, ...(typeof tags.kind === 'string' && tags.kind ? { kind: tags.kind } : {}), ...(typeof tags.appLabel === 'string' && tags.appLabel ? { appLabel: tags.appLabel } : {}), ...(tags.requeuedSteer === true ? { requeuedSteer: true } : {}), ...queueEntryAttachments(meta), ...queueEntryQuote(meta), ...queueEntryBanner(meta), ...queueEntrySendId(meta), ...queueEntryPastes(content) } })
+      appendCorrelatedQueue(msgs, { role: 'queued', content, cls: 'msg msg-queued', ts, meta: { queueId, ...(typeof tags.kind === 'string' && tags.kind ? { kind: tags.kind } : {}), ...(typeof tags.appLabel === 'string' && tags.appLabel ? { appLabel: tags.appLabel } : {}), ...(tags.requeuedSteer === true ? { requeuedSteer: true } : {}), ...(tags.automationSteer === true ? { automationSteer: true } : {}), ...(tags.durable === false ? { durable: false } : {}), ...(tags.written === true ? { written: true } : {}), ...queueEntryAttachments(meta), ...queueEntryQuote(meta), ...queueEntryBanner(meta), ...queueEntrySendId(meta), ...queueEntryKnowledgeEnvelope(meta), ...queueEntryPastes(content, queueEntrySendId(meta).sendId) } })
     },
     prepare(payload: { slot: string; content: string; ts: string; queue_id?: string; meta?: unknown }) {
       return { payload: { ...payload, queueId: payload.queue_id || crypto.randomUUID() } }

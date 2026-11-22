@@ -1,4 +1,4 @@
-"""Bounded re-attempt of an MCP server that failed to start for want of credentials.
+"""Bounded re-attempt of an MCP server that failed for want of credentials or dropped.
 
 A stdio MCP server whose signer resolves credentials lazily (``mcp-proxy-for-aws``
 is the reported case) fails its first ``initialize`` when the session starts
@@ -10,11 +10,26 @@ On a host that takes ``_kiro/mcp/resetServer`` (KAS), Crew asks the engine to
 connect the server again at a turn start, at most :data:`MAX_ATTEMPTS` times per
 server per session. :func:`is_recoverable_auth_failure` decides which failures
 qualify: an error that reads as a missing or rejected credential, the one
-failure a later credential can cure. Any other failure (a bad command, a crash,
-a protocol error) is left alone: re-running it costs a process spawn and cannot
-succeed. A kiro-cli session is not re-attempted: that engine exposes no client
+failure a later credential can cure. Any other start failure (a bad command, a
+crash, a protocol error) is left alone: re-running it costs a process spawn and
+cannot succeed. A kiro-cli session is not re-attempted: that engine exposes no client
 request that re-initializes one server, so the session's MCP report names the
 server for a restart instead.
+
+A managed server that only ran out of time starting is the other failure a second
+attempt can cure: :func:`is_start_timeout_failure` reads it, and the KAS readiness
+barrier (``session_handle_mcp.wait_mcp_ready``) re-attempts such a server once,
+while the session start is still waiting for it.
+
+A connected server that loses its connection mid-session (a stdio server whose
+process exited) is the third: KAS keeps it ``connected`` and fails each later
+call with :data:`MCP_NOT_CONNECTED`. Such a failed call
+(``session_handle_mcp._note_mcp_call_disconnected``) queues the server for the
+same turn-start re-attempt, from the same per-server budget.
+
+:func:`is_sse_fallback_failure` reads the one failure KAS reports for a remote OAuth
+server it holds no grant for, the error its legacy SSE fallback gets back; the
+KAS sign-in probe (``session_handle_mcp._probe_mcp_sign_in``) runs only on it.
 """
 
 from __future__ import annotations
@@ -22,11 +37,15 @@ from __future__ import annotations
 import re
 
 from kiro_crew.acp.transport_errors import is_auth_failure_output
+from kiro_crew.mcp_gateway.backend_handshake import INITIALIZE_DEADLINE_REASON
 
 #: Re-attempts per server per session. Each is one connect attempt of a server
-#: that is already failed, so a server that never recovers costs at most this
-#: many spawns over the session's life.
+#: that is already failed or dropped, so a server that never recovers costs at
+#: most this many spawns over the session's life.
 MAX_ATTEMPTS = 3
+
+#: KAS's ``rawOutput.message`` for a call to a server whose transport closed.
+MCP_NOT_CONNECTED = "MCP tool call failed: Not connected"
 
 # Wording of a credential that is absent, the case a later vend cures. Word-
 # bounded so that an error naming an "author" or a port "4013" is not read as
@@ -57,3 +76,71 @@ def is_recoverable_auth_failure(error_message: object) -> bool:
     if _CREDENTIAL_ABSENT.search(error_message) is not None:
         return True
     return is_auth_failure_output(error_message)
+
+
+# KAS's wording for a refresh the token endpoint answered with a client error
+# and no OAuth error code. Anchored on the closing parenthesis: the engine names
+# a code there only for ``server_error`` and ``temporarily_unavailable``, and a
+# 5xx or an unreachable endpoint may answer the same tokens later.
+_REFRESH_REFUSED = re.compile(r"could not be refreshed \(token endpoint answered (4\d\d)\)")
+# Timeouts, early-data refusals and throttling do not reject the saved sign-in.
+_TRANSIENT_REFRESH_STATUSES = frozenset({408, 425, 429})
+# An OAuth error code as the whole message: KAS reports a token endpoint's own
+# ``error`` that way when it is neither one it drops the tokens for nor one it
+# reads as passing.
+_OAUTH_ERROR_CODE = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)+")
+_PASSING_OAUTH_ERRORS = frozenset({"server_error", "temporarily_unavailable"})
+
+
+def is_refused_sign_in(error_message: object) -> bool:
+    """Whether a failed server's error says its OAuth server refused the saved sign-in.
+
+    KAS deletes a remote server's tokens, and reports ``failedAuthorization``,
+    only for ``invalid_grant``, ``invalid_client`` and ``unauthorized_client``.
+    Any other refusal of a refresh keeps the tokens and reports the server
+    ``failed`` with one of the two shapes read here, so signing in again is the
+    only cure. An answer a later attempt may reverse (a 5xx, an unreachable
+    endpoint, ``server_error``) is not one: a sign-in reset drops the tokens.
+    """
+    if not isinstance(error_message, str) or not error_message:
+        return False
+    if match := _REFRESH_REFUSED.search(error_message):
+        return int(match.group(1)) not in _TRANSIENT_REFRESH_STATUSES
+    return (
+        _OAUTH_ERROR_CODE.fullmatch(error_message) is not None
+        and error_message not in _PASSING_OAUTH_ERRORS
+    )
+
+
+# A host's own connect timeout ("connection timed out after 60000ms" from KAS).
+# Word-bounded so a config error that merely names a "timeout" does not qualify.
+_TIMED_OUT = re.compile(r"\btimed\s+out\b", re.IGNORECASE)
+
+
+def is_start_timeout_failure(error_message: object) -> bool:
+    """Whether a failed server's error reads as a start that ran out of time.
+
+    True for the gateway's first-``initialize`` deadline
+    (:data:`~kiro_crew.mcp_gateway.backend_handshake.INITIALIZE_DEADLINE_REASON`)
+    and for a host connect timeout. A bad command, a crash or a protocol error
+    is not one: a second spawn of it fails the same way.
+    """
+    if not isinstance(error_message, str) or not error_message:
+        return False
+    if INITIALIZE_DEADLINE_REASON in error_message:
+        return True
+    return _TIMED_OUT.search(error_message) is not None
+
+
+#: How the legacy SSE transport reports a stream request answered with anything but
+#: 200; the status code follows in parentheses.
+_SSE_NON_200 = "SSE error: Non-200 status code"
+
+
+def is_sse_fallback_failure(error_message: object) -> bool:
+    """Whether a failed server's error is its legacy SSE fallback's non-200 answer.
+
+    KAS reports a remote OAuth server it holds no grant for this way
+    (``SSE error: Non-200 status code (405)``), with any status code.
+    """
+    return isinstance(error_message, str) and _SSE_NON_200 in error_message

@@ -3,8 +3,8 @@ title: Conductor patrol session -- a crewmate conductor's patrol wakes run in a 
 status: draft
 author: iamwhatever, with kirocrew-worker
 created: 2026-10-24
-last-audited: 2026-10-24
-audited-at: 1270c45f4d
+last-audited: 2026-11-20
+audited-at: c157748343
 doc-pr: null
 implementation-prs: []
 tracking-issues: [23621]
@@ -155,7 +155,7 @@ flowchart LR
   own marks: trim to the newest turns when it passes 80K tokens. Its credits
   stay near the floor.
 - **Lifetime.** Started on the first routed wake. Ordinary idle reap
-  between wakes; a conductor patrol interval is 300 to 900 s, so it rarely
+  between wakes; a conductor patrol interval is 300 s, so it rarely
   idles that long.
   The transcript is kept and linked from each report row.
 - **Turns.** Each wake runs as one gateway-authored turn, through the same

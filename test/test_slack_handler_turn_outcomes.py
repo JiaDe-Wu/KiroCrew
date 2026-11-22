@@ -7,11 +7,20 @@ failures that must not fail a live turn.
 from __future__ import annotations
 
 import asyncio
+import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from redaction_structured_cases import github_classic
 from slack_handler_helpers import _clean_approval_state  # noqa: F401
-from slack_handler_helpers import FakeProvider, FakeSessionManager, _visible_texts, _within_lost_run
+from slack_handler_helpers import (
+    FakeProvider,
+    FakeSessionManager,
+    _visible_texts,
+    _within_lost_run,
+    hide_slack_timing_footer,
+)
 
 from conftest import MockSlackClient
 from kiro_crew.acp.client import AcpError
@@ -200,7 +209,7 @@ class TestStopReasonUnfinishedTurn:
         assert not any(b.startswith("success:") for b in sessions.booked), sessions.booked
 
     # At its threshold the breaker resets the session inside ``record_failure`` and
-    # answers True (``SessionAllocation.record_failure``). A same-key message can claim
+    # answers True (``SessionAllocationService.record_failure``). A same-key message can claim
     # a successor runtime while that reset is awaited, so the turn must not reset the
     # session a second time: that would end the successor mid-turn.
 
@@ -1528,6 +1537,39 @@ def test_native_review_ephemeral_raise_books_one_failure(monkeypatch):
     assert sessions.calls["success"] == 0
 
 
+def _thread_statuses(slack) -> list[str]:
+    return [a[1]["status"] for a in slack.actions if a[0] == "set_thread_status"]
+
+
+def test_review_ephemeral_raise_clears_the_awaiting_review_status():
+    # The draft never landed, so no draft owns "Awaiting review…": the status
+    # must come down, otherwise the requester waits on a review that never arrives.
+    slack = _ReviewEphemeralRaisesSlack()
+    provider = FakeProvider([LLMEvent(kind="text_chunk", text="the draft answer")])
+    sessions = _TrackNativeSessions(provider)
+
+    _run_review_turn(slack, sessions)
+
+    statuses = _thread_statuses(slack)
+    assert "Awaiting review…" in statuses, f"the review path never set its status: {statuses}"
+    assert statuses[-1] == "", f"status left on after the draft post failed: {statuses}"
+
+
+def test_review_ephemeral_success_keeps_the_awaiting_review_status():
+    # Counterpart: a landed draft owns the status until a button press, so the
+    # failure-path clear must not run when the post succeeded.
+    slack = MockSlackClient()
+    slack._stream_enabled = True
+    provider = FakeProvider([LLMEvent(kind="text_chunk", text="the draft answer")])
+    sessions = _TrackNativeSessions(provider)
+
+    _run_review_turn(slack, sessions)
+
+    statuses = _thread_statuses(slack)
+    assert statuses and statuses[-1] == "Awaiting review…", statuses
+    assert sessions.calls["success"] == 1 and sessions.calls["failure"] == 0
+
+
 class _OptionsFooterFailsSlack(MockSlackClient):
     """Answer streams fine, but the footer post_blocks carrying the [OPTIONS]
     choices fails. ``fallback_posts`` collects the plain-text re-send."""
@@ -1602,6 +1644,62 @@ def test_native_options_footer_and_fallback_both_fail_books_failure(monkeypatch)
     assert sessions.calls["failure"] == 1
 
 
+def _native_footers(slack) -> list[dict]:
+    """Every Block Kit post but the in-thread working indicator the turn starts with."""
+    return [kw for name, kw in slack.actions if name == "blocks" and kw["text"] != "Working…"]
+
+
+def test_native_hidden_timing_footer_posts_nothing_and_books_success(monkeypatch, tmp_path):
+    hide_slack_timing_footer(monkeypatch, tmp_path)
+    slack = MockSlackClient()
+    sessions = _TrackNativeSessions(FakeProvider([LLMEvent(kind="text_chunk", text="42")]))
+
+    asyncio.run(handle_message(slack, sessions, "C1", "q?", None, "msg1", "U1"))
+
+    assert _native_footers(slack) == [], "an empty footer must not be posted"
+    assert sessions.calls == {"success": 1, "failure": 0}
+
+
+def test_native_hidden_timing_footer_still_delivers_the_options(monkeypatch, tmp_path):
+    # The choices ride only in the footer, so the deferred OPTIONS verdict is
+    # booked from that post exactly as when the timing line is shown.
+    hide_slack_timing_footer(monkeypatch, tmp_path)
+    slack = MockSlackClient()
+    provider = FakeProvider(
+        [LLMEvent(kind="text_chunk", text="pick one [OPTIONS: Apple | Banana]")]
+    )
+    sessions = _TrackNativeSessions(provider)
+
+    asyncio.run(handle_message(slack, sessions, "C1", "q?", None, "msg1", "U1"))
+
+    (footer,) = _native_footers(slack)
+    assert [b["type"] for b in footer["blocks"]] == ["actions"]
+    assert "Apple" in json.dumps(footer["blocks"]) and "Finished in" not in json.dumps(footer)
+    assert footer["text"] == "Options"
+    assert sessions.calls == {"success": 1, "failure": 0}
+
+
+def test_native_hidden_timing_footer_keeps_the_link_to_dashboard(monkeypatch, tmp_path):
+    import kiro_crew.slack.handler as _h
+
+    hide_slack_timing_footer(monkeypatch, tmp_path)
+    monkeypatch.setattr(_h, "_dashboard_state", SimpleNamespace(get_linked_slot=lambda ts: None))
+    slack = MockSlackClient()
+    slack._stream_enabled = True  # a streamed answer, so the footer could ride in its seal
+    sessions = _TrackNativeSessions(FakeProvider([LLMEvent(kind="text_chunk", text="42")]))
+
+    asyncio.run(handle_message(slack, sessions, "C1", "q?", "thread1", "msg1", "U1"))
+
+    (footer,) = _native_footers(slack)
+    assert [e["text"]["text"] for b in footer["blocks"] for e in b["elements"]] == [
+        "Link to Dashboard"
+    ]
+    assert footer["text"] == "Link to Dashboard"
+    (seal,) = [kw for name, kw in slack.actions if name == "stop_stream"]
+    assert "blocks" not in seal, "a seal could not confirm a control-only footer"
+    assert sessions.calls == {"success": 1, "failure": 0}
+
+
 class _OptionsFallbackCapturingSlack(MockSlackClient):
     """Footer post_blocks fails; the plain-text OPTIONS fallback is captured.
 
@@ -1624,7 +1722,8 @@ class _OptionsFallbackCapturingSlack(MockSlackClient):
 
 
 #: An AWS-documentation example key, built from parts so no scanner matches it here.
-_FAKE_AWS_KEY = "AKIA" + "IOSFODNN7" + "EXAMPLE"
+# A GitHub token with a valid checksum, which the redactor masks.
+_FAKE_AWS_KEY = github_classic(seed=53)
 
 
 def test_native_options_fallback_is_redacted(monkeypatch):

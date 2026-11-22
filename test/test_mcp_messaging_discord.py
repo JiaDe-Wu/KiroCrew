@@ -240,6 +240,18 @@ def test_a_channel_addressed_send_does_not_claim_a_dm_or_notification(cron_calle
     assert "webex" in result and "room:Y2lzY29z" in result
 
 
+@pytest.mark.parametrize("code", ["channel_delivery_failed", "channel_not_permitted"])
+def test_a_channel_send_that_reached_nobody_is_an_error(cron_caller, code) -> None:
+    """A fault and a permission refusal both return "Error:", the prefix
+    ``call_tool_with_logging`` audits as a failed call."""
+    with patch(
+        "kiro_crew.mcp_core._post",
+        return_value={"ok": False, "code": code, "error": "telegram delivery failed: no"},
+    ):
+        result = _call_tool("send_message", {"text": "hi", "channel_type": "telegram"})
+    assert result.startswith("Error:")
+
+
 def test_an_addressed_send_is_refused_without_a_verifiable_identity() -> None:
     """The forwarded key becomes the governance SUBJECT at the egress chokepoint.
 
@@ -303,7 +315,7 @@ def test_notification_only_fallback_warns_that_discord_missed(cron_caller) -> No
     with patch("kiro_crew.mcp_core._post") as post:
         post.return_value = {"ok": True, "delivered_to": "notification"}
         result = _call_tool("send_message", {"text": "hi", "session": "discord"})
-    assert "⚠️" in result
+    assert "Warning:" in result
     assert "discord" in result
 
 

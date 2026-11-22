@@ -34,8 +34,8 @@ binding: `store_inventory.py` rebinds them, so a copy on the facade would go sta
 | `session_storage_parts/store_layout.py` | the trash, staging and manifest names, `BUCKET_DAYS`, `MIN_RECLAIM_AGE_DAYS`, `MUTATION_LOCK_NAME`, the unit-id shape, `SessionStorageError`, the index, unit, report and batch types, an empty's callbacks and `SKIP_*` codes, `BatchIdentity`, `trash_root` and the transcript directories, the archive index, and the tree walk (`_tree_files`, `_tree_bytes`) |
 | `session_storage_parts/batch_manifest.py` | a batch's manifest: the header and entries, `_manifest_records` under `_MANIFEST_RECORD_CAP`, `_read_manifest`, the summary and rewrite, `_manifest_rels`, `_rels_digest`, `_header_names_this_batch`, and making a batch durable (`_sync_batch`) |
 | `session_storage_parts/crew_staging.py` | a session's crew logs in the trash: `_stage_crew_logs`, putting them back, the holds file, the staged units no manifest lists (which nothing that removes the batch may remove), and discarding a batch's staging after an empty |
-| `session_storage_parts/store_inventory.py` | the read side: the cached scan (`_scan_units`, `_scan_raw`, `invalidate_scan_cache`), `_unit_paths`, `measure`, `list_units`, `select_reclaimable`, `cotenant_sids`, `reclaim_block_reason` and `list_trash` |
-| `session_storage_parts/pinned_delete.py` | deleting a batch's listed files by descriptor (`_FD_SAFE_DELETE`, `_delete_listed_files`), renaming a batch aside and back (`_stage_batch_by_name`), and the coarse path (`_coarse_remove`) |
+| `session_storage_parts/store_inventory.py` | the read side: the cached scan (`_scan_units`, `_scan_raw`, `invalidate_scan_cache`), `_unit_paths`, `measure` and its Claude Code figure (`_claude_code_usage`), `list_units`, `select_reclaimable`, `cotenant_sids`, `reclaim_block_reason` and `list_trash` |
+| `session_storage_parts/pinned_delete.py` | deleting a batch's listed files by descriptor (`_FD_SAFE_DELETE`, `_delete_listed_files`), renaming a batch aside and back (`_stage_batch_by_name`), and the coarse path (`_coarse_remove`, `_sweep_staged`) |
 | `session_storage_parts/file_moves.py` | `_mutation_lock`, `_batch_dir`, the no-follow movers and the cross-filesystem copy, `_rollback`, `_canonical_origin`, `_origin_path` and `_unlisted_files` |
 | `session_storage_parts/batch_removal.py` | `staged_targets` and its `_approve_batch`, `empty_trash`, and removing a batch a restore or a rolled-back move emptied (`_remove_emptied_batch`) |
 | `session_storage_parts/trash_reclaim.py` | `move_to_trash` and `_purge_search_index` |
@@ -73,7 +73,55 @@ breakdown and the HTTP payload has no field from which one could be derived, so 
 client can only present a session as one thing with one size. An inventory row
 likewise carries a single `bytes`.
 `test_session_storage_api.py::TestReport::test_payload_never_splits_the_two_stores`
-pins the absence.
+pins the absence. Splitting ONE session's size across Crew's two stores stays
+forbidden. The separate `claude_code` figure below is not such a split: it is
+about another program's store in the user's home, which Storage never moves and
+which the reader can clear themselves.
+
+### What Claude Code keeps
+
+On a Claude chat, the `claude` CLI keeps a store of its own that Crew never writes
+(`agent_sdk/claude_transcripts.py`). Both report payloads (`GET
+/api/system/session-storage` and `/sessions`) carry `"claude_code": {"bytes": n,
+"sessions": m}`, from `StorageReport.claude_code_bytes` and
+`claude_code_sessions`. It is a read-only figure. It is added to no session row's
+`bytes`, to no total, bucket or age option, and to no `reclaimable_bytes`. Those
+keep meaning what a move takes.
+
+- **Which sessions.** The current sid of each entry in this instance's own
+  session map whose provider label is Claude's (`PROVIDER_LABEL_CLAUDE`) and that
+  carries both a sid and a cwd (`SessionMap.mapped_sid_cwds`). A sid two keys
+  name counts once. Co-tenant maps and crew-log units are not read. Some chats are
+  not counted although Claude Code's files stay on disk: a chat that left the
+  session map, one whose entry lost its sid (`clear_sid`) or its cwd
+  (`clear_cwd`), and the earlier sids of a chat from before a reset or a model
+  switch. So the figure is a lower bound.
+- **Which paths.** Exactly the three `claude_transcripts` spells:
+  `<root>/projects/<project>/<sid>.jsonl`, `<root>/projects/<project>/<sid>/` and
+  `<root>/file-history/<sid>/`, where the root is `claude_config_dir()` and the
+  project is `claude_project_dir_name(cwd)`. `file-history/<sid>/` counts toward
+  the size. `claude_session_paths` returns them through the same private gate
+  `delete_claude_session_files` uses before it deletes (a UUID sid, a spellable
+  project name, a resolvable root, no symlink at `projects/`, the project
+  directory, `file-history/` or a leaf, `_is_safe_path`), so a session the delete
+  would refuse counts 0. `projects/` and `file-history/` are never listed. Only the
+  per-session directories are walked, without following links (`_tree_bytes`). A
+  sid with none of the three paths present counts 0 bytes and is not a session.
+- **Cost.** It is computed in `measure()`, once per report request, on the worker
+  thread that builds the payload. No timer runs it and it is not part of the scan
+  cache.
+- **Never removed.** A Storage move, restore or empty leaves Claude Code's files
+  where they are. Reclaiming them is declined for now: it would need its own
+  issue, design and security review, because the operator's own Claude Code
+  writes the same directories. Decision:
+  [2026-11-13](../../decisions/2026-11-13-the-storage-report-shows-claude-codes-own-store-but-never-removes-it.md).
+- **Claude Code only.** No other harness's own store (codex rollouts, for
+  example) is counted.
+
+`test_session_storage.py::TestClaudeCodeFigure` pins the sessions, the paths, the
+symlink refusals and that no row or total changes. The Storage screen shows one
+line under its totals when `claude_code.sessions` is above 0
+(`pages.sessionStorage.claude_code_kept`).
 
 ### Halves are always reclaimed together
 
@@ -221,7 +269,7 @@ Detection, not prevention. For a resume that writes, the window is the gap betwe
 file's stat and its rename. For a resume that only reads, it is the gap between the
 re-read that precedes its session and that session's files moving, plus however long
 the map write takes to become visible in the file this reads — bounded by
-`SessionMap._FLUSH_DEBOUNCE_SECS`. Either way what lands in that gap lands in the
+`session_map._FLUSH_DEBOUNCE_SECS`. Either way what lands in that gap lands in the
 trash — fully restorable, with destruction still needing a second explicit `empty`.
 
 ## What is reclaimable
@@ -309,8 +357,8 @@ still refuses, and `live` only chooses which reason is shown.
 
 The split between the two read endpoints is a cost boundary, not a taste.
 
-A row needs a title, which `list_sessions()` takes from the transcript's first
-metadata line, cached on mtime. A session that never got a title falls back to a
+A row needs a title, which `list_sessions_indexed()` answers from the listing
+index built over each transcript's first metadata line. A session that never got a title falls back to a
 **bounded re-read** — up to the first 21 lines, looking for the first user message —
 also cached on mtime. So a list costs roughly one `readline()` per titled session
 and a short bounded scan per untitled one. A detail needs the first message,
@@ -358,7 +406,7 @@ session's space both unreclaimable *and* invisible; the fix is that uids stop be
 display text, not that rows disappear.
 
 `dashboard/handlers/session_storage.py` is registered in `_REDACTION_SINKS`
-(`security_posture_sinks_gateway.py`). The registry is a ratchet — adding a redactor call without
+(through `_GATEWAY_SINKS` in `security_posture_sinks_gateway.py`). The registry is a ratchet — adding a redactor call without
 registering the module fails
 `test_every_redactor_call_site_is_a_registered_sink_or_allowlisted`.
 `TestTranscriptContentIsRedacted` covers both surfaces, and
@@ -490,15 +538,15 @@ its own payload.
 
 Every new batch starts an append-only `manifest.jsonl`: a header line followed by one entry per staged session recording each file's relative staged path, original path, and size. `_append_entry()` flushes each entry, and `_sync_batch()` `fsync`s the manifest and then EVERY staged directory level, deepest first, at each point `_move_to_trash_locked()` can leave a batch on disk. That is what makes a move that RETURNED durable: the moves are renames whose metadata the filesystem commits on its own schedule, so without it a power loss could come back to the sessions' only copies under an empty manifest — and a batch with no readable manifest is omitted from `list_trash()`, out of reach of restore and of empty alike. Every level, not just each file's own parent, because `mkdir(parents=True)` also creates the intermediates and a directory's name lives in its PARENT's entries — a session with archive segments but no transcript never otherwise records `crew` at all, and on the FIRST batch a machine ever stages the same call creates `trash/` and `trash/sessions/`, whose own entries `_fsync_tree()` walks down from the data home. A fresh chain is ALSO synced at the moment it is created, before any file is renamed into it: the same-filesystem move is a rename, which gives up the file's only other name in the same atomic step that creates the new one, so a rename that reaches disk while the `mkdir` that created its parent does not would leave no name resolving to the file at all. That sync costs one call per new directory rather than one per file, so the per-file path stays a bare rename; if it fails the session is rolled back and left in place, exactly as for a file that would not move, rather than abandoning a batch whose manifest has not been forced out. A failing sync RAISES: the batch is the only copy, so reporting a durable batch that is not one is worse than reporting a failure for work that partly happened. The single exception is the "resumed while being staged" path, which is already raising an error that names the session and locates its fragment; there a sync failure is logged so that pointer is not replaced by an `OSError`. None of this makes a crash mid-move consistent; a batch interrupted halfway still holds files its manifest never named, which is what `_unlisted_files()` is for. `_manifest_records()` retains every valid record it can read and ignores a trailing malformed record, while `_unlisted_files()` prevents deletion of files that no retained manifest entry names. `TestTrashAccounting::test_a_truncated_final_line_does_not_lose_the_batch` pins that recovery posture, and `TestStagedBatchDurability` fails if a returned move left the manifest or any staged directory level unsynced.
 
-A partial restore is the exception to append-only growth: `_rewrite_manifest()` writes the replacement through `atomic_write(..., fsync=True)` and then `fsync`s the batch directory, so both the new content and the rename that gave it the manifest's name are durable before the call returns. Without the directory half a power loss could return the pre-restore manifest, whose entries name files restore has already moved back into live storage. A batch with no readable manifest is omitted from `list_trash()`: its files could not be put back, so offering it as restorable would be a false promise.
+A partial restore is the exception to append-only growth: `_rewrite_manifest()` writes the replacement through `atomic_write(..., fsync=True)` and then `fsync`s the batch directory, so both the new content and the rename that gave it the manifest's name are durable before the call returns. Without the directory half a power loss could return the pre-restore manifest, whose entries name files restore has already moved back into live storage. A batch with no readable manifest is omitted from `list_trash()`: its files could not be put back, so offering it as restorable would be a false promise. A manifest that is not valid UTF-8 counts as unreadable: `_read_manifest()` and `_summarize_manifest()` return `None` for it, so one undecodable manifest is withheld like any other instead of failing the whole listing, a restore or an empty (`TestManifestReaders::test_one_undecodable_manifest_does_not_hide_the_other_batches`).
 
 **A manifest that is a link stops the empty before anything is removed**
 (`SKIP_UNREADABLE`), and the check runs BEFORE the manifest is read and before the
 platform branch, because both delete paths act on what it says. It uses
 `platform_compat.is_link_or_junction()` rather than `is_symlink()`: on Windows a
 junction reports False for the latter, and the coarse path is the Windows path.
-Without it there, `rmtree` removed the link and left any staged file it could not
-delete -- a locked one -- so the batch lost its listing and kept its data.
+Without it there, the coarse sweep would remove the link and leave any staged file it
+could not delete -- a locked one -- so the batch would lose its listing and keep its data.
 
 A manifest cannot be treated as this batch's own: the product writes it with
 `atomic_write`, so a link at that name was not written here, and the entries an
@@ -762,12 +810,17 @@ data and the batch is reported as kept instead. A link recorded by the scan IS r
 because removing a link destroys nothing, and leaving one would make a batch holding it
 impossible to empty for good. Where the platform supports neither `openat` nor
 `O_NOFOLLOW` (Windows) the batch is renamed to an unguessable staging name, verified there,
-and taken with `rmtree(ignore_errors=True)`, and progress degrades to one report per batch —
-a smoother bar is not worth a weaker delete. On that path the bytes freed are measured after
-the attempt and the survivors subtracted, because `ignore_errors=True` returns quietly when
-a locked file leaves the batch standing, and the batch's absence is checked as a
-post-condition so a tree that could not be removed is reported as kept rather than counted
-as emptied.
+and removed by `_sweep_staged`, and progress degrades to one report per batch — a smoother
+bar is not worth a weaker delete. The sweep walks `platform_compat.PinnedDirectory`, the
+same shape as `artifacts_disk._rmtree`: each directory is held still while it is emptied, a
+symlink or junction inside the batch is removed as a link and never entered, so its target
+keeps its files. A path walker cannot promise that, because `os.path.islink` answers False
+for a junction. The sweep pins with `links_only`, so a cloud-files or dedup directory, a
+reparse point that stands for no other name, is swept as the directory it is. The batch's manifest goes last, and only once everything else went, so a
+batch left standing keeps its listing. The sweep logs each entry it cannot remove and carries on, so on that path
+the bytes freed are measured after the attempt and the survivors subtracted, and the batch's
+absence is checked as a post-condition so a tree that could not be removed is reported as
+kept rather than counted as emptied.
 
 Every manifest name goes through one validator, `_plain_parts`, before it is stat'd or
 unlinked. Absoluteness is asked of the PATH in BOTH flavours rather than by comparing
@@ -851,7 +904,8 @@ clears such a batch on the user's own say-so, through an approval that does remo
 Where the platform has no `openat`/`O_NOFOLLOW`, these two paths remove the batch through
 `rename-verify-remove` instead: `_stage_batch_by_name` renames it aside inside the trash root,
 verifies `(st_dev, st_ino)` on the RENAMED directory against the identity the caller captured,
-and only the staged name is removed; a mismatch or an unreadable identity puts the directory
+and only the staged name is removed, by the same `_sweep_staged` the coarse empty uses, so a
+junction inside the batch is removed as a link; a mismatch or an unreadable identity puts the directory
 back under the name the user saw, and so does a tree that will not go. Refusing outright would be
 wrong: this branch is the whole of Windows, so refusing would leave a batch behind after every
 restore and every rolled-back move, still listing sessions it no longer held. What the rename buys
@@ -1034,9 +1088,9 @@ Two properties are load-bearing:
 
 `skipped` carries `SKIP_*` reason codes for every batch that is still there
 afterwards, whether it was refused up front or survived its own delete: the delete
-checks as a POST-CONDITION that the directory is gone, because
-`rmtree(ignore_errors=True)` reports nothing and a tree it could not remove otherwise
-left the batch on screen under a job that said it had succeeded.
+checks as a POST-CONDITION that the directory is gone, because the coarse sweep only
+logs what it could not remove, and a tree left standing would otherwise leave the batch
+on screen under a job that said it had succeeded.
 
 `skipped` carries codes for batches deliberately KEPT. That is a
 refusal a user has to be told: keeping a batch raises nothing, so an outcome read
@@ -1148,11 +1202,12 @@ not be able to be ATTEMPTED with no record that it was.
 
 Where the platform has no descriptor to bind to, the coarse path RENAMES the batch to
 `.<batch-id>.removing-<random>` first — atomic within the trash root — verifies the identity
-of the renamed directory, and removes it under that name. Checking a path and then handing
-the same path to `rmtree` re-resolves it, so a swap in between was followed; after the
-rename the approved name no longer exists, a swap that happened BEFORE it is caught and the
-impostor renamed back rather than destroyed, and the name finally removed is unguessable.
-Not airtight — `rmtree` still resolves the staging path — but failing closed instead would
+of the renamed directory, and removes it under that name with the pinned sweep. Checking a
+path and then handing the same path to a remover re-resolves it, so a swap in between is
+followed; after the rename the approved name does not exist, a swap that happened BEFORE it
+is caught and the impostor renamed back rather than destroyed, and the name finally removed
+is unguessable. Not airtight — the sweep still resolves the staging path once, to pin it —
+but failing closed instead would
 refuse every empty on that platform, which is a worse answer than a window an attacker has
 to guess their way into. A tree that will not go is renamed back, so the batch stays listed
 and restorable rather than stranded under a name `list_trash()` does not offer.

@@ -38,10 +38,16 @@ from kiro_crew.session_allocation import SessionAllocationService
 
 pytestmark = pytest.mark.xdist_group(name="tree_scan_session_allocation_bindings")
 
+SHARED_BINDINGS_CHECKS = (
+    "the_class_only_scan_can_fail",
+    "leaf_test_scope_derives_this_file_as_a_corpus_gate",
+)
+
 #: Owner label -> module. ``facade`` is ``kiro_crew.session_allocation`` itself.
 _HOMES: dict[str, str] = {
     "facade": "kiro_crew.session_allocation",
     "companions": "kiro_crew.session_allocation_parts.companions",
+    "eviction": "kiro_crew.session_allocation_parts.eviction",
     "get_or_create": "kiro_crew.session_allocation_parts.get_or_create",
 }
 
@@ -57,11 +63,11 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_crew_pins_effort": ("function", True, "24de81494340", "get_or_create"),
     "_dispatch_hard_kill": ("function", False, "06546ba55a30", "get_or_create"),
     "_draining_subagent_runtimes": ("property", False, "0624c13b3dee", "facade"),
-    "_evict_stale_session": ("function", True, "a6707a152144", "get_or_create"),
+    "_evict_stale_session": ("function", True, "264b2325abb3", "eviction"),
     "_fold_key": ("function", False, "f1d40e624ae4", "facade"),
     "_generation_key": ("function", False, "f1d40e624ae4", "facade"),
     "_get_or_bootstrap_run_runtime": ("function", True, "dc9735619fc4", "companions"),
-    "_get_or_create_impl": ("function", True, "746de0f75f44", "get_or_create"),
+    "_get_or_create_impl": ("function", True, "fc5716a269af", "get_or_create"),
     "_get_session_agent": ("function", False, "48f8c3736da9", "companions"),
     "_held_start_permit": ("function", False, "00575ac64dc4", "get_or_create"),
     "_inbound_callback_reservations": ("property", False, "71f690cdd0d7", "facade"),
@@ -72,7 +78,8 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_ownership_generations": ("property", False, "d8be45664668", "facade"),
     "_parent_aws_profile": ("function", False, "410e4e9178a1", "companions"),
     "_parent_runtime_kwargs": ("function", False, "f408fa261a2b", "companions"),
-    "_reacquire_and_validate": ("function", True, "c69e8f69c8aa", "get_or_create"),
+    "_reacquire_and_validate": ("function", True, "a7bd750ed9a6", "get_or_create"),
+    "_record_scratch_tree": ("function", True, "d224f00b6cd2", "get_or_create"),
     "_refuse_if_ending": ("function", False, "4fa619d0b3bc", "facade"),
     "_release_reacquired": ("function", False, "a6707a152144", "get_or_create"),
     "_remember_capability_failure": ("function", False, "6efcfdf79280", "get_or_create"),
@@ -81,6 +88,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_resolve_agent_model": ("function", False, "e7a565bb1ba0", "facade"),
     "_runtime_pid": ("staticmethod", False, "9a018c130ad5", "companions"),
     "_safe_cleanup": ("function", True, "76a7c030508f", "facade"),
+    "_sandbox_tightened": ("function", False, "29a1792fd34b", "eviction"),
     "_sessions": ("property", False, "16d9fe32838b", "facade"),
     "_start_sem": ("property", False, "1f1197566c49", "facade"),
     "_starting_pids": ("property", False, "d657ba783a38", "facade"),
@@ -105,10 +113,11 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "enqueue": ("function", False, "d3c6da093136", "facade"),
     "forget_conversation": ("function", False, "4b576121a346", "facade"),
     "forget_conversation_if_sid": ("function", False, "70e3d61c5764", "facade"),
+    "forget_starting_agent": ("function", False, "d02e096bed1e", "facade"),
     "get_agent": ("function", False, "f1d40e624ae4", "facade"),
     "get_agent_selection": ("function", False, "b3496bff0391", "facade"),
     "get_approval_policy": ("function", False, "f1d40e624ae4", "facade"),
-    "get_or_create": ("function", True, "c9826b33d6da", "get_or_create"),
+    "get_or_create": ("function", True, "667b2ff4b8ad", "get_or_create"),
     "get_pid": ("function", False, "1290edeed1b6", "facade"),
     "get_provider": ("function", False, "c66f77f7d253", "facade"),
     "get_subagent_runtime": ("function", True, "23c9947d4e41", "companions"),
@@ -119,6 +128,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "is_cancelled": ("function", False, "50fe52427d8c", "facade"),
     "is_continuable": ("function", False, "1eda252b53bd", "facade"),
     "is_provider_alive": ("function", True, "5ccb54f56604", "facade"),
+    "is_retiring": ("function", False, "1eda252b53bd", "facade"),
     "is_session_sharing_eligible": ("function", False, "3780bd272b7a", "companions"),
     "mapped_session_keys": ("function", False, "602c14087aa8", "facade"),
     "mapped_sid": ("function", False, "f1d40e624ae4", "facade"),
@@ -133,6 +143,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "restore_queue": ("function", False, "e233ef2976f2", "facade"),
     "resumable_hint": ("function", False, "1eda252b53bd", "facade"),
     "resumable_sid": ("function", False, "4b576121a346", "facade"),
+    "retract_reservation_cwds": ("function", False, "958babeb61c8", "facade"),
     "runtime_pids": ("function", False, "2468fe0fd6a3", "companions"),
     "seed_conversation": ("function", False, "7b9b418f95e7", "facade"),
     "session_generation": ("function", False, "028659ce42ac", "facade"),
@@ -140,6 +151,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "set_approval_policy": ("function", False, "33c822b68141", "facade"),
     "set_continuable_fallback": ("function", False, "b57343683ce0", "facade"),
     "spawn_in_flight": ("function", False, "4b576121a346", "facade"),
+    "starting_agent": ("function", False, "f1d40e624ae4", "facade"),
     "touch": ("function", False, "1eda252b53bd", "facade"),
     "try_acquire": ("function", True, "1eda252b53bd", "facade"),
     "unmark_continuable": ("function", False, "958babeb61c8", "facade"),
@@ -241,13 +253,6 @@ def _class_only_constructs(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[s
         if isinstance(spelled, str) and spelled.startswith("__") and not spelled.endswith("__"):
             found.append(spelled)
     return found
-
-
-def test_the_class_only_scan_can_fail() -> None:
-    tree = ast.parse("def f(self):\n    super().g()\n    return __class__, self.__hidden\n")
-    node = tree.body[0]
-    assert isinstance(node, ast.FunctionDef)
-    assert sorted(_class_only_constructs(node)) == ["__class__", "__hidden", "super()"]
 
 
 @pytest.mark.parametrize("owner", facade._ALLOCATION_OWNERS)
@@ -378,6 +383,7 @@ def _listed(doc: str, label: str) -> set[str]:
     "owner",
     [
         "kiro_crew.session_allocation_parts.companions",
+        "kiro_crew.session_allocation_parts.eviction",
         "kiro_crew.session_allocation_parts.get_or_create",
     ],
 )
@@ -514,16 +520,3 @@ def test_the_reach_check_can_fail() -> None:
     assert f"{owner} reads record_session_started without binding it" in (
         guards.unreached_readers(blind, sources)
     )
-
-
-def test_leaf_test_scope_derives_this_file_as_a_corpus_gate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """It reads the whole test tree, so a leaf-only diff must still run it."""
-    import source_corpus
-
-    root = source_corpus.repo_root()
-    monkeypatch.syspath_prepend(str(root / "scripts"))
-    leaf_test_scope = importlib.import_module("leaf_test_scope")
-    this_file = Path(__file__).resolve()
-    assert this_file.relative_to(root).as_posix() in leaf_test_scope.corpus_gates(root)

@@ -54,7 +54,7 @@ class AuthConfig(TypedDict, total=False):
     registers a public client at runtime, RFC 7591) or ``"preregistered"``: the
     provider refuses dynamic registration, so an OPERATOR registers an OAuth app
     in the vendor console and hands Kiro Crew its client id (and, for a
-    confidential client, its secret) through Settings → OAuth Apps. Which
+    confidential client, its secret) through Settings → Connections. Which
     providers are which is a vendor fact, not a preference, so it lives in the
     registry rather than in config.
 
@@ -120,7 +120,7 @@ class Provider(_RequiredProviderFields, total=False):
     ``auth.mode`` is ``preregistered`` -- the value Kiro itself registered, if
     any. It is a PUBLIC identifier forwarded to the runtime as the remote
     entry's ``clientId``; the corresponding secret is never stored here. An
-    operator-configured client (Settings → OAuth Apps) always takes precedence
+    operator-configured client (Settings → Connections) always takes precedence
     over it, and no entry sets it today, which is why the field is optional
     rather than required — an entry without it simply carries no default.
 
@@ -162,6 +162,18 @@ class Provider(_RequiredProviderFields, total=False):
     ``jira`` and ``confluence``). A KAS chat offers a server's sign-in only when
     the user's message names it (``text_names_mcp_server``). Each word is one
     lowercase word of three or more letters or digits, matched whole.
+
+    ``dcr_client_name`` is the ``client_name`` Crew-owned OAuth registers under at
+    a DCR provider, for a vendor that admits clients by name. Absent means
+    ``"Kiro Crew"`` (:mod:`kiro_crew.connections.crew_oauth_dcr`).
+
+    ``org_admin_guide`` names the shipped docs section (``<file>.md#<anchor>``
+    under ``src/kiro_crew/docs``) an organization admin follows to let this
+    install sign in, for a vendor whose admins can restrict which redirect
+    addresses and permissions a client may use. Its presence is what makes the
+    status feed report the redirect this install signs in with
+    (``signInRedirect``) and what a refused sign-in links to. DCR entries only:
+    a pre-registered entry's redirect is already printed on Settings → OAuth Apps.
     """
 
     client_id: str
@@ -171,6 +183,8 @@ class Provider(_RequiredProviderFields, total=False):
     tool_aliases: dict[str, str]
     category: str
     sign_in_words: list[str]
+    dcr_client_name: str
+    org_admin_guide: str
 
 
 class RegistryValidationError(ValueError):
@@ -243,8 +257,13 @@ _OPTIONAL_PROVIDER_FIELDS = {
     "tool_aliases",
     "category",
     "sign_in_words",
+    "dcr_client_name",
+    "org_admin_guide",
 }
 _SIGN_IN_WORD_PATTERN = re.compile(r"^[a-z0-9]{3,}$")
+# A shipped docs file and one heading anchor in it, nothing that could leave the
+# docs tree or carry a query.
+_ORG_ADMIN_GUIDE_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*\.md#[a-z0-9]+(?:-[a-z0-9]+)*$")
 # ``auth`` block vocabulary. Closed on purpose: the runtime branches on the mode
 # and the runbooks print the redirect host, so a misspelling must fail the load,
 # not silently fall back to DCR against a provider that refuses it.
@@ -265,6 +284,9 @@ CALLBACK_PATH = "/callback"
 # listener neither needs root nor races the OS's own outbound port allocation.
 _REDIRECT_PORT_MIN = 1024
 _REDIRECT_PORT_MAX = 49151
+# The one loopback port every Crew-owned DCR sign-in listens on (``state`` picks the
+# pending sign-in), so no pre-registered provider may claim it.
+DCR_CALLBACK_PORT = 48100
 _REGISTRATION_GUIDE_PATTERN = re.compile(r"^oauth-app-registration/[a-z0-9]+(?:-[a-z0-9]+)*\.md$")
 # Closed vocabulary for ``Provider.category``. Mirrors the buckets the ChatGPT
 # and Claude connector directories group by, so the coverage report can diff the
@@ -477,6 +499,10 @@ def _validate_auth(raw: object, index: int) -> None:
             index,
             f"auth.redirect_port must be between {_REDIRECT_PORT_MIN} and {_REDIRECT_PORT_MAX}",
         )
+    if port == DCR_CALLBACK_PORT:
+        raise _validation_error(
+            index, f"auth.redirect_port {port} is reserved for Crew-owned DCR sign-ins"
+        )
     if "redirect_host" in fields and raw["redirect_host"] not in REDIRECT_HOSTS:
         raise _validation_error(
             index, "auth.redirect_host must be one of " + ", ".join(REDIRECT_HOSTS)
@@ -502,7 +528,7 @@ def _validate_provider(raw: object, index: int) -> Provider:
     if extra:
         raise _validation_error(index, f"unknown fields: {', '.join(sorted(extra))}")
 
-    for optional in ("client_id", "prerequisite_copy", "revoke_manual_path"):
+    for optional in ("client_id", "prerequisite_copy", "revoke_manual_path", "dcr_client_name"):
         if optional in raw:
             value = raw[optional]
             if not isinstance(value, str) or not value.strip():
@@ -528,6 +554,17 @@ def _validate_provider(raw: object, index: int) -> Provider:
 
     if "auth" in raw:
         _validate_auth(raw["auth"], index)
+
+    if "org_admin_guide" in raw:
+        guide = raw["org_admin_guide"]
+        if not isinstance(guide, str) or not _ORG_ADMIN_GUIDE_PATTERN.fullmatch(guide):
+            raise _validation_error(
+                index, "org_admin_guide must be a docs section of the form <file>.md#<anchor>"
+            )
+        if is_preregistered(cast(Provider, raw)):
+            raise _validation_error(
+                index, "org_admin_guide is for DCR entries; a preregistered redirect is fixed"
+            )
 
     # Bound before the ``tool_aliases`` block below, which validates each alias
     # against this provider's own slug prefix.

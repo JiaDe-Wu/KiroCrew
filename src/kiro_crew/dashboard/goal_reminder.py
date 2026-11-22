@@ -50,6 +50,8 @@ monitor loop drives the thread (:func:`_monitor_loop_drives`). While a
 milestones card of the crewmate's waits on the user, the wake proposes no new
 milestones (:func:`milestones_card_waiting`). Only the owner's route and an
 applied card write the switch, so the crewmate cannot turn its own heartbeat on.
+A thread or channel linked to the chat gets only a wake's final reply, so a
+quiet wake posts nothing there (``mirror_reply_only``).
 
 A check-in that fires with the thread closed, a turn already running, its switch
 off or no goal left does nothing that time.
@@ -65,6 +67,7 @@ from typing import Any
 
 from kiro_crew import crewmate_prompts, member_goals
 from kiro_crew import members as members_mod
+from kiro_crew import session_directive
 from kiro_crew.dashboard_templates.page_look import PAGE_LOOK
 
 logger = logging.getLogger(__name__)
@@ -329,14 +332,9 @@ def dashboard_line(slug: str, rec: dict[str, Any], *, has_mate_tools: bool = Tru
     from kiro_crew import dashboard_agentic
 
     try:
-        from kiro_crew.dashboard_templates import instance as template_instance
         from kiro_crew.members import crew_panel_enabled
 
         if not crew_panel_enabled():
-            return ""
-        if template_instance.is_locked(slug):
-            # The person locked the layout: an apply would be refused, so no wake
-            # asks for a page.
             return ""
         if dashboard_agentic.bound_package(slug):
             return ""
@@ -565,6 +563,23 @@ _HEARTBEAT_MILESTONES_WAITING = (
 )
 
 
+#: After the out-of-date line in a heartbeat: those writes are this wake's work, so
+#: the nothing_to_do rule below it does not apply until they are done.
+HEARTBEAT_STALE_COUNTS = (
+    "Those writes are something this wake can move forward, so do them before "
+    "anything else, then go on as below."
+)
+
+
+def stale_line_for(slug: str, member: str) -> str:
+    """The out-of-date fields line for crewmate *member*'s check-in wake, or ``""``
+    (``dashboard_agentic.member_stale_line``, preview ``dashboard_stale_fields``).
+    Blocking IO. TOTAL."""
+    from kiro_crew import dashboard_agentic
+
+    return dashboard_agentic.member_stale_line(slug, member)
+
+
 def _heartbeat_handoff(ledger: bool = False) -> str:
     """The hand-off line for a thread with the ``session_*`` tools."""
     return _HEARTBEAT_WORKERS_LEDGER if ledger else _HEARTBEAT_WORKERS_V2
@@ -576,6 +591,7 @@ def heartbeat_prompt(
     has_session_tools: bool,
     milestones_waiting: bool = False,
     ledger: bool = False,
+    stale: str = "",
 ) -> str:
     """The hidden turn of one heartbeat wake, built from the current goal record.
 
@@ -587,7 +603,9 @@ def heartbeat_prompt(
     of the crewmate's still waits on the user, :func:`milestones_card_waiting`)
     drops new milestones from the next steps and says why. *ledger*
     (:func:`kiro_crew.member_mate_tools.member_has_ledger_tools`) tracks a
-    hand-off as a work-ledger item.
+    hand-off as a work-ledger item. *stale* is :func:`stale_line_for`: when it names
+    out-of-date Dashboard fields it goes above the nothing_to_do rule as work this
+    wake can move, so a quiet heartbeat does not end with the page still out of date.
     """
     every = member_goals.interval_label(heartbeat_interval(rec["schedules"]))
     new_milestones = "" if milestones_waiting else _HEARTBEAT_NEW_MILESTONES
@@ -596,6 +614,7 @@ def heartbeat_prompt(
         "[Heartbeat] "
         + _PREAMBLE
         + f"{member_goals.progress_block(rec)}\n\n"
+        + (f"{stale} {HEARTBEAT_STALE_COUNTS}\n\n" if stale else "")
         + "When nothing above can move forward, call nothing_to_do at once, with no "
         "text before it.\n\n"
         + f"This is your heartbeat, a wake every {every} that lets you keep your "
@@ -624,7 +643,8 @@ def heartbeat_prompt(
         "turn with nothing_to_do and post nothing, which is also how a wake with "
         "nothing to move forward ends. Every word you write in this thread is "
         "shown to the user, so on a quiet end call nothing_to_do with no text "
-        "before it; put any reason in its note.\n\n"
+        "before it and put any reason in its note; after it, write only "
+        f"{session_directive.QUIET_END_TOKEN}, which nobody sees.\n\n"
         "When you need the user's answer, ask about one thing, once, with an "
         "[OPTIONS: ...] line at the end of your message rather than an "
         "ask_question card, and leave it at that rather than asking again in "
@@ -775,6 +795,10 @@ async def fire(state: Any, job: Any) -> str:
         dashboard = await asyncio.to_thread(
             lambda: dashboard_line(slug, rec, has_mate_tools=member_has_mate_tools(member))
         )
+        # The out-of-date fields (preview `dashboard_stale_fields`), said in the
+        # review it asks for rather than left to the turn block alone.
+        stale = await asyncio.to_thread(stale_line_for, slug, member)
+        dashboard = "\n\n".join(part for part in (dashboard, stale) if part)
         page_tools = await asyncio.to_thread(_page_tools_on)
         # The binding read ran off the loop: a turn may have started meanwhile.
         again, skip = _idle_thread(state, slot_key, member)
@@ -796,6 +820,7 @@ async def fire(state: Any, job: Any) -> str:
         from kiro_crew.member_mate_tools import member_has_ledger_tools
 
         ledger = await asyncio.to_thread(member_has_ledger_tools, member)
+        stale = await asyncio.to_thread(stale_line_for, slug, member)
         waiting = await milestones_card_waiting(state, slot_key)
         # The cron timer stops firing once the gateway stops; this one check
         # covers a stop that began during the reads above, as does the thread's.
@@ -809,7 +834,11 @@ async def fire(state: Any, job: Any) -> str:
         if _monitor_loop_drives(slot_key):
             return LOOP_SKIP
         prompt = heartbeat_prompt(
-            rec, has_session_tools=has_tools, milestones_waiting=waiting, ledger=ledger
+            rec,
+            has_session_tools=has_tools,
+            milestones_waiting=waiting,
+            ledger=ledger,
+            stale=stale,
         )
     else:
         prompt = reminder_prompt(
@@ -826,7 +855,11 @@ async def fire(state: Any, job: Any) -> str:
     if again is not slot:
         return "skipped: the Bot's thread is not open"
     dispatch_hidden_turn(
-        state, slot, with_language(prompt, language, in_thread=True), human_seen=False
+        state,
+        slot,
+        with_language(prompt, language, in_thread=True),
+        human_seen=False,
+        mirror_reply_only=cadence == member_goals.CADENCE_HEARTBEAT,
     )
     return "started"
 

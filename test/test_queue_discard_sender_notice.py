@@ -140,7 +140,10 @@ def test_cancel_notice_excerpt_in_meta_is_redacted(tmp_path):
     state = _make_state(tmp_path)
     caller = state.get_or_create_slot("chat-1")
     target = _busy(state.get_or_create_slot("chat-2"))
-    message = "summarize this AKIAIOSFODNN7EXAMPLE run"
+    from redaction_structured_cases import github_classic
+
+    planted = github_classic(seed=113)
+    message = f"summarize this {planted} run"
     _send(state, caller, "chat-2", message)
     queue_id = target._queue[0]["id"]
 
@@ -151,10 +154,10 @@ def test_cancel_notice_excerpt_in_meta_is_redacted(tmp_path):
     excerpt = meta.get("notice_args", {}).get("excerpt", "")
     # The bare excerpt now rides in notice_args (the frontend owns the
     # ``Text: "…"`` label); whichever scrub ran, the credential is gone from it.
-    assert "AKIAIOSFODNN7EXAMPLE" not in excerpt
+    assert planted not in excerpt
     assert "[REDACTED" in excerpt
     # The content the dashboard renders carries the same scrubbed excerpt.
-    assert "AKIAIOSFODNN7EXAMPLE" not in (row.get("content") or "")
+    assert planted not in (row.get("content") or "")
 
 
 def test_cancelling_one_entry_tells_only_its_own_sender(tmp_path):
@@ -382,9 +385,11 @@ def test_an_unknown_discard_cause_writes_nothing_and_does_not_raise(tmp_path):
     [
         (sc.SEND_DISCARD_QUEUE_CANCEL, "send_discarded"),
         (sc.SEND_DISCARD_HARD_STOP, "send_discarded"),
+        (sc.SEND_DISCARD_REFUSED_STEER, "send_discarded"),
         # The steer sentence does not fit the "discarded before it ran" frame,
         # so it carries no token and the card shows its English content.
         (sc.SEND_DISCARD_HARD_STOP_STEER, None),
+        (sc.SEND_DISCARD_UNCONFIRMED_STEER, None),
     ],
 )
 def test_only_a_framed_discard_cause_carries_the_localized_token(tmp_path, cause, token):

@@ -12,6 +12,7 @@ import { copySessionLink } from '../utils/shareUrl'
 import { useMoveSlotToFolder } from './useMoveSlotToFolder'
 import { loadChatConfig } from '../pages/chat/ChatSettings'
 import { closeConfirmPrompt } from '../lib/closeConfirmPrompt'
+import { cachedViewerIds } from './sharedCrew/cachedViewer'
 import { askAppConfirm } from '../lib/appConfirm'
 import { forgetClosedSessionRef, rememberClosedSession, trackClosedSessionClose } from '../lib/recentlyClosedSessions'
 import { i18nT } from '../i18n/t'
@@ -113,8 +114,9 @@ export interface SessionActions {
   toggleMutesOpened: (slotKey: string) => void
   /** Toggle the per-row mute of this session. */
   toggleMuted: (slotKey: string) => void
-  /** Copy the session's share link. */
-  copyLink: (slotKey: string) => void
+  /** Copy the session's share link. Resolves whether the link reached the
+   *  clipboard, so the menu can confirm it or say that it did not. */
+  copyLink: (slotKey: string) => Promise<boolean>
   /** Move to a folder (or root for null) — shared optimistic move + rollback. */
   move: (slotKey: string, folderId: string | null) => void
   /** Relaunch the slot's agent process in place (fresh MCP servers/env, conversation preserved). */
@@ -488,7 +490,7 @@ export function useSessionActions(mode?: string, opts?: {
 
   const copyLink = useCallback((slotKey: string) => {
     const slot = store.getState().dashboard.slots.find(s => s.key === slotKey)
-    copySessionLink(slotKey, slot?.title, undefined, mode)
+    return copySessionLink(slotKey, slot?.title, undefined, mode)
   }, [mode])
 
   const move = useCallback((slotKey: string, folderId: string | null) => {
@@ -499,12 +501,13 @@ export function useSessionActions(mode?: string, opts?: {
 
   // The sidebar row ✕ and every session menu close land here. A busy session
   // always asks, on the same rule as Cmd+W (`closeBusyReasons`); an idle one
-  // keeps the user's `confirmCloseSession` setting. The prompt names which of
-  // the two made it ask (`closeConfirmPrompt`). The question is the in-app
+  // keeps the user's `confirmCloseSession` setting, and a chat another person
+  // in a shared Crew started always asks. The prompt names what made it ask
+  // (`closeConfirmPrompt`). The question is the in-app
   // dialog, never the browser's native confirm(): in the desktop app that one
   // can leave the window unable to take input once it closes.
   const close = useCallback((slotKey: string) => {
-    const ask = closeConfirmPrompt(store.getState(), slotKey, { settingOn: loadChatConfig().confirmCloseSession })
+    const ask = closeConfirmPrompt(store.getState(), slotKey, { settingOn: loadChatConfig().confirmCloseSession, viewerIds: cachedViewerIds() })
     const closeSlot = () => {
       // Recorded as the close is dispatched, not on `fulfilled` (which trails
       // the peer session's transcript load); a refused close drops the record.

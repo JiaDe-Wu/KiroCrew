@@ -55,6 +55,40 @@ refuses to shrink and the whole page scrolls instead.
 `PageHeader` also takes an `actions` node, rendered right-aligned on the title
 row. Put page-level buttons there rather than in the first `Card`.
 
+### Settings groups: a heading over one box
+
+Every Settings group is a heading, an optional one-line description, then ONE
+rounded box whose direct children are rows split by hairlines. The page itself is
+never wrapped in a card. All groups share one content width
+(`SETTINGS_CONTENT_MAX_W`, 720px) so the right edges line up from group to group.
+
+- **Row layout.** A small control or a setting that saves on its own sits on one
+  row: caption left, control right (`SettingsField` `layout="inline-fixed"` for
+  dropdowns, `"inline-auto"` for segmented controls and steppers). The control
+  sizes to its own content (dropdowns with a 12rem floor), so a long selected
+  label shows whole, and a trigger that is still cut carries the full text as its
+  `title`. The row wraps on the width the group box gives it, never on a viewport
+  breakpoint: when the caption (12rem basis) and the control do not fit side by
+  side, as in a narrow Settings pane, the control drops under the caption at full
+  width instead of being clipped. Inline rows are inline only inside a group box;
+  outside one they render stacked. Text a person types in order (a form) stays
+  `"stacked"`: caption above, full-width box below, so the box and its error
+  message are not squeezed into half a column.
+- **One indent.** A group heading, its description and any loose note between the
+  heading and the box start at the row text's inset (16px), never at the box
+  edge. Draw a heading with `SettingsSection` or `SettingsGroupHeader`, not a bare
+  `h4`: those two are the only owners of the indent. Loose text inside a
+  `SettingsSection` body gets the indent from the body itself.
+- **No box inside a box.** A `SettingsCard` or a grouped `Card` drawn inside
+  another box loses its own frame (`index.css`, `[data-settings-box]`). A row
+  that draws its own border is a bug: make it a plain row. A list of framed
+  choices (the harness picker) sits on the page directly, not inside a box.
+- **Inside a `Card`** in Settings (`CardFrameContext` `grouped`), the `CardTitle`
+  (or a flex header row holding it) and a following `<p>` move above the box as
+  the heading and description.
+- **Save** sits under the box, right-aligned to the box edge. A destructive
+  action sits apart from the constructive one, on its own row.
+
 ### A Settings tab's section list stays in view
 
 Tabs that host `SettingsSubNav` (Chat, Display, Notifications, Channels, Security)
@@ -68,10 +102,11 @@ the larger of 8px and the space between the list's row and the end of the conten
 the whole list inside the area at the end of the scroll as well. Both are measured off
 the nearest scrolling ancestor rather than computed from the viewport, so the cap also
 holds when Settings is embedded in a split pane. A capped list shows the same
-decorative "More below" cue as SidePanelLayout's tab column (`MoreBelowCue`) while
-rows remain below. The cue is a strip inside the cap, under the scrolling rows, so it
-stays on the list's visible bottom edge as the rows scroll; it hides at the end of the
-list and is absent when the list fits. The narrow single-column layout is unchanged.
+"More below" cue as SidePanelLayout's tab column (`MoreBelowCue`) while rows remain
+below. The cue is a strip inside the cap, under the scrolling rows, so it stays on the
+list's visible bottom edge as the rows scroll; it hides at the end of the list and is
+absent when the list fits. The cue is a button: a click scrolls the list down by most
+of its height. The narrow single-column layout is unchanged.
 
 ### Read every class here narrow-first
 
@@ -331,15 +366,24 @@ rows under 600px tall so a short window still fits both rows above the dock.
 way: one dock root (`composer-dock-root`) over the scroller's bottom edge holding
 the jump pill, the bars, the queue, the question card, the notices and the
 composer, measured by the same `useComposerDockMetrics` and paid for by the same
-`DOCK_CLEARANCE_PX` (`pages/chat/composerDockMetrics.ts`, shared by both hosts).
+`DOCK_CLEARANCE_PX` (`pages/chat/composerDockMetrics.ts`, shared by every host).
 The pane has no welcome hero, so nothing in it ends above the dock.
+
+The crew window (`pages/chat/crew-window/CrewChatWindow.tsx`, a session on a
+connected crew) is the third host: its dock root (`crew-window-dock`) holds the
+window's notices column and the composer, takes the same measurement and
+clearance, and stops short of the scrollbar gutter like the other two. In that
+column a card notice (`ErrorNotice`'s framed default) stands on its own, and
+the frameless lines (an inline read failure, the offline readout, the rewind
+prompt) share one glass chip, so no text paints bare onto the rows passing
+under it.
 
 The same reading applies at the TOP of a chat that a host crowns with a glass
 chip: the Members page's DM header (the Glass identity pill, the switcher, the
 panel opener) floats over the pane's top edge and the conversation scrolls under
-it (#18325). `ChatPane` takes the band's measured height as `topInset` and pads
+it. `ChatPane` takes the band's measured height as `topInset` and pads
 its scroller's rows below it (a Bot's chat draws no pinned-prompt band,
-#18346, so the inset is the only thing it pays); the host measures the header
+so the inset is the only thing it pays); the host measures the header
 with `useMeasuredHeight`, never a constant. Anything with controls that sits between such a header and the pane
 (a notice, a greeting card) stays in flow, padded below the header, and the pane
 then takes no inset: a control under the glass is an ambiguous tap. The row and
@@ -477,7 +521,7 @@ Inline within a `Card`, built from the shared primitives:
   since a native `<select>` cannot host a filter box, per-option sublabels or a
   command menu. Reaching for one of those does not mean the touch case has been
   handled for you; whether that scroller is a real defect on a phone is
-  unresolved in #5551. `NativeSelect` is the single file exempted from the
+  unresolved. `NativeSelect` is the single file exempted from the
   `no-restricted-syntax` rule; do not add a second.
 - `Toggle` for a boolean switch. It carries `role="switch"`, `aria-checked` and
   `aria-disabled` itself, so do not re-add them.
@@ -547,3 +591,16 @@ and below the drop overlay and every shell layer, and takes no pointer events,
 so the click that claims focus lands on the pane. A pane outside split view
 (`focused` undefined) never mounts it. The placeholder pane keeps its accent
 dot as well.
+
+### Split view: dropping a session on a pane
+
+A session row dragged from the sessions list (tree and flat lanes) onto a split
+pane shows that session in that pane and focuses it; the layout and every other
+pane stay as they are. Each pane, picker included, is one drop target over its
+whole area, drawn at `z-30` above `PaneDim`'s `z-20`, and a session
+already shown in a pane is refused on the hovered pane with a neutral note
+instead of the accent outline (its own pane says it cannot drop into itself).
+The dividers between panes are not drop targets.
+Panes take a drop only in desktop Split View and never while a crew window
+covers the chat area; single chat keeps its drop that stages a reference in the
+composer, and the Board layout and phones have no pane targets.

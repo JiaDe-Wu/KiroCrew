@@ -3,8 +3,10 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { store } from '../store'
 import { api } from '../api/client'
 import { fileReadUrl } from '../utils/fileReadUrl'
+import { filePopoutSlot } from '../utils/filePopout'
 import { i18nT } from '../i18n/t'
 import { pathBasename } from '../utils/pathBasename'
+import { apiTransport } from '../api/apiTransport'
 
 /**
  * The open file's place in the two libraries, for `MarkdownPanel`: whether it
@@ -73,7 +75,7 @@ export function useFileKnowledgeState(filePath: string, onError: ReportError) {
       // imported bundle and is otherwise only validated as a non-empty string,
       // so an id like `../../../sessions` would otherwise resolve to a
       // different route and land an irreversible DELETE on it.
-      const res = await fetch(`/api/knowledge/sources/${encodeURIComponent(sourceId)}`, { method: 'DELETE' })
+      const res = await apiTransport.request(`/api/knowledge/sources/${encodeURIComponent(sourceId)}`, { method: 'DELETE' })
       // 404 just means the source is already gone — removing an absent thing
       // is success, so the panel falls back to the Add affordance instead of
       // reporting a failure dressed as an error.
@@ -98,7 +100,7 @@ export function useFileKnowledgeState(filePath: string, onError: ReportError) {
   const { mutate: add, isPending: adding, isSuccess: added, data: addResult, reset } = useMutation({
     mutationFn: async () => {
       const name = pathBasename(filePath) || filePath
-      const res = await fetch('/api/knowledge/sources', {
+      const res = await apiTransport.request('/api/knowledge/sources', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name, source_type: 'local_file', uri: filePath }),
@@ -181,7 +183,7 @@ export function useFileArtifactState(filePath: string, content: string, onError:
       // restricted-session gate sees the REAL session. With the transport's
       // shared `dashboard:ui` placeholder an incognito session could persist a
       // promoted file its own restriction was meant to refuse.
-      const promoteSlot = store.getState().chat.activeSlot
+      const promoteSlot = filePopoutSlot() ?? store.getState().chat.activeSlot
       const created = await api.createArtifact({
         name,
         content: fresh,
@@ -215,7 +217,7 @@ export function useFileArtifactState(filePath: string, content: string, onError:
     mutationFn: async () => {
       // Read the owning slot ONCE, up front: both branches below pass it as the
       // X-Session-Key so a restricted slot is gated on the pin as well as the save.
-      const saveSlot = store.getState().chat.activeSlot
+      const saveSlot = filePopoutSlot() ?? store.getState().chat.activeSlot
       // Saved == pinned (consistent with the Artifacts tab/page + chat bookmark).
       if (existing) {
         await api.setArtifactPinned(

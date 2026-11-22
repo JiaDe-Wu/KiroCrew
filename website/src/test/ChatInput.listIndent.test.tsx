@@ -116,6 +116,23 @@ describe('ChatInput: Tab indents list lines', () => {
     expect(hint.textContent).toMatch(/Escape, then Tab/)
   })
 
+  // A small manual height must not squeeze the text column under the textarea's
+  // 44px floor, or the textarea paints over the hint. jsdom has no layout, so
+  // this pins the two floors that keep the hint below the text.
+  it('a manually sized composer floors the box at min-content and the text column at 44px', () => {
+    localStorage.setItem('mc-input-height', '93')
+    renderWithProviders(<Host />)
+    const ta = typeWithCaret('- item|')
+    expect(screen.getByTestId('list-indent-hint').className).not.toContain('sr-only')
+    const wrapper = screen.getByTestId('input-wrapper')
+    expect(wrapper.style.height).toBe('93px')
+    expect(wrapper.classList.contains('min-h-min')).toBe(true)
+    expect(wrapper.classList.contains('min-h-0')).toBe(false)
+    const column = ta.parentElement!
+    expect(column.classList.contains('min-h-[44px]')).toBe(true)
+    expect(column.classList.contains('min-h-0')).toBe(false)
+  })
+
   it('Dismiss hides the visible hint, keeps it for screen readers, and persists', () => {
     const { unmount } = renderWithProviders(<Host />)
     const ta = typeWithCaret('- item|')
@@ -223,6 +240,17 @@ describe('ChatInput: Tab indents list lines', () => {
     expect(ta.value).toBe('  - one\n  - two')
     await flushFrame()
     expect([ta.selectionStart, ta.selectionEnd, ta.selectionDirection]).toEqual([4, '  - one\n  - two'.length, 'backward'])
+  })
+
+  it('Tab on a numbered item restarts it at 1 and renumbers the items below; Shift+Tab takes both back', async () => {
+    renderWithProviders(<Host />)
+    const ta = typeWithCaret('1. one\n2. two|\n3. three')
+    expect(tab(ta)).toBe(false)
+    expect(ta.value).toBe('1. one\n   1. two\n2. three')
+    await flushFrame()
+    expect(ta.selectionStart).toBe('1. one\n   1. two'.length)
+    expect(tab(ta, { shiftKey: true })).toBe(false)
+    expect(ta.value).toBe('1. one\n2. two\n3. three')
   })
 
   it('Tab during IME composition is left alone', () => {

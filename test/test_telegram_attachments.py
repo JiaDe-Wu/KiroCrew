@@ -479,16 +479,18 @@ class TestTextInjectLimit:
     @pytest.mark.parametrize(
         ("section", "kept_chars", "tail"),
         [
-            ({}, 50 * 1024, "\n[… truncated]"),
+            ({}, 50 * 1024, "\n[… truncated: 51200 of 81920 characters of text shown]"),
             ({"max_text_inject_kb": 100}, 80 * 1024, ""),
-            ({"max_text_inject_kb": 0}, 1024, "\n[… truncated]"),
+            ({"max_text_inject_kb": 0}, 1024, "\n[… truncated: 1024 of 81920 characters of text shown]"),
         ],
         ids=["unset-keeps-50-kib", "set-to-100-kib", "zero-raised-to-1-kib"],
     )
     def test_the_key_sets_how_much_of_a_text_file_reaches_the_prompt(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, section, kept_chars, tail
     ) -> None:
-        """An 80 KiB CSV is cut at 50 KiB by default, whole at 100, and at the 1 KiB floor for 0."""
+        """An 80 KiB CSV is cut at 50 KiB by default, whole at 100, and at the 1 KiB floor for 0.
+
+        A cut names the file that carries the whole text, after the marker."""
         body = ("2026-01-02,BUY,12.50\n" * 4000)[: 80 * 1024]
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
         (tmp_path / "config.json").write_text(json.dumps({"telegram": section}), encoding="utf-8")
@@ -520,4 +522,100 @@ class TestTextInjectLimit:
 
         prompt = d.ctx_builder.build_calls[-1]["text"]  # type: ignore[attr-defined]
         injected = prompt.split("[File: tx.csv]\n", 1)[1].split("\n[End of file]", 1)[0]
-        assert injected == body[:kept_chars] + tail
+        inline, note, _ = injected.partition("\n[Its whole text is in ")
+        assert inline == body[:kept_chars] + tail
+        assert bool(note) == bool(tail)
+
+
+# ── a picture outlives its turn ────────────────────────────────────────────────
+
+
+class TestAPictureOutlivesTheTurn:
+    @staticmethod
+    def _photo_turn(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log: Any
+    ) -> tuple[Path, str, list[str], list[str]]:
+        """Run one Telegram turn for a photo captioned "look" into *log*.
+
+        Returns the transcript path, its user row ("" when none was written), the
+        texts handed to the live dashboard window, and the downloaded temp paths.
+        """
+        from kiro_crew.dashboard import channel_slots
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        (tmp_path / "config.json").write_text("{}", encoding="utf-8")
+        d, cli, _sess = _dispatcher({7})
+        live.reset_for_tests()
+        live.watch().prime(KiroCrewConfig.load())
+        d.conv_log = log
+        downloaded: list[str] = []
+
+        async def _download(file_id: str, dest: str) -> None:
+            Path(dest).write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+            downloaded.append(dest)
+
+        cli.download_file = AsyncMock(side_effect=_download)  # type: ignore[attr-defined]
+        projected: list[str] = []
+        monkeypatch.setattr(
+            channel_slots,
+            "project_channel_turn_live",
+            lambda _state, _key, user_text, *_a, **_k: projected.append(user_text),
+        )
+        photo = {"file_id": "p1", "file_name": "photo.jpg", "mime_type": "image/jpeg"}
+
+        asyncio.run(
+            d.handle_message(
+                InboundMessage(
+                    channel_type="telegram",
+                    user_id="7",
+                    conversation_id="7",
+                    text="look",
+                    attachments=[photo],
+                )
+            )
+        )
+
+        path = log._path(d._session_key(("direct", "7")))
+        lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+        rows = [json.loads(line) for line in lines]
+        user_text = next((row["content"] for row in rows if row.get("role") == "user"), "")
+        return path, user_text, projected, downloaded
+
+    def test_the_row_and_the_live_window_name_a_copy_kept_with_the_session(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The user row names a stored copy, not the temp file the turn deletes.
+
+        The live dashboard window is handed the same text, because it rewrites the
+        row from its own copy on every flush.
+        """
+        from kiro_crew.chat_attachments import attachments_dir
+        from kiro_crew.history import ConversationLog
+
+        log = ConversationLog(base_dir=tmp_path / "sessions")
+        path, user_text, projected, downloaded = self._photo_turn(tmp_path, monkeypatch, log)
+
+        store = attachments_dir(path.parent, path.stem)
+        assert store.is_dir(), user_text
+        (stored,) = store.iterdir()
+        stored_dest = str(stored).replace(os.sep, "/")
+        assert user_text.splitlines() == ["look", f"![image]({stored_dest})"]
+        assert projected == [user_text]
+        assert not os.path.exists(downloaded[0])
+
+    def test_a_store_that_fails_still_writes_the_row(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Both writers get the text as it came in, so the turn is not lost."""
+        from kiro_crew.history import ConversationLog, HistoryLockTimeout
+
+        log = ConversationLog(base_dir=tmp_path / "sessions")
+
+        def _timeout(*_a: Any) -> str:
+            raise HistoryLockTimeout("held")
+
+        monkeypatch.setattr(log, "store_ingested_images", _timeout)
+        _path, user_text, projected, _downloaded = self._photo_turn(tmp_path, monkeypatch, log)
+
+        assert projected == [user_text]
+        assert user_text.startswith("look\n") and "until this turn ends" in user_text

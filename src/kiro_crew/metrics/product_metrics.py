@@ -96,7 +96,19 @@ _FEATURES = frozenset(
         "kirocrew.memory.recalled",
         "kirocrew.lesson.injected",
         "kirocrew.skill.lazy_load.count",
-        "kirocrew.app.task.completed",
+        # Entity is app_public_id: a built-in or store name, else `private`;
+        # entity_version is app_public_version.
+        "kirocrew.app.installed",
+        "kirocrew.app.updated",
+        "kirocrew.app.uninstalled",
+        # Entity / entity_version as above; kind is the session_kind.
+        "kirocrew.app.session_started",
+        # Adds a turn's seconds; duration is app_duration_bucket.
+        "kirocrew.app.run_time",
+        "kirocrew.app.present",
+        # Owner views only: sent through the owner-gated /api/telemetry/app-view.
+        "kirocrew.app.opened",
+        "kirocrew.app.foreground_time",
         "kirocrew.channel.message.received",
         "kirocrew.ui.control.clicked",
     }
@@ -117,6 +129,22 @@ _INVENTORY = frozenset(
         "kirocrew.inventory.probe.failures",
         # Crewmates the person created; the count rides in the value.
         "kirocrew.inventory.members",
+        # The selected dictation and reply provider (metrics/voice.py labels).
+        "kirocrew.inventory.voice.provider",
+    }
+)
+
+# Voice: dictation and spoken replies (metrics/voice.py). `provider` is a
+# built-in name, `registered` for an edition's, or `other`; every other value is
+# a tuple-backed enum or a fixed bucket. No transcript, reply text, voice id,
+# language or error message is an attribute.
+_VOICE = frozenset(
+    {
+        "kirocrew.voice.stt.started",
+        "kirocrew.voice.stt.ended",
+        "kirocrew.voice.stt.errors",
+        "kirocrew.voice.unavailable",
+        "kirocrew.voice.tts.replies",
     }
 )
 
@@ -140,9 +168,37 @@ _RECOMMENDATIONS = frozenset(
     }
 )
 
+# Chat runtime sharing, the week of numbers that decides whether the preview
+# goes on by default (metrics/chat_runtime_share.py). `tenants`, `delay` and `rss`
+# are fixed buckets; every other value is a tuple-backed enum with `other` as
+# the remainder. No session key, pid, path or model id is an attribute. Adoption
+# itself is kirocrew.inventory.config.toggle{key=preview_chat_runtime_sharing}.
+_CHAT_RUNTIME_SHARE = frozenset(
+    {
+        "kirocrew.chat_runtime_share.toggled",
+        "kirocrew.chat_runtime_share.placed",
+        "kirocrew.chat_runtime_share.processes",
+        "kirocrew.chat_runtime_share.tenants",
+        "kirocrew.chat_runtime_share.rss_sampled",
+        "kirocrew.chat_runtime_share.reclaimed",
+        "kirocrew.chat_runtime_share.process_died",
+        "kirocrew.chat_runtime_share.turn_started",
+        "kirocrew.chat_runtime_share.turn_ended",
+        "kirocrew.chat_runtime_share.kas_queued",
+        "kirocrew.kas.engine_install",
+    }
+)
+
 #: The v1 export allowlist: every metric a product destination may receive.
 PRODUCT_METRICS: "frozenset[str]" = (
-    _SESSIONS | _CREW | _WORK | _FEATURES | _INVENTORY | _RECOMMENDATIONS
+    _SESSIONS
+    | _CREW
+    | _WORK
+    | _FEATURES
+    | _INVENTORY
+    | _VOICE
+    | _RECOMMENDATIONS
+    | _CHAT_RUNTIME_SHARE
 )
 
 # PENDING -- reviewed for export but NOT exportable yet. Each one joins

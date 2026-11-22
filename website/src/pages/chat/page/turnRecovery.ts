@@ -8,11 +8,11 @@ import { useContinuePress } from '../../../hooks/useContinuePress'
 import { SETTINGS_DEFAULT_MODEL_ID, SETTINGS_TURN_TIME_LIMIT_HIGHLIGHT } from '../../../hooks/useSettingHighlight'
 import { useAppSelector } from '../../../store'
 import { i18nT } from '../../../i18n/t'
-import { selectContinuable, selectTrailingSendUnconfirmed, selectTurnInterrupted } from '../../../store/chatSlice'
+import { selectContinuable, selectResumeInterrupted, selectTrailingSendUnconfirmed } from '../../../store/chatSlice'
 import type { ChatMessage } from '../../../types'
 import { KIRO_SIGN_IN_PATH } from '../../developer/kiroSignInLink'
 import type { CapabilityFix, FreshSessionState, RepairImagesState } from '../ErrorCard'
-import { newestErrorOwnsRecovery } from '../transcriptRenderers'
+import { authRequiredIsNewest, newestErrorOwnsRecovery } from '../transcriptRenderers'
 
 /** A slot's repair-images state and the error row it was pressed for. */
 interface RepairImagesEntry { state: RepairImagesState; row: string }
@@ -74,7 +74,9 @@ export function useTurnRecovery({
   // none of the busy checks, so a card would offer a Continue that `handleContinue`
   // early-returns on — a dead control in the one place recovery is promised.
   const continuable = useAppSelector(selectContinuable)
-  const interrupted = useAppSelector(selectTurnInterrupted)
+  // Held to the gateway's own reading (`selectResumeInterrupted`), so a tab that
+  // missed the reply does not offer Resume for a turn that finished.
+  const interrupted = useAppSelector(selectResumeInterrupted)
   // The footer's plain running indicator yields while the newest send is a
   // bubble whose receipt never came (see `selectTrailingSendUnconfirmed`).
   const sendUnconfirmed = useAppSelector(selectTrailingSendUnconfirmed)
@@ -112,9 +114,8 @@ export function useTurnRecovery({
     navigate(settingsPath({ tab: 'chat', sub: 'models', highlight: SETTINGS_DEFAULT_MODEL_ID }))
   }, [navigate])
   // The Kiro sign-in card (an `auth_required` error row's fix) lives on the
-  // full dashboard's Settings > Agent Harness tab, under the switch that
-  // selects the KAS backend the row can only come from; same surface rule as
-  // the Default Model link above.
+  // full dashboard's Settings > Kiro account tab; same surface rule as the
+  // Default Model link above.
   const openKiroSignIn = useCallback(() => {
     navigate(KIRO_SIGN_IN_PATH)
   }, [navigate])
@@ -141,6 +142,9 @@ export function useTurnRecovery({
   // Resume and hint yield too. Typing still works. One predicate spells the
   // set (`newestErrorOwnsRecovery`), and the panes read the same one.
   const cardOwnsRecovery = newestErrorOwnsRecovery(messages)
+  // A sign-in error keeps Resume (it works once the sign-in lands); only the
+  // composer's hint names the sign-in first. The panes read the same predicate.
+  const resumeAfterSignIn = authRequiredIsNewest(messages)
 
   // The fix on a `context_overflow` row: drop the native conversation so the
   // next message starts a fresh one from a text summary of this chat. One entry
@@ -262,7 +266,7 @@ export function useTurnRecovery({
   return {
     continuable, interrupted, sendUnconfirmed, continuing, handleContinue,
     openModelPickerFromError, openDefaultModelSetting, openKiroSignIn, openMemberCapabilities, openTurnLimitSetting,
-    cardOwnsRecovery,
+    cardOwnsRecovery, resumeAfterSignIn,
     freshSession, handleFreshSession,
     repairImages, handleRepairImages,
   }

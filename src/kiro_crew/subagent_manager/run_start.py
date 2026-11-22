@@ -437,6 +437,20 @@ async def _create_shared_session_impl(
     shared_runtime: AcpRuntime = runtime
 
     cwd = info.cwd or str(getattr(self._manager._sessions, "_pool_cwd", ""))
+    # Imported here: a rebound ``_impl`` resolves globals in ``kiro_crew.subagent``.
+    from kiro_crew.agent_sdk.kas_default_model import serve_kiro_cli_default_model
+
+    async def _serve_cli_default(handle: Any) -> None:
+        # After the bind, which publishes ownership before any cancellable await.
+        # A shared sub-agent carries no model pin (``_sharing_plan_impl``), so on
+        # KAS it starts on kiro-cli's chat.defaultModel unless Crew pins its agent one.
+        start_agent = agent or getattr(shared_runtime, "_agent", "") or None
+        await serve_kiro_cli_default_model(
+            shared_runtime,
+            handle,
+            cwd,
+            lambda: self._manager._sessions._cfg.acp_effective_model(start_agent, None),
+        )
 
     async def _late_adopter(handle: Any) -> bool:
         # A late session/new answer arrived. Keep the session only when this
@@ -454,6 +468,7 @@ async def _create_shared_session_impl(
             info, session_key, shared_runtime, handle
         )
         info._late_start_provider = provider
+        await _serve_cli_default(handle)
         return True
 
     handle = await runtime.create_session(
@@ -470,7 +485,9 @@ async def _create_shared_session_impl(
         on_gate_queued=_on_gate_queued,
         late_adopter=_late_adopter,
     )
-    return await self._manager._bind_shared_handle(info, session_key, runtime, handle)
+    provider = await self._manager._bind_shared_handle(info, session_key, runtime, handle)
+    await _serve_cli_default(handle)
+    return provider
 
 
 async def _await_late_start_impl(
@@ -561,7 +578,9 @@ async def _bind_shared_handle_impl(
     # A subagent's provider never rekeys either, and its whole point is that
     # it is NOT its parent: without the key its re-claim carries none and
     # gatewayd drops it, leaving this session unable to re-bind its token.
-    provider = AcpSessionProvider(handle, runtime, session_key=session_key)
+    provider = AcpSessionProvider(
+        handle, runtime, session_key=session_key, kas_memory_mode=handle.kas_memory_mode
+    )
     provider.memory_mode = info.memory_mode
     # The handle exists now. Publish ownership before any cancellable await so
     # force-reap always takes the shared-session branch and destroys this handle
@@ -580,14 +599,23 @@ async def _bind_shared_handle_impl(
     # instead of failing closed with the retry metadata kept. Resolved through
     # ``PROVIDER_LABEL_BY_BACKEND`` (harness-parity H13).
     cleanup_provider = self._manager._provider_label_of(provider)
+    # Imported here: a rebound ``_impl`` resolves globals in ``kiro_crew.subagent``.
+    from kiro_crew.agent_sdk.codex_transcripts import is_codex_provider_label, recorded_codex_home
+
+    # The runtime's extra_env can move the store, and the prune has no session to ask.
+    cleanup_codex_home = (
+        recorded_codex_home(provider) if is_codex_provider_label(cleanup_provider) else ""
+    )
     setattr(info, "_session_id", cleanup_session_id)
     setattr(info, "_session_provider", cleanup_provider)
+    setattr(info, "_session_codex_home", cleanup_codex_home)
     self._publish_identity(
         info.id,
         session_id=cleanup_session_id,
         provider=cleanup_provider,
         keep=info.keep,
         conversation_key=session_key if info.keep else "",
+        codex_home=cleanup_codex_home,
     )
     try:
         await self._remember_identity_off_loop(
@@ -596,6 +624,7 @@ async def _bind_shared_handle_impl(
             provider=cleanup_provider,
             keep=info.keep,
             conversation_key=session_key if info.keep else "",
+            codex_home=cleanup_codex_home,
         )
     except (OSError, ValueError, RecursionError):
         logger.debug(

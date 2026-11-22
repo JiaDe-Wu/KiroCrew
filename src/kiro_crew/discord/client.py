@@ -71,6 +71,7 @@ from kiro_crew.discord.client_rest import (
     _classify_edit,
     _remember,
 )
+from kiro_crew.http_proxy import proxy_for_url as _proxy_for_url
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.identity import channel_outbound_permitted
 from kiro_crew.messaging.outbound_files import OutboundFile, upload_filename
@@ -241,6 +242,8 @@ class DiscordClient:
         self._seq: int | None = None
         self._session_id: str = ""
         self._resume_url: str = ""
+        # Failed reconnects since the last READY or RESUMED (see _gateway_loop).
+        self._failures_since_session = 0
         self._hb_acked = True
         self._ws: Any = None  # WS handle; aiohttp generics vary across versions
         # Live turn tasks — prevent GC of in-flight handlers.
@@ -327,6 +330,10 @@ class DiscordClient:
         """Launch the background Gateway connection loop."""
         self._closed = False
         self._task = asyncio.create_task(self._gateway_loop())
+
+    def _proxy_for(self, url: str) -> str | None:
+        """The forward proxy for *url*, or ``None`` when ``NO_PROXY`` lists its host."""
+        return _proxy_for_url(self._proxy, url)
 
     # Bound from client_rest: the REST request ladder.
     _ensure_session = _client_rest._ensure_session
@@ -756,7 +763,7 @@ class DiscordClient:
         session = await self._ensure_session()
         async with session.get(
             url,
-            proxy=self._proxy,
+            proxy=self._proxy_for(url),
             timeout=aiohttp.ClientTimeout(total=30),
             allow_redirects=False,
         ) as resp:
@@ -1112,10 +1119,12 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _OP_RECONNECT,
         _OP_RESUME,
         _RESUME_CLOSE_CODE,
+        _RESUME_FAILURES_BEFORE_IDENTIFY,
         _WS_HEARTBEAT_SECS,
         _command_options,
         _find_button_label,
         _heartbeat_interval_secs,
+        _reply_message_id,
     )
     from kiro_crew.discord.client_recheck import (  # noqa: F401
         _REVOKED_DETAIL,

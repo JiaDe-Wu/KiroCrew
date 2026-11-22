@@ -1,9 +1,10 @@
 """Large-transfer staging under the data home, off the system temp dir.
 
-Snapshot build, snapshot restore and the dashboard state import each stage
-multi-hundred-MB-to-GB trees before they produce their final artifact: the
-snapshot build copies the whole data home in the clear, the restore extracts a
-bundle, and the import EXTRACTS its uploaded archive into a working tree. Done
+Snapshot build and snapshot restore stage multi-hundred-MB-to-GB trees before
+they produce their final artifact: the snapshot build copies the whole data home
+in the clear, and the restore extracts a bundle. The dashboard import extracts
+separately under the gateway-only, sandbox-masked ``import-staging`` leaf on the
+same disk. This module still owns its upload spool. Done
 with a bare ``tempfile.TemporaryDirectory()`` -- no ``dir=`` -- they land in the
 system temp dir, which under the shipped systemd unit is ``/tmp``. On a host
 whose ``/tmp`` is a tmpfs (the default on Fedora, Arch, Amazon Linux 2023 and
@@ -12,28 +13,27 @@ extraction, or a nightly backup of a large data home, can fill ``/tmp`` (50% of
 RAM) or push the gateway's cgroup into reclaim; with no swap the pages cannot be
 reclaimed, and a full ``/tmp`` hands every other process on the host ``ENOSPC``.
 
-The import's UPLOAD spool (the 2 GiB ``.zip`` written before extraction) is NOT
-staged here: ``dashboard.part_stream`` creates it on the serving event loop under a
-cancellation-safety invariant shared by three upload handlers, and pointing that
-on-loop create at a data home that may be NFS would risk freezing the loop on a
-stalled metadata op. The spool stays in the system temp dir; this module stages the
-large extraction/build work, not that spool.
+The import's UPLOAD spool (the up-to-2 GiB ``.zip`` written before extraction)
+stages here too, in a per-request ``kc_import_*`` directory the dashboard import
+handler creates and removes entirely off the event loop
+(``part_stream.stream_part_off_loop``), because the data home may be NFS.
 
 :func:`staging_dir` returns ``<data home>/staging``, a sibling of the scratch
 and work roots on the SAME real disk as the destination the staged bytes are
 renamed toward. Staging there costs RAM only where the data home itself is a
 tmpfs (which it is not under any shipped layout), and the final rename stays on
-one filesystem, so it stays atomic. The callers keep using their own
-``tempfile`` context managers and simply pass this directory as ``dir=``; the
-context manager cleans the per-call subtree up on success AND on failure, so the
-only residue is a tree orphaned by a hard crash (SIGKILL) between the create and
-the context manager's cleanup.
+one filesystem, so it stays atomic. The other callers keep using their own
+``tempfile`` context managers and simply pass this directory as ``dir=``. Every
+site removes its per-call subtree on success AND on failure, so the only residue
+is a tree orphaned by a hard crash (SIGKILL) between the create and that
+cleanup.
 
-That residue is what :func:`sweep_staging` reclaims. It is NOT redirecting the
+That residue is what :func:`sweep_staging` reclaims, in ``staging`` and in
+``import-staging``. It is NOT redirecting the
 gateway's ``tempfile`` base: ``sandbox_mount_sweep._mount_source_candidate_roots``
 deliberately keys the namespace launcher's last-resort bind-source root on
 ``tempfile.gettempdir()`` and documents that the two must agree, so this module
-touches only the three named staging sites and leaves ``tempfile.tempdir``
+touches only the named staging sites and leaves ``tempfile.tempdir``
 alone.
 
 The root is owner-only (0700) and link-checked, the same tightening every
@@ -56,7 +56,7 @@ root swapped for a symlink cannot turn the LISTING onto another directory. The
 removal of each idle subtree is :func:`pinned_fs.remove_tree_pinned` -- the one
 shared pinned whole-tree delete every disposable-tree caller uses -- given a target
 composed from ``config_dir().resolve()`` (the data home, which the agent cannot
-swap) joined to the LITERAL ``staging/<name>``, NEVER ``Path.resolve()`` of the
+swap) joined to the LITERAL ``<leaf>/<name>``, NEVER ``Path.resolve()`` of the
 agent-writable staging leaf. ``remove_tree_pinned`` pins the parent chain one
 ``openat`` per component with ``O_NOFOLLOW``, so a staging leaf (or the name)
 swapped for a symlink to the data home is refused by that open rather than
@@ -84,7 +84,7 @@ from pathlib import Path
 from kiro_crew import pinned_fs, platform_compat
 from kiro_crew.config.loader import config_dir
 from kiro_crew.platform_compat import PinnedDirectory, pinned_directory
-from kiro_crew.work_root import _tree_newest_mtime
+from kiro_crew.work_root import _activity_time, _tree_newest_mtime
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +92,11 @@ logger = logging.getLogger(__name__)
 #: sibling of the scratch and work roots, and -- like the ``snapshots`` leaf the
 #: archive lands in -- an ordinary VISIBLE data-home directory, not a masked one.
 STAGING_DIRNAME = "staging"
+
+#: Leaf of the data home where the dashboard import extracts its upload. The
+#: gateway creates it owner-only, and the sandbox hides it from agents.
+#: :func:`sweep_staging` reclaims crash orphans here too (``leaf=`` this name).
+IMPORT_STAGING_DIRNAME = "import-staging"
 
 #: Idle seconds before a crash-orphaned staging entry is reclaimed. Six hours:
 #: long enough that the slowest legitimate transfer (a multi-GB import extraction
@@ -148,8 +153,17 @@ def staging_dir() -> Path:
     return staging
 
 
-def sweep_staging(now: float | None = None, *, grace: float = IDLE_GRACE_SECONDS) -> int:
+def sweep_staging(
+    now: float | None = None,
+    *,
+    grace: float = IDLE_GRACE_SECONDS,
+    leaf: str = STAGING_DIRNAME,
+) -> int:
     """Remove staging directories idle past *grace*; return how many went.
+
+    *leaf* names the managed root under the data home: :data:`STAGING_DIRNAME`
+    (the default) or :data:`IMPORT_STAGING_DIRNAME`. The maintenance wake sweeps
+    both. Every safety rule below holds the same for either leaf.
 
     Reclaims only crash orphans: a successful or failed transfer removes its own
     per-call ``TemporaryDirectory`` subtree itself, so an entry is left here only
@@ -164,9 +178,10 @@ def sweep_staging(now: float | None = None, *, grace: float = IDLE_GRACE_SECONDS
       listed, so a link planted at it is refused by the open itself;
     * a missing root -- nothing to do;
     * an unlistable root -- reported, nothing swept;
-    * a plain DIRECTORY (a snapshot build / restore extraction / import extraction
-      ``TemporaryDirectory`` subtree) idle past *grace* -- removed; idle less -- kept;
-      unwalkable -- kept (reads as active);
+    * a plain DIRECTORY (a snapshot build or restore extraction
+      ``TemporaryDirectory`` subtree or an import upload spool in ``staging``, or an
+      import extraction subtree in ``import-staging``) idle past *grace*
+      -- removed; idle less -- kept; unwalkable -- kept (reads as active);
     * anything else (a plain file, a symlink, a Windows junction, a socket, a FIFO)
       -- skipped, never deleted. Every staging site creates a directory subtree, so a
       top-level non-directory is not a shape this leaf produces;
@@ -177,7 +192,7 @@ def sweep_staging(now: float | None = None, *, grace: float = IDLE_GRACE_SECONDS
     :data:`IDLE_GRACE_SECONDS`; the parameter serves a targeted caller and the
     tests.
     """
-    root = config_dir() / STAGING_DIRNAME
+    root = config_dir() / leaf
     reference = time.time() if now is None else now
     # Pin the root by descriptor BEFORE listing it, instead of a path-based
     # ``is_link_or_junction`` check followed by ``os.scandir(root)`` /
@@ -199,9 +214,7 @@ def sweep_staging(now: float | None = None, *, grace: float = IDLE_GRACE_SECONDS
         # A link at the root (NotADirectoryError / ELOOP), or an unopenable root:
         # report and sweep nothing, exactly as the old link-and-unlistable branches
         # did, but now the refusal is the open itself rather than a racy precheck.
-        logger.warning(
-            "staging: managed root %r is not a pinnable directory; skipping sweep", STAGING_DIRNAME
-        )
+        logger.warning("staging: managed root %r is not a pinnable directory; skipping sweep", leaf)
         return 0
     with root_pin:
         try:
@@ -216,18 +229,24 @@ def sweep_staging(now: float | None = None, *, grace: float = IDLE_GRACE_SECONDS
                 # deleted.
                 continue
             if root_pin.is_dir(name):
-                removed += _reclaim_dir_if_idle(root_pin, name, reference, grace)
+                removed += _reclaim_dir_if_idle(root_pin, name, reference, grace, leaf=leaf)
             # A top-level non-directory is left untouched: every staging site
-            # (snapshot build, restore extraction, import extraction) creates a
-            # ``TemporaryDirectory`` SUBTREE, so a bare file here is not a shape this
-            # leaf produces and the sweep does not claim to reclaim it.
+            # (snapshot build, restore extraction, import upload spool, and the
+            # import extraction in ``import-staging``) creates a directory SUBTREE,
+            # so a bare file here is not a shape this leaf produces and the sweep
+            # does not claim to reclaim it.
     return removed
 
 
 def _reclaim_dir_if_idle(
-    root_pin: PinnedDirectory, name: str, reference: float, grace: float
+    root_pin: PinnedDirectory,
+    name: str,
+    reference: float,
+    grace: float,
+    *,
+    leaf: str = STAGING_DIRNAME,
 ) -> int:
-    """Reclaim one staging subtree *name* idle past *grace*.
+    """Reclaim one staging subtree *name* of the *leaf* root idle past *grace*.
 
     On a platform that supports a pinned tree walk (POSIX), the removal is the shared
     :func:`pinned_fs.remove_tree_pinned` -- the one pinned whole-tree delete every
@@ -235,7 +254,7 @@ def _reclaim_dir_if_idle(
     with ``O_NOFOLLOW`` and opens the target through it, so a component swapped for a
     symlink after the path was formed is refused by the open rather than followed. The
     target is composed from ``config_dir().resolve()`` -- the data home, which the
-    agent cannot swap -- joined to the LITERAL ``staging/<name>``, NOT
+    agent cannot swap -- joined to the LITERAL ``<leaf>/<name>``, NOT
     ``(<root>).resolve() / name`` (that would pre-follow a staging leaf swapped for a
     symlink to the data home and hand the governance tree to the removal).
 
@@ -254,7 +273,7 @@ def _reclaim_dir_if_idle(
     it is re-confirmed inside the ``approve`` callback against the scanned descriptors,
     so the removal commits only while the tree is still idle.
     """
-    child = config_dir() / STAGING_DIRNAME / name
+    child = config_dir() / leaf / name
     try:
         idle = reference - _tree_newest_mtime(child, fallback=reference)
     except OSError:
@@ -276,10 +295,11 @@ def _reclaim_dir_if_idle(
         # tree is still idle. Fail-safe: an unreadable entry reads as active and keeps
         # the tree. ``os.stat(dir_fd=..., follow_symlinks=False)`` throughout, so no
         # path is re-resolved and a swap cannot substitute an old tree for a live one.
+        # Each entry is read through ``_activity_time``, as ``_tree_newest_mtime`` does.
         newest = 0.0
         stack = [(root_fd, False)]
         try:
-            newest = os.fstat(root_fd).st_mtime
+            newest = _activity_time(os.fstat(root_fd), reference)
             while stack:
                 fd, owned = stack.pop()
                 try:
@@ -287,8 +307,7 @@ def _reclaim_dir_if_idle(
                         listing = list(entries)
                     for entry in listing:
                         info = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
-                        if info.st_mtime > newest:
-                            newest = info.st_mtime
+                        newest = max(newest, _activity_time(info, reference))
                         if stat.S_ISDIR(info.st_mode):
                             sub = os.open(
                                 entry.name,
@@ -315,7 +334,7 @@ def _reclaim_dir_if_idle(
                         os.close(fd)
         return None if (reference - newest) >= grace else "staging child is active again"
 
-    target = str(config_dir().resolve() / STAGING_DIRNAME / name)
+    target = str(config_dir().resolve() / leaf / name)
     try:
         outcome = pinned_fs.remove_tree_pinned(target, what="staging child", approve=_still_idle)
     except pinned_fs.PinnedPathRefusal:

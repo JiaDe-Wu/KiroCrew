@@ -52,24 +52,29 @@ class TestPromptDashboardDeliver:
 
         state, slot = dashboard_state
         await orchestrator._deliver_result(
-            "💓 Heartbeat", "CR check", "Fix these comments", "prompt:dashboard:chat-1"
+            "Heartbeat", "CR check", "Fix these comments", "prompt:dashboard:chat-1"
         )
         slot.enqueue_or_run_prompt.assert_called_once()
         call_args = slot.enqueue_or_run_prompt.call_args
         prompt = call_args.args[0]
         assert "Fix these comments" in prompt
-        # run_chat coro and state are passed through in the documented positional order
-        assert call_args.args[1] is _run_chat
+        # run_chat coro and state are passed through in the documented positional order;
+        # the turn runs as the gateway's synthetic payload, under the heartbeat kind.
+        assert call_args.args[1].func is _run_chat
+        assert call_args.args[1].keywords == {"_synthetic_payload": True}
         assert call_args.args[2] is state
+        assert call_args.kwargs == {"gateway_prompt_kind": "heartbeat_prompt"}
 
     @pytest.mark.asyncio()
-    async def test_prompt_warns_on_missing_slot(self, orchestrator, dashboard_state, caplog, monkeypatch):
+    async def test_prompt_warns_on_missing_slot(
+        self, orchestrator, dashboard_state, caplog, monkeypatch
+    ):
         state, _ = dashboard_state
         state.resolve_slot.return_value = None
         sel_mock = MagicMock()
         monkeypatch.setattr("kiro_crew.slack.gateway.sel", lambda: sel_mock)
         await orchestrator._deliver_result(
-            "💓 Heartbeat", "CR check", "Fix these", "prompt:dashboard:chat-99"
+            "Heartbeat", "CR check", "Fix these", "prompt:dashboard:chat-99"
         )
         assert any("not found" in r.message for r in caplog.records)
         # notify must NOT fire when slot is missing (avoids dead-link notifications)
@@ -85,7 +90,7 @@ class TestPromptDashboardDeliver:
     async def test_prompt_sends_notification_once(self, orchestrator, dashboard_state):
         state, slot = dashboard_state
         await orchestrator._deliver_result(
-            "💓 Heartbeat", "CR check", "Fix these", "prompt:dashboard:chat-1"
+            "Heartbeat", "CR check", "Fix these", "prompt:dashboard:chat-1"
         )
         state.notify.assert_called_once()
         call_args = state.notify.call_args
@@ -109,14 +114,14 @@ class TestPromptDashboardDeliver:
         state, slot = dashboard_state
         slot.enqueue_or_run_prompt.return_value = ran
         await orchestrator._deliver_result(
-            "💓 Heartbeat", "CR check", "Fix these", "prompt:dashboard:chat-1"
+            "Heartbeat", "CR check", "Fix these", "prompt:dashboard:chat-1"
         )
         slot.enqueue_or_run_prompt.assert_called_once()
         assert "Fix these" in slot.enqueue_or_run_prompt.call_args.args[0]
         assert state.push_slots_update.call_count == int(ran)
         if ran:
             state.notify.assert_called_once_with(
-                "heartbeat", "💓 Heartbeat", "CR check\n\nFix these", meta={"slot": "chat-1"}
+                "heartbeat", "Heartbeat", "CR check\n\nFix these", meta={"slot": "chat-1"}
             )
         else:
             state.notify.assert_not_called()
@@ -128,13 +133,11 @@ class TestPromptDashboardDeliver:
         caplog.set_level(logging.DEBUG, logger="kiro_crew.slack.gateway")
         orchestrator.dashboard_state = None
         await orchestrator._deliver_result(
-            "💓 Heartbeat", "CR check", "Fix these", "prompt:dashboard:chat-1"
+            "Heartbeat", "CR check", "Fix these", "prompt:dashboard:chat-1"
         )
         # Assert the observability log fires so a silent regression removing
         # the logger.debug would fail the test (not just the no-crash case).
-        assert any(
-            "no dashboard_state" in r.message for r in caplog.records
-        )
+        assert any("no dashboard_state" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio()
     async def test_prompt_empty_slot_name_ignored(self, orchestrator, dashboard_state, caplog):
@@ -145,7 +148,7 @@ class TestPromptDashboardDeliver:
         caplog.set_level(logging.DEBUG, logger="kiro_crew.slack.gateway")
         state, _ = dashboard_state
         await orchestrator._deliver_result(
-            "💓 Heartbeat", "CR check", "Fix these", "prompt:dashboard:"
+            "Heartbeat", "CR check", "Fix these", "prompt:dashboard:"
         )
         state.get_slot.assert_not_called()
         state.resolve_slot.assert_not_called()
@@ -159,7 +162,7 @@ class TestPromptDashboardDeliver:
         state, slot = dashboard_state
         oversize = "x" * (MAX_PROMPT_BYTES + 1000)
         await orchestrator._deliver_result(
-            "💓 Heartbeat", "CR check", oversize, "prompt:dashboard:chat-1"
+            "Heartbeat", "CR check", oversize, "prompt:dashboard:chat-1"
         )
         delivered = slot.enqueue_or_run_prompt.call_args.args[0]
         assert len(delivered.encode("utf-8")) <= MAX_PROMPT_BYTES
@@ -175,14 +178,12 @@ class TestPromptDashboardDeliver:
         from kiro_crew.dashboard.handlers import MAX_PROMPT_BYTES
 
         state, slot = dashboard_state
-        title = "💓 Heartbeat"
+        title = "Heartbeat"
         summary = "CR check"
         prefix_bytes = len(f"{title}\n\n".encode("utf-8"))
         ascii_pad_len = MAX_PROMPT_BYTES - prefix_bytes - 1
         content = "x" * ascii_pad_len + "你" + "y" * 100
-        await orchestrator._deliver_result(
-            title, summary, content, "prompt:dashboard:chat-1"
-        )
+        await orchestrator._deliver_result(title, summary, content, "prompt:dashboard:chat-1")
         delivered = slot.enqueue_or_run_prompt.call_args.args[0]
         delivered.encode("utf-8").decode("utf-8")  # raises if invalid
         assert len(delivered.encode("utf-8")) <= MAX_PROMPT_BYTES
@@ -194,13 +195,11 @@ class TestPromptDashboardDeliver:
         from kiro_crew.dashboard.handlers import MAX_PROMPT_BYTES
 
         state, slot = dashboard_state
-        title = "💓 Heartbeat"
+        title = "Heartbeat"
         summary = "CR check"
         prefix_bytes = len(f"{title}\n\n".encode("utf-8"))
         content = "x" * (MAX_PROMPT_BYTES - prefix_bytes)
-        await orchestrator._deliver_result(
-            title, summary, content, "prompt:dashboard:chat-1"
-        )
+        await orchestrator._deliver_result(title, summary, content, "prompt:dashboard:chat-1")
         delivered = slot.enqueue_or_run_prompt.call_args.args[0]
         assert content in delivered
         assert len(delivered.encode("utf-8")) == MAX_PROMPT_BYTES
@@ -242,25 +241,23 @@ class TestDashboardSlotInjectDeliver:
         state._slots = {"chat-1-1776476208": slot}
         state.resolve_slot = lambda name: DashboardState.resolve_slot(state, name)
 
-        await orchestrator._deliver_result(
-            "💓 Heartbeat", "test", "result", "dashboard:chat-1"
-        )
+        await orchestrator._deliver_result("Heartbeat", "test", "result", "dashboard:chat-1")
         assert [(m["role"], m["content"], m["cls"]) for m in slot.messages] == [
-            ("assistant", "💓 Heartbeat\n\nresult", "msg msg-a")
+            ("assistant", "Heartbeat\n\nresult", "msg msg-a")
         ]
         state.notify.assert_called_once_with(
-            "heartbeat", "💓 Heartbeat", "test\n\nresult", meta={"slot": "chat-1-1776476208"}
+            "heartbeat", "Heartbeat", "test\n\nresult", meta={"slot": "chat-1-1776476208"}
         )
 
     @pytest.mark.asyncio()
-    async def test_inject_no_notify_when_slot_missing(self, orchestrator, dashboard_state, monkeypatch):
+    async def test_inject_no_notify_when_slot_missing(
+        self, orchestrator, dashboard_state, monkeypatch
+    ):
         state, _ = dashboard_state
         state.resolve_slot.return_value = None
         sel_mock = MagicMock()
         monkeypatch.setattr("kiro_crew.slack.gateway.sel", lambda: sel_mock)
-        await orchestrator._deliver_result(
-            "💓 Heartbeat", "test", "result", "dashboard:chat-99"
-        )
+        await orchestrator._deliver_result("Heartbeat", "test", "result", "dashboard:chat-99")
         state.notify.assert_not_called()
         # SEL audit event fires on not_found for inject path too
         sel_mock.log_api_access.assert_called_once()
@@ -318,13 +315,16 @@ class TestLogTaskException:
         import asyncio
         import logging
 
+        from redaction_structured_cases import github_classic
+
         from kiro_crew.dashboard.state import _log_task_exception
 
         caplog.set_level(logging.ERROR)
+        secret = github_classic(seed=42)
 
         async def leaky():
-            # AKIA-prefixed key is a recognized credential pattern
-            raise RuntimeError("creds leaked: AKIAIOSFODNN7EXAMPLE")
+            # A GitHub token with a valid checksum is a recognized credential
+            raise RuntimeError(f"creds leaked: {secret}")
 
         task = asyncio.create_task(leaky())
         try:
@@ -336,7 +336,7 @@ class TestLogTaskException:
         assert "Background task failed" in log_output
         # Recognized credential pattern must not appear anywhere in the log output
         # (including in the traceback frames, not just the exception message).
-        assert "AKIAIOSFODNN7EXAMPLE" not in log_output
+        assert secret not in log_output
         assert "[REDACTED: credential]" in log_output
 
     @pytest.mark.asyncio()
@@ -411,6 +411,7 @@ class TestSlotPrefixMatch:
 
     def _state_with_slots(self, slots: dict):
         from unittest.mock import MagicMock
+
         state = MagicMock()
         state._slots = slots
         return state
@@ -497,11 +498,10 @@ class TestSlotPrefixMatch:
         slot.key = "chat-1-1776476208"
         state._slots = {"chat-1-1776476208": slot}
         from kiro_crew.dashboard.state import DashboardState
+
         state.resolve_slot = lambda name: DashboardState.resolve_slot(state, name)
 
-        await orchestrator._deliver_result(
-            "💓 Heartbeat", "test", "result", "prompt:dashboard:chat-1"
-        )
+        await orchestrator._deliver_result("Heartbeat", "test", "result", "prompt:dashboard:chat-1")
         state.notify.assert_called_once()
         meta = state.notify.call_args[1]["meta"]
         assert meta["slot"] == "chat-1-1776476208"
@@ -513,11 +513,10 @@ class TestSlotPrefixMatch:
         slot.key = "chat-1-1776476208"
         state._slots = {"chat-1-1776476208": slot}
         from kiro_crew.dashboard.state import DashboardState
+
         state.resolve_slot = lambda name: DashboardState.resolve_slot(state, name)
 
-        await orchestrator._deliver_result(
-            "💓 Heartbeat", "test", "result", "prompt:dashboard:chat-1"
-        )
+        await orchestrator._deliver_result("Heartbeat", "test", "result", "prompt:dashboard:chat-1")
         slot.enqueue_or_run_prompt.assert_called_once()
         prompt, _, passed_state = slot.enqueue_or_run_prompt.call_args.args
         assert prompt.endswith("result")
@@ -589,9 +588,19 @@ class TestEnqueueOrRunPrompt:
         Mutation guard: drop the ``start_queue_persist`` call and no write starts.
         """
         import asyncio
+        from concurrent.futures import ThreadPoolExecutor
         from unittest.mock import AsyncMock, MagicMock
 
         from kiro_crew.dashboard.state import _ChatSlot
+        from kiro_crew.testing.wait import await_until
+
+        # The write is started, not awaited, and runs on the loop's default
+        # executor. One worker runs jobs in order, so a no-op job submitted after
+        # the enqueue returns only once the write has run.
+        # ``_join_test_loop_executor`` joins the loop's current default executor
+        # at teardown.
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
 
         slot = _ChatSlot(key="chat-1")
         # A turn still in flight, so the prompt queues.
@@ -600,11 +609,10 @@ class TestEnqueueOrRunPrompt:
         state._background_tasks = set()
 
         ran = slot.enqueue_or_run_prompt("hold this durably", AsyncMock(), state)
-        # The write is started, not awaited, and runs in an executor.
-        for _ in range(20):
-            await asyncio.sleep(0)
-            if state.flush_slot_now.call_args_list:
-                break
+        await await_until(
+            loop.run_in_executor(None, lambda: None),
+            what="the executor running the queue's durable write",
+        )
 
         assert ran is False
         assert state.flush_slot_now.call_args_list == [

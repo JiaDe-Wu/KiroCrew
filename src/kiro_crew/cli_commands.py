@@ -311,8 +311,8 @@ def _tailnet(args: argparse.Namespace) -> None:
     try:
         for candidate in (config_path(), config_local_path()):
             bad_path = candidate
-            if candidate.exists():
-                _assert_config_sections_are_objects(read_config_for_update(candidate))
+            # No exists() check: a deleted file reads as its endorsed copy, else {}.
+            _assert_config_sections_are_objects(read_config_for_update(candidate))
         bad_path = None
     except ConfigReadError as exc:
         print(
@@ -364,7 +364,7 @@ def _tailnet(args: argparse.Namespace) -> None:
     enabled = bool(cfg.dashboard.tailscale.enabled)
 
     if action == "up":
-        # Asked first, so an enterprise build whose policy does not turn tailnet on
+        # Asked first, so an LTS build whose policy does not turn tailnet on
         # says so before any port or config advice. A pure read here; the refusal is
         # audited once, and a permit is audited by ``publish`` itself.
         refused = (
@@ -511,10 +511,11 @@ def _tailnet(args: argparse.Namespace) -> None:
 
 
 def _telemetry(args: argparse.Namespace) -> None:
-    """Inspect or toggle the anonymous usage beacon (``kirocrew telemetry``).
+    """Inspect or toggle usage data: local metric recording and the anonymous beacon.
 
     ``status`` is read-only and never materializes an install id. ``disable`` /
-    ``enable`` persist ``telemetry.beacon_enabled`` to config.json, so the choice
+    ``enable`` persist BOTH switches, ``telemetry.enabled`` (local recording) and
+    ``telemetry.beacon_enabled`` (the heartbeat), to config.json, so the choice
     survives restarts and upgrades — an env-var-only opt-out would silently lapse
     the next time the user launched from a different shell.
     """
@@ -522,13 +523,14 @@ def _telemetry(args: argparse.Namespace) -> None:
     cfg = KiroCrewConfig.load()
 
     if action == "status":
+        print(_format_recording_status(cfg))
+        print()
         print(
             beacon.format_status(
                 beacon.status(
                     cfg.telemetry.beacon_endpoint,
                     enabled=cfg.telemetry.beacon_enabled,
                     app_version=__version__,
-                    acked=cfg.dashboard.privacy_acked,
                 )
             )
         )
@@ -560,6 +562,21 @@ def _telemetry(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+    # Turning local recording ON is local-only unless an export destination is
+    # configured, in which case it would also start sending metrics off the
+    # machine. The dashboard refuses that write with a 409; this command does the
+    # same for recording (the heartbeat is still written) and says why. An
+    # unresolvable posture counts as egress: fail closed.
+    set_recording = True
+    if want:
+        try:
+            # The built-in Kiro destination does not count: it needs no
+            # written opt-in.
+            from kiro_crew.metrics.kiro_export import egress_needs_written_opt_in
+
+            set_recording = not egress_needs_written_opt_in(cfg.telemetry)
+        except Exception:  # noqa: BLE001 - unknown posture is treated as egress
+            set_recording = False
     path = config_path()
 
     def _mutate_telemetry(data: dict) -> dict:
@@ -573,35 +590,26 @@ def _telemetry(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        # Same rule as the whole-file check above, applied per section: coercing a
+        # Same rule as the whole-file check above, applied to the section: coercing a
         # non-object section to {} would DISCARD whatever the user had there and then
         # print success. Absent is fine (create it); present-but-wrong-type is a
         # refusal, because this command cannot know what the value was meant to be.
-        sections: dict[str, dict[str, object]] = {}
-        for name in ("telemetry", "dashboard"):
-            existing = data.get(name)
-            if existing is None:
-                sections[name] = {}
-                continue
-            if not isinstance(existing, dict):
-                print(
-                    f'❌ {path} has a non-object "{name}" value '
-                    f"({type(existing).__name__}); refusing to overwrite it. Fix or "
-                    "remove it, then retry.",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-            sections[name] = existing
+        telemetry = data.get("telemetry")
+        if telemetry is None:
+            telemetry = {}
+        elif not isinstance(telemetry, dict):
+            print(
+                f'❌ {path} has a non-object "telemetry" value '
+                f"({type(telemetry).__name__}); refusing to overwrite it. Fix or "
+                "remove it, then retry.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
-        sections["telemetry"]["beacon_enabled"] = want
-        data["telemetry"] = sections["telemetry"]
-        # Running this command IS the informed choice the first-run chapter exists to
-        # collect, so record the ack. Otherwise `telemetry enable` on a fresh
-        # headless install would write beacon_enabled: true and still send nothing,
-        # because the first-egress gate would keep waiting for a dashboard screen the
-        # user may never open.
-        sections["dashboard"]["privacy_acked"] = True
-        data["dashboard"] = sections["dashboard"]
+        if set_recording:
+            telemetry["enabled"] = want
+        telemetry["beacon_enabled"] = want
+        data["telemetry"] = telemetry
         return data
 
     try:
@@ -640,10 +648,31 @@ def _telemetry(args: argparse.Namespace) -> None:
     # sets this key locally would keep sending while this command
     # printed "DISABLED" — a false promise on a privacy control is worse than an
     # error, so re-read the effective config and report the shadowing file.
+    exporting = False
+    loaded_cfg: object = None
     try:
-        effective = KiroCrewConfig.load().telemetry.beacon_enabled
+        loaded_cfg = KiroCrewConfig.load()
+        loaded = loaded_cfg.telemetry
+        effective = loaded.beacon_enabled
+        recording = loaded.enabled
+        if want and not set_recording and recording:
+            from kiro_crew.metrics.provider import outbound_consented
+
+            # Recording on by default is not an opt-in to export, so a
+            # configured destination may still be sending nothing.
+            exporting = outbound_consented(loaded_cfg)
     except Exception:  # noqa: BLE001 - diagnostics must not mask the write
         effective = want
+        recording = want
+    if set_recording and recording != want:
+        state = "ON" if recording else "OFF"
+        print(
+            f"Warning: wrote {path.name}, but local metric recording is still {state}: an "
+            "overlay in config.local.json takes precedence.",
+            file=sys.stderr,
+        )
+        print("   Edit telemetry.enabled there too.", file=sys.stderr)
+        sys.exit(1)
     if effective != want:
         state = "ENABLED" if effective else "DISABLED"
         print(
@@ -658,12 +687,150 @@ def _telemetry(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    if want:
-        print("✅ Anonymous usage beacon ENABLED (one heartbeat per day).")
+    if want and not set_recording and recording and exporting:
+        # Recording was already on before this command; saying it was "NOT turned
+        # on" would tell the user both recording and export are off while both run.
+        print("Anonymous usage beacon ENABLED (one heartbeat per day).")
+        print(
+            "   Local metric recording was already on, and this host is configured to "
+            "export metrics off the machine. This command changed neither; the "
+            "config file, where the destination is configured, controls both."
+        )
+    elif want and not set_recording and recording:
+        # On by default only: the destination is configured but nothing is sent.
+        print("Anonymous usage beacon ENABLED (one heartbeat per day).")
+        print(
+            "   Local metric recording is on by default. This host has an export "
+            "destination configured, but nothing is exported until "
+            "telemetry.enabled: true is written in the config file."
+        )
+        if _kiro_telemetry_listed():
+            print("   Product usage metrics are sent to Kiro telemetry (kiro-telemetry).")
+    elif want and not set_recording:
+        print("Anonymous usage beacon ENABLED (one heartbeat per day).")
+        print(
+            "   Local metric recording was NOT turned on: this host is configured to "
+            "export metrics off the machine, so turning it on would also start that "
+            "export. Set telemetry.enabled in the config file instead, where the "
+            "destination is configured."
+        )
+    elif want:
+        print("Usage data ENABLED: local metric recording and the anonymous beacon")
+        print("   (one heartbeat per day).")
+        if _kiro_telemetry_listed():
+            print(
+                "   Product usage metrics are also sent to Kiro telemetry (kiro-telemetry), "
+                "labelled with a hashed install ID.",
+                flush=True,
+            )
         print("   Run 'kirocrew telemetry status' to see exactly what is sent.")
     else:
-        print("✅ Anonymous usage beacon DISABLED. Nothing will be sent.")
+        print("Usage data DISABLED: local metric recording and the anonymous beacon")
+        print("   are off. Nothing will be recorded or sent.")
         print(f"   You can also delete {beacon.INSTALL_ID_FILE} from the data home.")
+    _report_env_pin(want)
+
+
+def _kiro_telemetry_listed() -> bool:
+    """Whether this build sends product usage metrics to Kiro telemetry."""
+    try:
+        from kiro_crew.metrics import kiro_export
+
+        return bool(kiro_export.destinations())
+    except Exception:  # noqa: BLE001 - informational only
+        return False
+
+
+def _format_recording_status(cfg: KiroCrewConfig) -> str:
+    """The local metric recording half of ``kirocrew telemetry status``."""
+    from kiro_crew.metrics.provider import _held_consent, env_pin, env_pin_is_soft, pin_env_var
+
+    pin = env_pin()
+    # An unparseable config file holds consent as unknown (None): a new recorder is
+    # not built, but one a running gateway already holds keeps going until restart.
+    effective = _held_consent(cfg, bool(cfg.telemetry.enabled)) if pin is None else pin
+    # Same resolver as the dashboard's disclosure. An unknown posture counts as
+    # exporting: this is a privacy statement, so it must not promise local-only.
+    # A destination also means neither `telemetry enable` nor Settings will write
+    # telemetry.enabled (both refuse it), and export waits for that written opt-in.
+    try:
+        from kiro_crew.metrics.provider import otlp_egress_active, outbound_consented
+
+        # Unknown consent: a running gateway may still export to a destination this
+        # (fallback) load cannot see, so never promise local-only.
+        egress_host = effective is None or otlp_egress_active(cfg.telemetry)
+        from kiro_crew.metrics import kiro_export
+
+        builtin = bool(kiro_export.destinations())
+        exports = egress_host and (effective is None or outbound_consented(cfg) or builtin)
+    except Exception:  # noqa: BLE001 - unknown posture is treated as egress
+        egress_host = exports = True
+    # Names only, never an endpoint (it can carry credentials). A build's own
+    # destination is marked so, since config cannot remove it.
+    sends_to = ""
+    try:
+        from kiro_crew.metrics.provider import otlp_egress_listing
+
+        sends_to = ", ".join(
+            (
+                f"{row.destination.name} (included by this build)"
+                if row.locked
+                else row.destination.name
+            )
+            for row in otlp_egress_listing(cfg.telemetry)
+        )
+    except Exception:  # noqa: BLE001 - the line is informational; the posture above stands
+        sends_to = ""
+    if exports:
+        where = " (when on, also sent to the metrics destination configured for this machine)"
+    elif egress_host:
+        where = " (stays on this machine until telemetry.enabled: true is written)"
+    else:
+        where = " (stays on this machine)"
+    if effective is None:
+        enabled = (
+            "unknown (telemetry.enabled is not true or false; a running gateway keeps "
+            "recording until it restarts)"
+        )
+    elif effective:
+        enabled = "yes"
+    else:
+        enabled = "no"
+    lines = [
+        "Local metric recording" + where,
+        "",
+        "  Enabled:     " + enabled,
+        f"  Config:      telemetry.enabled is {'true' if cfg.telemetry.enabled else 'false'}",
+    ]
+    if sends_to:
+        lines.append(f"  Collectors:  {sends_to}")
+    if pin is not None and env_pin_is_soft():
+        remedy = (
+            "in the config file, where the export destination is configured"
+            if egress_host
+            else "(kirocrew telemetry enable, or Settings > Privacy)"
+        )
+        lines.append(f"  Held off by: {pin_env_var()} until telemetry.enabled is written {remedy}")
+    elif pin is not None:
+        lines.append(f"  Pinned by:   {pin_env_var()} (the config value has no effect)")
+    return "\n".join(lines)
+
+
+def _report_env_pin(want: bool) -> None:
+    """Say so when an env var keeps either switch from following the write."""
+    from kiro_crew.metrics.provider import env_pin, pin_env_var
+
+    pin = env_pin()
+    if pin is not None and pin != want:
+        print(
+            f"Warning: {pin_env_var()} is set in this shell and overrides telemetry.enabled.",
+            file=sys.stderr,
+        )
+    if want and beacon.is_env_opted_out():
+        print(
+            f"Warning: {beacon.opt_out_env_var()} is set in this shell, so the beacon stays off.",
+            file=sys.stderr,
+        )
 
 
 def _handle_secrets(args: argparse.Namespace) -> None:
@@ -732,6 +899,7 @@ _OWNERS = (
     "kiro_crew.cli_commands_eval",
     "kiro_crew.cli_commands_learn",
     "kiro_crew.cli_commands_secrets",
+    "kiro_crew.cli_commands_usage",
 )
 for _owner in _OWNERS:
     importlib.import_module(_owner)
@@ -758,24 +926,31 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _remove_deleted_agent_leftovers,
     )
     from kiro_crew.cli_commands_app import (  # noqa: F401
+        _DASHBOARD_REMEDY_BY_ACTION,
+        _MEMBER_THREADS_DESC,
         _SESSION_APPROVAL_CONSENT_REQUIRED,
         _SESSION_APPROVAL_DESC,
         _app_already_gone,
         _app_declares_backend,
         _apply_through_gateway,
+        _audit_file_only_toggle,
         _cleanup_app_crons_from_scheduler,
         _deregister_or_report,
         _handle_app,
         _handle_app_import,
         _install_app_through_gateway,
         _print_file_only_app_result,
+        _print_git_update_hint,
         _print_pointer_cleanup,
         _refuse_session_approval_from_cli,
         _refuse_unsafe_app_name,
         _register_app_crons_to_scheduler,
         _register_unrecorded_builtin,
+        _resolve_install_source,
         _run_app_action_through_gateway,
         _run_app_mcp_server,
+        _set_folded_app_switch,
+        _shell_quoted,
         _warn_backend_not_stopped,
         _warn_hooks_need_restart,
     )
@@ -788,23 +963,38 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _cron_dispatch,
         _cron_folder_label,
         _cron_folder_ref,
+        _cron_model,
         _cron_preview,
         _cron_update_not_found,
         _format_schedule,
+        _ownerless_hint,
+        _running_since,
     )
     from kiro_crew.cli_commands_eval import (  # noqa: F401
+        _EVAL_RUN_ONLY,
+        _SCENARIO_ONLY,
+        _eval_provider_kwargs,
+        _eval_run_flag_refusal,
+        _judge_results,
         _load_eval_scenarios,
+        _load_failure,
+        _load_user_scenarios,
+        _read_user_scenario,
         _run_eval,
+        _run_eval_tasks,
         write_eval_artifacts,
     )
     from kiro_crew.cli_commands_gateway_api import (  # noqa: F401
+        _SPAWN_WAIT_SECS,
         _artifact,
         _client_port,
         _create_cron_folder,
         _gateway_send,
         _internal_secret,
         _peer_refusal,
+        _refusal_text,
         _spawn,
+        _spawn_done_status,
         _spawn_row_text,
         _spawn_run,
     )
@@ -833,9 +1023,11 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _memory_carve,
         _memory_cmd,
         _memory_create_store,
+        _memory_dream,
         _memory_forget,
         _memory_search_embedding,
         _memory_search_history,
+        _memory_shadow,
         _memory_show,
         _memory_verb,
         _refuse_forget_outside_owner_terminal,
@@ -846,17 +1038,26 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _handle_secrets_authorize,
         _publish_secret_request_policy,
         _spawn_precreates_policy_directory,
-        _windows_authorize_unavailable,
     )
     from kiro_crew.cli_commands_security import (  # noqa: F401
         _TIME_SELECTOR_RE,
         _TIME_SELECTOR_UNITS,
+        _explain_batch,
+        _explain_record,
         _policy,
         _policy_fetch,
         _print_denied_command_summary,
         _print_policy_source,
         _security,
         parse_time_selector,
+    )
+    from kiro_crew.cli_commands_usage import (  # noqa: F401
+        _MONEY_DECIMALS,
+        _UNATTRIBUTED_LABEL,
+        _figure,
+        _print_table,
+        _usage_report,
+        _window_days,
     )
     from kiro_crew.cli_commands_workspace import (  # noqa: F401
         _WS_DIR_OUTSIDE_HOME,

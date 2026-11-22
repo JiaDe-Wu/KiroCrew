@@ -413,6 +413,34 @@ def test_removing_a_goal_strips_it_from_key_results_and_undo_puts_both_back() ->
     assert exc.value.code == "undo_unavailable"
 
 
+@pytest.mark.parametrize(
+    "goal_removed_first", [False, True], ids=["key-result-first", "goal-first"]
+)
+def test_undoing_both_removals_keeps_the_held_key_results_goal_link(
+    goal_removed_first: bool,
+) -> None:
+    """A key result held for its own Undo still served the goal, so undoing both relinks it."""
+    _seed()
+    slug = _slug(ORDINARY)
+    a = member_goals.set_goal(slug, ORDINARY, "Ship", by="user")["goal_id"]
+    b = member_goals.set_goal(slug, ORDINARY, "Hire", by="user")["goal_id"]
+    member_goals.set_key_results(
+        slug, ORDINARY, [{"text": "Both", "target": "yes", "goal_ids": [a, b]}]
+    )
+    kid = member_goals.read_goals(slug, ORDINARY)["key_results"][0]["id"]
+    if goal_removed_first:
+        member_goals.remove_goal(slug, ORDINARY, a)
+        member_goals.remove_key_result(slug, ORDINARY, kid)
+    else:
+        member_goals.remove_key_result(slug, ORDINARY, kid)
+        member_goals.remove_goal(slug, ORDINARY, a)
+    member_goals.restore_goal(slug, ORDINARY, a)
+    member_goals.restore_key_result(slug, ORDINARY, kid)
+    rec = member_goals.read_goals(slug, ORDINARY)
+    assert [g["id"] for g in rec["goals"]] == [a, b]
+    assert sorted(rec["key_results"][0]["goal_ids"]) == sorted([a, b])
+
+
 def test_key_result_movement_reads_the_window_from_readings(_floor_monkeypatch) -> None:
     _seed()
     slug = _slug(ORDINARY)
@@ -653,7 +681,7 @@ def test_each_check_in_is_dispatched_as_a_plain_hidden_turn(
     assert asyncio.run(goal_reminder.fire(state, Job())) == "started"
     ((args, kwargs),) = sent
     assert args[1] is slot
-    assert kwargs == {"human_seen": False}
+    assert kwargs == {"human_seen": False, "mirror_reply_only": False}
 
 
 @pytest.mark.parametrize("cadence", ["daily", "weekly", "monthly", "heartbeat"])
@@ -1332,7 +1360,7 @@ def test_the_reminder_fires_one_hidden_turn_in_the_crewmates_own_thread(_floor_m
     member_goals.set_schedules(slug, ORDINARY, {"daily": True})
     assert asyncio.run(goal_reminder.fire(state, Job())) == "started"
     ((args, kwargs),) = sent
-    assert args[1] is slot and kwargs == {"human_seen": False}
+    assert args[1] is slot and kwargs == {"human_seen": False, "mirror_reply_only": False}
     prompt = args[2]
     assert "Keep docs current" in prompt
     assert "pages reviewed" in prompt and "key_result_progress" in prompt

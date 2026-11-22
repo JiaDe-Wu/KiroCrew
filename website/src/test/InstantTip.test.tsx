@@ -141,9 +141,9 @@ function FlowOrphanHarness() {
  *  outcome is a new value, the way a copy chip hands over its attempt number.
  *  "outcome" bumps it (a new outcome), "idle" clears it (the flash ended), and
  *  "act" arms the anchor the way a press does. */
-function HoldHarness() {
+function HoldHarness({ openOnTouchRelease = false }: { openOnTouchRelease?: boolean } = {}) {
   const [hold, setHold] = useState(0)
-  const { tip, tipHandlers, tipId, arm } = useInstantTip({ hold })
+  const { tip, tipHandlers, tipId, arm } = useInstantTip({ hold, openOnTouchRelease })
   return (
     <>
       <button type="button" {...tipHandlers} onMouseDown={e => arm(e.currentTarget)}>anchor</button>
@@ -825,6 +825,61 @@ describe('InstantTip', () => {
       expect(tip.className).not.toMatch(/-translate-y-full/)
     })
 
+    it('clamps a tall first-line bubble inside the viewport without flipping below', () => {
+      const savedBubbleHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetHeight')
+      const savedViewportHeight = Object.getOwnPropertyDescriptor(window, 'innerHeight')
+      Object.defineProperty(HTMLElement.prototype, 'offsetHeight', { configurable: true, value: 214 })
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: 800 })
+      try {
+        render(<FlowHarness />)
+        const a = screen.getByRole('button', { name: 'anchor A' })
+        // The first-line anchor wants an above bubble at 94; its 214px height
+        // would put the top edge at -120 without the measured-height clamp.
+        a.getBoundingClientRect = () => rect(102, 100, 180)
+        fireEvent.focus(a)
+        const tip = screen.getByRole('tooltip')
+        expect(tip).toHaveAttribute('data-placement', 'above')
+        expect(tip.className).toMatch(/-translate-y-full/)
+        const topEdge = parseFloat(tip.style.top) - 214
+        expect(topEdge).toBe(8)
+      } finally {
+        if (savedBubbleHeight) Object.defineProperty(HTMLElement.prototype, 'offsetHeight', savedBubbleHeight)
+        else delete (HTMLElement.prototype as unknown as Record<string, unknown>).offsetHeight
+        if (savedViewportHeight) Object.defineProperty(window, 'innerHeight', savedViewportHeight)
+        else delete (window as unknown as Record<string, unknown>).innerHeight
+      }
+    })
+
+    it('clamps a lower-line bubble that flips above inside the viewport', () => {
+      const savedBubbleHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetHeight')
+      const savedViewportHeight = Object.getOwnPropertyDescriptor(window, 'innerHeight')
+      Object.defineProperty(HTMLElement.prototype, 'offsetHeight', { configurable: true, value: 80 })
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: 800 })
+      Object.defineProperty(Range.prototype, 'getClientRects', {
+        configurable: true,
+        value: () => [rect(10, 20, 90, 18)],
+      })
+      try {
+        render(<FlowHarness />)
+        screen.getByTestId('flow').getBoundingClientRect = () => rect(10, 0, 600, 60)
+        const b = screen.getByRole('button', { name: 'anchor B' })
+        // This lower-line anchor opens below at 58, but the 80px bubble crosses
+        // the flow floor at 70. Its above candidate at 22 would start at -58.
+        b.getBoundingClientRect = () => rect(30, 100, 180)
+        fireEvent.focus(b)
+        const tip = screen.getByRole('tooltip')
+        expect(tip).toHaveAttribute('data-placement', 'above')
+        expect(tip.className).toMatch(/-translate-y-full/)
+        const topEdge = parseFloat(tip.style.top) - 80
+        expect(topEdge).toBe(8)
+      } finally {
+        if (savedBubbleHeight) Object.defineProperty(HTMLElement.prototype, 'offsetHeight', savedBubbleHeight)
+        else delete (HTMLElement.prototype as unknown as Record<string, unknown>).offsetHeight
+        if (savedViewportHeight) Object.defineProperty(window, 'innerHeight', savedViewportHeight)
+        else delete (window as unknown as Record<string, unknown>).innerHeight
+      }
+    })
+
     it('keeps a below bubble inside its flow container, and flips above one that would cross the container\'s bottom (the last line, or one near it)', () => {
       // Below the message's box the bubble would sit on whatever follows the
       // message (in a transcript: the timestamp and action row). The container's
@@ -1049,6 +1104,17 @@ function TapOpensHarness() {
   )
 }
 
+/** An anchor that opens on the touch release itself (`openOnTouchRelease`). */
+function ReleaseOpensHarness() {
+  const { tip, tipHandlers, tipId } = useInstantTip({ openOnTouchRelease: true })
+  return (
+    <>
+      <button type="button" {...tipHandlers}>anchor</button>
+      <InstantTip tip={tip} tipId={tipId}>bubble content</InstantTip>
+    </>
+  )
+}
+
 /** The events a browser sends for one finger tap, in order: the touch
  *  pointer's own events, then the mouse events it replays once the finger
  *  lifts (mousedown moves focus), then the click. */
@@ -1116,6 +1182,112 @@ describe('InstantTip on touch', () => {
     render(<TapOpensHarness />)
     tap(screen.getByRole('button', { name: 'anchor' }))
     expect(screen.getByRole('tooltip')).toBeInTheDocument()
+  })
+
+  it('openOnTap: the touch release opens nothing; the replayed focus opens it, before the click', () => {
+    render(<TapOpensHarness />)
+    const anchor = screen.getByRole('button', { name: 'anchor' })
+    fireEvent.pointerEnter(anchor, { pointerType: 'touch' })
+    fireEvent.pointerDown(anchor, { pointerType: 'touch' })
+    fireEvent.pointerUp(anchor, { pointerType: 'touch' })
+    expect(screen.queryByRole('tooltip')).toBeNull()
+    fireEvent.mouseEnter(anchor)
+    fireEvent.mouseDown(anchor)
+    expect(screen.queryByRole('tooltip')).toBeNull()
+    fireEvent.focus(anchor)
+    expect(screen.getByRole('tooltip')).toBeInTheDocument()
+  })
+
+  it('openOnTouchRelease: the first touch pointerup opens without focus or mouse replay', () => {
+    render(<ReleaseOpensHarness />)
+    const anchor = screen.getByRole('button', { name: 'anchor' })
+    fireEvent.pointerDown(anchor, { pointerType: 'touch' })
+    expect(screen.queryByRole('tooltip')).toBeNull()
+    fireEvent.pointerUp(anchor, { pointerType: 'touch' })
+    expect(screen.getByRole('tooltip')).toBeInTheDocument()
+    expect(document.activeElement).not.toBe(anchor)
+  })
+
+  it('openOnTouchRelease: a mouse pointerup opens nothing, and a mouse still hovers', () => {
+    render(<ReleaseOpensHarness />)
+    const anchor = screen.getByRole('button', { name: 'anchor' })
+    fireEvent.pointerEnter(anchor, { pointerType: 'mouse' })
+    fireEvent.pointerDown(anchor, { pointerType: 'mouse' })
+    fireEvent.pointerUp(anchor, { pointerType: 'mouse' })
+    expect(screen.queryByRole('tooltip')).toBeNull()
+    fireEvent.mouseEnter(anchor)
+    act(() => { vi.advanceTimersByTime(OPEN_DELAY_MS) })
+    expect(screen.getByRole('tooltip')).toBeInTheDocument()
+  })
+
+  it.each([false, true])('openOnTouchRelease: after scroll a retap reopens with focused=%s and no new focus event', focused => {
+    render(<ReleaseOpensHarness />)
+    const anchor = screen.getByRole('button', { name: 'anchor' })
+    fireEvent.pointerDown(anchor, { pointerType: 'touch' })
+    fireEvent.pointerUp(anchor, { pointerType: 'touch' })
+    if (focused) act(() => anchor.focus())
+    expect(screen.getByRole('tooltip')).toBeInTheDocument()
+    fireEvent.scroll(window)
+    expect(screen.queryByRole('tooltip')).toBeNull()
+    // Replayed enter/focus must not reopen a dismissed hint or arm a timer.
+    fireEvent.mouseEnter(anchor)
+    fireEvent.focus(anchor)
+    act(() => { vi.advanceTimersByTime(OPEN_DELAY_MS) })
+    expect(screen.queryByRole('tooltip')).toBeNull()
+    fireEvent.pointerDown(anchor, { pointerType: 'touch' })
+    fireEvent.pointerUp(anchor, { pointerType: 'touch' })
+    expect(screen.getByRole('tooltip')).toBeInTheDocument()
+    expect(document.activeElement === anchor).toBe(focused)
+  })
+
+  it('openOnTouchRelease: Escape closes the hint', () => {
+    render(<ReleaseOpensHarness />)
+    tap(screen.getByRole('button', { name: 'anchor' }))
+    expect(screen.getByRole('tooltip')).toBeInTheDocument()
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(screen.queryByRole('tooltip')).toBeNull()
+  })
+
+  it('openOnTouchRelease: an outside pointerdown closes in capture phase without moving focus', () => {
+    render(<ReleaseOpensHarness />)
+    const anchor = screen.getByRole('button', { name: 'anchor' })
+    const child = document.createElement('span')
+    anchor.append(child)
+    tap(anchor)
+    fireEvent.pointerDown(child, { pointerType: 'touch' })
+    expect(screen.getByRole('tooltip')).toBeInTheDocument()
+    const outside = document.createElement('div')
+    outside.addEventListener('pointerdown', e => e.stopPropagation())
+    document.body.append(outside)
+    try {
+      fireEvent.pointerDown(outside, { pointerType: 'touch' })
+      expect(screen.queryByRole('tooltip')).toBeNull()
+    } finally { outside.remove() }
+  })
+
+  it('openOnTap: an outside pointerdown leaves the hint to its own blur, as before', () => {
+    render(<TapOpensHarness />)
+    tap(screen.getByRole('button', { name: 'anchor' }))
+    fireEvent.pointerDown(document.body, { pointerType: 'touch' })
+    expect(screen.getByRole('tooltip')).toBeInTheDocument()
+  })
+
+  it.each([false, true])('an outside pointerdown does not dismiss a held outcome with openOnTouchRelease=%s', openOnTouchRelease => {
+    render(<HoldHarness openOnTouchRelease={openOnTouchRelease} />)
+    tap(screen.getByRole('button', { name: 'anchor' }))
+    fireEvent.click(screen.getByRole('button', { name: 'outcome' }))
+    fireEvent.pointerDown(document.body, { pointerType: 'touch' })
+    expect(screen.getByRole('tooltip')).toHaveTextContent('held content')
+  })
+
+  it('openOnTouchRelease: a tap survives the browser replay mouseleave until focus leaves', () => {
+    render(<ReleaseOpensHarness />)
+    const anchor = screen.getByRole('button', { name: 'anchor' })
+    tap(anchor)
+    fireEvent.mouseLeave(anchor)
+    expect(screen.getByRole('tooltip')).toBeInTheDocument()
+    fireEvent.blur(anchor)
+    expect(screen.queryByRole('tooltip')).toBeNull()
   })
 
   it('an outcome the tap produced still opens its held bubble at the tapped anchor', () => {

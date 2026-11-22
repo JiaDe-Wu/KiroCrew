@@ -19,7 +19,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { Link, Navigate, useLocation, useNavigate } from 'react-router-dom'
 import { AlertTriangle, CheckCircle2, RefreshCw, ShoppingBag, X } from 'lucide-react'
-import { EmptyState, IconButton, PageHeader, SearchInput } from '../../components/ui'
+import { Btn, EmptyState, IconButton, PageHeader, SearchInput } from '../../components/ui'
 import { uiLocation } from '../../uiLocations/uiLocation'
 import SimpleSelect from '../../components/SimpleSelect'
 import { Tabs, TabsContent, TabsCount, TabsList, TabsTrigger } from '../../components/ui/tabs'
@@ -29,19 +29,26 @@ import CategoryRail from '../../components/appstore/CategoryRail'
 import AppListRow from '../../components/appstore/AppListRow'
 import TrustAppModal, { isTrustDeniedError } from '../../components/appstore/TrustAppModal'
 import SourcesPopover from '../../components/appstore/SourcesPopover'
-import { categoryCounts, categoryFor, type Category } from '../../components/appstore/categories'
+import { MarketStoreSections, isMarketSourceKey, marketRowTags, useMarketSourceRows, useRailStoreRows } from '../../components/appstore/MarketListingRows'
+import { registriesReadError, useMarketRegistriesQuery } from '../../components/appstore/marketAccount'
+import { categoryCounts, categoryFor, categoryLabel, type Category } from '../../components/appstore/categories'
 import { sourceKey, sourceRowKey, type RegistryApp } from '../../components/appstore/types'
 import { api } from '../../api/client'
+import { useConnected } from '../../hooks/useConnected'
+import { offlineProps } from '../../utils/offline'
 import { i18nT } from '../../i18n/t'
 import { compareText } from '../../i18n/format'
 import ErrorNotice from '../../components/ErrorNotice'
+import StatusNotice from '../../components/StatusNotice'
 import ErrorBoundary from '../../components/ErrorBoundary'
 import useAppsData from './useAppsData'
 import { useAppActions } from './useAppActions'
 import { useAppUpdates } from './useAppUpdates'
 import UpdatesList from './UpdatesList'
 import { cardDataKey } from './cardDataKey'
-import { registryRefreshFailureMessage } from '../../components/appstore/registryRefreshMessage'
+import {
+  registryListingFailureMessage, registryRefreshFailureMessage,
+} from '../../components/appstore/registryRefreshMessage'
 
 /**
  * Which app in a featured card has an action in flight, or null.
@@ -138,7 +145,16 @@ function DiscoverPageBody() {
      (enable lives in Library) and persists until acted on; an update success
      resolves HERE, so it links nowhere and auto-dismisses instead. */
   const [successLink, setSuccessLink] = useState(false)
+  /* Update All's chat-control consent lines: the update landed, so not the red
+     error notice; warn-toned like the detail page's own re-consent notice,
+     because the app is now disabled; and not transient, because each names an
+     app the user still has to enable. */
+  const [updateNotice, setUpdateNotice] = useState('')
   const [actionLoading, setActionLoading] = useState<string | null>(null)
+  // The store refresh, Enable and the Updates tab write to the gateway, so each
+  // is refused while it is offline (offlineProps names why), as on the Library.
+  const connected = useConnected()
+  const offlineVerb = i18nT('utils.offline.manage_apps')
 
   /* Sub-tab state (V1 mockup: Featured | Updates). Component-internal state
      initialized SYNCHRONOUSLY from the URL so a `/apps/-/updates` deep-link or
@@ -158,14 +174,30 @@ function DiscoverPageBody() {
   const {
     apps, appsError, registryError, loading,
     browseApps, featuredSections, categories, sources, updatables,
-    announceAppsChanged, registriesUnknown,
+    announceAppsChanged, registriesUnknown, catalogUnavailable, registryFetchFailures,
   } = useAppsData()
 
+  // Each added Kiro Space store is one more source in the rail.
+  const marketSources = useMarketSourceRows(query)
+  // A failed store-list read is said in the loading and empty branches too:
+  // the store sections, which say it otherwise, are not mounted there. It must
+  // not choose the branch: a refetch clears `error`, and the flip would remount
+  // the sections and refetch again.
+  const marketReadError = registriesReadError(useMarketRegistriesQuery().error)
+  const storeReadNotice = marketReadError
+    ? <div className="mb-4" data-testid="market-registries-error"><ErrorNotice message={marketReadError} askAgent /></div>
+    : null
+  const railSources = useMemo(() => [...sources, ...marketSources], [sources, marketSources])
+  const marketSelected = isMarketSourceKey(source)
+  // The store rows the rail counts beside the git rows: every added store's for
+  // All sources, the picked store's for a store source, none for a git source.
+  const storeRows = useRailStoreRows(source, query)
+
   useEffect(() => {
-    if (!loading && source !== null && !sources.some(row => sourceRowKey(row) === source)) {
+    if (!loading && source !== null && !railSources.some(row => sourceRowKey(row) === source)) {
       setSource(null)
     }
-  }, [loading, source, sources])
+  }, [loading, source, railSources])
 
   const {
     setError, displayError, dismissError,
@@ -188,9 +220,9 @@ function DiscoverPageBody() {
   // keeps every row on this worklist updating where it stands: the header
   // and Update All promise in-place updating, so a row's button must not
   // navigate away mid-triage (the hook's comment carries the full contract).
-  const { updatingAll, updatePending, runUpdate, updateAll } = useAppUpdates({
+  const { updatingAll, updatePending, runUpdate, updateAll, trustHandoff } = useAppUpdates({
     apps, updatables, announceAppsChanged, updateApp,
-    setError, setSuccess: showSuccess,
+    setError, setSuccess: showSuccess, setNotice: setUpdateNotice,
     // A lapsed execution trust on an in-place update is a consent prompt:
     // reuse the enable path's modal, but hand the gate the UPDATE retry —
     // its default retry is the enable action, which would start the app
@@ -198,6 +230,22 @@ function DiscoverPageBody() {
     onTrustDenied: (name, retryUpdate) => trust.open(trustTarget(name), retryUpdate),
     rowUpdatesInPlace: true,
   })
+  // The "Open <app> details" buttons of the Update All notice showing
+  // *message*, if that notice named any. One app per line: a batch can name
+  // any number of apps, and a row of buttons holds at most two
+  // (max-two-buttons-per-row).
+  const handoffButtons = (message: string) => {
+    const linked = trustHandoff.find(h => h.message === message)?.apps
+    return linked && (
+      <div className="flex flex-col items-start gap-2 mt-1">
+        {linked.map(({ name, label, rerunUpdate }) => (
+          <Btn key={name} onClick={() => (rerunUpdate ? updateApp(name) : openDetail(name))}>
+            {i18nT('pages.appsPage.open_app_details', { name: label })}
+          </Btn>
+        ))}
+      </div>
+    )
+  }
 
   // Manual store refresh. This exists because the two cache layers degrade
   // silently -- a failed catalog fetch leaves the store on the seed listing
@@ -212,16 +260,15 @@ function DiscoverPageBody() {
   // The settled results are READ, not discarded: a failed refresh keeps
   // serving the prior (stale or seed) listing, which looks identical to a
   // successful one, so the outcome must reach the error banner or the user
-  // cannot tell them apart. TWO outcomes are observable here and the code
-  // claims only those: a REJECTED POST reports its own message, and a
-  // fulfilled registries response reporting per-source failures names them
-  // (the same branch RegistryManager runs on this response shape).
+  // cannot tell them apart. THREE outcomes are observable here and the code
+  // claims only those: a REJECTED POST reports its own message, a fulfilled
+  // registries response reporting per-source failures names them (the same
+  // branch RegistryManager runs on this response shape), and a refetched
+  // listing that says it is the offline fallback (`catalogUnavailable`).
   //
-  // A degraded OFFICIAL catalog is deliberately NOT claimed: the store POST
-  // only drops caches and never fetches (see handle_registry_refresh), so it
-  // resolves ok whatever the catalog's health, and the fetch it defers to
-  // serves the seed listing with a 200. Reporting that needs a signal on the
-  // follow-up GET, which is a server change and not this one.
+  // The official catalog is judged by that refetched listing, not by the store
+  // POST: the POST only drops caches and never fetches (see
+  // handle_registry_refresh), so it resolves ok whatever the catalog's health.
   //
   // Reporting never skips the invalidations below -- the healthy source still
   // gets its refetch.
@@ -241,8 +288,22 @@ function DiscoverPageBody() {
     // Clear only while the banner still shows what this handler put there.
     else setError(prev => (prev === previous ? '' : prev))
   }
+
+  // The sources the listing reports it could not read: the official catalog,
+  // when the shelf is the offline fallback, then the registries whose index
+  // fetch failed, whose apps are missing from the shelf or shown as last synced.
+  // Nothing else on the page says so. Shown whatever the banner above holds,
+  // because the banner speaks for one refresh and this notice for the listing on
+  // screen. A dismissal holds until the text changes, so a new failure or cause
+  // shows again.
+  const [dismissedFetchNotice, setDismissedFetchNotice] = useState('')
+  const fetchNotice = [
+    catalogUnavailable ? i18nT('pages.appsPage.store_catalog_unreachable') : '',
+    registryListingFailureMessage(registryFetchFailures ?? []),
+  ].filter(Boolean).join('\n')
+  const showFetchNotice = fetchNotice !== '' && fetchNotice !== dismissedFetchNotice
   const handleRefresh = async () => {
-    if (refreshing) return
+    if (refreshing || !connected) return
     setRefreshing(true)
     try {
       const [storeResult, registriesResult] = await Promise.allSettled([
@@ -252,19 +313,21 @@ function DiscoverPageBody() {
       const rejection = [storeResult, registriesResult].find(
         (r): r is PromiseRejectedResult => r.status === 'rejected',
       )
-      if (rejection) {
-        reportRefreshOutcome(rejection.reason instanceof Error && rejection.reason.message
-          ? rejection.reason.message
-          : i18nT('components.registryManager.failed_to_refresh_registries'))
-      } else {
-        reportRefreshOutcome(registriesResult.status === 'fulfilled'
-          ? registryRefreshFailureMessage(registriesResult.value)
-          : '')
-      }
+      const outcome = rejection
+        ? (rejection.reason instanceof Error && rejection.reason.message
+            ? rejection.reason.message
+            : i18nT('components.registryManager.failed_to_refresh_registries'))
+        : (registriesResult.status === 'fulfilled'
+            ? registryRefreshFailureMessage(registriesResult.value)
+            : '')
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['registry'] }),
         queryClient.invalidateQueries({ queryKey: ['apps'] }),
       ])
+      const offline = storeResult.status === 'fulfilled'
+        && queryClient.getQueryData<{ catalogUnavailable?: boolean }>(['registry'])?.catalogUnavailable
+      reportRefreshOutcome([outcome, offline ? i18nT('pages.appsPage.store_catalog_unreachable') : '']
+        .filter(Boolean).join(' '))
     } finally {
       setRefreshing(false)
     }
@@ -292,10 +355,24 @@ function DiscoverPageBody() {
   }, [browseApps, source, query])
 
   const filteredCategories = useMemo(() => {
-    const counts = new Map(categoryCounts(sourceBrowse).map(row => [row.category, row.count]))
-    // Keep zero-count categories visible so a selected category never vanishes.
-    return categories.map(row => ({ ...row, count: counts.get(row.category) || 0 }))
-  }, [categories, sourceBrowse])
+    // Git rows of the picked source (none when a store is picked) plus store rows.
+    const counted = [...sourceBrowse, ...storeRows.map(r => ({ tags: marketRowTags(r) }))]
+    const allCounts = categoryCounts(counted)
+    const counts = new Map(allCounts.map(row => [row.category, row.count]))
+    // Keep zero-count categories visible so a selected category never vanishes:
+    // the git categories, any category only store rows have, and the picked one.
+    const known = new Set(categories.map(row => row.category))
+    const extra = allCounts.filter(row => !known.has(row.category))
+    const picked = category !== 'all' && !known.has(category) && !extra.some(row => row.category === category)
+      ? [{ category, count: 0 }]
+      : []
+    return [...categories, ...extra, ...picked].map(row => ({ ...row, count: counts.get(row.category) || 0 }))
+  }, [categories, sourceBrowse, storeRows, category])
+  const storeInstalledCount = useMemo(
+    () => storeRows.filter(r => r.installed
+      && (category === 'all' || categoryFor(marketRowTags(r)) === category)).length,
+    [storeRows, category],
+  )
 
   /* The install-state facet narrows the registry shelf only: an installed
      app the catalog does not list is never added here (Library lists it). */
@@ -330,6 +407,7 @@ function DiscoverPageBody() {
   // `handleInstall` owns the consent modal.
 
   const enableApp = async (name: string) => {
+    if (!connected) return
     setActionLoading(`${name}:enable`)
     setError('')
     try {
@@ -377,8 +455,9 @@ function DiscoverPageBody() {
             // drops a keyboard user's focus to the page for the whole refresh.
             aria-label={refreshing ? i18nT('pages.appsPage.refreshing_store') : i18nT('pages.appsPage.refresh_store')}
             title={refreshing ? i18nT('pages.appsPage.refreshing_store') : i18nT('pages.appsPage.refresh_store')}
+            {...offlineProps(connected, offlineVerb, i18nT('pages.appsPage.refresh_store'))}
             onClick={handleRefresh}
-            aria-disabled={refreshing || undefined}
+            aria-disabled={refreshing || !connected || undefined}
             className="aria-disabled:opacity-30 aria-disabled:cursor-default"
           >
             <RefreshCw size={15} className={refreshing ? 'animate-spin' : undefined} />
@@ -439,14 +518,38 @@ function DiscoverPageBody() {
         </div>
         {/* Notifications. No hand-off on the error notice: the SourcesPopover's
             install-path input shares this page — navigating away would discard
-            what the user typed. */}
+            what the user typed. An Update All notice that sends apps to their
+            details (repository trust, chat-control consent) carries a button
+            per app to the detail page; a trust app's button reruns the update
+            there, which offers that trust. Only while that notice is the one
+            shown. */}
         {displayError && (
           <ErrorNotice
             message={displayError}
             onDismiss={dismissError}
             className="mb-4 animate-rise"
+            footer={handoffButtons(displayError)}
           />
         )}
+        {/* No hand-off: the SourcesPopover's install-path input shares this
+            page, and navigating away would discard what the user typed. */}
+        {showFetchNotice && (
+          <ErrorNotice
+            message={fetchNotice}
+            messageClassName="whitespace-pre-line"
+            onDismiss={() => setDismissedFetchNotice(fetchNotice)}
+            className="mb-4 animate-rise"
+            testId="registry-fetch-notice"
+          />
+        )}
+        <StatusNotice
+          message={updateNotice}
+          tone="warn"
+          onDismiss={() => setUpdateNotice('')}
+          className="mb-4 animate-rise"
+          testId="update-all-notice"
+          footer={handoffButtons(updateNotice)}
+        />
         {successMsg && (
           <div className="mb-4 bg-bg-elevated border rounded-lg p-3 flex items-center gap-3 animate-rise" style={{ borderColor: 'color-mix(in srgb, var(--ok) 45%, transparent)' }}>
             <span className="text-text text-sm flex-1">{successMsg}</span>
@@ -524,20 +627,24 @@ function DiscoverPageBody() {
               rows={updatables}
               updatingAll={updatingAll}
               updatePending={updatePending}
+              connected={connected}
               onUpdate={runUpdate}
               onUpdateAll={updateAll}
             />
           )
         }</TabsContent>
         <TabsContent value="featured">{
-          loading ? (
-          <div className="text-center py-12 text-muted text-sm">{i18nT('pages.appsPage.loading_apps')}</div>
-        ) : browseApps.length === 0 ? (
-          <EmptyState
+          /* An added store keeps the rail and its own sections up whatever
+             the git catalog did: a failed or empty catalog read must not hide
+             a store that loaded. */
+          loading && marketSources.length === 0 ? (
+          <>{storeReadNotice}<div className="text-center py-12 text-muted text-sm">{i18nT('pages.appsPage.loading_apps')}</div></>
+        ) : browseApps.length === 0 && marketSources.length === 0 ? (
+          <>{storeReadNotice}<EmptyState
             icon={<ShoppingBag size={36} />}
             title={i18nT('pages.appsPage.no_apps_available')}
             subtitle={i18nT('pages.appsPage.add_an_app_source_gear_icon_above_or_install_fro')}
-          />
+          /></>
         ) : (
           <>
             {/* One render path, whatever fed it. `featuredSections` already
@@ -611,6 +718,7 @@ function DiscoverPageBody() {
                     busyName={
                       featuredBusyName(actionLoading, section.apps)
                     }
+                    connected={connected}
                     onGet={name => getApp(name)}
                     onEnable={name => enableApp(name)}
                     onOpenApp={(name, e) => openDetail(name, e)}
@@ -624,26 +732,30 @@ function DiscoverPageBody() {
 
             <div className="flex items-baseline justify-between mt-2 mb-3">
               <h3 className="text-[17px] font-semibold text-text-strong">
-                {category === 'all' ? i18nT('pages.appsPage.all_apps') : category}
+                {category === 'all' ? i18nT('pages.appsPage.all_apps') : categoryLabel(category)}
               </h3>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-[224px_minmax(0,1fr)] gap-6 items-start">
               <div className="md:sticky md:top-2">
                 <CategoryRail
                   categories={filteredCategories}
-                  total={sourceBrowse.length}
+                  total={sourceBrowse.length + storeRows.length}
                   selected={category}
                   onSelect={setCategory}
                   installedOnly={installedOnly}
-                  installedCount={installedBrowse.length}
+                  installedCount={installedBrowse.length + storeInstalledCount}
                   onSelectInstalledOnly={setInstalledOnly}
-                  sources={sources}
+                  sources={railSources}
                   selectedSource={source}
                   onSelectSource={setSource}
                   onAddSource={() => setSourcesOpen(true)}
                 />
               </div>
               <div className="min-w-0">
+                {/* Kiro Space stores: their own blocks, keyed by store and ref.
+                    Shown for All sources or their own source; a git source hides them. */}
+                <MarketStoreSections query={query} source={source} category={category} installedOnly={installedOnly} />
+                {!marketSelected && (<>
                 <div className="flex items-center justify-between mb-3 text-[12.5px] text-muted">
                   <span role="status" aria-live="polite">{i18nT('pages.appsPage.app', { count: filteredBrowse.length })}</span>
                   {/* A `<label>` cannot wrap this any more: `SimpleSelect`
@@ -662,7 +774,9 @@ function DiscoverPageBody() {
                     />
                   </span>
                 </div>
-                {filteredBrowse.length === 0 ? (
+                {loading ? (
+                  <div className="text-center py-12 text-muted text-sm">{i18nT('pages.appsPage.loading_apps')}</div>
+                ) : filteredBrowse.length === 0 ? (
                   <EmptyState icon={<ShoppingBag size={32} />} title={i18nT('pages.appsPage.no_matching_apps')} subtitle={source !== null ? i18nT('appStoreSources.empty') : i18nT('pages.appsPage.try_a_different_search_or_category')} />
                 ) : (
                   /* Two rows to a line on a desktop dashboard. A row is a
@@ -694,6 +808,7 @@ function DiscoverPageBody() {
                         /* Update All lives on the Library page, so the old
                            `|| !!updatingAll` freeze no longer applies here. */
                         busy={actionLoading === `${app.name}:enable`}
+                        connected={connected}
                         onOpen={e => openDetail(app.name, e)}
                         onGet={() => getApp(app.name)}
                         onUpdate={() => updateApp(app.name)}
@@ -703,6 +818,7 @@ function DiscoverPageBody() {
                   ))}
                   </div>
                 )}
+                </>)}
               </div>
             </div>
           </>

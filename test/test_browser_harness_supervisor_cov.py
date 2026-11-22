@@ -26,7 +26,7 @@ from tmpdir_helpers import SHORT_TMP_PREFIX, short_tmp_base
 
 from kiro_crew.browser_harness import HARNESS_VERSION, chromium, credentials, discover, supervisor
 from kiro_crew.browser_harness.supervisor import HarnessSupervisor
-from kiro_crew.testing.wait import await_until
+from kiro_crew.testing.wait import await_until, finished
 
 POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="pipe fds and AF_UNIX are POSIX")
 
@@ -221,6 +221,61 @@ def test_a_broken_provider_seam_reads_as_no_provider_but_a_composition_error_rai
     sup = HarnessSupervisor(tmp_path, config_reader=lambda: {}, credential_provider=fail_closed)
     with pytest.raises(PlatformCompositionError):
         sup._provider()
+
+
+# ── status ──
+
+
+@pytest.mark.asyncio
+async def test_status_reads_current_choice_after_a_failed_chromium_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = {"choice": "headless"}
+    sup = HarnessSupervisor(tmp_path, config_reader=lambda: cfg, credential_provider=lambda: None)
+    monkeypatch.setattr(
+        supervisor.install, "install_state", lambda home: _installed(home, python=Path("py"))
+    )
+    monkeypatch.setattr(sup, "runtime_dir", lambda: tmp_path / "run")
+    monkeypatch.setattr(supervisor, "CdpRelay", _Relay)
+    facts = discover.HostFacts(chrome=tmp_path / "chrome", chrome_profile=tmp_path / "profile")
+    monkeypatch.setattr(discover, "probe_host", lambda platform: facts)
+    with pytest.raises(supervisor.BrowserUnavailable, match="not downloaded"):
+        await sup.ensure_in_background()
+    assert not sup.holds_browser
+    assert sup.status()["browser"] == {"kind": "kiro_chromium", "headless": True}
+
+    cfg["choice"] = "user_chrome"
+    status = sup.status()
+    assert status["browser"] == {"kind": "user_chrome", "headless": False}
+    assert status["installed"] is True and status["chromium"]["present"] is False
+    assert status["connection"] == supervisor.ERROR and "not downloaded" in status["detail"]
+
+
+@pytest.mark.parametrize("lifecycle", ["connected", "dead_daemon", "starting"])
+@pytest.mark.asyncio
+async def test_status_keeps_the_held_browser_choice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lifecycle: str
+) -> None:
+    sup = HarnessSupervisor(
+        tmp_path, config_reader=lambda: {"choice": "headless"}, credential_provider=lambda: None
+    )
+    monkeypatch.setattr(discover, "probe_host", lambda platform: discover.HostFacts())
+    sup._choice = discover.BrowserChoice("user_chrome", None, False, None)
+    task = None
+    if lifecycle == "starting":
+        task = asyncio.create_task(asyncio.Event().wait())
+        monkeypatch.setattr(sup, "_ensure_task", task)
+    else:
+        sup._handle = _handle(daemon=_Proc(None if lifecycle == "connected" else 1))
+        sup._handle.choice = sup._choice
+    try:
+        assert sup.holds_browser
+        assert sup.status()["browser"] == {"kind": "user_chrome", "headless": False}
+    finally:
+        if task is not None:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
 
 
 # ── ensure / stop / test ──
@@ -490,6 +545,104 @@ async def test_teardown_survives_a_failed_tab_close_and_stops_every_child(
 
 
 @pytest.mark.asyncio
+async def test_a_stop_cut_mid_teardown_leaves_the_rest_to_the_next_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sup = HarnessSupervisor(tmp_path, config_reader=lambda: {})
+
+    async def _no_ipc() -> None:
+        return None
+
+    sup._ipc_shutdown = _no_ipc  # type: ignore[method-assign]
+    worker, daemon, browser = _Proc(), _Proc(), _Proc()
+    relay = _Relay()
+    sup._handle = _handle(relay=relay, daemon=daemon, worker=worker, browser=browser)
+    in_worker_stop = asyncio.Event()
+    cut_once = [True]
+
+    async def _stop(proc: Any) -> None:
+        if proc is None or proc.returncode is not None:
+            return
+        if proc is worker and cut_once[0]:
+            cut_once[0] = False
+            in_worker_stop.set()
+            await asyncio.Event().wait()  # held until the cancel below
+        proc.returncode = 0
+
+    monkeypatch.setattr(supervisor, "_stop_process", _stop)
+    first = asyncio.ensure_future(sup.stop())
+    await await_until(in_worker_stop, what="the worker stop starting")
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert daemon.returncode is None and browser.returncode is None
+    # Kept for the next stop, never reused as the live handle.
+    assert sup._cut_handle is not None and sup._handle is None
+    assert not sup.connected and sup.holds_browser
+
+    await finished(sup.stop(), "the repeat stop")
+    assert (worker.returncode, daemon.returncode, browser.returncode) == (0, 0, 0)
+    assert relay.closed and sup._handle is None and sup._cut_handle is None
+
+
+class _StalledTabsRelay(_Relay):
+    """A relay whose CDP connection stays open but never answers a tab close."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tab_closes = 0
+        self.in_tab_close = asyncio.Event()
+
+    async def close_agent_targets(self) -> None:
+        self.tab_closes += 1
+        self.in_tab_close.set()
+        await asyncio.Event().wait()  # held until a bound or a cancel ends it
+
+
+@pytest.mark.asyncio
+async def test_a_stop_cut_in_a_stalled_tab_close_skips_it_on_the_next_stop(
+    tmp_path: Path, stopped: list[Any]
+) -> None:
+    sup = HarnessSupervisor(tmp_path, config_reader=lambda: {})
+
+    async def _no_ipc() -> None:
+        return None
+
+    sup._ipc_shutdown = _no_ipc  # type: ignore[method-assign]
+    worker, daemon, browser = _Proc(), _Proc(), _Proc()
+    relay = _StalledTabsRelay()
+    sup._handle = _handle(relay=relay, daemon=daemon, worker=worker, browser=browser)
+    first = asyncio.ensure_future(sup.stop())
+    await await_until(relay.in_tab_close, what="the tab close starting")
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert stopped == []
+
+    await finished(sup.stop(), "the repeat stop")
+    assert relay.tab_closes == 1, "the repeat stop waited on the stalled tab close again"
+    assert stopped == [worker, daemon, browser] and relay.closed
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_tab_close_is_bounded_and_the_children_are_still_stopped(
+    tmp_path: Path, stopped: list[Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(supervisor, "_TAB_CLOSE_SECS", 0)
+    sup = HarnessSupervisor(tmp_path, config_reader=lambda: {})
+
+    async def _no_ipc() -> None:
+        return None
+
+    sup._ipc_shutdown = _no_ipc  # type: ignore[method-assign]
+    worker, daemon, browser = _Proc(), _Proc(), _Proc()
+    relay = _StalledTabsRelay()
+    sup._handle = _handle(relay=relay, daemon=daemon, worker=worker, browser=browser)
+    await finished(sup.stop(), "a stop whose tab close stalls")
+    assert stopped == [worker, daemon, browser] and relay.closed
+
+
+@pytest.mark.asyncio
 async def test_an_upstream_close_disconnects_only_a_connected_supervisor(tmp_path: Path) -> None:
     sup = HarnessSupervisor(tmp_path, config_reader=lambda: {})
     sup._set(supervisor.CONNECTED, "")
@@ -636,9 +789,10 @@ async def test_the_port_launcher_clears_a_stale_port_file_and_reads_the_new_one(
 
 
 @pytest.mark.asyncio
-async def test_the_port_launcher_gives_up_when_chromium_exits_first(
+async def test_the_port_launcher_reports_the_exit_code_when_chromium_exits_first(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stopped: list[Any]
 ) -> None:
+    """A browser that died is told apart from one that is only slow to open its port."""
     sup = HarnessSupervisor(tmp_path, base_env={})
     exited = _Proc(returncode=21)
 
@@ -650,8 +804,9 @@ async def test_the_port_launcher_gives_up_when_chromium_exits_first(
 
     sup._spawn = _spawn  # type: ignore[method-assign]
     monkeypatch.setattr(supervisor, "_devtools_ws_url", _no_url)
-    with pytest.raises(supervisor.BrowserUnavailable, match="did not open its debugging port"):
+    with pytest.raises(supervisor.BrowserUnavailable) as raised:
         await sup._launch_chromium_port(["chromium"], tmp_path)
+    assert str(raised.value) == "Kiro's Chromium exited with code 21"
     assert stopped == [exited]
 
 

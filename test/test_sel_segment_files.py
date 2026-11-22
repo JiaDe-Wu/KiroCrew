@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import os
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,7 @@ from sel_helpers import (  # noqa: F401 -- fixtures are requested by name
 )
 
 import kiro_crew.sel as sel_mod
+from conftest import requires_symlinks
 from kiro_crew import platform_compat
 from kiro_crew.sel import SecurityEventLog
 
@@ -597,12 +599,16 @@ class TestSegmentDirIsNotFollowedThroughALink:
         assert log._segments_oldest_first(), "precondition: rotation happened"
         assert list(outside.iterdir()) == [], "audit segments landed outside the fence"
 
-    def test_an_unremovable_link_refuses_to_rotate(self, sel_dir, small_segments):
+    def test_an_unremovable_link_refuses_to_rotate(self, sel_dir, small_segments, caplog):
         """Refusing beats writing audit records outside the fence.
 
         The log keeps growing, which is the failure this release bounds — but an
         oversized log inside the fence beats a bounded one outside it.
         """
+        # Each refused rotation logs a warning with a traceback, about 36 MiB over
+        # this test, and pytest keeps captured logs for the whole session. No
+        # assertion reads them.
+        caplog.set_level(logging.ERROR, logger="kiro_crew.sel")
         log = SecurityEventLog(base_dir=sel_dir, sync=True)
         _fill(log, 200)
         # Answer "link" only for rotation's paths (the segment dir and its
@@ -685,7 +691,7 @@ class TestSegmentOpensValidateTheDescriptor:
     displacement test locks that invariant.
     """
 
-    @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+    @requires_symlinks
     def test_a_symlink_is_refused_by_both_consumers(self, sel_dir, small_segments):
         """O_NOFOLLOW (and the lstat identity check where it is absent) is what
         catches this: a followed link to a regular file yields a perfectly
@@ -710,7 +716,6 @@ class TestSegmentOpensValidateTheDescriptor:
         # The link's target survives: the entry is ignored, never chased.
         assert secret.exists()
 
-    @pytest.mark.skipif(os.name == "nt", reason="POSIX hardlink semantics")
     def test_an_alias_plant_cannot_displace_newer_history(self, sel_dir, small_segments):
         """A LOWER-sequence hardlink of the newest segment must not displace
         the real name from the read order. Aliases are deliberately NOT
@@ -743,7 +748,6 @@ class TestSegmentOpensValidateTheDescriptor:
         total, valid = log.verify_integrity()
         assert total == valid, "alias duplication broke signature validity"
 
-    @pytest.mark.skipif(os.name == "nt", reason="POSIX hardlink semantics")
     def test_a_backup_hardlink_does_not_suppress_audit_history(self, sel_dir, small_segments):
         """Backup tools (rsync --link-dest, cp -al, rsnapshot) hardlink audit
         files from OUTSIDE the segment dir. A link count above one must not
@@ -779,7 +783,7 @@ class TestSegmentOpensValidateTheDescriptor:
         total, valid = log.verify_integrity()
         assert total == valid
 
-    @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+    @requires_symlinks
     def test_a_symlinked_live_log_stays_readable(self, sel_dir, small_segments):
         """An operator may relocate the live log via symlink. The WRITER
         follows it (O_CREAT | O_APPEND open), so the readers must too — a

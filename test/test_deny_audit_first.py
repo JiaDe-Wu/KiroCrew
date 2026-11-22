@@ -62,6 +62,8 @@ class _Slot:
 class _Event:
     request_id = "req-1"
     tool_call_id = "call-1"
+    tool_purpose = ""
+    tool_input = ""
     title = "bash"
     tool_kind = "execute"
 
@@ -414,5 +416,5 @@ class TestEveryDenySiteAuditsBeforeTheWire:
         assert not unaudited, (
             "these deny sites answer the wire before their SEL audit write -- a "
             "stalled reader cancels the coroutine and the decision is never "
-            f"audited (issue #8621 invariant): lines {unaudited}"
+            f"audited: lines {unaudited}"
         )

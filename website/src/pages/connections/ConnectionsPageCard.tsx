@@ -13,11 +13,17 @@
  */
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
 import { OverlayPortal } from '../../components/overlayRoot'
-import { useTranslation } from 'react-i18next'
+import { useCopyAck } from '../../components/FilePathMenu'
+import { copyToClipboard } from '../../utils/clipboard'
+import { docSectionHref } from '../../utils/docsLink'
+import { Trans, useTranslation } from 'react-i18next'
+import { motion, useReducedMotion } from 'framer-motion'
 import {
   AlertTriangle,
+  Check,
   CheckCircle2,
   CircleDashed,
+  Copy,
   ExternalLink,
   KeyRound,
   Link2,
@@ -25,23 +31,29 @@ import {
   Lock,
   RotateCw,
   Settings2,
+  ChevronDown,
   Unplug,
   X,
 } from 'lucide-react'
-import { Link } from 'react-router-dom'
-import { settingsPath } from '../../components/settingsPath'
-import { connectionsOAuthClientEntryId } from '../../components/commandPalette/settingsManual'
 import type { McpServer } from '../../types'
-import { fmtDate } from '../../i18n/format'
+import type { ConnectionStatus } from '../../api/client/connections'
+import { fmtDate, fmtList, joinSentences } from '../../i18n/format'
 import { Btn } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
 import ProviderLogo, { PROVIDER_LOGO_SLUGS } from './ProviderLogo'
 import type { ConnectionProvider } from './registry'
+import { isGoogleSlug, MCP_SERVERS_HREF } from './connectionsLinks'
+import { Link } from 'react-router-dom'
+import { settingsPath } from '../../components/settingsPath'
+
+/** The Settings entry of the preview that turns on Crew's own sign-in
+ *  (its id in `settingsRegistry.gen.ts`). */
+const CREW_SIGN_IN_SETTING_ID = 'developer.mcp-sign-in-by-kiro-crew'
 // The loopback pre-check lives in `utils/loopbackReturnAddress` (shared with
 // the chat banner's relay affordance).
 import { isValidLoopbackReturnAddress, normalizeLoopbackReturnAddress } from '../../utils/loopbackReturnAddress'
 import { isElectron } from '../../lib/electron'
-import { useImeGuard } from '../../hooks/useImeGuard'
+import { useDocumentImeLatch, useImeGuard } from '../../hooks/useImeGuard'
 import {
   errorIndicatesProviderRejection,
   type ConnectionAction,
@@ -82,6 +94,9 @@ interface ConnectionCardProps {
    *  `state`, because two substates share `not-verified`: a confirmed absence
    *  can name itself, while an unknowable one must keep the honest hedge. */
   grantPresent?: boolean
+  /** True when a Connect on this page ended `mint_grant_unproven`: grant files
+   *  are on disk but failed the check, so the card states that fact. */
+  grantUnproven?: boolean
   /** Other configured MCP entries backed by the SAME OAuth grant as this
    *  provider, from /api/connections/status. Non-empty only when the grant is
    *  present AND shared. Drives a proactive note so a user learns the connection
@@ -96,9 +111,23 @@ interface ConnectionCardProps {
    *  on the connected row; it never removes an action, because the sign-in runs
    *  on Kiro CLI and its grant is real for Kiro CLI chats. */
   backendLacksOauth?: boolean
+  /** The `needs-configuration` card is waiting for Crew's own sign-in, not for an
+   *  OAuth app: its instruction and its link point at that setting. */
+  needsCrewSignIn?: boolean
+  /** The `needs-configuration` card whose configured entry Crew's sign-in does not
+   *  serve: no Connect, no OAuth app step and no step to turn that sign-in on. */
+  crewSignInNotOwned?: boolean
+  /** The mint refuses this card's sign-in, grant or not (the status row's
+   *  `crewMintRefused`): no Connect or Reconnect, the setup line in their place. */
+  crewMintRefused?: ConnectionStatus['crewMintRefused']
   /** True on a connected row while chats run on KAS: a KAS chat signs in once
    *  when the user names the server, so the row says which word to type. */
   signInInChat?: boolean
+  /** Crew holds this sign-in: Test, which runs on Kiro CLI's grant, is not offered. */
+  crewHeld?: boolean
+  /** Where this card's sign-in returns, from the status row; shown beside the
+   *  consent actions so the user can hand it to an org admin. */
+  signInRedirect?: ConnectionStatus['signInRedirect']
   busy?: ConnectionAction
   /** The provider NAME (not slug) of whichever card currently owns the single
    *  in-flight Connections Test, or undefined when none is running. Used only
@@ -108,6 +137,16 @@ interface ConnectionCardProps {
   testingProvider?: string
   feedbackSlots: ReadonlyArray<{ slug: string; value: Feedback }>
   highlighted: boolean
+  /** Clicking the card's name opens its configuration in place: the actions
+   *  and, for a pre-registered provider, `oauthPanel`. Undefined renders the
+   *  card always open, for a product row inside the Google entry. */
+  expand?: { expanded: boolean; onToggle: () => void; panelId: string }
+  oauthPanel?: ReactNode
+  /** Out of the current search: hidden, not unmounted, so drafts survive. */
+  hidden?: boolean
+  /** False while any OAuth app form on the page holds unsaved input: the
+   *  error notice then offers no chat hand-off, which would navigate away. */
+  handOffAllowed?: boolean
   onConnect: () => Promise<unknown>
   onCancel: () => Promise<unknown>
   onDisconnect: () => Promise<unknown>
@@ -145,6 +184,7 @@ const PREREQUISITE_KEYS = {
   'google-sheets': 'pages.connectionsPage.prerequisite_google_sheets',
   'google-docs': 'pages.connectionsPage.prerequisite_google_docs',
   'google-slides': 'pages.connectionsPage.prerequisite_google_slides',
+  slack: 'pages.connectionsPage.prerequisite_slack',
 } as const
 
 /**
@@ -163,14 +203,35 @@ const PREREQUISITE_KEYS = {
  * needs attention) or carry a form (the remote return-address relay) -- copy
  * about what an action will do or needs is neither, and goes here.
  */
-function PrerequisiteTip({ label, heading, text }: { label: string; heading: string; text: string }) {
+function PrerequisiteTip({ label, heading, text, redirect, link }: {
+  label: string
+  heading: string
+  /** A plain string, or a `Trans` when a step links somewhere. */
+  text: ReactNode
+  /** Where this card's sign-in returns, each value with its own copy control, so
+   *  an org admin can be handed the whole address (`signInRedirect` on the
+   *  status row). */
+  redirect?: { caption: string; values: string[] }
+  /** A docs page the caveat points at, opened in a new tab. */
+  link?: { href: string; label: string }
+}) {
   const [pinned, setPinned] = useState(false)
   const [hovered, setHovered] = useState(false)
   const btnRef = useRef<HTMLButtonElement>(null)
   const tipRef = useRef<HTMLDivElement>(null)
   const hoverOff = useRef<number | undefined>(undefined)
+  // Set while focus leaves the bubble back to the icon, so that one focus does
+  // not reopen it and the next Tab moves on past the icon.
+  const leaving = useRef(false)
   const tipId = useId()
+  const headingId = useId()
   const open = pinned || hovered
+  // A bubble with a link or a copy control is something to operate, not just
+  // read, so it is a non-modal dialog the icon's Tab moves into.
+  const interactive = !!(link || redirect)
+  // IMEs cycle candidates with Tab, so a Tab the bubble re-aims is claimed
+  // first: one the IME owns keeps its composition (see useDocumentImeLatch).
+  const tipImeLatch = useDocumentImeLatch(open && interactive)
 
   // WCAG 1.4.13 hoverable: the pointer must be able to travel from the icon
   // into the bubble, so hover-off waits a short grace instead of dismissing
@@ -184,6 +245,15 @@ function PrerequisiteTip({ label, heading, text }: { label: string; heading: str
     hoverOff.current = window.setTimeout(() => setHovered(false), 120)
   }
   useEffect(() => () => window.clearTimeout(hoverOff.current), [])
+
+  const focusables = () =>
+    Array.from(tipRef.current?.querySelectorAll<HTMLElement>('a[href], button') ?? [])
+  const backToIcon = () => {
+    leaving.current = true
+    setPinned(false)
+    setHovered(false)
+    btnRef.current?.focus()
+  }
 
   useEffect(() => {
     // Gated on `open`, not `pinned`: a tip opened by keyboard focus alone must
@@ -201,15 +271,17 @@ function PrerequisiteTip({ label, heading, text }: { label: string; heading: str
       setHovered(false)
     }
     const onKey = (e: globalThis.KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setPinned(false)
-        setHovered(false)
-      }
+      if (e.key !== 'Escape') return
+      if (tipRef.current?.contains(document.activeElement)) backToIcon()
+      setPinned(false)
+      setHovered(false)
     }
     // The bubble is position:fixed and computed once, so scrolling the gallery
     // would detach it from its icon — dismiss instead (capture phase, so any
-    // scrolling ancestor counts, not just the window).
-    const onScroll = () => {
+    // scrolling ancestor counts, not just the window). Scrolling the bubble's
+    // own capped content is not a gallery scroll.
+    const onScroll = (e: Event) => {
+      if (tipRef.current?.contains(e.target as Node)) return
       setPinned(false)
       setHovered(false)
     }
@@ -225,15 +297,21 @@ function PrerequisiteTip({ label, heading, text }: { label: string; heading: str
 
   // Bottom-anchored above the icon so bubble height never matters; clamped to
   // the viewport the same way InfoTip clamps, falling below only when the icon
-  // sits within bubble reach of the top edge.
+  // sits within bubble reach of the top edge. A bubble with controls is capped
+  // to the room on the chosen side and scrolls inside that cap, so it never runs
+  // off the screen; Tab into it moves focus, and so the scroll, to each control.
+  // A text-only bubble has no focus stop to scroll with, so it stays uncapped.
   const pos = () => {
     if (!btnRef.current) return { top: 0, left: 0 }
     const r = btnRef.current.getBoundingClientRect()
     const tipW = 300
     let left = r.left + r.width / 2 - tipW / 2
     left = Math.max(8, Math.min(left, window.innerWidth - tipW - 8))
-    if (r.top > 132) return { bottom: window.innerHeight - r.top + 6, left }
-    return { top: r.bottom + 6, left }
+    const above = r.top > 132
+    const room = above ? r.top - 14 : window.innerHeight - r.bottom - 14
+    const cap = interactive ? { maxHeight: room } : {}
+    if (above) return { bottom: window.innerHeight - r.top + 6, left, ...cap }
+    return { top: r.bottom + 6, left, ...cap }
   }
 
   return (
@@ -244,33 +322,178 @@ function PrerequisiteTip({ label, heading, text }: { label: string; heading: str
         aria-label={label}
         aria-expanded={open}
         aria-describedby={open ? tipId : undefined}
+        aria-controls={open && interactive ? tipId : undefined}
         onClick={e => { e.stopPropagation(); setPinned(p => !p) }}
+        onKeyDown={e => {
+          // The bubble renders in a portal at the end of the document, so Tab
+          // would skip it: carry focus into its first control instead.
+          if (e.key !== 'Tab' || e.shiftKey || !open) return
+          const first = focusables()[0]
+          if (!first) return
+          if (!tipImeLatch.claimSyntheticKey(e)) return
+          e.preventDefault()
+          setPinned(true)
+          first.focus()
+        }}
         onMouseEnter={holdHover}
         onMouseLeave={releaseHover}
-        onFocus={holdHover}
+        onFocus={() => { if (leaving.current) leaving.current = false; else holdHover() }}
         onBlur={releaseHover}
         className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-warn transition-colors hover:text-warn-text hover:bg-warn-subtle"
       >
         <AlertTriangle className="h-4 w-4" aria-hidden="true" />
       </button>
       {open && <OverlayPortal>{
-        /* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- the mouse listeners implement WCAG 1.4.13 "hoverable" (pointer may cross into the tooltip without it dismissing); keyboard users have their own complete path on the button (focus opens, Escape dismisses), so there is no keyboard operation to mirror here */
+        /* eslint-disable-next-line jsx-a11y/no-static-element-interactions -- the role is set per render (dialog or tooltip), which the rule cannot read; the mouse listeners implement WCAG 1.4.13 "hoverable" (pointer may cross into the tooltip without it dismissing); the keyboard path is the icon's Tab into the bubble and Tab / Shift+Tab / Escape back out */
         <div
           ref={tipRef}
           id={tipId}
-          role="tooltip"
+          role={interactive ? 'dialog' : 'tooltip'}
+          aria-labelledby={interactive ? headingId : undefined}
           onMouseEnter={holdHover}
           onMouseLeave={releaseHover}
-          className="fixed z-[9999] max-w-[300px] whitespace-normal rounded-lg border border-warn/30 p-2.5 text-[12px] leading-relaxed text-text"
+          // Focus inside the bubble (a click on a copy button, or Tab) pins it,
+          // so the pointer leaving does not unmount the control that holds focus.
+          onFocus={() => setPinned(true)}
+          onKeyDown={e => {
+            if (e.key !== 'Tab') return
+            const items = focusables()
+            const at = items.indexOf(document.activeElement as HTMLElement)
+            // Out past either end goes back to the icon, closing the bubble.
+            if ((e.shiftKey && at === 0) || (!e.shiftKey && at === items.length - 1)) {
+              if (!tipImeLatch.claimSyntheticKey(e)) return
+              e.preventDefault()
+              backToIcon()
+            }
+          }}
+          className={`fixed z-[9999] max-w-[300px] ${interactive ? 'overflow-y-auto' : ''} whitespace-normal rounded-lg border border-warn/30 p-2.5 text-[12px] leading-relaxed text-text`}
           style={{ ...pos(), backgroundColor: 'var(--card)', boxShadow: 'var(--shadow-lg)' }}
         >
-          <span className="block font-medium text-text-strong">{heading}</span>
-          <span className="mt-0.5 block">{text}</span>
+          <span id={headingId} className="block font-medium text-text-strong">{heading}</span>
+          {text && <span className="mt-0.5 block">{text}</span>}
+          {redirect && (
+            <>
+              <span className="mt-1.5 block text-muted">{redirect.caption}</span>
+              {redirect.values.map(value => <RedirectValue key={value} value={value} />)}
+            </>
+          )}
+          {link && (
+            <a href={link.href} target="_blank" rel="noopener noreferrer" className="mt-1.5 inline-flex items-center gap-1 font-medium text-accent hover:text-accent-hover">
+              {link.label} <ExternalLink className="lucide-inline" aria-hidden="true" />
+            </a>
+          )}
         </div>
       }</OverlayPortal>}
     </>
   )
 }
+
+/** One redirect address with a button that copies exactly that value. The
+ *  confirmation is a text swap with no animation, so it reads the same with
+ *  reduced motion, and it is announced through a polite live region. A copy the
+ *  browser refuses says so and asks the user to select the text instead; it
+ *  offers no agent hand-off, which would navigate to chat and drop a return
+ *  address typed on a waiting card. */
+function RedirectValue({ value }: { value: string }) {
+  const { t } = useTranslation()
+  // A refusal stays on screen until a later copy succeeds or the user dismisses
+  // it, not only for the acknowledgment's moment. It is set from each attempt's
+  // own result, so a repeated failure shows again after a dismiss.
+  const [failed, setFailed] = useState(false)
+  const copyRef = useRef<HTMLButtonElement>(null)
+  // The shared acknowledgment: `copied` / `failed`, reset after a moment.
+  const { copyStatus, copyPath } = useCopyAck(value, async () => {
+    const ok = await copyToClipboard(value)
+    setFailed(!ok)
+    return ok
+  })
+  const copied = copyStatus === 'copied'
+  return (
+    <>
+      <span className="mt-0.5 flex items-start gap-1.5">
+        <code className="min-w-0 flex-1 select-all break-all font-mono text-[11px] text-text-strong">{value}</code>
+        <button
+          ref={copyRef}
+          type="button"
+          onClick={() => void copyPath()}
+          aria-label={t('pages.connectionsPage.copy_redirect_address', { address: value })}
+          className="inline-flex shrink-0 items-center gap-1 rounded px-1 py-0.5 text-[11px] text-text hover:bg-bg-hover hover:text-text-strong"
+        >
+          {copied ? <Check className="h-3.5 w-3.5 text-ok" aria-hidden="true" /> : <Copy className="h-3.5 w-3.5" aria-hidden="true" />}
+          <span aria-live="polite">{copied ? t('pages.connectionsPage.redirect_address_copied') : ''}</span>
+        </button>
+      </span>
+      {failed && (
+        <ErrorNotice
+          variant="inline"
+          message={t('pages.connectionsPage.redirect_address_copy_failed')}
+          askAgent={false}
+          // Focus goes back to this address's copy button, not the page body,
+          // so the bubble keeps its keyboard path (Tab, Escape) after dismissal.
+          onDismiss={() => { copyRef.current?.focus(); setFailed(false) }}
+          className="mt-0.5"
+        />
+      )}
+    </>
+  )
+}
+
+/** A card's status label, also shown on the closed Google entry. */
+function ConnectionStateBadge({ state, managedInMcpServers = false }: { state: ConnectionCardState; managedInMcpServers?: boolean }) {
+  const { t } = useTranslation()
+  const stateMeta: Record<ConnectionCardState, { label: string; icon: ReactNode; tone: string }> = {
+    'not-connected': {
+      label: t('pages.connectionsPage.not_connected'),
+      icon: <Link2 className="w-3.5 h-3.5" aria-hidden="true" />,
+      tone: 'bg-bg-hover text-muted',
+    },
+    'waiting-for-approval': {
+      label: t('pages.connectionsPage.waiting_for_approval'),
+      icon: <CircleDashed className="w-3.5 h-3.5 animate-spin motion-reduce:animate-none" aria-hidden="true" />,
+      tone: 'bg-warn-subtle text-warn-text',
+    },
+    connected: {
+      label: t('pages.connectionsPage.connected'),
+      icon: <CheckCircle2 className="w-3.5 h-3.5" aria-hidden="true" />,
+      tone: 'bg-ok-subtle text-ok-text',
+    },
+    // Warn tone, not the error tone: an unverifiable state is not a failure. The
+    // icon is static on purpose — a spinner would claim a grant is in flight
+    // when nothing is pending.
+    'not-verified': {
+      label: t('pages.connectionsPage.not_verified'),
+      icon: <KeyRound className="w-3.5 h-3.5" aria-hidden="true" />,
+      tone: 'bg-warn-subtle text-warn-text',
+    },
+    'needs-attention': {
+      label: t('pages.connectionsPage.needs_attention'),
+      icon: <AlertTriangle className="w-3.5 h-3.5" aria-hidden="true" />,
+      tone: 'bg-danger-subtle text-danger-text',
+    },
+    // Muted, not warn: nothing is wrong with the provider, a step is missing on
+    // OUR side. The lock says "this needs a key" without alarming a user who
+    // cannot act on it (only the owner can configure).
+    'needs-configuration': {
+      label: t('pages.connectionsPage.needs_configuration'),
+      icon: <Lock className="w-3.5 h-3.5" aria-hidden="true" />,
+      tone: 'bg-bg-hover text-muted',
+    },
+  }
+  // An entry Crew's sign-in does not own has nothing left to configure here, so
+  // it keeps the muted tone but says where the entry is managed instead.
+  const meta = managedInMcpServers && state === 'needs-configuration'
+    ? { ...stateMeta[state], label: t('pages.connectionsPage.managed_in_mcp_servers'), icon: <Settings2 className="w-3.5 h-3.5" aria-hidden="true" /> }
+    : stateMeta[state]
+  return (
+    <span className={`inline-flex shrink-0 items-center gap-1 text-[11px] font-medium ${meta.tone}`}>
+      {meta.icon}
+      {meta.label}
+    </span>
+  )
+}
+
+/** The card slides to where the grid puts it once it opens or closes. */
+export const CARD_LAYOUT_TRANSITION = { duration: 0.2, ease: 'easeOut' } as const
 
 function ConnectionCard({
   provider,
@@ -279,14 +502,24 @@ function ConnectionCard({
   oauth,
   connectedSince,
   grantPresent,
+  grantUnproven = false,
   grantSharedWith,
   grantSharedUnconfirmed,
   backendLacksOauth = false,
+  needsCrewSignIn = false,
+  crewSignInNotOwned = false,
+  crewMintRefused,
   signInInChat = false,
+  crewHeld = false,
+  signInRedirect,
   busy,
   testingProvider,
   feedbackSlots,
   highlighted,
+  expand,
+  oauthPanel,
+  hidden = false,
+  handOffAllowed = true,
   onConnect,
   onCancel,
   onDisconnect,
@@ -299,6 +532,37 @@ function ConnectionCard({
   const [returnAddress, setReturnAddress] = useState('')
   const [invalidReturnAddress, setInvalidReturnAddress] = useState(false)
   const approvalUrl = safeApprovalUrl(oauth?.oauthUrl || '')
+
+  // Focus handoff across the one state change a press on THIS card causes that
+  // unmounts its own button: Connect/Reconnect start the mint, which moves the
+  // card to `waiting-for-approval` immediately, so the pressed button vanishes
+  // and the browser drops focus to the page body, stranding a keyboard user
+  // mid-task. `pendingWaitingFocusRef` records that a press asked for the move;
+  // the effect honours it ONCE on arrival into waiting-for-approval, and only
+  // while focus is still on the body (a user who clicked elsewhere meanwhile
+  // keeps it). The card instance persists across the transition -- it is keyed by
+  // provider slug in ConnectionsPage.tsx -- so only the inner state blocks
+  // remount, which is what lets this ref survive to the effect.
+  const pendingWaitingFocusRef = useRef(false)
+  const waitingPrimaryRef = useRef<HTMLButtonElement>(null)
+  useEffect(() => {
+    if (!pendingWaitingFocusRef.current) return
+    if (state !== 'waiting-for-approval') return
+    // Wait until Cancel is actually focusable before consuming the handoff. The
+    // card renders waiting-for-approval the moment `locallyWaiting` is set, which
+    // is BEFORE the mint's `busy` clears (it clears only after the awaited
+    // refetch). While `busy` is set, Cancel is natively `disabled={!!busy}`, so a
+    // `.focus()` then is a no-op -- and consuming the flag here would strand the
+    // user, since nothing retries. `busy` is in the deps so the effect re-runs
+    // and lands the focus once it clears.
+    if (busy) return
+    pendingWaitingFocusRef.current = false
+    // Only reclaim focus the unmount dropped. A focused element that unmounts
+    // leaves the browser focusing document.body; any other active element means
+    // the user moved on, and moving it back would be the worse surprise.
+    if (document.activeElement !== null && document.activeElement !== document.body) return
+    waitingPrimaryRef.current?.focus()
+  }, [state, busy])
 
   // The approval tab is opened by the CLICK and filled later, which is the only
   // ordering the browser allows. POST /api/connections/mint answers as soon as
@@ -377,6 +641,9 @@ function ConnectionCard({
     // attempt starts from this card, so it is the only honest place to record that
     // a URL arriving later is one we asked for.
     startedFromThisCardRef.current = true
+    // The mint moves the card to `waiting-for-approval`, unmounting whichever
+    // button (Connect, Reconnect) started it; hand focus to that state's Cancel.
+    pendingWaitingFocusRef.current = true
     // The desktop shell asks for no tab. Every window.open there is arbitrated by
     // the main process (electron/external-scheme.js): a blank target cannot be
     // parsed as a URL, so it is denied, the call returns null, and a browser-only
@@ -518,8 +785,10 @@ function ConnectionCard({
     : t('pages.connectionsPage.service_value_prop', { provider: provider.name })
   // One shared element so EVERY consent-initiating action (Connect, Authorize,
   // Reconnect) carries the provider-side prerequisite — a GitLab whose Duo is
-  // off fails identically whichever button started the OAuth flow.
-  const providerPrerequisite = provider.prerequisite_copy
+  // off fails identically whichever button started the OAuth flow. A Google
+  // product row skips it: the Google entry states that step once, as one tip
+  // beside its own action, instead of a triangle beside each of six Connects.
+  const providerPrerequisite = provider.prerequisite_copy && !isGoogleSlug(provider.slug)
     ? provider.slug in PREREQUISITE_KEYS
       ? t(PREREQUISITE_KEYS[provider.slug as keyof typeof PREREQUISITE_KEYS], {
           defaultValue: provider.prerequisite_copy,
@@ -530,69 +799,88 @@ function ConnectionCard({
   // beside the action, never a second triangle: it says only what is known (the
   // chat harness drops the settings), not that the sign-in fails.
   const backendCaveat = backendLacksOauth ? t('pages.connectionsPage.backend_oauth_caveat', { provider: provider.name }) : ''
-  // Caveat first: it is the part a user can read without the provider's setup terms.
-  const prerequisiteText = [backendCaveat, providerPrerequisite].filter(Boolean).join(' ')
+  // Not connected means this card has no entry, so a present grant belongs to
+  // another holder (for example, a user's own agent spec): say why.
+  const storedSignIn = state === 'not-connected' && grantPresent === true
+    ? t('pages.connectionsPage.stored_sign_in_no_server', { provider: provider.name })
+    : ''
+  // Caveats first: they are the part a user can read without the provider's setup terms.
+  const prerequisiteText = joinSentences([storedSignIn, backendCaveat, providerPrerequisite])
   const sharedGrant = (grantSharedWith && grantSharedWith.length > 0) || grantSharedUnconfirmed
   const sharedText = sharedGrant
-    ? `${
+    ? joinSentences([
         grantSharedWith && grantSharedWith.length > 0
-          ? t('pages.connectionsPage.grant_shared_fact', { names: grantSharedWith.join(', ') })
-          : t('pages.connectionsPage.grant_shared_fact_unconfirmed')
-      } ${t('pages.connectionsPage.grant_shared_caveat')}`
+          ? t('pages.connectionsPage.grant_shared_fact', { names: fmtList(grantSharedWith) })
+          : t('pages.connectionsPage.grant_shared_fact_unconfirmed'),
+        t('pages.connectionsPage.grant_shared_caveat'),
+      ])
     : ''
   // A shared row already has a Disconnect tip, so the caveat joins it. A row
   // that is not shared has no tip to join, and the card rule allows one tip per
   // row and no new heading key, so there the caveat is a fact about the
   // current state and rides the status list instead (chatUseNote below).
   const kasSignInNote = signInInChat ? t('pages.connectionsPage.chat_use_kas_sign_in', { word: provider.slug }) : ''
-  const connectedTipText = sharedGrant ? [sharedText, backendCaveat, kasSignInNote].filter(Boolean).join(' ') : ''
+  const connectedTipText = sharedGrant ? joinSentences([sharedText, backendCaveat, kasSignInNote]) : ''
   const chatUseNote = (backendLacksOauth || signInInChat) && !sharedGrant
-  const prerequisiteTip = prerequisiteText ? (
+  // The address the sign-in returns to, for an org admin's redirect allowlist:
+  // one exact URI when Crew registers it, else the loopback origins on any port.
+  const redirectValues = signInRedirect?.exact ? [signInRedirect.exact] : (signInRedirect?.anyPort ?? [])
+  const redirect = redirectValues.length
+    ? {
+        caption: signInRedirect?.exact
+          ? t('pages.connectionsPage.sign_in_redirect_exact')
+          : t('pages.connectionsPage.sign_in_redirect_any_port'),
+        values: redirectValues,
+      }
+    : undefined
+  // The provider's org-admin checklist, when the registry names one, is a link
+  // in the same tip as the caveat that sends the user there.
+  const adminGuide = docSectionHref(provider.org_admin_guide)
+  const link = adminGuide ? { href: adminGuide, label: t('pages.connectionsPage.org_admin_checklist_link') } : undefined
+  const prerequisiteTip = prerequisiteText || redirect ? (
     <PrerequisiteTip
       label={t('pages.connectionsPage.prerequisites_for_provider', { provider: provider.name })}
       heading={t('pages.connectionsPage.before_you_connect')}
       text={prerequisiteText}
+      redirect={redirect}
+      link={link}
     />
   ) : null
-  const stateMeta: Record<ConnectionCardState, { label: string; icon: ReactNode; tone: string }> = {
-    'not-connected': {
-      label: t('pages.connectionsPage.not_connected'),
-      icon: <Link2 className="w-3.5 h-3.5" aria-hidden="true" />,
-      tone: 'bg-bg-hover text-muted',
-    },
-    'waiting-for-approval': {
-      label: t('pages.connectionsPage.waiting_for_approval'),
-      icon: <CircleDashed className="w-3.5 h-3.5 animate-spin motion-reduce:animate-none" aria-hidden="true" />,
-      tone: 'bg-warn-subtle text-warn-text',
-    },
-    connected: {
-      label: t('pages.connectionsPage.connected'),
-      icon: <CheckCircle2 className="w-3.5 h-3.5" aria-hidden="true" />,
-      tone: 'bg-ok-subtle text-ok-text',
-    },
-    // Warn tone, not the error tone: an unverifiable state is not a failure. The
-    // icon is static on purpose — a spinner would claim a grant is in flight
-    // when nothing is pending.
-    'not-verified': {
-      label: t('pages.connectionsPage.not_verified'),
-      icon: <KeyRound className="w-3.5 h-3.5" aria-hidden="true" />,
-      tone: 'bg-warn-subtle text-warn-text',
-    },
-    'needs-attention': {
-      label: t('pages.connectionsPage.needs_attention'),
-      icon: <AlertTriangle className="w-3.5 h-3.5" aria-hidden="true" />,
-      tone: 'bg-danger-subtle text-danger-text',
-    },
-    // Muted, not warn: nothing is wrong with the provider, a step is missing on
-    // OUR side. The lock says "this needs a key" without alarming a user who
-    // cannot act on it (only the owner can configure).
-    'needs-configuration': {
-      label: t('pages.connectionsPage.needs_configuration'),
-      icon: <Lock className="w-3.5 h-3.5" aria-hidden="true" />,
-      tone: 'bg-bg-hover text-muted',
-    },
-  }
-  const meta = stateMeta[state]
+  const notOwnedHelp = (
+    <span className="text-[12px] text-muted" data-testid="crew-sign-in-not-owned">
+      <Trans
+        i18nKey="pages.connectionsPage.crew_sign_in_not_owned_help"
+        values={{ provider: provider.name }}
+        components={{ mcpLink: <Link to={MCP_SERVERS_HREF} className="underline hover:text-accent" /> }}
+      />
+    </span>
+  )
+  const crewSignInSetup = (
+    <>
+      <PrerequisiteTip
+        label={t('pages.connectionsPage.prerequisites_for_provider', { provider: provider.name })}
+        heading={t('pages.connectionsPage.before_you_connect')}
+        text={(
+          <Trans
+            i18nKey="pages.connectionsPage.needs_crew_sign_in_help"
+            values={{ provider: provider.name }}
+            components={{ settingsLink: <Link to={settingsPath({ tab: 'agent' })} className="underline hover:text-accent" /> }}
+          />
+        )}
+      />
+      <Link
+        to={settingsPath({ tab: 'developer', sub: 'feature-previews', highlight: CREW_SIGN_IN_SETTING_ID })}
+        className="inline-flex items-center gap-1.5 rounded-md bg-accent px-2.5 py-1.5 text-[12px] font-medium text-accent-fg hover:opacity-90"
+      >
+        <Settings2 className="w-3.5 h-3.5" aria-hidden="true" />
+        {t('pages.connectionsPage.open_crew_sign_in_setting')}
+      </Link>
+    </>
+  )
+  // What stands in for Connect and Reconnect while the mint refuses this card: a
+  // press would change the entry and then get 409 `crew_sign_in_required`.
+  const mintRefusedHelp = crewMintRefused === 'not_owned' ? notOwnedHelp
+    : crewMintRefused === 'sign_in_off' ? crewSignInSetup : null
   const runRelay = async () => {
     // Normalize a scheme-less mobile paste (#7406) and submit the normalized
     // form, mirroring the chat banner's relay affordance.
@@ -606,11 +894,28 @@ function ConnectionCard({
     if (delivered) setReturnAddress('')
   }
 
+  // A card that needs the user stays open: a consent in flight (Re-open,
+  // Cancel), a broken or unproven connection (its error and Reconnect). The
+  // Google entry opens for the same states.
+  const forcedOpen = state === 'waiting-for-approval' || state === 'needs-attention' || state === 'not-verified'
+  const open = expand === undefined || expand.expanded || forcedOpen
+  // The name toggles only when toggling changes what the card shows. A forced
+  // open card cannot close, and a card with no OAuth app part already shows
+  // its whole action row closed while it is not connected or needs setup, so
+  // a chevron there would point at nothing.
+  // An entry Crew's sign-in does not own never uses the OAuth app, so its card has no app part.
+  const oauthPart = crewSignInNotOwned ? undefined : oauthPanel
+  const showsMoreOpen = oauthPart !== undefined || (state !== 'not-connected' && state !== 'needs-configuration')
+  const toggle = expand !== undefined && !forcedOpen && showsMoreOpen ? expand : undefined
+  const reduceMotion = useReducedMotion()
   return (
-    <article
+    <motion.article
+      layout={reduceMotion ? false : true}
+      transition={CARD_LAYOUT_TRANSITION}
       id={`connection-${provider.slug}`}
+      hidden={hidden}
       data-state={state}
-      className={`relative flex flex-col rounded-lg border bg-card p-3.5 shadow-sm transition-colors ${
+      className={`relative flex flex-col rounded-lg border bg-card p-3.5 shadow-sm transition-colors ${open && oauthPart !== undefined ? 'xl:col-span-2 2xl:col-span-3 ' : ''}${
         highlighted ? 'border-accent ring-1 ring-accent/40' : state === 'needs-attention' ? 'border-danger/40' : 'border-border'
       }`}
     >
@@ -627,11 +932,21 @@ function ConnectionCard({
             </span>
           )}
         </span>
-        <h3 className="m-0 min-w-0 flex-1 truncate text-[14px] font-semibold text-text-strong">{provider.name}</h3>
-        <span className={`inline-flex shrink-0 items-center gap-1 text-[11px] font-medium ${meta.tone}`}>
-          {meta.icon}
-          {meta.label}
-        </span>
+        <h3 className="m-0 min-w-0 flex-1 truncate text-[14px] font-semibold text-text-strong">
+          {toggle ? (
+            <button
+              type="button"
+              onClick={toggle.onToggle}
+              aria-expanded={open}
+              aria-controls={toggle.panelId}
+              className="inline-flex max-w-full items-center gap-1 border-none bg-transparent p-0 text-left font-semibold text-text-strong hover:text-accent"
+            >
+              <span className="min-w-0 truncate">{provider.name}</span>
+              <ChevronDown className={`h-3.5 w-3.5 shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} aria-hidden="true" />
+            </button>
+          ) : provider.name}
+        </h3>
+        <ConnectionStateBadge state={state} managedInMcpServers={crewSignInNotOwned} />
       </header>
 
       {/* A two-line FLOOR with a three-line ceiling, not a fixed height. The
@@ -657,18 +972,24 @@ function ConnectionCard({
         {valueProp}
       </p>
 
-      <div className="mt-auto">
+      {/* Closed, a card shows its name, status and value prop, plus the one
+          next step a new user needs: Connect on a not-connected card, Configure
+          (which is the expand) on a missing client. Every other action and the
+          OAuth app form open with the card. */}
+      {(open || state === 'needs-configuration' || state === 'not-connected') && <div id={expand?.panelId} className="mt-auto">
         {state === 'not-connected' && (
           <div className="flex items-center justify-between gap-3">
             <a href={provider.docs_url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-[12px] text-muted hover:text-text">
               {t('pages.connectionsPage.documentation')} <ExternalLink className="w-3 h-3" aria-hidden="true" />
             </a>
             <div className="flex items-center gap-2">
-              {prerequisiteTip}
-              <Btn primary onClick={() => void startMint(onConnect)} disabled={!!busy}>
-                {busy === 'connect' && <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />}
-                {busy === 'connect' ? t('pages.connectionsPage.connecting') : t('pages.connectionsPage.connect')}
-              </Btn>
+              {mintRefusedHelp ?? <>
+                {prerequisiteTip}
+                <Btn primary onClick={() => void startMint(onConnect)} disabled={!!busy}>
+                  {busy === 'connect' && <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />}
+                  {busy === 'connect' ? t('pages.connectionsPage.connecting') : t('pages.connectionsPage.connect')}
+                </Btn>
+              </>}
             </div>
           </div>
         )}
@@ -708,7 +1029,13 @@ function ConnectionCard({
                   {t('pages.connectionsPage.waiting_for_approval_address')}
                 </span>
               )}
-              <Btn className="ml-auto" onClick={() => void onCancel()} disabled={!!busy}>
+              {/* The focus heir when Connect/Reconnect unmounted into this state:
+                  the mint made Cancel the only action here, so the keyboard user
+                  the unmount stranded lands on it. Cancel itself is optimistic
+                  (it drops the wait synchronously rather than running a tracked
+                  action), so it needs no busy-focus guard of its own; it is only
+                  ever disabled while a SEPARATE action (the relay) holds `busy`. */}
+              <Btn ref={waitingPrimaryRef} className="ml-auto" onClick={() => void onCancel()} disabled={!!busy}>
                 <X className="w-3.5 h-3.5" aria-hidden="true" /> {t('pages.connectionsPage.cancel')}
               </Btn>
             </div>
@@ -729,16 +1056,39 @@ function ConnectionCard({
                     setReturnAddress(event.target.value)
                     if (invalidReturnAddress) setInvalidReturnAddress(false)
                   }}
-                  {...ime.bindEnter({ onEnter: () => void runRelay() })}
+                  {...ime.bindEnter({ onEnter: () => { if (busy !== 'relay') void runRelay() } })}
                   placeholder={t('pages.connectionsPage.return_address_placeholder')}
                   autoComplete="off"
                   spellCheck={false}
-                  disabled={busy === 'relay'}
+                  // `readOnly`, not `disabled`, while the relay runs: the card
+                  // stays in waiting-for-approval throughout, so a `disabled`
+                  // input would drop the focus of the keyboard user who just
+                  // submitted it. readOnly keeps it in the tab order and
+                  // uneditable; the Enter guard above and the button guard below
+                  // refuse a re-submit.
+                  readOnly={busy === 'relay'}
                   aria-invalid={invalidReturnAddress}
                   aria-describedby={invalidReturnAddress ? `return-address-error-${provider.slug}` : undefined}
-                  className="min-w-0 flex-1 rounded-md border border-border bg-bg px-2.5 py-1.5 font-mono text-[11px] text-text focus-ring-accent"
+                  className="min-w-0 flex-1 rounded-md border border-border bg-bg px-2.5 py-1.5 font-mono text-[11px] text-text read-only:opacity-60 read-only:cursor-not-allowed focus-ring-accent"
                 />
-                <Btn primary onClick={() => void runRelay()} disabled={!returnAddress.trim() || busy === 'relay'}>
+                {/* The relay keeps the card in waiting-for-approval, so this button
+                    stays mounted while it runs: aria-disabled (not disabled) holds
+                    its focus, and the guard refuses a second submit. It is still
+                    hard-disabled before an address is typed, which is a precondition
+                    not an in-flight state, so that keeps the native attribute. */}
+                <Btn
+                  primary
+                  onClick={() => { if (busy !== 'relay') void runRelay() }}
+                  disabled={!returnAddress.trim() && busy !== 'relay'}
+                  aria-disabled={busy === 'relay' || undefined}
+                  aria-busy={busy === 'relay' || undefined}
+                  // Mirror the primary Btn's native `disabled:` look (ui.tsx) so
+                  // the busy appearance is unchanged: a native-disabled primary
+                  // turns grey (bg-bg-hover/text-muted/no border/no shadow), not
+                  // just faded, so aria-disabled must repaint the same way rather
+                  // than leave an accent button that still looks pressable.
+                  className="aria-disabled:bg-bg-hover aria-disabled:text-muted aria-disabled:border-transparent aria-disabled:shadow-none aria-disabled:opacity-60 aria-disabled:cursor-not-allowed aria-disabled:hover:bg-bg-hover aria-disabled:hover:shadow-none aria-disabled:active:scale-100"
+                >
                   {busy === 'relay' && <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />}
                   {busy === 'relay' ? t('pages.connectionsPage.relaying') : t('pages.connectionsPage.complete_connection')}
                 </Btn>
@@ -763,21 +1113,39 @@ function ConnectionCard({
                   card state uses for its pre-action caveat -- never as a band
                   above the action row. The badge already says what state the
                   card is in; the tip says what pressing the button entails. */}
-              <PrerequisiteTip
-                label={t('pages.connectionsPage.prerequisites_for_provider', { provider: provider.name })}
-                heading={t('pages.connectionsPage.before_you_connect')}
-                text={t('pages.connectionsPage.needs_configuration_help', { provider: provider.name })}
-              />
-              {/* A route, not a Connect button: the missing step lives on the
-                  Settings tab, and only the owner can complete it. The highlight
-                  lands on this provider's card there. */}
-              <Link
-                to={settingsPath({ tab: 'connections', highlight: connectionsOAuthClientEntryId(provider.slug) })}
-                className="inline-flex items-center gap-1.5 rounded-md bg-accent px-2.5 py-1.5 text-[12px] font-medium text-accent-fg hover:opacity-90"
-              >
-                <Settings2 className="w-3.5 h-3.5" aria-hidden="true" />
-                {t('pages.connectionsPage.configure_oauth_app')}
-              </Link>
+              {/* Not on a Google product row: its OAuth app is the shared part
+                  below the rows, and this tip names a Configure button the row
+                  does not have. */}
+              {/* An entry Crew's sign-in does not own gets none of the blocks
+                  below: the mint refuses it, and its sign-in is already on. One
+                  line says why there is no Connect and links to the entry. */}
+              {crewSignInNotOwned && notOwnedHelp}
+              {/* No Connect and no OAuth app step yet: this provider's client
+                  never leaves the vault, so the card can connect only once Crew
+                  does the sign-in. The link opens the switch that turns that on. */}
+              {needsCrewSignIn && !crewSignInNotOwned && crewSignInSetup}
+              {!needsCrewSignIn && !crewSignInNotOwned && expand && !open && (
+                <PrerequisiteTip
+                  label={t('pages.connectionsPage.prerequisites_for_provider', { provider: provider.name })}
+                  heading={t('pages.connectionsPage.before_you_connect')}
+                  text={t('pages.connectionsPage.needs_configuration_help', { provider: provider.name })}
+                />
+              )}
+              {/* Not a Connect button: the missing step is the OAuth app part,
+                  which opens in place on this card. Only the owner can save it. */}
+              {/* Shown only while closed: once open, the form below is the
+                  next step and the name toggle closes the card. */}
+              {!needsCrewSignIn && !crewSignInNotOwned && expand && !open && oauthPanel !== undefined && (
+                <Btn
+                  primary
+                  onClick={expand.onToggle}
+                  aria-expanded={expand.expanded}
+                  aria-controls={expand.panelId}
+                >
+                  <Settings2 className="w-3.5 h-3.5" aria-hidden="true" />
+                  {t('pages.connectionsPage.set_up_provider', { provider: provider.name })}
+                </Btn>
+              )}
             </div>
           </div>
         )}
@@ -786,23 +1154,28 @@ function ConnectionCard({
           <div className="space-y-3">
             <div className="flex items-start gap-2 rounded-md border border-warn/30 bg-warn-subtle p-2.5 text-[12px] text-text">
               <KeyRound className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warn" aria-hidden="true" />
-              {/* Two substates share this card. `grantPresent === false` is a
+              {/* Three substates share this card. `grantPresent === false` is a
                   CONFIRMED verdict (the status feed stat'd kiro-cli's grant
-                  artifacts and found none), so the copy names the held fact
+                  artifacts and found none), and `grantUnproven` is a Connect on
+                  this page whose check just failed, so both name the held fact
                   instead of hedging "cannot see the authorization" — the hedge
                   is only honest while the verdict is indeterminate. */}
               <span>
                 {grantPresent === false
                   ? t('pages.connectionsPage.not_authorized_help', { provider: provider.name })
-                  : t('pages.connectionsPage.not_verified_help', { provider: provider.name })}
+                  : grantUnproven
+                    ? t('pages.connectionsPage.grant_unproven_help', { provider: provider.name })
+                    : t('pages.connectionsPage.not_verified_help', { provider: provider.name })}
               </span>
             </div>
             <div className="flex items-center justify-end gap-2">
-              {prerequisiteTip}
-              <Btn primary onClick={() => void startMint(onReconnect)} disabled={!!busy}>
-                {busy === 'connect' ? <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" /> : <KeyRound className="w-3.5 h-3.5" aria-hidden="true" />}
-                {busy === 'connect' ? t('pages.connectionsPage.connecting') : t('pages.connectionsPage.connect')}
-              </Btn>
+              {mintRefusedHelp ?? <>
+                {prerequisiteTip}
+                <Btn primary onClick={() => void startMint(onReconnect)} disabled={!!busy}>
+                  {busy === 'connect' ? <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" /> : <KeyRound className="w-3.5 h-3.5" aria-hidden="true" />}
+                  {busy === 'connect' ? t('pages.connectionsPage.connecting') : t('pages.connectionsPage.connect')}
+                </Btn>
+              </>}
             </div>
           </div>
         )}
@@ -837,16 +1210,25 @@ function ConnectionCard({
                 and label name the Disconnect it qualifies, never the
                 pre-connect "Before you connect" (#26890): the card is already
                 connected. */}
-            <div className="flex items-center justify-between gap-2">
-              <Btn
-                onClick={() => void onTest()}
-                disabled={!!busy || !!testingProvider}
+            <div className={`flex items-center gap-2 ${crewHeld ? 'justify-end' : 'justify-between'}`}>
+              {/* Test runs on Kiro CLI's grant; a Crew-held sign-in has none, and
+                  the gateway refuses it (409 crew_oauth_test_unsupported, or
+                  kas_sign_in_test_unsupported for a Connect on the KAS engine). */}
+              {/* Its own test in flight marks it aria-disabled, not disabled:
+                  a disabled button leaves the tab order and drops the focus of
+                  the keyboard user who just pressed it. Another action or a
+                  sibling's test still disables it outright. */}
+              {!crewHeld && <Btn
+                onClick={() => { if (busy !== 'test') void onTest() }}
+                disabled={(!!busy && busy !== 'test') || !!testingProvider}
+                aria-disabled={busy === 'test' || undefined}
+                className="aria-disabled:opacity-60 aria-disabled:cursor-default aria-disabled:hover:bg-transparent aria-disabled:hover:border-border aria-disabled:active:scale-100"
                 title={testingProvider ? t('pages.connectionsPage.test_blocked_by_sibling', { provider: testingProvider }) : undefined}
                 aria-label={testingProvider ? t('pages.connectionsPage.test_blocked_by_sibling', { provider: testingProvider }) : undefined}
               >
                 {busy === 'test' ? <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" /> : <RotateCw className="w-3.5 h-3.5" aria-hidden="true" />}
                 {busy === 'test' ? t('pages.connectionsPage.testing') : t('pages.connectionsPage.test_connection')}
-              </Btn>
+              </Btn>}
               <div className="flex items-center gap-2">
                 {/* ONE tip for the row (connection-card-caveat-tip): the
                     shared-grant fact and the backend caveat merge into a
@@ -863,7 +1245,18 @@ function ConnectionCard({
                     text={connectedTipText}
                   />
                 ) : null}
-                <Btn danger onClick={() => void onDisconnect()} disabled={!!busy}>
+                {/* A FAILED disconnect leaves the card connected with Disconnect
+                    still mounted, so aria-disabled (not disabled) holds the focus
+                    of the keyboard user who pressed it; the guard refuses a second
+                    press. A different action (Test) still disables it outright. */}
+                <Btn
+                  danger
+                  onClick={() => { if (busy !== 'disconnect') void onDisconnect() }}
+                  disabled={!!busy && busy !== 'disconnect'}
+                  aria-disabled={busy === 'disconnect' || undefined}
+                  aria-busy={busy === 'disconnect' || undefined}
+                  className="aria-disabled:opacity-30 aria-disabled:cursor-not-allowed aria-disabled:hover:bg-transparent aria-disabled:hover:border-border aria-disabled:active:scale-100"
+                >
                   <Unplug className="w-3.5 h-3.5" aria-hidden="true" /> {t('pages.connectionsPage.disconnect')}
                 </Btn>
               </div>
@@ -876,8 +1269,9 @@ function ConnectionCard({
             {/* The headline is copy selected by evidence (verdict vs could-not-reach);
                 the raw detail stays the ErrorNotice `message` so the journal lookup
                 key keeps its structured context. Detail absent: the headline itself
-                is the message so the notice still renders. askAgent is ON: a status
-                card holds no unsaved draft, so the hand-off can destroy nothing. */}
+                is the message so the notice still renders. askAgent is OFF while
+                any OAuth app form on the page holds unsaved input: the hand-off
+                opens chat and would drop it. Otherwise nothing unsaved is lost. */}
             <ErrorNotice
               title={(oauth?.error || server?.error) ? t(
                 errorIndicatesProviderRejection(oauth?.error || server?.error)
@@ -889,18 +1283,32 @@ function ConnectionCard({
                 'pages.connectionsPage.connection_unreachable',
                 { provider: provider.name },
               )}
-              askAgent
+              askAgent={handOffAllowed}
             />
             <div className="flex items-center justify-end gap-2">
-              {prerequisiteTip}
-              <Btn primary onClick={() => void startMint(onReconnect)} disabled={!!busy}>
-                {busy === 'connect' ? <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" /> : <RotateCw className="w-3.5 h-3.5" aria-hidden="true" />}
-                {busy === 'connect' ? t('pages.connectionsPage.reconnecting') : t('pages.connectionsPage.reconnect')}
-              </Btn>
+              {/* Reconnect runs the mint, which moves the card to
+                  waiting-for-approval and unmounts this button; the handoff
+                  there lands focus on Cancel. It has no in-flight state of its
+                  own to stay mounted for -- hence native `disabled`. */}
+              {mintRefusedHelp ?? <>
+                {prerequisiteTip}
+                <Btn primary onClick={() => void startMint(onReconnect)} disabled={!!busy}>
+                  {busy === 'connect' ? <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" /> : <RotateCw className="w-3.5 h-3.5" aria-hidden="true" />}
+                  {busy === 'connect' ? t('pages.connectionsPage.reconnecting') : t('pages.connectionsPage.reconnect')}
+                </Btn>
+              </>}
             </div>
           </div>
         )}
-      </div>
+      </div>}
+
+      {/* Hidden, not unmounted, while closed: closing the card keeps a typed
+          but unsaved Client ID and secret. */}
+      {oauthPart !== undefined && (
+        <div className="mt-3 border-t border-border pt-3" hidden={!open}>
+          {oauthPart}
+        </div>
+      )}
 
       {feedbackSlots.length > 0 && (
         <div data-slot="connection-feedback" className="mt-3 grid text-[11px]">
@@ -942,7 +1350,8 @@ function ConnectionCard({
                 {isError ? (
                   /* No hand-off: the waiting card renders the return-address
                      paste-back input, whose typed value lives only in card-local
-                     state and is cleared ONLY on a delivered relay -- so after a
+                     state and is cleared ONLY on a delivered relay or a spent
+                     approval (an address no retry can deliver) -- so after a
                      FAILED relay the address the user must retry with is still
                      sitting in that input, and the hand-off navigates to the chat
                      and unmounts this gallery, discarding it. That covers the
@@ -978,9 +1387,9 @@ function ConnectionCard({
           })}
         </div>
       )}
-    </article>
+    </motion.article>
   )
 }
 
 // `ConnectionsPage.tsx` renders one per provider.
-export { ConnectionCard }
+export { ConnectionCard, ConnectionStateBadge, PrerequisiteTip }

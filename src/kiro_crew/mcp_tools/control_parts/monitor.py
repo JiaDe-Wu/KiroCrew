@@ -21,10 +21,7 @@ from typing import Any
 from kiro_crew import autonudge, mcp_core
 from kiro_crew.autonudge_judge import screen_phrase
 from kiro_crew.config.loader import KiroCrewConfig
-from kiro_crew.mcp_tools._limits import (
-    _MONITOR_DEFAULT_MAX_CYCLES,
-    _MONITOR_DEFAULT_MAX_RUNTIME_SECS,
-)
+from kiro_crew.mcp_tools._limits import _MONITOR_DEFAULT_MAX_CYCLES
 from kiro_crew.mcp_tools.control_parts.directive import _emit_directive
 from kiro_crew.monitoring.limits import runtime_ceiling_secs
 from kiro_crew.monitoring.models import (
@@ -78,7 +75,7 @@ def autonudge_stop(name: str, args: dict[str, Any]) -> str:
         )
     return _emit_directive(
         "autonudge_stop",
-        {"reason": args.get("reason", "").strip()},
+        {"reason": str(args.get("reason") or "").strip()},
         # NOT a confirmation, and worded so a model cannot read it as one: this
         # tool resolves no session, so it cannot know whether a loop is bound
         # here. The consumer applies the stop and records the real outcome —
@@ -87,7 +84,9 @@ def autonudge_stop(name: str, args: dict[str, Any]) -> str:
         # acting on an unverified claim.
         "Stop REQUESTED for this session's auto-nudge loop. This is not "
         "confirmation that a loop was found or stopped; the applied outcome is "
-        "recorded separately and may report that nothing was stopped.",
+        "recorded separately and may report that nothing was stopped. In a Bot's "
+        "chat or a Bot's worker session that outcome arrives as an [Automation "
+        "notice] message that starts a new turn.",
     )
 
 
@@ -114,19 +113,11 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
     if not message:
         return "monitor_start: message must not be empty."
     interval_secs = int(args.get("interval_secs") or 300)
-    # Default to bounded cycle and runtime caps. A loop without either bound
-    # only ever stops when the model volunteers an autonudge_stop, and observed
-    # loop stores show that is not reliable.
+    # The cycle cap is set once the gate is known, below. The runtime defaults to
+    # the operator's ceiling (``monitoring.max_runtime_secs``, 7 days as shipped):
+    # the one runaway backstop for a loop whose caller chose no budget.
     raw_max = args.get("max_cycles")
-    max_cycles = _MONITOR_DEFAULT_MAX_CYCLES if raw_max is None else int(raw_max)
-    # The runtime budget is bounded by default alongside the cycle cap, so a
-    # quiet or slow loop cannot survive indefinitely without a fresh decision.
-    # An omitted budget takes the default capped to the operator ceiling, so a
-    # ceiling below the default never refuses a value the caller did not send.
-    max_runtime_secs = int(
-        args.get("max_runtime_secs")
-        or min(_MONITOR_DEFAULT_MAX_RUNTIME_SECS, runtime_ceiling_secs())
-    )
+    max_runtime_secs = int(args.get("max_runtime_secs") or runtime_ceiling_secs())
     # The one escape from gating, and deliberately an opt-OUT. An opt-IN is what
     # An opt-out is used rather than opt-in: an opt-in default gates everything
     # and releases nothing (every opt-in mechanism sees zero adoption because
@@ -195,6 +186,22 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
         if (gate or watch)
         else None
     )
+    # No cap by default on a GATED loop: a quiet tick costs no turn, the gate's own
+    # quiet floor bounds silence, and the model ends the loop itself by checking live
+    # state, sending one final report, then stopping it. A loop that re-injects every
+    # interval (``gate=false``, or no subject to observe) keeps the default cap.
+    if raw_max is not None:
+        max_cycles = int(raw_max)
+    else:
+        max_cycles = 0 if gated is not None else _MONITOR_DEFAULT_MAX_CYCLES
+    # A work-ledger patrol takes no bound or cadence from the model at all: the one
+    # patrol interval, no cycle cap, and the runtime ceiling as its one backstop
+    # (rfc-permanent-patrol.md), so a self-armed patrol matches the default one.
+    if watch == "work-ledger":
+        from kiro_crew.conductor_patrol import PATROL_INTERVAL_SECS
+
+        interval_secs = PATROL_INTERVAL_SECS
+        max_cycles, max_runtime_secs = 0, runtime_ceiling_secs()
     # Before the payload is built, so the emitted dict is byte-identical to what
     # it was (its shape is asserted by exact equality in the contract test) and a
     # certain refusal is reported instead of acknowledged.
@@ -216,6 +223,12 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
     # absent and empty agree there.
     if watch:
         payload["watch"] = watch
+    # CONDITIONAL, like ``watch``: set only when the default cap was chosen because
+    # this run saw no subject. The gateway's replay of this handler skips the session
+    # log, so a bare ``PR <n>`` it cannot resolve lands here; the applier re-reads the
+    # log off-loop and drops the cap if the loop is gated after all.
+    if raw_max is None and gate and gated is None:
+        payload["max_cycles_default"] = True
     # CONDITIONAL for the reason ``banner`` is: a caller that arms no judge must see
     # the payload shape it saw before, which the contract test asserts by exact
     # equality. The applier reads it with ``.get``, so absent and empty agree there.
@@ -260,8 +273,10 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
             "[status N]\" — and the applier's own result replaces this text in "
             "the transcript. If the notice says NOT armed, read the reason "
             "before trying again. Only a live dashboard/Slack/Discord/Webex "
-            "session can host a loop. Call autonudge_stop when "
-            "the exit condition is met; hitting the cap is a runaway backstop, "
+            "session can host a loop. Once live state meets the exit condition, send "
+            "ONE final report, then monitor_stop (or autonudge_stop) in a later "
+            "step; a spent bound is "
+            "a backstop, "
             "not a finish. From dashboard, Slack, or Discord, use monitor_update "
             "if the instruction goes stale; on Webex, stop this loop and create "
             "a new finite one instead."
@@ -353,6 +368,15 @@ def _arming_preflight_refusal(tool_name: str, session_key: str) -> str:
         )
     if reading.get("active"):
         return ""
+    if tool_name == "monitor_update":
+        finished = _finished_watch(reading)
+        if finished:
+            return (
+                f"monitor_update: NOT applied — this session's loop already ended: "
+                f"{finished}. An ended loop cannot be updated or retargeted, so no "
+                "loop is watching anything now. To watch a new subject, call "
+                "monitor_start in this turn; do NOT report monitoring as changed."
+            )
     monitor = reading.get("monitor")
     if not isinstance(monitor, dict):
         return ""
@@ -371,6 +395,32 @@ def _arming_preflight_refusal(tool_name: str, session_key: str) -> str:
         "succeed. Tell the user that is the one step needed, and do NOT report "
         "monitoring as started. Use monitor_inspect to read the retained record."
     )
+
+
+def _finished_watch(reading: dict[str, Any]) -> str:
+    """Why the loop in a session-monitor *reading* ended on its subject, or ``""``.
+
+    The turn boundary refuses ``monitor_update`` on such a loop whatever the patch
+    (a finished subject is not a bound to raise), so the refusal is certain here.
+    """
+    loop = reading.get("autonudge_loop")
+    if isinstance(loop, dict):
+        if (
+            not loop.get("active")
+            and loop.get("stopped_reason") == autonudge.MONITOR_TERMINAL_REASON
+        ):
+            return "its pull request merged or closed"
+        return ""
+    monitor = reading.get("monitor")
+    if not isinstance(monitor, dict):
+        return ""
+    outcome = monitor.get("outcome")
+    # A retained stop (a user's, say) is not "ended on its subject": its remedy is the
+    # owner's Clear, which the retained-stop refusal below names.
+    if outcome and not retained_outcome_blocks_rearm(outcome, monitor.get("stopped_reason")):
+        target = str(monitor.get("target") or "").strip()
+        return f"its watch{f' on {target}' if target else ''} finished ({monitor.get('outcome')})"
+    return ""
 
 
 def _parsed_pull_request_target(kind: Any, raw: Any) -> tuple[str, str]:
@@ -445,6 +495,7 @@ def monitor_watch(name: str, args: dict[str, Any]) -> str:
             args.get("max_provider_errors") or DEFAULT_MONITOR_PROVIDER_ERRORS
         ),
         "wake_instructions": str(args.get("wake_instructions") or "").strip(),
+        "wake_on_terminal": bool(args.get("wake_on_terminal") or False),
     }
     return _emit_directive(
         "monitor_watch",
@@ -457,7 +508,9 @@ def monitor_watch(name: str, args: dict[str, Any]) -> str:
         "Arming happens when this turn's result is processed, so "
         "this ack cannot confirm it; the outcome is reported as a transcript notice "
         'on this session — "Automation loop armed: …" or "Automation loop NOT armed: '
-        '<reason> [status N]". If the notice says NOT armed, read the reason before '
+        "<reason> [status N]\". In a Bot's chat or a Bot's worker session a NOT armed "
+        "outcome also arrives as an [Automation notice] message that starts a new "
+        "turn. If the notice says NOT armed, read the reason before "
         "trying again — a monitor the user stopped is retained as evidence and only "
         "its owner can clear it. Do NOT report monitoring as started on the strength "
         "of this ack; verify with monitor_inspect at the start of a later turn or in "
@@ -521,6 +574,8 @@ def _compact_monitor_inspection(result: dict[str, Any]) -> dict[str, Any]:
         "objective",
         "budgets",
         "cadence_secs",
+        "wake_instructions",
+        "wake_on_terminal",
         "last_observation_status",
         "last_observation_reason_code",
         "last_fingerprint",
@@ -614,7 +669,9 @@ def monitor_stop(name: str, args: dict[str, Any]) -> str:
     return _emit_directive(
         "monitor_stop",
         {"reason": str(args.get("reason") or "").strip()},
-        "Monitor stop requested for this session.",
+        "Monitor stop requested for this session. In a Bot's chat or a Bot's "
+        "worker session the applied outcome, stopped or nothing to stop, arrives "
+        "as an [Automation notice] message that starts a new turn.",
     )
 
 

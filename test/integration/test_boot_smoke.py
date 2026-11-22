@@ -12,6 +12,7 @@ import inspect
 import os
 import signal
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -25,6 +26,7 @@ from kiro_crew.agent_sdk import host_auth
 from kiro_crew.dashboard.handlers import kiro_usage_api
 from kiro_crew.platform import governance
 from kiro_crew.slack.gateway import GatewayOrchestrator
+from kiro_crew.testing.wait import async_wait_until
 
 try:
     import resource as _resource
@@ -456,6 +458,8 @@ _KNOWN_SECOND_BOOT_CHANGES: dict[tuple[str, str], str] = {
     ("kiro_crew.config.loader_snapshots", "_MATERIALIZED_REFRESH_APPLIED"): "counter",
     ("kiro_crew.config.loader_snapshots", "_MATERIALIZED_REFRESH_ISSUED"): "counter",
     ("kiro_crew.context", "_store_cache_generation"): "counter",
+    # Bumped per recorded app declaration so the tool gate retires a listing; no home state.
+    ("kiro_crew.apps.credential_masks", "_generation"): "counter",
     ("kiro_crew.dashboard.handlers.updates_check", "_last_update_check"): "clock",
     # When the shared-crew admission service last read its config: a monotonic
     # stamp the harness zeroes and each boot sets again when it builds its service.
@@ -463,6 +467,10 @@ _KNOWN_SECOND_BOOT_CHANGES: dict[tuple[str, str], str] = {
     # The SSM listener's last answer: every boot replaces it with a new value from its
     # own config (off, or the port it bound), so no earlier boot's answer carries over.
     ("kiro_crew.shared_crew.ssm", "_listener"): "rebuilt by each boot",
+    # Which apps have a public id, mapped to their version: each boot's
+    # refresh_public_app_ids swaps in a new dict read from that boot's install
+    # records, so no earlier boot's map carries over.
+    ("kiro_crew.metrics.feature_usage", "_public_app_ids"): "rebuilt by each boot",
     # When telemetry consent was last re-read, and whether a re-read is in
     # flight: a boot that outlasts the recheck window starts one. The consent
     # itself (``_built_consent``) does not change here.
@@ -472,6 +480,8 @@ _KNOWN_SECOND_BOOT_CHANGES: dict[tuple[str, str], str] = {
     # the two counters around it, not home state.
     ("kiro_crew.agent", "_rebuild_answer_generation"): "counter",
     ("kiro_crew.platform.context", "_GOVERNANCE_GENERATION"): "counter",
+    # The trust verdict's install counter: monotonic, no home state.
+    ("kiro_crew.approval_mode_policy", "_ceiling_gen"): "counter",
     ("kiro_crew.platform.governance_profiles", "_PROFILE_GENERATION"): "counter",
     # Host facts re-probed on their own TTL or backoff: the user login session
     # behind cgroup scopes and the machine's own host names. A boot that
@@ -624,6 +634,13 @@ async def test_a_second_boot_touches_only_known_module_globals(gateway_boot, mon
     config_paths.valid_scratch_root_override()
     async with gateway_boot() as gw:
         await gw.get_json("/api/health", auth=False)
+        # The warm-up boot must get as far as a boot here can, or a process-once
+        # global it never reached is first set by the second boot. The update
+        # coordinator starts after the channel transports, past the HTTP bind.
+        await async_wait_until(
+            lambda: gw.orchestrator._update_check_task is not None,
+            describe=lambda: "the warm-up boot never started its update coordinator",
+        )
     before = _module_globals()
     async with gateway_boot() as gw:
         await gw.get_json("/api/health", auth=False)
@@ -641,17 +658,19 @@ async def test_a_second_boot_touches_only_known_module_globals(gateway_boot, mon
 @pytest.mark.asyncio
 async def test_a_boot_inherits_no_cooldown_or_cached_count(gateway_boot) -> None:
     """A path-resolver stall cooldown, a load-probe count, a thread's wait
-    allowance and the cached status counts are what a fresh process starts
-    without, so a boot here must start without them too. The witness above
+    allowance, the cached status counts and the recall pool's settings memo are
+    what a fresh process starts without, so a boot here must start without them too. The witness above
     cannot see most of that: an inherited dict entry changes no identity and,
     once the boot adds its own, no size. So one of each is seeded under a key
     no boot uses, and both reset points must drop it."""
+    from kiro_crew import recall_pool
     from kiro_crew.dashboard import status_counts
     from kiro_crew.security import paths
 
     prefix = paths._stall_prefix(os.path.join(os.sep, "kc-integration-unresolved", "leaf"))
     synthetic_tid = -1  # thread idents are positive, so no real caller collides
     seeded_counts = (987_654, 876_543)
+    seeded_settings = (0, 987_654)  # pool off, with a cap no real read returns
 
     def _seed() -> None:
         until = paths._path_resolve_clock() + 1_000.0
@@ -661,6 +680,11 @@ async def test_a_boot_inherits_no_cooldown_or_cached_count(gateway_boot) -> None
             paths._path_resolve_thread_waits[synthetic_tid] = (until, 1.0)
         status_counts._counts_cache = seeded_counts
         status_counts._counts_cache_ts = time.monotonic()
+        recall_pool._settings_cache = (recall_pool._now() + 1_000.0, seeded_settings)
+
+    def _recall_settings_seeded() -> bool:
+        cached = recall_pool._settings_cache
+        return cached is not None and cached[1] == seeded_settings
 
     def _still_seeded() -> list[str]:
         held = {
@@ -668,6 +692,7 @@ async def test_a_boot_inherits_no_cooldown_or_cached_count(gateway_boot) -> None
             "_path_resolve_load_probes": prefix in paths._path_resolve_load_probes,
             "_path_resolve_thread_waits": synthetic_tid in paths._path_resolve_thread_waits,
             "_counts_cache": status_counts._counts_cache == seeded_counts,
+            "_settings_cache": _recall_settings_seeded(),
         }
         return [name for name, present in held.items() if present]
 
@@ -680,6 +705,8 @@ async def test_a_boot_inherits_no_cooldown_or_cached_count(gateway_boot) -> None
         if status_counts._counts_cache == seeded_counts:
             status_counts._counts_cache = (None, None)
             status_counts._counts_cache_ts = float("-inf")
+        if _recall_settings_seeded():
+            recall_pool._settings_cache = None
 
     try:
         async with gateway_boot():
@@ -794,6 +821,18 @@ async def test_a_run_that_dies_on_its_own_is_still_shut_down(gateway_boot) -> No
     leaked = _live_tasks() - tasks_before - {asyncio.current_task()}
     assert not [t.get_name() for t in leaked]
     assert _process_is_clean()
+
+
+def _mcp_probe_threads() -> list[str]:
+    return [t.name for t in threading.enumerate() if t.name.startswith("mc-mcpprobe")]
+
+
+@pytest.mark.asyncio
+async def test_a_boot_leaves_no_mcp_probe_thread_running(gateway_boot) -> None:
+    """Teardown joins the boot's MCP probe threads (conftest docstring, item 3)."""
+    async with gateway_boot():
+        await async_wait_until(_mcp_probe_threads, describe=lambda: "the boot ran no MCP probe")
+    assert not _mcp_probe_threads()
 
 
 @pytest.mark.asyncio

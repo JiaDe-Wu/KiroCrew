@@ -16,13 +16,14 @@ import { useImeGuard } from '../../hooks/useImeGuard'
 import { useScrollEdges } from '../../hooks/useScrollEdges'
 import { FOLDER_COLOR_PALETTE } from '../folderColorCatalog'
 import { i18nT } from '../../i18n/t'
-import { publishNoticeKey } from '../PublishHub'
+import { publicationBadgeLabel, usePublicationProviderName } from '../../lib/publicationBadge'
 import { LiveSiteLink } from './LiveSiteLink'
 import ErrorNotice from '../ErrorNotice'
 import { useOpenInEditor } from '../FilePathMenu'
 import { canOpenFileInEditor, editorAcceptsPath } from '../../lib/electron'
 import { usePathKind } from '../../hooks/usePathKind'
 import { useBranding } from '../../hooks/useBranding'
+import { guidePick } from '../../uiLocations/targetRegistry'
 import type { Artifact, ArtifactFolder, SessionDoc } from '../../types'
 
 export type SortKey = 'name' | 'slug' | 'kind' | 'source' | 'version' | 'tags' | 'updated'
@@ -35,6 +36,7 @@ export const KIND_BADGE: Record<Artifact['kind'], 'ok' | 'err' | 'warn' | 'aim'>
   svg: 'warn',
   json: 'ok',
   text: 'ok',
+  canvas: 'aim',
   webapp: 'aim',
   image: 'warn',
   // A crewmate's dashboard package. `aim` with `widget` and `webapp`, the other
@@ -45,6 +47,17 @@ export const KIND_BADGE: Record<Artifact['kind'], 'ok' | 'err' | 'warn' | 'aim'>
   // falls back to its default tone, so a package reads as an ordinary document in
   // the one place its versions and its revert live.
   dashboard: 'aim',
+}
+
+/** An artifact's kind as a small pill, sized to sit beside 11-13px row text
+ *  rather than above it. The library table, the masonry and the card grid all
+ *  draw the kind through this. */
+export function KindPill({ kind }: { kind: Artifact['kind'] }) {
+  return (
+    <Badge variant={KIND_BADGE[kind]} className="text-[10.5px] leading-4 px-1.5 py-0 font-sans">
+      {kind}
+    </Badge>
+  )
 }
 
 export function isoToTs(iso: string): number {
@@ -434,11 +447,14 @@ export function ArtifactRow({ a, onOpen, onDelete, deletingSlug, onTogglePin, pi
 }) {
   // The row's own writes go to the gateway, so they gate like every other sink.
   const rowConnected = useConnected()
+  const providerName = usePublicationProviderName(a.publication)
   const inner = (setDropRef?: (el: HTMLElement | null) => void) => (
     <DndDraggable id={`artifact-row:${a.slug}`} data={{ type: 'artifact', slug: a.slug, name: a.name, folderId: a.folder_id || '' } satisfies LibraryDrag}>
       {({ setNodeRef, listeners, isDragging }) => (
         <tr
-          ref={(el) => { setNodeRef(el); setDropRef?.(el) }}
+          // The artifact's name as the row shows it: a guide's pick outlines
+          // the one row named exactly like this (artifacts.list).
+          {...guidePick(a.name, (el: Element | null) => { setNodeRef(el as HTMLElement | null); setDropRef?.(el as HTMLElement | null) })}
           {...listeners}
           style={{ opacity: isDragging ? 0.4 : 1 }}
           className={`group/artrow transition-colors cursor-pointer ${dropHighlight ? 'bg-accent/10' : 'hover:bg-bg-hover'}`}
@@ -471,18 +487,33 @@ export function ArtifactRow({ a, onOpen, onDelete, deletingSlug, onTogglePin, pi
                 <Share2
                   size={12}
                   className={a.publication.last_error ? 'text-danger' : a.publication.notice ? 'text-warn' : 'text-ok'}
-                  aria-label={a.publication.last_error ? i18nT('pages.artifactsPage.published_sync_issue') : a.publication.notice ? i18nT(publishNoticeKey({ rolling_out: 'pages.artifactsPage.published_rolling_out', distribution_disabled: 'pages.artifactsPage.published_distribution_disabled', notice_generic: 'pages.artifactsPage.published_notice_generic' }, a.publication.notice_code)) : i18nT('pages.artifactsPage.published', { visibility: a.publication.visibility.toLowerCase() })}
-                />
+                  aria-label={publicationBadgeLabel(a.publication, providerName)}
+                >
+                  <title>{publicationBadgeLabel(a.publication, providerName)}</title>
+                </Share2>
               )}
             </div>
             {a.description && <div className="text-[12px] text-muted truncate max-w-[400px]">{a.description}</div>}
             <LiveSiteLink slug={a.slug} />
+            {a.publication?.last_error && (
+              <span role="presentation" className="block mt-1" onClick={(e) => e.stopPropagation()}>
+                {/* The hand-off is on: this list holds no unsaved input. */}
+                <ErrorNotice
+                  variant="inline"
+                  className="whitespace-normal"
+                  title={i18nT('pages.artifactsPage.published_sync_issue')}
+                  message={a.publication.last_error}
+                  askAgent
+                  testId="publication-sync-error"
+                />
+              </span>
+            )}
           </td>
           <td className="px-2.5 py-2 border-b border-border">
             <code className="text-[12px] text-muted">{a.slug}</code>
           </td>
           <td className="px-2.5 py-2 border-b border-border">
-            <Badge variant={KIND_BADGE[a.kind]}>{a.kind}</Badge>
+            <KindPill kind={a.kind} />
           </td>
           <td className="px-2.5 py-2 border-b border-border text-[12px] text-muted truncate max-w-[180px]" title={a.session_title || a.source}>{a.session_title || a.source}</td>
           <td className="px-2.5 py-2 border-b border-border text-sm text-muted">{i18nT('pages.artifactsPage.v')}{a.version}</td>

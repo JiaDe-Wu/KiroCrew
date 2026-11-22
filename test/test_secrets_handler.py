@@ -19,6 +19,7 @@ from kiro_crew.dashboard.handlers.secrets import (
     _unused_stored_secrets,
     setup_secrets_routes,
 )
+from kiro_crew.platform_compat import symlink_or_junction
 from kiro_crew.secrets import SecretVault
 
 
@@ -114,7 +115,12 @@ class TestApiSecretsList:
                 resp = await client.get("/api/secrets")
                 assert resp.status == 200
                 data = await resp.json()
-                assert data == {"names": ["DB_PASS", "TEST_KEY"], "managed": []}
+                assert data["names"] == ["DB_PASS", "TEST_KEY"]
+                assert data["managed"] == []
+                assert [(i["name"], i["type"]) for i in data["items"]] == [
+                    ("DB_PASS", "secret"),
+                    ("TEST_KEY", "secret"),
+                ]
 
     @pytest.mark.asyncio
     async def test_empty_vault(self, empty_vault_dir: Path) -> None:
@@ -129,7 +135,7 @@ class TestApiSecretsList:
                 resp = await client.get("/api/secrets")
                 assert resp.status == 200
                 data = await resp.json()
-                assert data == {"names": [], "managed": []}
+                assert data == {"names": [], "items": [], "managed": []}
 
     @pytest.mark.asyncio
     async def test_classifies_only_actual_jira_vault_consumers(self, tmp_path: Path) -> None:
@@ -236,7 +242,7 @@ class TestApiSecretsList:
             async with TestClient(TestServer(app)) as client:
                 response = await client.get("/api/secrets")
                 assert response.status == 200
-                assert await response.json() == {"names": [], "managed": []}
+                assert await response.json() == {"names": [], "items": [], "managed": []}
 
     @pytest.mark.asyncio
     async def test_single_whitespace_jira_entry_is_ignored(self, tmp_path: Path) -> None:
@@ -258,7 +264,7 @@ class TestApiSecretsList:
             async with TestClient(TestServer(app)) as client:
                 response = await client.get("/api/secrets")
                 assert response.status == 200
-                assert await response.json() == {"names": [], "managed": []}
+                assert await response.json() == {"names": [], "items": [], "managed": []}
 
     @pytest.mark.asyncio
     async def test_config_failure_keeps_names_and_reports_managed_error(
@@ -278,11 +284,10 @@ class TestApiSecretsList:
             async with TestClient(TestServer(app)) as client:
                 response = await client.get("/api/secrets")
                 assert response.status == 200
-                assert await response.json() == {
-                    "names": ["DB_PASS", "TEST_KEY"],
-                    "managed": [],
-                    "managed_error": True,
-                }
+                data = await response.json()
+                assert data["names"] == ["DB_PASS", "TEST_KEY"]
+                assert data["managed"] == []
+                assert data["managed_error"] is True
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("degraded", [{"*"}, {"dashboard"}, {"wakatime"}])
@@ -310,6 +315,7 @@ class TestApiSecretsList:
                 assert response.status == 200
                 assert await response.json() == {
                     "names": [],
+                    "items": [],
                     "managed": [],
                     "managed_error": True,
                 }
@@ -401,6 +407,12 @@ class TestGerritManagedRows:
 
     def test_no_hosts_no_rows(self) -> None:
         assert _managed_secret_catalog([], [], False, False, []) == []
+
+    def test_stored_wakatime_oauth_tokens_stay_labelled_while_wakatime_is_off(self) -> None:
+        # The vault routes refuse this entry whether or not WakaTime is enabled,
+        # so a disabled integration must not turn it into a deletable custom row.
+        catalog = _managed_secret_catalog(["WAKATIME_OAUTH_TOKENS"], [], False, False, [])
+        assert catalog == [{"name": "WAKATIME_OAUTH_TOKENS", "kind": "wakatime_oauth"}]
 
     def test_lone_host_offers_the_global_name(self) -> None:
         catalog = _managed_secret_catalog([], [], False, False, [_GERRIT_ONE])
@@ -547,8 +559,10 @@ class TestApiSecretsSet:
         data_home.mkdir()
         link_target = tmp_path / "elsewhere"
         link_target.mkdir()
-        # The data home's .vault is a symlink to another folder.
-        (data_home / ".vault").symlink_to(link_target, target_is_directory=True)
+        # The data home's .vault redirects to another folder: a symlink, or on a
+        # Windows host without symlink privilege a junction, which the handler
+        # and ``atomic_write`` treat the same way.
+        symlink_or_junction(link_target, data_home / ".vault")
 
         with patch("kiro_crew.dashboard.handlers.secrets.config_dir", return_value=str(data_home)):
             async with TestClient(TestServer(app)) as client:
@@ -589,12 +603,14 @@ class TestApiSecretsSet:
         # A real .vault directory (not a link), so the symlink branch is not taken.
         (tmp_path / ".vault").mkdir()
 
-        async def _raise_enospc(_self: SecretVault, _name: str, _value: str) -> str:
+        async def _raise_enospc(
+            _self: SecretVault, _name: str, _item_type: str, _fields: object
+        ) -> str:
             raise OSError(errno.ENOSPC, "No space left on device")
 
         with (
             patch("kiro_crew.dashboard.handlers.secrets.config_dir", return_value=str(tmp_path)),
-            patch.object(SecretVault, "set_with_revision", _raise_enospc),
+            patch.object(SecretVault, "set_item_with_revision", _raise_enospc),
         ):
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(
@@ -1187,3 +1203,27 @@ class TestApiSecretsChannelCredentialRemote:
             status, _ = await self._call(tmp_path, "delete", name, headers=_REMOTE)
             assert status == 200, name
             assert SecretVault(tmp_path).get(name) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["post", "delete"])
+async def test_wakatime_oauth_tokens_entry_is_not_edited_here(vault_dir: Path, method: str) -> None:
+    """The OAuth flow rotates WAKATIME_OAUTH_TOKENS under its own lock, so the
+    generic routes refuse it with 409 and leave the stored entry untouched."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from kiro_crew.config.loader import CRED_WAKATIME_OAUTH_TOKENS
+
+    SecretVault(vault_dir)._set_sync(CRED_WAKATIME_OAUTH_TOKENS, "{}")
+    with patch("kiro_crew.dashboard.handlers.secrets.config_dir", return_value=str(vault_dir)):
+        async with TestClient(TestServer(_app())) as client:
+            if method == "post":
+                resp = await client.post(
+                    "/api/secrets", json={"name": CRED_WAKATIME_OAUTH_TOKENS, "value": "x"}
+                )
+            else:
+                resp = await client.delete(f"/api/secrets/{CRED_WAKATIME_OAUTH_TOKENS}")
+            assert resp.status == 409
+            assert (await resp.json())["code"] == "managed_by_wakatime_oauth"
+    stored = SecretVault(vault_dir).get(CRED_WAKATIME_OAUTH_TOKENS)
+    assert stored is not None and stored.reveal() == "{}"

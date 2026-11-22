@@ -1,10 +1,10 @@
 ---
 title: Update Architecture (install-shape capability contract)
-status: in-progress
+status: partial
 author: zezhexu
 created: 2026-07-31
-last-audited: 2026-10-06
-audited-at: 9348a25a34
+last-audited: 2026-11-20
+audited-at: 0c5d8bd5f3
 doc-pr: 1003
 implementation-prs: [1734, 15838, 16202, 16245]
 tracking-issues: []
@@ -13,7 +13,7 @@ superseded-by: []
 ---
 # RFC: Update Architecture (install-shape capability contract)
 
-- Status: in-progress — the backend capability contract
+- Status: partial — the backend capability contract
   (`platform/update_capability.py`), managed-venv wheel engine
   (`platform/wheel_engine.py`) and host-local dashboard approval step-up
   (`platform/update_stepup.py`) ship, and the gateway's unattended apply runs
@@ -78,7 +78,10 @@ layout, the trees' names and the restart interpreter),
 `platform/wheel_engine_build_child.py` (one child process of the apply) and
 `platform/wheel_engine_transfer.py` (the bounded download of a release's
 bytes, where `_download_to_file` compares the wheel's SHA-256 to the signed
-digest; `download_verified_wheel` in the facade is its one caller).
+digest; `download_verified_wheel` in the facade is its one caller). Its
+connection opens through `asset_downloader.build_opener`, so a redirect stays on
+the CDN host, except while an operator's `KIROCREW_CDN_BASE` mirror is set, which
+may hand the transfer to another https host.
 
 **Landed in [#16202](https://github.com/kirodotdev/KiroCrew/pull/16202)** (with
 [#15838](https://github.com/kirodotdev/KiroCrew/pull/15838) stopping an in-flight

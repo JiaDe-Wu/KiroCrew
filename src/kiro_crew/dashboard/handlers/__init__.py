@@ -121,6 +121,7 @@ from kiro_crew.dashboard.handlers.connections import (  # noqa: E402, F401
     api_connections_disconnect,
     api_connections_mint,
     api_connections_mint_state,
+    api_connections_oauth_callback,
     api_connections_oauth_client_delete,
     api_connections_oauth_client_put,
     api_connections_oauth_clients,
@@ -151,6 +152,7 @@ from kiro_crew.dashboard.handlers.cron import (  # noqa: E402, F401
     api_cron_folders_create,
     api_cron_folders_delete,
     api_cron_folders_update,
+    api_cron_get,
     api_cron_history,
     api_cron_history_all,
     api_cron_history_detail,
@@ -165,6 +167,7 @@ from kiro_crew.dashboard.handlers.cron import (  # noqa: E402, F401
     api_lessons,
     api_lessons_create,
     api_lessons_delete,
+    api_lessons_update,
 )
 
 # ── Diagnostics / Report a Problem (handlers/diagnostics.py) ──
@@ -177,6 +180,7 @@ from kiro_crew.dashboard.handlers.diagnostics import (  # noqa: E402, F401
 from kiro_crew.dashboard.handlers.files import (  # noqa: E402, F401
     _validate_dashboard_path,
     _write_file_restricted,
+    api_browse_create_dir,
     api_browse_dirs,
     api_browse_files,
     api_channel_upload_file,
@@ -261,6 +265,7 @@ from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402, F401
     api_mcp_measure_start,
     api_mcp_probe,
     api_mcp_probe_cached,
+    api_mcp_probe_one,
     api_mcp_quarantine_clear,
     api_mcp_remove,
     api_mcp_resolve_refresh,
@@ -270,6 +275,7 @@ from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402, F401
     api_mcp_toggle,
     api_mcp_toggle_all,
     api_mcp_toggle_tool,
+    api_mcp_unreadable_files,
 )
 
 # ── Crew Members (handlers/members.py) ──
@@ -282,6 +288,7 @@ from kiro_crew.dashboard.handlers.members import (  # noqa: E402, F401
     api_member_rules_get,
     api_member_rules_put,
     api_member_thread,
+    api_member_wake,
     api_members,
 )
 from kiro_crew.dashboard.handlers.memory import (  # noqa: E402, F401
@@ -318,6 +325,7 @@ from kiro_crew.dashboard.handlers.memory import (  # noqa: E402, F401
 from kiro_crew.dashboard.handlers.memory_admin import (  # noqa: E402, F401
     api_memory_backup,
     api_memory_backups,
+    api_memory_ownerless_stores,
     api_memory_restore,
     api_memory_restore_cancel,
     api_memory_retired,
@@ -336,6 +344,36 @@ from kiro_crew.dashboard.handlers.memory_member import (  # noqa: E402, F401
     api_memory_seed,
 )
 
+# ── Memory providers (handlers/memory_provider.py) ──
+from kiro_crew.dashboard.handlers.memory_provider import (  # noqa: E402, F401
+    api_memory_provider_conformance,
+    api_memory_provider_get,
+    api_memory_provider_item,
+    api_memory_provider_item_revisions,
+    api_memory_provider_items,
+    api_memory_provider_items_create,
+    api_memory_provider_put,
+)
+from kiro_crew.dashboard.handlers.memory_provider_bench import (  # noqa: E402, F401
+    api_bench_compare,
+    api_bench_evalset,
+    api_bench_evalsets,
+    api_bench_run,
+    api_bench_run_report,
+    api_bench_run_resume,
+    api_bench_runs,
+    api_bench_suite_fetch,
+    api_bench_suites,
+)
+from kiro_crew.dashboard.handlers.memory_provider_migrations import (  # noqa: E402, F401
+    api_memory_provider_export,
+    api_memory_provider_import,
+    api_memory_provider_migration,
+    api_memory_provider_migration_resume,
+    api_memory_provider_migration_rollback,
+    api_memory_provider_migrations,
+)
+
 # ── Messaging (extracted to handlers/messaging.py) ──
 from kiro_crew.dashboard.handlers.messaging import (  # noqa: E402, F401
     _redact,
@@ -347,6 +385,7 @@ from kiro_crew.dashboard.handlers.messaging import (  # noqa: E402, F401
     api_discord_config_save,
     api_feishu_config_get,
     api_feishu_config_save,
+    api_feishu_sdk_install,
     api_imessage_config_get,
     api_imessage_config_save,
     api_notification_ack,
@@ -366,9 +405,14 @@ from kiro_crew.dashboard.handlers.messaging import (  # noqa: E402, F401
     api_slack_history,
     api_slack_manifest,
     api_slack_manifest_status,
+    api_slack_owner_claim_cancel,
+    api_slack_owner_claim_confirm,
+    api_slack_owner_claim_get,
+    api_slack_owner_claim_start,
     api_slack_pins,
     api_slack_profile,
     api_slack_reactions,
+    api_slack_reconnect,
     api_spawn,
     api_spawn_continue,
     api_spawn_delete,
@@ -468,6 +512,7 @@ from kiro_crew.dashboard.handlers.sessions import (  # noqa: E402, F401
     api_sessions_memory,
     api_sessions_restart,
     api_sessions_search,
+    api_sessions_search_messages,
     api_sessions_summarize,
     api_sessions_usage,
     api_sessions_usage_refresh,
@@ -574,6 +619,12 @@ async def api_task_detail(request):
     return await handler(request)
 
 
+async def api_task_timeline(request):
+    from kiro_crew.dashboard.handlers.tasks import api_task_timeline as handler
+
+    return await handler(request)
+
+
 async def api_tasks_list(request):
     from kiro_crew.dashboard.handlers.tasks import api_tasks_list as handler
 
@@ -586,12 +637,18 @@ async def api_tasks_summary(request):
     return await handler(request)
 
 
+from kiro_crew.dashboard.handlers.prompt_as_sent import (  # noqa: E402, F401
+    api_prompt_as_sent,
+)
 from kiro_crew.dashboard.handlers.telemetry import (  # noqa: E402, F401
     api_beacon_status,
     api_collection_status,
     api_context_trace,
     api_telemetry_startup,
     api_usage_turns,
+)
+from kiro_crew.dashboard.handlers.telemetry_app_view import (  # noqa: E402, F401
+    api_app_view,
 )
 from kiro_crew.dashboard.handlers.telemetry_ui_control import (  # noqa: E402, F401
     api_ui_control_clicked,
@@ -663,6 +720,10 @@ from kiro_crew.dashboard.handlers.usage import (  # noqa: E402, F401
 from kiro_crew.dashboard.handlers.usage_series import api_usage_series  # noqa: E402, F401
 from kiro_crew.dashboard.handlers.wakatime import (  # noqa: E402, F401
     api_wakatime_export,
+    api_wakatime_oauth_authorize,
+    api_wakatime_oauth_callback,
+    api_wakatime_oauth_disconnect,
+    api_wakatime_oauth_status,
     api_wakatime_stats,
 )
 
@@ -1016,6 +1077,9 @@ from kiro_crew.dashboard.handlers.browser_live import (  # noqa: E402, F401
     bind_live_hub,
 )
 
+# The owner's media buttons on an app page (play, pause, seek, volume), owner-only.
+from kiro_crew.dashboard.handlers.browser_media import api_browser_media  # noqa: E402, F401
+
 # ── Browser ops: the ``browser`` MCP tool's forwarding leg (handlers/browser_ops.py) ──
 from kiro_crew.dashboard.handlers.browser_ops import (  # noqa: E402, F401
     api_browser_handback,
@@ -1037,6 +1101,13 @@ from kiro_crew.dashboard.handlers.computer_use import (  # noqa: E402, F401
     api_computer_use_config_save,
     api_computer_use_frame,
     api_computer_use_invoke,
+)
+
+# Owner review of a hand-edited sealed keystone file (Settings > Security).
+from kiro_crew.dashboard.handlers.config_pending import (  # noqa: E402, F401
+    api_config_pending_apply,
+    api_config_pending_discard,
+    api_config_pending_list,
 )
 
 # ── Core (extracted to handlers/core.py) ──
@@ -1099,7 +1170,17 @@ from kiro_crew.dashboard.handlers.decisions import (  # noqa: E402, F401
 from kiro_crew.dashboard.handlers.decisions_sagemaker import (  # noqa: E402, F401
     api_decisions_provider_sagemaker_test,
 )
+
+# MCP message-body fields — owner-gated, and the ONLY writer of
+# ``mcp_body_fields.json`` (see ``security.mcp_body_fields``).
+from kiro_crew.dashboard.handlers.mcp_body_fields import (  # noqa: E402, F401
+    api_mcp_body_fields_add,
+    api_mcp_body_fields_get,
+    api_mcp_body_fields_remove,
+)
 from kiro_crew.dashboard.handlers.notifications_push import (  # noqa: E402, F401
+    api_own_notification_ack,
+    api_own_notifications,
     api_push_notification,
     api_push_subscribe,
     api_push_unsubscribe,
@@ -1121,10 +1202,23 @@ from kiro_crew.dashboard.handlers.portability import (  # noqa: E402, F401
     api_portability_preview,
 )
 
+# The per-folder project-hooks choice (see ``kiro_crew.project_hooks_consent``).
+from kiro_crew.dashboard.handlers.project_hooks_consent import (  # noqa: E402, F401
+    api_project_hooks_consent_get,
+    api_project_hooks_consent_put,
+)
+
 # Owner reveal of a removed credential -- the ONE reader of the in-memory
 # ``security.reveal_store``; refuses every agent, app and non-owner caller.
 from kiro_crew.dashboard.handlers.redacted_reveal import (  # noqa: E402, F401
     api_owner_value_reveal,
+)
+
+# MCP safety switches — owner-gated, the one dashboard writer of
+# ``mcp.protect_kiro_permission_rules`` and ``mcp.honour_auto_approve``.
+from kiro_crew.dashboard.handlers.safety_switches import (  # noqa: E402, F401
+    api_safety_switches_get,
+    api_safety_switches_put,
 )
 from kiro_crew.dashboard.handlers.security import (  # noqa: E402, F401
     api_denied_command_builtin_toggle,
@@ -1141,4 +1235,9 @@ from kiro_crew.dashboard.handlers.security import (  # noqa: E402, F401
     api_trusted_registries_list,
     api_trusted_registry_grant,
     api_trusted_registry_revoke,
+)
+from kiro_crew.dashboard.handlers.tool_grants import (  # noqa: E402, F401
+    api_tool_grant_add,
+    api_tool_grant_remove,
+    api_tool_grants_list,
 )

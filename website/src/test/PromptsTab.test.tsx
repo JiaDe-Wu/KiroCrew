@@ -675,7 +675,9 @@ describe('PromptsTab feedback', () => {
     // always on screen, and a blank detail pane reads as a broken tab.
     await waitFor(() => expect(mockApi.promptDetail).toHaveBeenCalled())
     expect(screen.getByRole('listbox')).toBeInTheDocument()
-    expect(screen.getByRole('option', { name: /my-prompt/ })).toHaveAttribute('aria-selected', 'true')
+    // The selection effect fires the read before React commits the selected
+    // row, so wait for the row itself.
+    await waitFor(() => expect(screen.getByRole('option', { name: /my-prompt/ })).toHaveAttribute('aria-selected', 'true'))
     expect(screen.getByRole('option', { name: /sop/ })).toHaveAttribute('aria-selected', 'false')
   })
 
@@ -1119,5 +1121,31 @@ describe('PromptsTab list-load failure', () => {
     // After the successful refetch the list renders and the error clears.
     await screen.findByRole('option', { name: /my-prompt/ })
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+})
+
+describe('PromptsTab list Retry', () => {
+  it('keeps the pressed Retry mounted and focused while the retry reads', async () => {
+    // Retry clears `error` while it reads, which used to unmount the button
+    // the user had just pressed and drop their focus to the page (#32164).
+    let settle: (value: never[]) => void = () => {}
+    mockApi.prompts
+      .mockRejectedValueOnce(new Error('prompt service is unreachable'))
+      .mockReturnValueOnce(new Promise(resolve => { settle = resolve }))
+    renderTab()
+
+    const retry = await screen.findByRole('button', { name: 'Retry' })
+    retry.focus()
+    fireEvent.click(retry)
+    await waitFor(() => expect(mockApi.prompts).toHaveBeenCalledTimes(2))
+
+    expect(retry).toBeInTheDocument()
+    expect(retry).toHaveFocus()
+    expect(retry).toHaveAttribute('aria-disabled', 'true')
+    fireEvent.click(retry)
+    expect(mockApi.prompts).toHaveBeenCalledTimes(2)
+
+    settle([])
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument())
   })
 })

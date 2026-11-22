@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 
 from kiro_crew.agent_sdk.backends import (
+    ACP_BACKEND_ANTIGRAVITY,
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
     ACP_BACKEND_COPILOT,
@@ -27,6 +28,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_MIMOCODE,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
     ACP_BACKEND_STRANDS,
@@ -59,11 +61,18 @@ def _claude(name: str) -> NativeAllowStore:
     return NativeAllowStore(f".claude/{name}", (("CLAUDE_CONFIG_DIR", name), ("CLAUDE_HOME", name)))
 
 
-def _goose(name: str) -> NativeAllowStore:
-    # goose reads GOOSE_PATH_ROOT first (``acp.harness.goose.goose_config_dir``).
-    return NativeAllowStore(
-        f".config/goose/{name}",
-        (("GOOSE_PATH_ROOT", f"config/{name}"), ("XDG_CONFIG_HOME", f"goose/{name}")),
+def _goose(name: str) -> tuple[NativeAllowStore, ...]:
+    # goose reads GOOSE_PATH_ROOT first (``acp.harness.goose.goose_config_dir``), else
+    # ~/.config/goose on POSIX and, through its ``etcetera`` Windows app strategy,
+    # %APPDATA%\Block\goose\config on Windows.
+    overrides = (
+        ("GOOSE_PATH_ROOT", f"config/{name}"),
+        ("XDG_CONFIG_HOME", f"goose/{name}"),
+        ("APPDATA", f"Block/goose/config/{name}"),
+    )
+    return tuple(
+        NativeAllowStore(f"{home}/{name}", overrides)
+        for home in (".config/goose", "AppData/Roaming/Block/goose/config")
     )
 
 
@@ -75,10 +84,16 @@ NATIVE_ALLOW_STORES: Mapping[str, tuple[NativeAllowStore, ...]] = {
     ACP_BACKEND_CLAUDE: (_claude("settings.json"), _claude("settings.local.json")),
     # permission.yaml: tools under user.always_allow run without a permission request.
     # config.yaml: its extensions block decides what starts at the next spawn.
-    ACP_BACKEND_GOOSE: (_goose("permission.yaml"), _goose("config.yaml")),
+    ACP_BACKEND_GOOSE: (*_goose("permission.yaml"), *_goose("config.yaml")),
     ACP_BACKEND_OPENCODE: tuple(
         NativeAllowStore(f".config/opencode/{name}", (("XDG_CONFIG_HOME", f"opencode/{name}"),))
         for name in ("opencode.json", "opencode.jsonc", "config.json")
+    ),
+    # MiMo Code reads its global config from its own directory under the same XDG
+    # root (``resolveMimocodeHome`` and ``Config``'s global load, 0.1.15).
+    ACP_BACKEND_MIMOCODE: tuple(
+        NativeAllowStore(f".config/mimocode/{name}", (("XDG_CONFIG_HOME", f"mimocode/{name}"),))
+        for name in ("mimocode.json", "mimocode.jsonc", "config.json")
     ),
     ACP_BACKEND_CODEX: (NativeAllowStore(".codex/config.toml", (("CODEX_HOME", "config.toml"),)),),
     # extensions: code pi loads into its own process.
@@ -96,9 +111,13 @@ NATIVE_ALLOW_STORES: Mapping[str, tuple[NativeAllowStore, ...]] = {
 
 #: Harnesses with no row above, and why.
 NATIVE_ALLOW_STORES_NONE: Mapping[str, str] = {
-    ACP_BACKEND_KIRO: "its stores, ~/.kiro/agents and ~/.kiro/settings/mcp.json, are "
-    "fenced by name in security.paths_lists",
-    ACP_BACKEND_KAS: "it runs kiro-cli's engine and reads the same stores as kiro",
+    ACP_BACKEND_ANTIGRAVITY: "no on-disk tool allow list is known; verified sessions "
+    "remain in the required mode=default and ask through session/request_permission",
+    ACP_BACKEND_KIRO: "its stores, ~/.kiro/agents, ~/.kiro/settings/mcp.json and the "
+    "permissions.yaml / permissions.json rule files under ~/.kiro/settings and "
+    "~/.kiro/workspace-roots, are fenced by name in security.paths_lists",
+    ACP_BACKEND_KAS: "it runs kiro-cli's engine and reads the same stores as kiro, "
+    "the permissions rule files included",
     ACP_BACKEND_DEEPSEEK: "no on-disk allow list is known; every call goes through "
     "Crew's gate extension",
     ACP_BACKEND_STRANDS: "in the Python-project ACP mode Crew runs, the CLI consults "
@@ -123,6 +142,12 @@ PROJECT_ALLOW_STORES: tuple[str, ...] = (
     ".pi/settings.json",
     ".pi/mcp.json",
     ".pi/extensions/",
+    # MiMo Code, opencode's fork, under its own names (``ConfigPaths`` 0.1.15): config
+    # found walking up from the work dir, and its .mimocode dirs (config, agents,
+    # commands, plugins), the one in the home directory included.
+    "mimocode.json",
+    "mimocode.jsonc",
+    ".mimocode/",
 )
 
 

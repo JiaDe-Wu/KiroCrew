@@ -247,6 +247,30 @@ def test_realpath_dedup_across_two_roots(tmp_path):
     assert [path for path, _ in docs] == [str(doc.resolve())]
 
 
+def _case_insensitive(directory: Path) -> bool:
+    probe = directory / "CaseProbe"
+    probe.mkdir()
+    try:
+        return (directory / "caseprobe").exists()
+    finally:
+        probe.rmdir()
+
+
+def test_one_root_spelled_in_two_letter_cases_emits_each_document_once(tmp_path):
+    if not _case_insensitive(tmp_path):
+        pytest.skip("needs a case-insensitive filesystem")
+    root = tmp_path / "Standards"
+    doc = _write(root / "style.md", "always")
+    other_spelling = tmp_path / "standards"
+    assert os.path.samefile(root, other_spelling)
+    docs = collect_folder_steering(
+        [str(root), str(other_spelling)],
+        project=None,
+        home=_fake_home(tmp_path),
+    )
+    assert [path for path, _ in docs] == [str(doc.resolve())]
+
+
 def test_delivered_sources_skip_only_the_same_canonical_file(tmp_path, monkeypatch):
     """Delivered inputs stay string-only while fold-colliding siblings survive."""
     root = tmp_path / "standards"
@@ -820,8 +844,14 @@ def test_walk_opens_the_root_pinned_and_children_relative_to_descriptors(tmp_pat
     assert [Path(p).name for p, _ in docs] == ["top.md", "inner.md"]
     assert pinned_roots == [str(root.resolve())]
     # Every listing took a descriptor, never a path: the root and its one
-    # subdirectory, both opened relative to a pinned handle.
-    assert len(scandir_args) == 2 and all(isinstance(a, int) for a in scandir_args)
+    # subdirectory, both opened relative to a pinned handle. The sensitive-path gate
+    # lists the data home's apps/ through the same patched scandir; that is not the walk.
+    walked = [
+        a
+        for a in scandir_args
+        if isinstance(a, int) or Path(os.path.realpath(a)).is_relative_to(root.resolve())
+    ]
+    assert len(walked) == 2 and all(isinstance(a, int) for a in walked)
     # Every pinned open (the root's ancestor chain and the child) used the
     # no-follow directory flags; the count depends on the tmp path's depth.
     assert flag_calls and all(f & os.O_NOFOLLOW and f & os.O_DIRECTORY for f in flag_calls)

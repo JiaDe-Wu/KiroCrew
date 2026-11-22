@@ -190,11 +190,9 @@ def refusal_diagnostic(
     """Build the diagnostic for a refusal of *subject* by *rule* at *span*.
 
     ``span`` omitted means the whole subject, which is the honest reading for a
-    tier that decides on the argv as a whole rather than at an offset: an
-    argv-structural floor matches a command's SHAPE, so pointing at one region of
-    it would name a cause the reader could disprove. Out-of-range or inverted
-    offsets are clamped rather than rejected, because a diagnostic must never be
-    the thing that raises inside a gate that has already decided to refuse.
+    tier that decides on the argv as a whole rather than at an offset. Out-of-range
+    or inverted offsets are clamped rather than rejected, because a diagnostic must
+    never be the thing that raises inside a gate that has already decided to refuse.
     """
     if span is None:
         start, end = 0, len(subject)
@@ -224,3 +222,23 @@ def annotate_refusal(reason: str, diagnostic: RefusalDiagnostic) -> str:
     if not reason:
         return reason
     return f"{reason}\n{diagnostic.as_line()}"
+
+
+def refusal_rule_id(text: str) -> str:
+    """The ``rule`` id on the diagnostic line *text* carries, or ``""``.
+
+    Read from the LAST line carrying the prefix, and only from a line that STARTS
+    with it. :func:`annotate_refusal` appends the diagnostic on its own final line,
+    so the last such line is the gateway's own; an earlier one is inside the refusal
+    text, which can quote the subject that caused it. The token goes back through
+    :func:`_diagnostic_id`, so a value that is not a diagnostic id reads as ``""``.
+    """
+    for line in reversed(str(text or "").splitlines()):
+        if not line.startswith(REFUSAL_DIAGNOSTIC_PREFIX):
+            continue
+        for token in line[len(REFUSAL_DIAGNOSTIC_PREFIX) :].split():
+            if token.startswith("rule="):
+                value = _diagnostic_id(token[len("rule=") :])
+                return "" if value == _UNNAMED else value
+        return ""
+    return ""

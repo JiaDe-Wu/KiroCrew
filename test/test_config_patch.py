@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -159,6 +160,26 @@ async def test_picking_kiro_cli_stores_kiro_and_the_response_says_kiro(tmp_confi
         assert refused.status == 400
     assert json.loads(tmp_config.read_text(encoding="utf-8"))["agent"]["acp_backend"] == "kiro"
     assert KiroCrewConfig.load().agent.acp_backend == ACP_BACKEND_KIRO
+
+
+@pytest.mark.asyncio
+async def test_a_harness_the_launch_refuses_on_this_host_is_not_saved(
+    tmp_config, monkeypatch
+) -> None:
+    """The save refuses an enforced harness with the launch's own sentence."""
+    from kiro_crew import sandbox
+    from kiro_crew.acp_backends import ACP_BACKEND_CODEX
+    from kiro_crew.agent_sdk.tool_gate import sandbox_floor_refusal
+
+    monkeypatch.setattr(sandbox, "credential_mask_applies", lambda _mode: False)
+    app = _make_app()
+    async with TestClient(TestServer(app)) as client:
+        response = await _patch(client, "agent.acp_backend", ACP_BACKEND_CODEX)
+        assert response.status == 409
+        body = await response.json()
+    assert body["code"] == "acp_backend_sandbox_refused"
+    assert body["error"] == sandbox_floor_refusal(ACP_BACKEND_CODEX, "auto")
+    assert "acp_backend" not in json.loads(tmp_config.read_text(encoding="utf-8"))["agent"]
 
 
 @pytest.mark.asyncio
@@ -395,11 +416,32 @@ class TestRoleModels:
         # cycle drive it.
         app = _make_app()
         _arm(app, _live_state())
-        with patch("kiro_crew.agent.rebuild_agent_config") as rebuild:
+        with patch(
+            "kiro_crew.agent.rebuild_agent_config_reporting",
+            return_value=(Path("kirocrew.json"), True),
+        ) as rebuild:
             async with TestClient(TestServer(app)) as c:
                 resp = await _patch(c, "agent.role_models.background", "claude-sonnet-4.6")
                 assert resp.status == 200
             rebuild.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_background_rebuild_that_did_not_land_still_answers_200(
+        self, tmp_config
+    ) -> None:
+        # The applier raises so the watcher retries it; the watcher contains that
+        # raise, so the PATCH that saved the value still answers 200 as before.
+        app = _make_app()
+        _arm(app, _live_state())
+        with patch(
+            "kiro_crew.agent.rebuild_agent_config_reporting",
+            return_value=(Path("kirocrew.json"), False),
+        ):
+            async with TestClient(TestServer(app)) as c:
+                resp = await _patch(c, "agent.role_models.background", "claude-sonnet-4.6")
+                assert resp.status == 200
+                body = await resp.json()
+        assert body["agent"]["role_models"]["background"] == "claude-sonnet-4.6"
 
     @pytest.mark.asyncio
     async def test_role_effort_valid_enum_passes(self, tmp_config) -> None:
@@ -413,6 +455,22 @@ class TestRoleModels:
             assert resp.status == 200
         data = json.loads(tmp_config.read_text(encoding="utf-8"))
         assert data["agent"]["role_efforts"]["subagent"] == "low"
+
+    @pytest.mark.asyncio
+    async def test_light_role_pins_nest_beside_the_subagent_pins(self, tmp_config) -> None:
+        app = _make_app()
+        app["state"] = SimpleNamespace(
+            subagents=MagicMock(spec=["update_completion_keep"]),
+            sessions=SimpleNamespace(refresh_defaults=AsyncMock()),
+        )
+        async with TestClient(TestServer(app)) as c:
+            resp = await _patch(c, "agent.role_models.subagent_light", "claude-haiku-4.5")
+            assert resp.status == 200
+            resp = await _patch(c, "agent.role_efforts.subagent_light", "low")
+            assert resp.status == 200
+        data = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert data["agent"]["role_models"]["subagent_light"] == "claude-haiku-4.5"
+        assert data["agent"]["role_efforts"]["subagent_light"] == "low"
 
     @pytest.mark.asyncio
     async def test_role_effort_invalid_enum_rejected(self, tmp_config) -> None:
@@ -1664,9 +1722,10 @@ class TestTelemetryEnabledPatch:
         _arm(app, _live_state())
         metrics_provider.watch_config()
         try:
-            with patch("kiro_crew.metrics.provider.shutdown") as reset:
+            with patch("kiro_crew.metrics.provider._detach", return_value=None) as reset:
                 async with TestClient(TestServer(app)) as c:
-                    assert (await _patch(c, "telemetry.enabled", True)).status == 200
+                    # False: the default is on, so writing true would change nothing.
+                    assert (await _patch(c, "telemetry.enabled", False)).status == 200
         finally:
             sub = metrics_provider._config_sub
             if sub is not None:
@@ -1677,14 +1736,14 @@ class TestTelemetryEnabledPatch:
     async def test_unrelated_field_leaves_the_recorder_alone(self, tmp_config) -> None:
         # Rebuilding the recorder flushes and restarts the exporter thread, so it
         # must not ride along on every unrelated config write.
-        with patch("kiro_crew.metrics.provider.shutdown") as reset:
+        with patch("kiro_crew.metrics.provider._detach", return_value=None) as reset:
             async with TestClient(TestServer(_make_app())) as c:
                 assert (await _patch(c, "session.timeout_secs", 600)).status == 200
         reset.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_rejected_value_leaves_the_recorder_alone(self, tmp_config) -> None:
-        with patch("kiro_crew.metrics.provider.shutdown") as reset:
+        with patch("kiro_crew.metrics.provider._detach", return_value=None) as reset:
             async with TestClient(TestServer(_make_app())) as c:
                 assert (await _patch(c, "telemetry.enabled", "yes")).status == 400
         reset.assert_not_called()
@@ -1693,7 +1752,7 @@ class TestTelemetryEnabledPatch:
     async def test_recorder_reset_failure_does_not_fail_the_write(self, tmp_config) -> None:
         # The value is already durable by this point; a flush that raises must not
         # report the save as failed and send the UI's switch back.
-        with patch("kiro_crew.metrics.provider.shutdown", side_effect=RuntimeError("boom")):
+        with patch("kiro_crew.metrics.provider._detach", side_effect=RuntimeError("boom")):
             async with TestClient(TestServer(_make_app())) as c:
                 assert (await _patch(c, "telemetry.enabled", True)).status == 200
         data = json.loads(tmp_config.read_text(encoding="utf-8"))
@@ -1820,72 +1879,10 @@ class TestTelemetryEnabledEgressGate:
     @pytest.mark.asyncio
     async def test_refused_enable_does_not_touch_the_recorder(self, tmp_config) -> None:
         self._seed_endpoint(tmp_config, "http://otel.internal:4318/v1/metrics")
-        with patch("kiro_crew.metrics.provider.shutdown") as reset:
+        with patch("kiro_crew.metrics.provider._detach", return_value=None) as reset:
             async with TestClient(TestServer(_make_app())) as c:
                 assert (await _patch(c, "telemetry.enabled", True)).status == 409
         reset.assert_not_called()
-
-
-# ── Update-nudge snooze/skip (dashboard.update_nudge) ────────────────────
-
-
-class TestUpdateNudgeKeys:
-    """The proactive update popup's per-version snooze/skip persistence.
-
-    One atomic dict write, since the three fields form one verdict. The strict spec
-    (all keys required, no extras) keeps it from being a generic JSON passthrough.
-    """
-
-    _REC = {"version": "0.5.0", "snoozed_until": 1756000000.0, "skipped": True}
-
-    @pytest.mark.asyncio
-    async def test_full_record_round_trips_atomically(self, tmp_config) -> None:
-        async with TestClient(TestServer(_make_app())) as c:
-            assert (await _patch(c, "dashboard.update_nudge", self._REC)).status == 200
-        data = json.loads(tmp_config.read_text(encoding="utf-8"))
-        assert data["dashboard"]["update_nudge"] == self._REC
-
-    @pytest.mark.asyncio
-    async def test_non_object_rejected(self, tmp_config) -> None:
-        async with TestClient(TestServer(_make_app())) as c:
-            assert (await _patch(c, "dashboard.update_nudge", "0.5.0")).status == 400
-
-    @pytest.mark.asyncio
-    async def test_missing_key_rejected(self, tmp_config) -> None:
-        async with TestClient(TestServer(_make_app())) as c:
-            rec = {"version": "0.5.0", "skipped": True}
-            assert (await _patch(c, "dashboard.update_nudge", rec)).status == 400
-
-    @pytest.mark.asyncio
-    async def test_unknown_key_rejected(self, tmp_config) -> None:
-        async with TestClient(TestServer(_make_app())) as c:
-            rec = {**self._REC, "extra": 1}
-            assert (await _patch(c, "dashboard.update_nudge", rec)).status == 400
-
-    @pytest.mark.asyncio
-    async def test_version_overlong_rejected(self, tmp_config) -> None:
-        async with TestClient(TestServer(_make_app())) as c:
-            rec = {**self._REC, "version": "x" * 129}
-            assert (await _patch(c, "dashboard.update_nudge", rec)).status == 400
-
-    @pytest.mark.asyncio
-    async def test_negative_snooze_rejected(self, tmp_config) -> None:
-        async with TestClient(TestServer(_make_app())) as c:
-            rec = {**self._REC, "snoozed_until": -1.0}
-            assert (await _patch(c, "dashboard.update_nudge", rec)).status == 400
-
-    @pytest.mark.asyncio
-    async def test_bool_snooze_rejected(self, tmp_config) -> None:
-        # bool is an int subclass; a bare float() coercion would store 1.0.
-        async with TestClient(TestServer(_make_app())) as c:
-            rec = {**self._REC, "snoozed_until": True}
-            assert (await _patch(c, "dashboard.update_nudge", rec)).status == 400
-
-    @pytest.mark.asyncio
-    async def test_skipped_wrong_type_rejected(self, tmp_config) -> None:
-        async with TestClient(TestServer(_make_app())) as c:
-            rec = {**self._REC, "skipped": "yes"}
-            assert (await _patch(c, "dashboard.update_nudge", rec)).status == 400
 
 
 class TestChatTurnTimeout:

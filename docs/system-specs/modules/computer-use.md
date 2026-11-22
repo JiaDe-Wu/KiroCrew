@@ -113,6 +113,34 @@ The gate **fails closed** — a missing, unreadable or malformed keystone yields
 entry — matching `enable_state`'s own posture, for a stronger reason: the open
 position hands out the operator's whole desktop.
 
+`is_enabled()` reads whatever the gateway last endorsed, not a tampered disk file.
+`computer_use.json` is a per-file read-only sandbox leaf, and the Linux bind stops
+sealing it after the gateway's next rename-save, so a prompt-injected agent could
+write `enabled: true` directly past the seal; where the namespace sandbox seals it,
+`enable_state.load_state` parses the gateway-endorsed copy whenever the on-disk bytes
+differ (whole-file, so every key including `enabled` is covered). `save_state`
+endorses its own serialized bytes before the rename publishes them, and the dashboard
+saver's strict read (`_read_state_strict`) reconciles the same way before it mutates,
+so nothing re-endorses a tampered `enabled: true`; while the keystone is pending, an
+ordinary save of it is refused (`file_pending_review`) until the owner applies or discards. Where the
+sandbox seals the keystone, a copy that cannot be written aborts the save, and an
+unreadable copy reads as an unreadable keystone (disabled). A keystone with no endorsed copy
+yet is endorsed as it is by the gateway's next start (`adopt_unendorsed`, a JSON object stored
+as Kiro Crew writes one); any other is read as written until the gateway's first save of it
+endorses it or a later start adopts it. A keystone that
+differs from its copy (a hand edit, or an in-sandbox write) is PENDING: `is_enabled()` keeps
+reading the endorsed copy until the dashboard owner applies or discards the change in
+Settings > Security (owner-gated, CSRF-guarded, never an agent or MCP tool), so writing
+`enabled: true` from a sandbox never enables computer use on its own. Apply runs the PUT's
+own field validation (`keystone_patch`: `enabled` a boolean and not locked by policy,
+`allowed_apps` / `extra_denied_apps` pattern lists within the PUT's caps, lowercased as the PUT
+stores them) on the keys the edit changed; a refused value answers `409 write_refused` with the
+PUT's message and the keystone stays pending. This applies only where the Linux namespace sandbox
+actually seals the keystone (`loosening_provenance.enforcement_active`: a Linux host that
+can build the namespace sandbox, probed once per process); off Linux, and on a Linux host
+without user namespaces, the keystone is read as written. Mechanism and threat:
+[security](security.md) and [config](config.md).
+
 Both in-process checks stay, and they cover what the gate structurally cannot: the
 keystone flipping **off** mid-session, after the spec was written and the backend
 spawned. The gate covers what they cannot: the process existing.
@@ -229,7 +257,7 @@ sessions are genuinely separate — in the 1:1 shim topology. On a POOLED backen
 process serves many sessions, so the pid separates only what the injected caller
 block does not already name: co-tenants gatewayd CAN name get real per-session keys,
 and the ones it cannot are separated by the **per-connection nonce** gatewayd injects
-alongside the caller block (`_meta."kirocrew.tenant".nonce`, #5322). The nonce is
+alongside the caller block (`_meta."kirocrew.tenant".nonce`). The nonce is
 gateway-minted and stripped on every inbound frame like the caller block, so a stub
 cannot choose to share a peer's namespace; it carries no session key, so
 `CallerContext.from_meta` still finds no identity and nothing is laundered into
@@ -260,9 +288,9 @@ claim: on the AF_UNIX leg `token_auth._verify_unix_peer` resolves the peer pid's
 `session_pid_<pid>` ancestry and denies `403 peer_session_mismatch` when the recovered
 key differs from the declared one, which is the same-uid impersonation case that check
 exists to close. A placeholder names no session, so it can never equal a recovered key,
-and declaring it made every Computer Use call from a dashboard-launched kiro-cli fail
-with a bare `Error: Forbidden` on macOS, where the ancestry file always resolves
-(#9841; `kirocrew computer apps` worked because the CLI never takes that leg). The
+and declaring it would make every Computer Use call from a dashboard-launched kiro-cli
+fail with a bare `Error: Forbidden` on macOS, where the ancestry file always resolves
+(`kirocrew computer apps` is not affected because the CLI never takes that leg). The
 shim therefore decides by the key's own prefix (`mcp_computer._declares_identity`):
 a strictly-resolved key is declared in the header and kernel-verified as before; an
 `unresolved:` key is carried in the body only, and the request has no `X-Session-Key`,
@@ -405,13 +433,14 @@ ring trim orders by name. If descriptor adoption or the write fails, each writer
 removes its invocation-owned partial frame before degrading; it never sweeps a
 neighbouring capture owned by another call or process.
 
-**`computer_list_apps` only omits an app it cannot name.** It used to carry a
-per-app governance filter (`gate.app_is_disclosable` against the `computer_use.apps`
-/ `.app_names` axes) because it is the one verb that names every application and
-resolves no target, so `require_computer_use` could not see them. With those axes
-gone the function survives as a shape check: an app with neither a bundle id nor a
-display name is dropped because there is nothing to show. Terminals and password
-managers now appear in the list like everything else.
+**`computer_list_apps` omits only what the target policy refuses and what it cannot
+name.** `policy.check_app` drops Kiro Crew, any window titled Kiro Crew, and the apps
+the operator's `extra_denied_apps` and `allowed_apps` exclude. There is no per-app
+governance axis, so `gate.app_is_disclosable` is a shape check: an app with neither a
+bundle id nor a display name is dropped because there is nothing to show. Terminals
+and password managers appear in the list like everything else. Every listing ends
+with `UNLISTED_APPS_NOTE`, so neither a short list nor an empty one reads as every
+app that is open; the note names no hidden app and counts none.
 
 ### Result shape: text only, by construction
 
@@ -455,17 +484,14 @@ separately — deliberately, and neither is optional.**
 The tree half is redacted inside `render_tree`; the header was concatenated *after*
 that pass, and `detail` is not our prose — every driver confirmation interpolates
 app-supplied text (`_click_text` embeds `app.name`, the process name macOS reports,
-which is attacker-controlled). A process named `Notes key=AKIA…` therefore put a raw
+which is attacker-controlled). A process named `Notes key=ghp_…` therefore put a raw
 credential directly in front of a fully redacted tree. Fixed by redacting `detail` at
 the interpolation.
 
 Redacting the *joined* string instead would put the image note through the redactor,
 and `render_tree` appends that note after its own redaction on purpose: it is
 machine-generated, and the model must receive the spool path byte-exact to open it or
-hand it to the user. A path is one base64-alphabet run to the bare-secret-key
-heuristic, which withholds only this host's macOS per-user directory id
-(`redaction._host_darwin_user_dir_id`), not every temp root a spool can land under; see
-`render._render_image_note`. Hence: header redacted on its own, already-redacted body
+hand it to the user; see `render._render_image_note`. Hence: header redacted on its own, already-redacted body
 passed through untouched. Both halves of
 that rule are pinned by tests, the second one structurally — a mutating tool's refresh
 walk is `want_image=False`, so no behavioural test in that file would notice a
@@ -502,11 +528,11 @@ Mechanics:
   `"enabled": "false"` (a truthy string) or `"enabled": 1` does not enable
   desktop control.
 - The opt-in is ANDed with the one on/off governance key `capabilities.computer_use`
-  ([rfc-crew-enterprise-edition](../../request-for-change/rfc-crew-enterprise-edition.md)
+  ([rfc-crew-lts-edition](../../request-for-change/rfc-crew-lts-edition.md)
   appendix row "Desktop control"; `enable_state.locked_by_policy`, policy layer
   only, fail-closed). When the policy keeps it off, `is_enabled()` answers `False`,
   the config GET carries `locked_by_policy: true`, and a PUT with `enabled: true`
-  answers 409 `locked_by_policy`. An enterprise build is off until a policy turns
+  answers 409 `locked_by_policy`. An LTS build is off until a policy turns
   the key on (D3: the baseline row is off). An `oss` build with no policy naming
   the key is unchanged. Nothing finer (apps, actions, approval) is governed.
 - The only writer is the dashboard PUT handler, which does not route through the
@@ -572,9 +598,17 @@ screenshot_jpeg_quality, cursor_motion, cursor_motion_supported, allowed_apps,
 extra_denied_apps, policy_error, permissions{accessibility,
 screen_recording, responsible_hint}, limits{field: [min, max]}}`.
 
-- `permissions` comes from shelling `kirocrew computer doctor --json`
+- `permissions` comes from a short-lived child,
+  `<gateway interpreter> [-s] -P -m kiro_crew.computer_use.permission_probe`
   (`asyncio.create_subprocess_exec`, fixed argv, 5s timeout, one
-  `test_spawn_audit.BENIGN_SPAWNS` entry). Degrades to `unknown` on timeout,
+  `test_spawn_audit.BENIGN_SPAWNS` entry), which prints the driver's
+  `probe_permissions()` block as one JSON object. It is not
+  `kirocrew computer doctor --json`, which asks the same driver: the CLI's start-up
+  plus the doctor's agent-spec projection measure 3.5s warm and over 11s on a cold
+  file cache on macOS, so on a busy host that probe outlasts the timeout and both
+  rows read "Could not check" while both grants are held. The child imports only the driver
+  seam (about half a second), and `test_computer_use_permission_probe.py` fails if
+  it loads `kiro_crew.cli` or `kiro_crew.agent`. Degrades to `unknown` on timeout,
   non-zero exit or unparseable output, and reports `unsupported` when the current
   platform has no probe; macOS and Windows both probe. A timed-out child is killed —
   the panel polls every 5s while a
@@ -604,12 +638,8 @@ notification push; the two machine routes are covered instead by their
 `request["internal_auth"]` assertion, which an app token can never satisfy.
 
 **There is no `409` and no `read_only` field**, because there is no ceiling: no
-`computer_use*` row exists in `SCOPE_CATALOG`. An earlier revision of this spec (and
-of the handler's own docstring and a 16-line comment) described a `409` for a widening
-request under a forbidding ceiling and a `forbidden`-only `read_only` the panel would
-key `disabled` on. Both belonged to the governance model that was removed by product
-decision, and the prose outlived the code — there is no `status=409` in the module at
-all. Do not re-document either without re-implementing it.
+`computer_use*` row exists in `SCOPE_CATALOG`, and there is no `status=409` in the
+module at all. Do not document either without implementing it.
 
 On `PUT`, a corrupt keystone or `config.json` is `500` and is left byte-identical
 rather than clobbered (`StateCorruptError`, the `ConfigCorruptError` precedent). Every mutation
@@ -804,6 +834,11 @@ rather than a corner. The parent probe and the bundle probes are independent: an
 parent is not evidence of an unwritable bundle. A bundle installed by any user-space
 installer — every drag-install, every Homebrew cask — is owned by the installing user, so
 `Foo.app/Contents/MacOS/Foo` can be replaced without the parent ever being writable.
+`_writable_component` returns the first path that would let this user change what runs,
+and the refusal names it: a writable parent reads "is installed in a directory
+(`<parent>`) this user can write"; the bundle or anything in it reads "has a component
+(`<path>`) this user can write or that could not be verified", naming a replaceable
+executable as the file rather than its directory.
 
 **A stock `/Applications` is judged by the bundle, not the parent.** macOS ships it
 `drwxrwxr-x root admin`, so every admin user (the default for a Mac's primary account) can
@@ -814,6 +849,13 @@ On it the parent probe is skipped, and the bundle, `Contents` and `Contents/MacO
 judged by ownership as well as mode (`_file_is_replaceable`), because a directory's owner
 can `chmod` it at will. A root-owned bundle there launches; one this user owns is still
 refused. Any other parent, or a `stat` that fails, keeps the parent probe.
+
+**The check and the launch are separate steps.** `spawn_detached` launches by the PATH
+`resolve_target` verified, so on a stock `/Applications` an admin user can rename the verified
+bundle aside and put another at the same path between the checks and LaunchServices reading
+it; nothing re-checks the bundle at the spawn. This window is accepted and recorded as a
+`shortcut:` in `spawn_detached`; closing it means launching by a file reference held from the
+check to the spawn, not adding a refusal on top of the path launch.
 
 **Every level, not just the endpoints.** Write access to any single directory on that path
 is enough to control what executes, and `Contents` is the one an endpoints-only check
@@ -1444,7 +1486,7 @@ type-check `CFGetTypeID(v)` against `CFStringGetTypeID()`/`CFArrayGetTypeID()`
 **before** using a value — a wrong-type read is another segfault, not an
 exception.
 
-**2. Electron/Chromium apps need an explicit opt-in.** Chrome returned
+**2. Electron apps need an explicit opt-in.** A cold-started Chrome once returned
 `kAXErrorCannotComplete = -25204` for every attribute read. Setting
 `AXManualAccessibility = kCFBooleanTrue` on the app element and waiting ~2s
 unlocked **1431 nodes in 0.07s**. Without this, Slack, VS Code, Obsidian and
@@ -1454,10 +1496,32 @@ create the app element, immediately
 mandatory, because ctypes releases the GIL around the C call and a genuinely hung
 target app would otherwise park the worker thread indefinitely — read
 `AXWindows`, and on `-25204` set the opt-in, poll for up to
-`ELECTRON_OPT_IN_WAIT_SECS` in 0.25s steps, retry **once**, then raise naming the
+`ELECTRON_OPT_IN_WAIT_SECS` in 0.25s steps, retry **once** (the largest walk is kept,
+but a secure field that any walk saw still sets `has_secure`), then raise naming the
 raw AX code so a support thread is diagnosable. The first `computer_get_state`
 on an Electron app is inherently slow; the skill says so, so a model does not
 read it as a hang.
+
+Chromium browsers need a second attribute. On macOS 14+ a client that just reads
+from Chrome gets the browser's tabs, toolbar and bookmarks with no page in the tree.
+That window is far above the stub threshold, so the `AXManualAccessibility` retry
+never runs. Chrome's own `accessibilitySetValue:forAttribute:` handles
+`AXEnhancedUserInterface`, so for a bundle id in `CHROMIUM_BROWSER_BUNDLE_IDS` a
+walk with no `AXWebArea` sets `AXEnhancedUserInterface`, waits out Chrome's 2s
+debounce, and re-walks for up to `CHROMIUM_OPT_IN_WAIT_SECS`. If the page never
+appears, the browser-UI walk stands. Once the write is accepted or a page appears,
+the opt-in never runs again for that browser process (pid plus start time), so a window that has no page (Task
+Manager, picture-in-picture) does not pay the wait on every snapshot and every
+pre-action fingerprint walk. A refused write that shows no page is retried after
+`CHROMIUM_OPT_IN_RETRY_SECS`, and a walk cut short by its time budget does not trigger
+the opt-in. Chrome keeps the mode on until the attribute is set back
+to false or VoiceOver toggles, so only the first snapshot after an accepted opt-in
+pays the wait; after a VoiceOver toggle the page stays out until the browser restarts.
+Nothing sets it back to false: once opted in, that Chrome process stays in enhanced
+accessibility mode for the rest of its life, as it would with a screen reader running.
+The cost is Chrome's, not Computer Use's: every renderer in that process builds and
+updates its accessibility tree on each page change, which uses more CPU and memory
+and can slow heavy pages, until the browser quits.
 
 **3. `pgrep` is the wrong way to resolve an app to a pid.**
 `pgrep -n "Google Chrome"` returned 47492 — a short-lived helper that vanished
@@ -1529,38 +1593,35 @@ redaction that missed would be worse than none.
 
 **Every walk cutoff sets a flag, and the capture gate treats "unknown" as
 "present".** `MAX_CHILDREN_PER_NODE = 512` bounds one pathological container (a
-table with 100k rows) before the global node budget notices — but it used to drop
-the tail *silently*, so `saw_secure` reflected only the first 512 children while
-`truncated` stayed False. The walk then reported itself complete and non-secure and
-`capture_snapshot_image` had nothing to refuse on, leaving a password field as child
-513 with the whole window's pixels capturable (reviewer finding). A capped read now
-sets `truncated`, which already means "there is more of this tree than you were
+table with 100k rows) before the global node budget notices. Dropping the tail
+silently would leave `saw_secure` reflecting only the first 512 children with
+`truncated` False, so `capture_snapshot_image` would have nothing to refuse on and a
+password field at child 513 would leave the whole window's pixels capturable. A
+capped read therefore sets `truncated`, which already means "there is more of this tree than you were
 shown". Detected as `len(children) >= limit` rather than by re-reading the array for
 a real count (that would reintroduce the cost the cap exists to avoid), so a node
 with exactly the cap many children is treated as truncated too — a false positive
 costs one suppressed screenshot, a false negative is the disclosure.
 
 **And that suppression ANNOUNCES itself** (`TRUNCATED_WINDOW_NOTE`, emitted by
-`render._render_image_note`). It did not: the renderer special-cased only
-`has_secure` and returned `""` for every other empty `image_path`, so a truncated
-walk produced no image and no reason. Truncation is the NORMAL state for a
-Chromium/Electron window at the shipped 1200-node default (Chrome measured 1475
-nodes), so `screenshot: true` on Chrome, Slack or VS Code silently returned nothing
-— the retry loop `SECURE_WINDOW_NOTE` and `OBS_SUPPRESSED_NOTE` exist to prevent.
+`render._render_image_note`). Truncation is the NORMAL state for a Chromium/Electron
+window at the shipped 1200-node default (Chrome measured 1475 nodes), so without the
+note `screenshot: true` on Chrome, Slack or VS Code would silently return nothing —
+the retry loop `SECURE_WINDOW_NOTE` and `OBS_SUPPRESSED_NOTE` exist to prevent.
 The note names the remedy (raise `max_tree_nodes` / `max_tree_depth`), because
 unlike the secure case this one is fixable by the caller, and it is checked AFTER
 `has_secure` so a window that is both keeps the more specific reason. The shipped
-`FakeComputerUseBackend` mirrors the refusal too — it previously attached pixels to
-a truncated walk, so deleting the production branch left the suite green.
+`FakeComputerUseBackend` mirrors the refusal too, so deleting the production branch
+turns the suite red.
 
 **It fires only when an image was actually REQUESTED** (`walk_budget.want_image`;
 `None` — an unstamped, backend-built snapshot — still announces, since there the
 request is unknown and a spurious note is cheaper than a silent omission). Without
-that condition the fix inverts into the same defect: every mutating action's refresh
+that condition the note inverts into the same defect: every mutating action's refresh
 walk forces `want_image=False` by design, so a successful click on a browser window
-came back announcing the suppression of an image nobody asked for and telling the
+would come back announcing the suppression of an image nobody asked for and telling the
 model to "re-run with a higher `max_tree_nodes`" — an argument mutating tools do not
-accept (reviewer finding on the first version of this fix). Both directions are
+accept. Both directions are
 pinned by `test_computer_use_snapshot.py::TestASuppressedScreenshotAlwaysSaysSoWhy`,
 including one case through the real `dispatch_tool` path, because neither is visible
 to a `render_tree` unit test on its own.
@@ -1584,6 +1645,18 @@ refusal above exists to protect (reviewer finding). `type_text` and `press_key` 
 return a failed `DriverResult` naming what did *not* happen ("the keystrokes were
 NOT sent"), because a model told only "focus failed" would assume the input landed
 and go verify a change that never occurred.
+
+**A Cmd shortcut to a background app is sent with a caveat on macOS.** macOS hands a
+Cmd shortcut to the frontmost app's menu bar and key window, so one posted to a
+background app can do nothing while a bare "sent" reads as success. Measured: Cmd+A
+posted to a background TextEdit left the selection unchanged, pressing Edit > Select
+All through `AXPress` did nothing either, and the same Cmd+A selected all the text
+once TextEdit was frontmost. Other apps and shortcuts were not measured, and the key
+goes to the target app's pid either way, so it is never delivered to the wrong app.
+So the macOS driver still posts the key, then reads the app's `AXFrontmost` for any
+key carrying the Cmd modifier and, when it is not `true` (an unreadable value counts
+as background), keeps `ok=True` but says macOS may have ignored it and names the
+element routes. Plain keys get no caveat.
 
 ### Threading
 
@@ -1826,7 +1899,7 @@ that actually talks to AppKit.
 These are the protections that survive the governance removal, and they survive
 BECAUSE they were never governance keys. Each is unconditional code — no policy
 file, no profile, no toggle — which is exactly why removing the ceiling did not
-touch them. They sit with `_SENSITIVE_HOME_DIRS` and the AKIA redaction:
+touch them. They sit with `_SENSITIVE_HOME_DIRS` and the credential redaction:
 
 - **Secure-field value redaction** — `render` emits `<secure>`; the value bytes
   are never rendered, not truncated, not masked-with-a-hint.
@@ -2271,10 +2344,11 @@ is parked off-screen at `-32000, -32000`, so the capture SUCCEEDS over a uniform
 buffer and the blank-frame gate rejects it with no cause anyone can report. The
 tree is still returned — the UIA tree of a minimized window reads perfectly well.
 
-`kirocrew computer doctor --json` is what the gateway shells for the Settings
-permission rows — a short-lived subprocess, deliberately NOT an in-gateway ctypes
-call, so a native fault cannot take the gateway (and with it cron, Slack and the
-dashboard WS) down.
+The gateway reads the Settings permission rows from a short-lived child,
+`python -m kiro_crew.computer_use.permission_probe`, deliberately NOT an
+in-gateway ctypes call, so a native fault cannot take the gateway (and with it
+cron, Slack and the dashboard WS) down. `kirocrew computer doctor --json` reports
+the same `probe_permissions()` answer, but is too slow to start for that budget.
 
 ### An app's own popups are not addressable surfaces
 
@@ -2392,13 +2466,18 @@ Both halves are pinned by tests (`ComputerUsePanel.test.tsx`,
 dead button that only reproduces in a packaged build.
 
 Editor links that name a file get a fourth verdict, `confirm`:
-`vscode://file/<path>` and `vscode://vscode-remote/ssh-remote+<host>/<path>`
+`vscode://file/<path>`, `vscode://file/<drive>:/<path>` (a Windows drive letter,
+local files only) and `vscode://vscode-remote/ssh-remote+<host>/<path>`
 (and `vscode-insiders://`), with an optional `:line[:col]`. The handler shows a
 native dialog with the full URL and hands it to the OS only if the user picks
 Open, one dialog at a time. Its "Don't ask again" box skips the dialog for
 later links to the same editor and machine (one SSH host, or local files) until
-the app quits; the choice is held in memory only. `isEditorLink` checks the raw string, requires the
-host to pass `HOSTNAME_RE`, and refuses a `..` segment after decoding. Every
+the app quits; the choice is held in memory only. A local link whose decoded
+path starts with two slashes and has no drive letter
+(`vscode://file//<host>/<share>/<path>`) names a share on another machine, so it
+is remembered for that one path and no other choice covers it. `isEditorLink`
+checks the raw string, requires the host to pass `HOSTNAME_RE`, and refuses a
+`..` segment after decoding. Every
 other editor URL, such as an extension URI handler
 (`vscode://<extension-id>/…`), stays `block`.
 
@@ -2448,9 +2527,7 @@ and restart, or use the Kiro CLI backend), and it is absent once the running gat
 routes the server: `gateway_routed_names()`, the saved routing and a stub in the
 overlay built at the gateway's start, the answer the MCP tab gives. On every other
 backend the line names only the Kiro CLI backend, routed or not. The projection's
-own withhold warnings are silenced for this one question: no session runs in it,
-and the Settings panel repeats the `--json` probe every few seconds while a
-permission is missing.
+own withhold warnings are silenced for this one question: no session runs in it.
 
 ### `call` is a harness, not an eleventh tool
 
@@ -2522,9 +2599,14 @@ The lock matters because the rebuild READS the keystone and WRITES the spec. Out
 it, two overlapping PUTs interleave: an enable's slower rebuild can land its spec
 *after* a later disable's, leaving a spec that mounts — and therefore spawns — the
 server the keystone now forbids. Holding `_get_config_lock()` makes read-decide-write
-atomic against every keystone writer, so whichever rebuild finishes last is the one
-that read the final state. It is a plain reacquisition: the write block has already
-exited its own, and `rebuild_agent_config` never takes this lock.
+atomic against every keystone writer in the gateway, so whichever rebuild finishes last
+is the one that read the final state. It is a plain reacquisition: the write block has
+already exited its own, and `rebuild_agent_config` never takes this lock.
+`kirocrew config pending` writes the keystone from another process and asks for a
+restart instead of rebuilding. The PUT's write (`_write_state`) refuses a pending
+keystone before it reads it, so it cannot publish a stale copy over that command's
+Apply; what remains is the window `refuse_save_if_pending` documents, an outside edit
+and its Apply both landing inside one save.
 
 App agents are rewritten in the same step, after the host rebuild and before the
 reset. An app agent that references `@kirocrew-computer` gets the entry in its
@@ -2556,6 +2638,8 @@ Deliberately narrow, so a restart is never gratuitous:
 The response carries `sessions_reset` so the panel can EXPLAIN the restart — an
 unexplained session reset reads as a crash. Pinned by
 `test_computer_use_api_keystone.py::TestEnableRestartsSessions`.
+Applying a pending `computer_use.json` edit in Settings > Security that changes whether
+computer use is on runs the same rebuild and reset (`apply_enable_change`, shared with the PUT).
 
 ## Known limitations
 
@@ -2591,21 +2675,20 @@ ONLY one, and the consequences should be stated rather than discovered:
 
   Accepted false positive, stated rather than discovered: any window whose title
   merely contains "kiro crew" is refused — an editor with this repo open, a browser
-  reading this PR. The failure directions are not symmetric. Refusing an unrelated
+  reading its source. The failure directions are not symmetric. Refusing an unrelated
   window is visible and recoverable (the refusal names the target); failing to refuse
   our own dashboard silently hands the agent its own security settings. A title is
   also the only signal available: the driver reads no page URL, and `AXURL` is not
   bound anywhere in the package;
 * an agent that can write `~/.kiro/agents/*.json` can stop kiro-cli sending
   permission requests, so the interactive prompt is not a guarantee either. That is
-  a pre-existing gap affecting every capability, hardening deferred to its own PR;
+  a gap affecting every capability, not hardened here;
 * **typing into a terminal window reaches a shell without passing the command deny
   floor.** The `BUILTIN_DENIED_RULES` table's rules are matched against a `bash` tool call's
   command string; a `computer_type_text` into Terminal.app is not one, so
-  `security.py` sees none of it. The terminal denylist entry that used to cover this
-  was removed with the rest of the per-app model (it was incomplete by construction —
-  an IDE's embedded terminal never matched it — and it blocked legitimate use on the
-  operator's own machine). The sensitive-text scan still inspects what is typed, but
+  `security.py` sees none of it. There is no per-app terminal denylist entry: one
+  is incomplete by construction (an IDE's embedded terminal never matches it) and
+  blocks legitimate use on the operator's own machine. The sensitive-text scan still inspects what is typed, but
   it is a credential/secret filter, not the command floor. Stated here because it is
   the sharpest edge of the one-opt-in posture.
 
@@ -2626,7 +2709,7 @@ computer use.
   leaked real paths, window titles and bundle ids in live probes, and a document
   path inside an `AXTitle` is not a credential so redaction will not catch it.
   `window_titles`, `file_paths` and `element_values` are **not** separately
-  governable — the `observations` scope was removed, `apply_observation_ceiling` is
+  governable — there is no `observations` scope, `apply_observation_ceiling` is
   a pass-through and `permitted_observation_channels` returns every channel — so
   there is no `computer_use.apps` (or any other) row left to narrow. A deployment
   that needs a real bound on what the tree may disclose should not enable the
@@ -2715,13 +2798,14 @@ computer use.
 | `computer_use/macos_ffi_ax.py` | Accessibility reads, actions and settable writes, with the messaging timeout and the Create Rule |
 | `computer_use/macos_ffi_window.py` | The CoreGraphics window list, `executable_path`, in-process window capture and the JPEG size check |
 | `computer_use/apps_macos.py` | Window-list app enumeration + pid resolution (never `pgrep`). Bundle `Info.plist` reads honour `security.is_sensitive_path`, so a bundle planted under a protected directory resolves to "identity unknown" rather than being opened |
-| `computer_use/snapshot_macos.py` | Iterative AX walk, `AXManualAccessibility` retry, secure detection |
+| `computer_use/snapshot_macos.py` | Iterative AX walk, `AXManualAccessibility` and Chromium `AXEnhancedUserInterface` retries, secure detection |
 | `computer_use/capture_macos.py` | In-process capture + ImageIO encode + `0o700` persistence + ring trim |
 | `computer_use/screencast.py` | Live-view (PiP) relay: `frame_scope`, the three suppressions, `build_frame_payload`, the loopback POST |
 | `computer_use/cursor_motion.py` | Cursor Motion PATH MODEL — pure geometry (Bezier + arc + progress spring), plus `drag_points` for a multi-point drag. No ctypes, no AppKit, no config |
 | `computer_use/overlay.py` | Gateway-side overlay SUPERVISOR: the `cursor_motion` opt-in, child lifecycle, motion commands. Never raises, never blocks the loop |
 | `computer_use/overlay_proc.py` | The AppKit overlay CHILD (`python -m …overlay_proc`). Its OWN ctypes surface — out of process on purpose; `NSWindowSharingNone` keeps it out of screenshots |
 | `computer_use/permissions.py` | Advisory TCC probe + `responsible_hint` |
+| `computer_use/permission_probe.py` | The Settings panel's permission-probe CHILD (`python -m …permission_probe`): the driver's `probe_permissions()` as one JSON line, without the CLI's start-up |
 | `computer_use/macos_driver.py` | `MacOSBackend` glue |
 | `computer_use/cli.py` | `kirocrew computer doctor [--json] \| apps \| call` |
 | `mcp_computer.py` | The thin stdio shim (`kirocrew mcp-computer`) |

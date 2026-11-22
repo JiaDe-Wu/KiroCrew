@@ -1,13 +1,13 @@
 ---
 title: Session Tag-Change Event as a server-side signal on lane transitions
-status: in-review
+status: draft
 author: (issue #7663 author)
 created: 2026-09-02
-last-audited: 2026-10-06
-audited-at: 9348a25a34
+last-audited: 2026-11-20
+audited-at: 0c5d8bd5f3
 doc-pr: 10930
-implementation-prs: [7669]
-implementation-scope: partial — 7669 (not merged) carries the delta-only payload and the dispatcher, and defers every emit site and re-entrancy
+implementation-prs: [7669, 32962, 36132]
+implementation-scope: partial — 7669 closed unmerged; 32962 and 36132 ship phases 1 and 3 as `SessionLaneChanged`; phase 2 (`origin`, `hook_reentry_depth`) is not built
 tracking-issues: [13865]
 supersedes: []
 superseded-by: []
@@ -21,11 +21,13 @@ fires when a session's **status** tags change, so an automation can respond to a
 lane transition, the motivating case being a close-out prompt that runs when a
 session enters **Done**. It argues for reusing the existing script-hook engine
 rather than adding a subsystem, and settles the four design questions the issue
-flagged as expensive to reverse once anything subscribes. It is a design of
-record only: nothing here is on main.
+flagged as expensive to reverse once anything subscribes. No acceptance is
+recorded. Phases 1 and 3 are on main under the name `SessionLaneChanged`
+([#32962](https://github.com/kirodotdev/KiroCrew/pull/32962),
+[#36132](https://github.com/kirodotdev/KiroCrew/pull/36132)); phase 2 is not.
 
 > **Event name.** This document proposes the event as `SessionTagsChanged`; the
-> implementation PR #7669, which is not merged, names it **`SessionLaneChanged`**, because the event fires on a
+> first implementation PR #7669 (closed unmerged) and the shipped #32962 name it **`SessionLaneChanged`**, because the event fires on a
 > change to a session's **status** tags — a board-lane transition — and not on a
 > change to its tags generally. The name below is the proposal as written; read
 > every `SessionTagsChanged` in this document as `SessionLaneChanged`.
@@ -322,14 +324,26 @@ the shape that let review miss call sites twice during #7366 (as the
 mcp-lifecycle RFC records) and would re-open that finding here.
 
 **Amendment — what the implementation PR carries, and how it differs from the above.** The
-recommendation stands as the target shape, but the implementation PR (#7669) does
-**not** implement it. #7669 carries the dispatcher, `dispatch_session_lane_changed_bulk`, with
-no emit site: it touches neither `chat_tags.py` nor `chat_handlers.py`, so no writer calls
-the dispatcher and the event cannot fire. Per-writer emits — the two `chat_tags.py`
-writers, and closing-order step 1, the folder inheritance in `_read_folder_tags` reached
-from `api_chat_slot_create` (`chat_api/slot_create.py`) — are deferred to a follow-up PR. The two
+single choke point stands as the target shape; the implementation PR (#7669) carries the
+per-writer step toward it. It has `dispatch_session_lane_changed_bulk` AND two emit
+sites: the two `chat_tags.py` writers. Both run under a dashboard request, so
+`_lane_dispatch_is_permitted` applies to them unchanged and neither needed a new
+authorization rule.
+
+An earlier revision of #7669 carried the dispatcher with no emit site, and this paragraph
+described that revision; the two superseded sentences are not preserved, because an
+amendment recording a shape no reviewable head ever had is worse than none.
+
+Closing-order step 1, the folder inheritance in `_read_folder_tags` reached from
+`api_chat_slot_create` (`chat_api/slot_create.py`), is written but NOT in #7669: it was
+held back to bring that PR under the review size cap, needs no new authorization rule,
+and follows once the dispatcher reaches `main`. Until then an inherited folder status
+tag is a real gap rather than a designed silence.
+
+Still deferred, and for the stated reason rather than for convenience: the two
 `slot.tags.append` sites in `surface_channel_session` (`channel_slots.py`) stay silent
-after that follow-up too, until closing-order step 2.
+until closing-order step 2 settles what authorizes a fire on a surface with no dashboard
+caller, and the choke point is step 3 because it inherits that answer.
 
 The blocker is authorization, not scheduling. The dispatch helper itself needs no
 request — `_lane_dispatch_queue()` takes its loop from `asyncio.get_running_loop()`

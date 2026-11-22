@@ -1,10 +1,13 @@
 import { useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { api } from '../../api/client'
+import { api, type RemoteControlState, type SlackConfigData } from '../../api/client'
+import { REMOTE_CONTROL_QUERY_KEY } from '../../api/client/remoteAccess'
 import { fetchDashboardConfig } from '../../api/dashboardConfigQuery'
 import { useUpdateSwitchesShown } from '../../utils/updateSwitches'
-import { configuredAcpBackend, type AcpBackendConfig } from '../../api/acpBackend'
-import { KIRO_SIGN_IN_BACKEND } from '../../pages/developer/kiroSignInLink'
+import { isInstancesDisabledError } from '../../utils/instancesDisabled'
+import { ACP_BACKEND_KAS, type AcpBackendConfig } from '../../api/acpBackend'
+import { fetchConfigSchema } from '../settingRef/useConfigSchema'
+import type { SchemaEntry } from '../settingRef/resolveSettingRef'
 import type { SettingsSearchGovernance } from './settingsSearchCore'
 
 /**
@@ -45,20 +48,53 @@ export function useSettingsSearchGovernance(
   // The updater's answer from cache only, on every surface: a search open is no
   // reason for an IPC round trip, and About re-reads it when it is opened.
   const { app, gateway } = useUpdateSwitchesShown({ fetch: false })
-  // The `['kirocrewConfig']` read naming the selected harness. The sign-in card
-  // signs out Crew's own Kiro sign-in, which agents run as only on KAS; on any
-  // other harness the entry would promise a sign-out of an account it does not
-  // touch. Withheld only on a successful read that names another harness.
-  // From cache only, on every surface: the shell already reads this at boot
-  // (the credits pill), so a search adds no request of its own.
+  // The `['config-schema']` read the Kiro account tab is drawn by
+  // (`useKiroSignInOffered`): the sign-in entry is offered while the build's
+  // `agent.acp_backend` choices list KAS, whichever harness runs. Withheld only
+  // on a successful read that does not list it. Read once and kept: the schema
+  // changes only with the build.
+  const schemaQ = useQuery<Map<string, SchemaEntry>>({
+    queryKey: ['config-schema'],
+    queryFn: fetchConfigSchema,
+    ...(fetch ? { staleTime: Infinity } : CACHED_ONLY),
+  })
+  const backendChoices = schemaQ.data?.get('agent.acp_backend')?.enum
+  const kiroSignInOffered = !schemaQ.isSuccess || !backendChoices || backendChoices.includes(ACP_BACKEND_KAS)
+  // The `['kirocrewConfig']` read holds Channels' switch, which Display > View
+  // draws only while on. From cache only, on every surface: the shell already
+  // reads this at boot (the credits pill), so a search adds no request of its own.
   const cfgQ = useQuery<AcpBackendConfig>({
     queryKey: ['kirocrewConfig'],
     queryFn: () => api.kirocrewConfig(),
     ...CACHED_ONLY,
   })
-  const kiroSignInOffered = !cfgQ.isSuccess || configuredAcpBackend(cfgQ.data) === KIRO_SIGN_IN_BACKEND
+  const channelsOn = cfgQ.isSuccess
+    && (cfgQ.data as { dashboard?: { channels_enabled?: unknown } } | undefined)?.dashboard?.channels_enabled === true
+  // The `['slack-config']` read Settings > Slack itself renders from, from cache
+  // only: it carries the server's own answer to whether Connections offers the
+  // Slack card (`slack_mcp_card`), which with the saved switch is the page's whole
+  // rule for drawing the Slack tools switch. Withheld only on a successful read
+  // that says neither; until the Slack page has been opened there is no answer.
+  const slackQ = useQuery<SlackConfigData>({ queryKey: ['slack-config'], queryFn: api.getSlackConfig, ...CACHED_ONLY })
+  const slackToolsShown = !slackQ.isSuccess
+    || slackQ.data?.slack_mcp_card === true
+    || slackQ.data?.slack_mcp === true
+  // The `['instances']` read RemoteCrewPanel picks its branch by, from cache only:
+  // the shell's tab bar already reads it at boot.
+  const instancesQ = useQuery({ queryKey: ['instances'], queryFn: () => api.listInstances(), ...CACHED_ONLY })
+  const remoteCrewsEnabled = instancesQ.isSuccess
+    ? true
+    : isInstancesDisabledError(instancesQ.error) ? false : undefined
+  // The `['remote-control']` read RemoteControlCard is drawn by. Owner-only, so a
+  // teammate's read is refused and the entry is not offered to them either.
+  const remoteControlQ = useQuery<RemoteControlState>({
+    queryKey: REMOTE_CONTROL_QUERY_KEY,
+    queryFn: () => api.remoteControl(),
+    ...(fetch ? FRESH_ENOUGH : CACHED_ONLY),
+  })
+  const remoteControlShown = remoteControlQ.isSuccess && (remoteControlQ.data.requested || remoteControlQ.data.running)
   return useMemo(
-    () => ({ decisionsEnabled, tipsEnabled, updateSwitches: { app, gateway }, kiroSignInOffered }),
-    [decisionsEnabled, tipsEnabled, app, gateway, kiroSignInOffered],
+    () => ({ decisionsEnabled, tipsEnabled, updateSwitches: { app, gateway }, kiroSignInOffered, remoteCrewsEnabled, channelsOn, slackToolsShown, remoteControlShown }),
+    [decisionsEnabled, tipsEnabled, app, gateway, kiroSignInOffered, remoteCrewsEnabled, channelsOn, slackToolsShown, remoteControlShown],
   )
 }

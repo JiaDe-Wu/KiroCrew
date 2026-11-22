@@ -18,7 +18,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from kiro_crew.messaging import approval
+from kiro_crew.constants import DENY_CAUSE_APPROVAL_TIMEOUT, DENY_CAUSE_APPROVAL_UNDELIVERABLE
+from kiro_crew.messaging import approval, session_trust
 from kiro_crew.messaging.approval import (
     APPROVE,
     DENY,
@@ -38,7 +39,7 @@ from kiro_crew.messaging.approval import (
     pending_for,
     reset_for_tests,
 )
-from kiro_crew.testing.wait import await_until
+from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS, await_until
 
 SESSION = "whatsapp:kirocrew:direct:447700900000"
 
@@ -46,8 +47,10 @@ SESSION = "whatsapp:kirocrew:direct:447700900000"
 @pytest.fixture(autouse=True)
 def _clean_registry():
     reset_for_tests()
+    session_trust.clear_trusted_sessions()
     yield
     reset_for_tests()
+    session_trust.clear_trusted_sessions()
 
 
 def event(request_id: str = "req-1", title: str = "bash") -> SimpleNamespace:
@@ -107,7 +110,9 @@ class TestRegistry:
         open_approval(SESSION, "r1")
         assert deliver_verdict(SESSION, DENY) == RECEIPT_DENIED
         open_approval(SESSION, "r2")
-        assert deliver_verdict(SESSION, TRUST) == RECEIPT_TRUSTED
+        assert deliver_verdict(SESSION, TRUST, sessions=_Sessions()) == RECEIPT_TRUSTED
+        open_approval(SESSION, "r3")
+        assert deliver_verdict(SESSION, TRUST) == RECEIPT_APPROVED, "no manager, no grant"
 
     async def test_sessions_do_not_see_each_others_requests(self):
         open_approval("whatsapp:a", "req-1")
@@ -210,6 +215,13 @@ class _Sessions:
         self.policy = policy
 
 
+class _FailingSessions(_Sessions):
+    """A manager whose approval-policy write fails, as a full disk would."""
+
+    def set_approval_policy(self, key: str, policy: str) -> None:
+        raise OSError("disk full")
+
+
 @pytest.mark.asyncio
 class TestSessionTrust:
     async def test_trust_is_recorded_as_the_session_approval_policy(self):
@@ -221,9 +233,56 @@ class TestSessionTrust:
         decider = TextReplyApprovalDecider(SESSION, sessions=sessions, timeout_s=5.0)
         task = asyncio.create_task(decider(event()))
         await asyncio.sleep(0)
-        deliver_verdict(SESSION, TRUST)
+        assert deliver_verdict(SESSION, TRUST, sessions=sessions) == RECEIPT_TRUSTED
+        # Written by the reply itself, before the decider resumes: the receipt
+        # just said "Trusted", so the grant it names must already exist.
+        assert sessions.writes == [(SESSION, "auto")]
+        assert not task.done()
         assert await task is True
         assert sessions.writes == [(SESSION, "auto")]
+
+    async def test_a_trust_whose_policy_write_fails_answers_approved(self):
+        """The receipt follows the grant. A "Trusted" receipt over a failed write
+        would promise that later tools run without asking while they still ask,
+        so this one tool is approved, the reply says so, and no half grant stays.
+        """
+        open_approval(SESSION, "req-1")
+        decider = TextReplyApprovalDecider(SESSION, timeout_s=FALLBACK_TIMEOUT_SECS)
+        task = asyncio.create_task(decider(event()))
+        await asyncio.sleep(0)
+        assert deliver_verdict(SESSION, TRUST, sessions=_FailingSessions()) == RECEIPT_APPROVED
+        assert await task is True
+        assert session_trust.is_session_trusted(SESSION) is False
+        assert SESSION not in session_trust._trusted_sessions
+
+    async def test_a_failed_trust_resolves_the_request_as_approve(self):
+        entry = open_approval(SESSION, "req-1")
+        deliver_verdict(SESSION, TRUST, sessions=_FailingSessions())
+        assert entry.future.result() == APPROVE
+
+    async def test_a_trust_typed_while_the_timeout_notice_posts_is_expired(self):
+        """The window is closed once ``expired`` is set, even while the notice is
+        still being posted: a Trust landing then must not become standing
+        authority for later tools while this tool itself is denied.
+        """
+        announced = asyncio.Event()
+        release = asyncio.Event()
+
+        async def on_timeout() -> None:
+            announced.set()
+            await release.wait()
+
+        sessions = _Sessions()
+        open_approval(SESSION, "req-1").on_timeout = on_timeout
+        decider = TextReplyApprovalDecider(SESSION, sessions=sessions, timeout_s=0)
+        task = asyncio.create_task(decider(event()))
+        await await_until(announced, what="the timeout notice to start")
+        assert deliver_verdict(SESSION, TRUST, sessions=sessions) == RECEIPT_EXPIRED
+        release.set()
+        assert await await_until(task, what="the decider to deny") is False
+        assert decider.last_deny_cause == DENY_CAUSE_APPROVAL_TIMEOUT
+        assert sessions.writes == []
+        assert session_trust.is_session_trusted(SESSION) is False
 
     async def test_trusted_reads_the_policy_back(self):
         decider = TextReplyApprovalDecider(SESSION, sessions=_Sessions(policy="auto"))
@@ -256,8 +315,9 @@ class TestPrompt:
         inherits the guarantee, and a caller that forgets it leaks on a security
         prompt of all places.
         """
-        key = "AKIA" + "IOSFODNN7EXAMPLE"
-        text = build_approval_prompt(f"bash {key}", f"upload with {key}")
+        key = "Qh4Tm2Vx9KpRc" + "Z8Nw3HdJf1Lb5Gs0Ye9Ua2WkEQR"
+        labelled = f"aws_secret_access_key={key}"
+        text = build_approval_prompt(f"bash {labelled}", f"upload with {labelled}")
         assert key not in text, "an agent-authored credential reached the chat"
         assert "bash" in text, "screening must not eat the tool name"
 
@@ -275,6 +335,7 @@ class TestResolution:
     @pytest.mark.asyncio
     async def test_an_approve_resolves_the_waiting_prompt(self) -> None:
         pending = PendingApprovals("webex")
+        pending.reserve("s1", 1)
         task = asyncio.create_task(pending.decide_with_cause("s1", _event()))
         await _until(lambda: pending.has_pending("s1"))
 
@@ -284,6 +345,7 @@ class TestResolution:
     @pytest.mark.asyncio
     async def test_a_deny_resolves_the_waiting_prompt(self) -> None:
         pending = PendingApprovals("webex")
+        pending.reserve("s1", 1)
         task = asyncio.create_task(pending.decide_with_cause("s1", _event()))
         await _until(lambda: pending.has_pending("s1"))
 
@@ -303,6 +365,7 @@ class TestResolution:
         # A late answer must not be able to resolve a LATER prompt that happens
         # to reuse this request id.
         pending = PendingApprovals("webex")
+        pending.reserve("s1", 1)
         task = asyncio.create_task(pending.decide_with_cause("s1", _event()))
         await _until(lambda: pending.has_pending("s1"))
         pending.resolve("s1", True)
@@ -322,6 +385,8 @@ class TestIsolation:
         the namespace, one user's "approve" would approve the other's tool.
         """
         pending = PendingApprovals("webex")
+        pending.reserve("session-a", 1)
+        pending.reserve("session-b", 1)
         a = asyncio.create_task(pending.decide_with_cause("session-a", _event(1)))
         b = asyncio.create_task(pending.decide_with_cause("session-b", _event(1)))
         await _until(lambda: pending.has_pending("session-a") and pending.has_pending("session-b"))
@@ -337,6 +402,7 @@ class TestIsolation:
     @pytest.mark.asyncio
     async def test_has_pending_is_scoped_to_the_session(self) -> None:
         pending = PendingApprovals("webex")
+        pending.reserve("session-a", 1)
         task = asyncio.create_task(pending.decide_with_cause("session-a", _event()))
         await _until(lambda: pending.has_pending("session-a"))
 
@@ -349,6 +415,7 @@ class TestIsolation:
         # Keys are compared with the ":" separator attached, so "webex:a" must
         # not resolve a prompt pending for "webex:ab".
         pending = PendingApprovals("webex")
+        pending.reserve("webex:ab", 1)
         task = asyncio.create_task(pending.decide_with_cause("webex:ab", _event()))
         await _until(lambda: pending.has_pending("webex:ab"))
 
@@ -372,6 +439,7 @@ class TestDenyByDefault:
         """
         monkeypatch.setattr("kiro_crew.messaging.approval.APPROVAL_TIMEOUT_S", 0.01)
         pending = PendingApprovals("webex")
+        pending.reserve("s1", 1)
 
         assert (await pending.decide_with_cause("s1", _event()))[0] is False
         # And the entry is gone, so a reply arriving after the window is told the
@@ -384,6 +452,7 @@ class TestDenyByDefault:
         # the key degrades to the session plus an empty id, which is still unique
         # per session.
         pending = PendingApprovals("webex")
+        pending.reserve("s1", "")
         task = asyncio.create_task(pending.decide_with_cause("s1", SimpleNamespace()))
         await _until(lambda: pending.has_pending("s1"))
 
@@ -396,6 +465,7 @@ class TestDecider:
     async def test_the_decider_binds_one_session(self) -> None:
         pending = PendingApprovals("webex")
         decider = SessionApprovalDecider(pending, session_key="s1")
+        pending.reserve("s1", 1)
         task = asyncio.create_task(decider(_event()))
         await _until(lambda: pending.has_pending("s1"))
 
@@ -432,6 +502,8 @@ class TestExactIdResolution:
     @pytest.mark.asyncio
     async def test_an_exact_request_id_resolves_only_that_prompt(self) -> None:
         pending = PendingApprovals("webex")
+        pending.reserve("s1", 1)
+        pending.reserve("s1", 2)
         first = asyncio.create_task(pending.decide_with_cause("s1", _event(1)))
         await _until(lambda: pending.has_pending("s1"))
         second = asyncio.create_task(pending.decide_with_cause("s1", _event(2)))
@@ -447,6 +519,7 @@ class TestExactIdResolution:
     @pytest.mark.asyncio
     async def test_an_unknown_request_id_resolves_nothing(self) -> None:
         pending = PendingApprovals("webex")
+        pending.reserve("s1", 1)
         task = asyncio.create_task(pending.decide_with_cause("s1", _event(1)))
         await _until(lambda: pending.has_pending("s1"))
 
@@ -459,6 +532,8 @@ class TestExactIdResolution:
     @pytest.mark.asyncio
     async def test_without_an_id_the_oldest_prompt_resolves_first(self) -> None:
         pending = PendingApprovals("webex")
+        pending.reserve("s1", 1)
+        pending.reserve("s1", 2)
         first = asyncio.create_task(pending.decide_with_cause("s1", _event(1)))
         await _until(lambda: pending.has_pending("s1"))
         second = asyncio.create_task(pending.decide_with_cause("s1", _event(2)))
@@ -491,9 +566,9 @@ class TestWidgetNonce:
     @pytest.mark.asyncio
     async def test_the_minted_nonce_resolves_the_prompt_it_was_minted_for(self) -> None:
         pending = PendingApprovals("webex")
+        nonce = pending.reserve("s1", 1)
         task = asyncio.create_task(pending.decide_with_cause("s1", _event(1)))
         await _until(lambda: pending.has_pending("s1"))
-        nonce = pending.reserve("s1", 1)
 
         assert pending.resolve("s1", True, request_id=1, expected_nonce=nonce) is True
         assert (await task)[0] is True
@@ -501,9 +576,9 @@ class TestWidgetNonce:
     @pytest.mark.asyncio
     async def test_a_wrong_nonce_leaves_the_prompt_pending(self) -> None:
         pending = PendingApprovals("webex")
+        pending.reserve("s1", 1)
         task = asyncio.create_task(pending.decide_with_cause("s1", _event(1)))
         await _until(lambda: pending.has_pending("s1"))
-        pending.reserve("s1", 1)
 
         assert pending.resolve("s1", True, request_id=1, expected_nonce="wrong") is False
         assert task.done() is False
@@ -513,8 +588,11 @@ class TestWidgetNonce:
 
     @pytest.mark.asyncio
     async def test_an_unminted_prompt_refuses_every_nonce(self) -> None:
-        # Fail closed: a prompt with no widget has no press to honour.
+        # Fail closed: a prompt with no widget has no press to honour. ``reserve``
+        # always mints, so the nonce-less entry is made by dropping it.
         pending = PendingApprovals("webex")
+        pending.reserve("s1", 1)
+        pending._nonces.clear()
         task = asyncio.create_task(pending.decide_with_cause("s1", _event(1)))
         await _until(lambda: pending.has_pending("s1"))
 
@@ -531,12 +609,13 @@ class TestWidgetNonce:
         answer a LATER prompt that reused the request id.
         """
         pending = PendingApprovals("webex")
+        stale = pending.reserve("s1", 1)
         first = asyncio.create_task(pending.decide_with_cause("s1", _event(1)))
         await _until(lambda: pending.has_pending("s1"))
-        stale = pending.reserve("s1", 1)
         pending.resolve("s1", True, request_id=1, expected_nonce=stale)
         assert (await first)[0] is True
 
+        pending.reserve("s1", 1)
         second = asyncio.create_task(pending.decide_with_cause("s1", _event(1)))
         await _until(lambda: pending.has_pending("s1"))
 
@@ -549,9 +628,9 @@ class TestWidgetNonce:
         # There is no widget to have gone stale, and the sender was authorized
         # upstream — so the guard must not apply to the typed path.
         pending = PendingApprovals("webex")
+        pending.reserve("s1", 1)
         task = asyncio.create_task(pending.decide_with_cause("s1", _event(1)))
         await _until(lambda: pending.has_pending("s1"))
-        pending.reserve("s1", 1)
 
         assert pending.resolve("s1", True) is True
         assert (await task)[0] is True
@@ -579,9 +658,33 @@ class TestApprovalStallSignalling:
         )
 
         pending = PendingApprovals("webex")
+        pending.reserve("webex:agent:direct:a@b.com", 1)
         assert (await pending.decide_with_cause("webex:agent:direct:a@b.com", _event(1)))[
             0
         ] is False
+        assert stalled == ["webex:agent:direct:a@b.com"]
+
+    @pytest.mark.asyncio
+    async def test_an_undelivered_prompt_signals_autonudge(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A muted conversation never reserves, so the denial is immediate; the
+        # loop must still hold rather than keep firing turns that get denied.
+        from kiro_crew import autonudge
+
+        stalled: list[str] = []
+        monkeypatch.setattr(
+            autonudge,
+            "get_instance",
+            lambda: SimpleNamespace(notify_approval_stalled=stalled.append),
+        )
+
+        pending = PendingApprovals("webex")
+        result = await asyncio.wait_for(
+            pending.decide_with_cause("webex:agent:direct:a@b.com", _event(1)),
+            timeout=FALLBACK_TIMEOUT_SECS,
+        )
+        assert result == (False, DENY_CAUSE_APPROVAL_UNDELIVERABLE)
         assert stalled == ["webex:agent:direct:a@b.com"]
 
     @pytest.mark.asyncio
@@ -599,6 +702,7 @@ class TestApprovalStallSignalling:
         )
 
         pending = PendingApprovals("webex")
+        pending.reserve("cron:nightly", 1)
         assert (await pending.decide_with_cause("cron:nightly", _event(1)))[0] is False
         assert stalled == []
 
@@ -617,6 +721,7 @@ class TestApprovalStallSignalling:
         monkeypatch.setattr(autonudge, "get_instance", _boom)
 
         pending = PendingApprovals("webex")
+        pending.reserve("webex:agent:direct:a@b.com", 1)
         assert (await pending.decide_with_cause("webex:agent:direct:a@b.com", _event(1)))[
             0
         ] is False
@@ -648,15 +753,15 @@ class TestReservationRace:
     async def test_reserving_does_not_orphan_a_live_future(self) -> None:
         """Never replace a future someone is already awaiting.
 
-        A second reservation — or one that follows ``decide`` — must keep the
-        existing future, or a resolved answer sets an object nobody reads and the
-        prompt hangs for its whole window before denying.
+        A second reservation while ``decide`` awaits must keep the existing
+        future, or a resolved answer sets an object nobody reads and the prompt
+        hangs for its whole window before denying.
         """
         pending = PendingApprovals("webex")
+        nonce = pending.reserve("s1", 1)
         task = asyncio.create_task(pending.decide_with_cause("s1", _event(1)))
         await _until(lambda: pending.has_pending("s1"))
 
-        nonce = pending.reserve("s1", 1)
         again = pending.reserve("s1", 1)
 
         assert nonce == again
@@ -680,6 +785,30 @@ class TestReservationRace:
         assert pending.resolve("s1", True, request_id=1) is False
 
     @pytest.mark.asyncio
+    async def test_an_answered_unadopted_reservation_is_discarded_with_the_turn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Approve landed after the turn failed, before any decider read it.
+
+        The next turn's request reuses the address (ACP ids restart at 1), and a
+        muted turn never reserves first, so adopting that answer would approve a
+        tool whose prompt nobody saw.
+        """
+        # A regression waits out this window and reports an expiry; keep it under --timeout.
+        monkeypatch.setattr(approval, "APPROVAL_TIMEOUT_S", FALLBACK_TIMEOUT_SECS)
+        pending = PendingApprovals("webex")
+        nonce = pending.reserve("s1", 1)
+        assert pending.resolve("s1", True, request_id=1, expected_nonce=nonce) is True
+
+        pending.discard_reservations("s1")
+
+        # The later, muted request is denied as undelivered, not by the old Approve.
+        assert await pending.decide_with_cause("s1", _event(1)) == (
+            False,
+            DENY_CAUSE_APPROVAL_UNDELIVERABLE,
+        )
+
+    @pytest.mark.asyncio
     async def test_discarding_leaves_another_sessions_reservation_alone(self) -> None:
         pending = PendingApprovals("webex")
         pending.reserve("s1", 1)
@@ -695,6 +824,7 @@ class TestReservationRace:
         # ``decide`` retires its own entry, so a teardown running while a decision
         # is genuinely in flight must not cancel it.
         pending = PendingApprovals("webex")
+        pending.reserve("s1", 1)
         task = asyncio.create_task(pending.decide_with_cause("s1", _event(1)))
         await _until(lambda: pending.has_pending("s1"))
 
@@ -723,6 +853,7 @@ class TestApprovalHoldRelease:
         session = "slack:T1:C1:1700000000.000100"
         pending = PendingApprovals("webex")
 
+        pending.reserve(session, 1)
         task = asyncio.create_task(pending.decide_with_cause(session, _event()))
         await _until(lambda: pending.has_pending(session))
         assert pending.resolve(session, True) is True
@@ -730,6 +861,7 @@ class TestApprovalHoldRelease:
         assert released == [autonudge.binding_key_for(session)]
 
         monkeypatch.setattr("kiro_crew.messaging.approval.APPROVAL_TIMEOUT_S", 0.01)
+        pending.reserve(session, "req-2")
         assert (await pending.decide_with_cause(session, _event("req-2")))[0] is False
         assert released == [autonudge.binding_key_for(session)], "a timeout released the hold"
         assert stalled == [session]

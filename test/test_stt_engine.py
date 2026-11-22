@@ -2,7 +2,7 @@
 
 No test here loads a real recogniser or touches the network. The engine's one
 seam onto the native library is ``WhisperEngine._build_model``, so a fake stands
-in there; the downloader's one seam is ``urllib.request.urlopen``. Both are
+in there; the downloader's one seam is its opener (``opener_helpers.answer_with``). Both are
 patched per test, which is also what keeps a native context from outliving a test
 on an xdist worker.
 
@@ -29,6 +29,7 @@ import weakref
 
 import numpy as np
 import pytest
+from opener_helpers import answer_with
 from stt_engine_helpers import (  # noqa: F401 -- the fixture is requested by name
     _FakeBinding,
     _FakeModel,
@@ -116,7 +117,10 @@ def test_is_present_requires_the_exact_pinned_size(monkeypatch, tmp_path):
     path = tmp_path / model.filename
     path.write_bytes(b"x" * 10)
     assert not models.is_present(model)
-    path.write_bytes(b"x" * model.size_bytes)
+    # Only the size is checked, so a sparse file stands in for the model without
+    # holding its full size in memory.
+    with open(path, "r+b") as f:
+        f.truncate(model.size_bytes)
     assert models.is_present(model)
 
 
@@ -789,7 +793,7 @@ def test_a_planted_link_at_a_predictable_staging_path_is_not_followed(
         else:
             planted.hardlink_to(victim)
 
-    monkeypatch.setattr(models.urllib.request, "urlopen", _stub_urlopen(payload))
+    answer_with(monkeypatch, _stub_urlopen(payload))
     assert models._download_blocking(model) == target
     assert victim.read_text(encoding="utf-8") == "do not overwrite me"
     assert target.read_bytes() == payload
@@ -817,7 +821,7 @@ def test_each_staging_file_gets_its_own_name(monkeypatch, tmp_path):
         def __exit__(self, *_exc):
             return False
 
-    monkeypatch.setattr(models.urllib.request, "urlopen", lambda _u, timeout=None: _Recorder())
+    answer_with(monkeypatch, lambda _u, timeout=None: _Recorder())
     for _ in range(3):
         with pytest.raises(models.ModelDownloadError):
             models._download_blocking(model)

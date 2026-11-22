@@ -9,14 +9,21 @@ actually testable through the dashboard, not silently starved of its context.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp.test_utils import make_mocked_request
 from body_stream_helpers import BodyStreamPayload
+from redaction_structured_cases import github_classic
 
 from kiro_crew.dashboard.handlers.hooks import api_hook_test
-from kiro_crew.hooks import HOOK_EVENT_STOP, HOOK_EVENT_USER_PROMPT_SUBMIT, ScriptHookStore
+from kiro_crew.hooks import (
+    HOOK_EVENT_SESSION_LANE_CHANGED,
+    HOOK_EVENT_STOP,
+    HOOK_EVENT_USER_PROMPT_SUBMIT,
+    ScriptHookStore,
+)
 
 
 def _req_with_store(
@@ -130,6 +137,43 @@ async def test_user_prompt_submit_hook_test_supplies_full_prompt(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_session_lane_changed_hook_test_supplies_the_lane_keys(tmp_path):
+    # A live lane fire always carries slot/added/removed, so a hook reading
+    # ``json.load(sys.stdin)["added"]`` is correct -- and Test passed ``None``
+    # for every event but two, so that hook failed while being written and
+    # worked once it actually fired.
+    store = ScriptHookStore(tmp_path)
+    hook = store.create(
+        {
+            "name": "lane-hook",
+            "event": HOOK_EVENT_SESSION_LANE_CHANGED,
+            "matcher": "",
+            "command": "cat",
+        }
+    )
+    fake_result = SimpleNamespace(
+        exit_code=0, stdout="", stderr="", duration_ms=1, error="", hook_name="lane-hook"
+    )
+    with (
+        patch(
+            "kiro_crew.hooks.run_script_hook", new_callable=AsyncMock, return_value=fake_result
+        ) as mock_run,
+        patch("kiro_crew.dashboard.handlers.hooks._sel", return_value=MagicMock()),
+    ):
+        resp = await api_hook_test(_req_with_store(store, hook.id, "ignored"))
+
+    assert resp.status == 200
+    _args, _kwargs = mock_run.call_args
+    hook_event = _args[2] if len(_args) > 2 else _kwargs.get("hook_event")
+    assert hook_event is not None, "Test sent no payload, so a lane hook KeyErrors"
+    assert hook_event["hook_event_name"] == HOOK_EVENT_SESSION_LANE_CHANGED
+    # By NAME, not value: the values are representative, the KEYS are the contract.
+    assert hook_event["slot"]
+    assert isinstance(hook_event["added"], list) and hook_event["added"]
+    assert isinstance(hook_event["removed"], list) and hook_event["removed"]
+
+
+@pytest.mark.asyncio
 async def test_other_event_hook_test_uses_default_payload(tmp_path):
     # An event whose context fire() sends only via the env var (not a dedicated
     # stdin key) keeps the default (None) payload — run_script_hook builds it,
@@ -178,7 +222,7 @@ async def test_hook_test_redacts_context_in_sel_metadata(tmp_path):
             "command": "cat",
         }
     )
-    secret = "AKIAIOSFODNN7EXAMPLE"
+    secret = github_classic(seed=111)
     context = f"deploy with {secret}"
     fake_result = type(
         "R",

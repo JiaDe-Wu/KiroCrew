@@ -1,4 +1,5 @@
-"""Route registration for SSO login, terminal, projects, channels, auth tokens, instances, cloud.
+"""Route registration for SSO login, terminal, projects, channels, auth tokens, instances,
+cloud, relay viewer.
 
 One contiguous slice of the dashboard's route table, kept in its original
 order. aiohttp resolves routes in REGISTRATION order, and several routes here
@@ -15,6 +16,8 @@ from kiro_crew.dashboard import (
     handlers,
     handlers_channel,
     handlers_cloud,
+    handlers_cloud_instance_types,
+    handlers_cloud_signin_skip,
     handlers_crew_turn,
     handlers_instances,
     handlers_project,
@@ -27,6 +30,12 @@ from kiro_crew.dashboard.handlers.auth_refresh import (
     api_auth_refresh,
 )
 from kiro_crew.dashboard.handlers.mobile_connect import api_mobile_connect_methods
+from kiro_crew.dashboard.handlers.relay_viewer import (
+    api_relay_viewer_browser_open,
+    api_relay_viewer_crews,
+    api_relay_viewer_crews_seen,
+    api_relay_viewer_token,
+)
 from kiro_crew.platform import current_context, safe_context_call
 
 
@@ -184,6 +193,10 @@ def register(app: web.Application) -> None:
     # built-in EC2 lane plus whatever the edition composes in.
     app.router.add_get("/api/cloud/provisioners", handlers_cloud.api_cloud_provisioners)
     app.router.add_get("/api/cloud/identity", handlers_cloud.api_cloud_identity)
+    # The EC2 instance types a Region offers, for the launch form's custom type.
+    app.router.add_get(
+        "/api/cloud/instance-types", handlers_cloud_instance_types.api_cloud_instance_types
+    )
     app.router.add_get("/api/cloud/launch", handlers_cloud.api_cloud_launch_list)
     app.router.add_post("/api/cloud/launch", handlers_cloud.api_cloud_launch_create)
     app.router.add_get("/api/cloud/launch/{id}", handlers_cloud.api_cloud_launch_get)
@@ -198,6 +211,19 @@ def register(app: web.Application) -> None:
         "/api/cloud/launch/{id}/signin/restart",
         handlers_cloud.api_cloud_launch_signin_restart,
     )
+    app.router.add_post(
+        "/api/cloud/launch/{id}/signin/skip",
+        handlers_cloud_signin_skip.api_cloud_launch_signin_skip,
+    )
     app.router.add_post("/api/cloud/{tag}/stop", handlers_cloud.api_cloud_stop)
     app.router.add_post("/api/cloud/{tag}/start", handlers_cloud.api_cloud_start)
     app.router.add_delete("/api/cloud/{tag}", handlers_cloud.api_cloud_destroy)
+
+    # Relay viewer (off by default): the owner's list of remote Crews, and the
+    # desktop app's access token mint (loopback plus the local secret, checked in
+    # the handler, which token auth lets through for POST only).
+    app.router.add_get("/api/relay-viewer/crews", api_relay_viewer_crews)
+    app.router.add_post("/api/relay-viewer/crews/seen", api_relay_viewer_crews_seen)
+    app.router.add_post("/api/relay-viewer/token", api_relay_viewer_token)
+    # A browser tab's open: the gateway keeps the grant and relays the Crew.
+    app.router.add_post("/api/relay-viewer/browser-open", api_relay_viewer_browser_open)

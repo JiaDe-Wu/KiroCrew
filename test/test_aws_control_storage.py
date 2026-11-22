@@ -479,11 +479,13 @@ class TestListSection:
         # Keys can be authored by console uploads or other tools, so a name
         # embedding a credential must be redacted before it reaches the
         # dashboard — same double-pass discipline as every egress surface.
+        # An AWS secret value is exactly 40 characters of the AWS alphabet.
+        secret = "Qh4Tm2Vx9KpRczZ8Nw3Hd" + "zJf1Lb5Gs0Ye9Ua2WkE"
         payload = json.dumps(
             {
                 "Contents": [
                     {
-                        "Key": "drive/aws_secret_access_key=AKIAIOSFODNN7EXAMPLEKEY.txt",
+                        "Key": f"drive/aws_secret_access_key={secret}.txt",
                         "Size": 1,
                     }
                 ],
@@ -491,7 +493,7 @@ class TestListSection:
             }
         )
         result, _ = self._list(payload)
-        assert "AKIAIOSFODNN7EXAMPLEKEY" not in result["files"][0]["key"]
+        assert secret not in result["files"][0]["key"]
 
     def test_empty_body_reads_as_an_empty_page(self):
         # _checked returning "" (or None) must parse as an empty listing, not
@@ -1413,7 +1415,6 @@ class TestGetObjectHeadBytes:
         with pytest.raises(expected):
             self._run(b"head", {"ContentRange": "bytes 0-3/4"}, tmp_path=tmp_path, writer=swap)
 
-    @pytest.mark.skipif(os.name != "posix", reason="hard links need a privilege on Windows CI")
     def test_a_destination_hard_linked_elsewhere_is_refused(self, tmp_path):
         # A second name on the staged file means something outside the fence
         # can read the object bytes after the staging directory is removed.

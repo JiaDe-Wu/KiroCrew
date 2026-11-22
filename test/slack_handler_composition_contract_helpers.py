@@ -119,9 +119,9 @@ class _Slack(MockSlackClient):
         self._maybe_fail("post_ephemeral")
         return await super().post_ephemeral(channel, user_id, text, blocks, thread_ts)
 
-    async def stop_stream(self, channel, ts, final_text=None):
+    async def stop_stream(self, channel, ts, final_text=None, blocks=None):
         self._maybe_fail("stop_stream")
-        return await super().stop_stream(channel, ts, final_text)
+        return await super().stop_stream(channel, ts, final_text, blocks)
 
     async def update_message(self, channel, ts, text):
         self._maybe_fail("update_message")
@@ -240,6 +240,13 @@ class _Sessions:
         self._log.add("sessions.try_acquire", key=key)
         return self._known
 
+    #: True models a session the Kiro account check flagged: ``try_acquire``
+    #: refuses it while it stays registered.
+    retiring = False
+
+    def is_retiring(self, key) -> bool:
+        return self.retiring
+
     def release(self, key):
         self._log.add("sessions.release", key=key)
 
@@ -349,7 +356,11 @@ class _Config:
 
     def __init__(self) -> None:
         self.slack = SimpleNamespace(
-            reactions_enabled=True, show_thinking=True, sessions_limit=10, reactions={}
+            reactions_enabled=True,
+            show_thinking=True,
+            show_timing_footer=True,
+            sessions_limit=10,
+            reactions={},
         )
         self.agent = SimpleNamespace(default_agent="")
         self.raw: dict = {}
@@ -410,10 +421,11 @@ def world_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path):
         log.add("voice.tts_available", **kwargs)
         return True
 
-    async def _inline(func, /, *args, **kwargs):
+    async def _inline(func, /, *args, _admission_timeout=None, **kwargs):
         # A thread hop finishes whenever the worker gets the CPU, so a reaction task
         # scheduled before it would land on either side of it in the transcript. Run
-        # the work in place: the order then depends on the code alone.
+        # the work in place: the order then depends on the code alone, and the call
+        # always gets a worker, so the pool's admission bound has nothing to bound.
         return func(*args, **kwargs)
 
     async def _inline_gate(func, /, *args, on_queue_timeout, **kwargs):

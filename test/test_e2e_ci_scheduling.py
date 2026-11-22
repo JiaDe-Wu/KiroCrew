@@ -16,6 +16,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from spawn_test_helpers import unblocked_signals
+
 from kiro_crew.testing.wait import wait_until
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,16 +90,17 @@ class TestE2eScheduling(unittest.TestCase):
     def start(self, commands, **kwargs):
         env = dict(os.environ)
         env.pop("PYTEST_ADDOPTS", None)
-        proc = subprocess.Popen(
-            self.drive(commands, **kwargs),
-            cwd=self.root,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            start_new_session=True,
-        )
+        with unblocked_signals():
+            proc = subprocess.Popen(
+                self.drive(commands, **kwargs),
+                cwd=self.root,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                start_new_session=True,
+            )
 
         def cleanup():
             if proc.poll() is None:
@@ -175,7 +178,9 @@ class TestE2eScheduling(unittest.TestCase):
     def test_lane_timeout_is_failure_and_sibling_still_finishes(self):
         proc = self.start(
             {
-                "a": self.drive({"a": self.command("a", gated=True, descendant=True)}, timeout=5),
+                "a": self.drive(
+                    {"a": self.command("a", gated=True, descendant=True)}, timeout=3, grace=0.5
+                ),
                 "b": self.command("b", gated=True),
             }
         )
@@ -305,12 +310,19 @@ finally:
         self.assertEqual(proc.returncode, 0, output)
 
     def test_drain_preserves_direct_popen_exit_status(self):
+        # The child's shutdown outlasts the drain's rescan interval with its
+        # handler already gone, as interpreter finalization does on a slow
+        # runner, so a repeated SIGTERM would replace status 23 with -15.
         probe = """
 import pathlib, runpy, subprocess, sys, time
 m = runpy.run_path(sys.argv[1])
 ready = pathlib.Path('ready')
 code = '''import pathlib, signal, sys, time
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(23))
+def stop(*_):
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    time.sleep(.3)
+    sys.exit(23)
+signal.signal(signal.SIGTERM, stop)
 pathlib.Path('ready').touch()
 time.sleep(60)
 '''
@@ -326,12 +338,12 @@ def spawn(*args, **kwargs):
     return child
 subprocess.Popen = spawn
 try:
-    result = m['_supervise']({'child': [sys.executable, '-c', code]}, timeout=.1, grace=.5)
+    result = m['_supervise']({'child': [sys.executable, '-c', code]}, timeout=.1, grace=5)
     print('result=', result, 'status=', children[0].returncode, flush=True)
 finally:
     for child in children:
         if child.poll() is None:
-            child.terminate()
+            child.kill()
         child.wait(timeout=5)
 """
         proc = self.start({"probe": [sys.executable, "-c", probe, str(HELPER)]})
@@ -406,13 +418,14 @@ raise SystemExit(m['main']())
 
         jobs = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())["jobs"]
         job = jobs["e2e"]
-        # 25 on CodeBuild; 40 on a non-fleet runner, where the slowest observed
-        # fork run took 23.9 of the 25 and a green run was one slow dependency
-        # install from a cancellation with no failing test.
+        # 30 on CodeBuild, the smallest budget whose derived Playwright ceiling
+        # reaches the 1500 s cap; 40 on a non-fleet runner, where the slowest
+        # observed fork run took 23.9 of 25 minutes and a green run was one slow
+        # dependency install from a cancellation with no failing test.
         self.assertEqual(
             job["timeout-minutes"],
             "${{ startsWith(needs.changes.outputs.linux_runner_large, "
-            "'codebuild-') && 25 || 40 }}",
+            "'codebuild-') && 30 || 40 }}",
         )
         steps = job["steps"]
         parallel = next(
@@ -460,6 +473,77 @@ raise SystemExit(m['main']())
         self.assertNotIn("i18n", "\n".join(str(s) for s in steps))
         self.assertEqual(module["MEMORY_UI_TIMEOUT"], 720)
 
+    def test_the_suite_is_sharded_and_what_runs_once_stays_on_one_leg(self):
+        import re
+
+        import test_playwright_e2e as harness
+        import yaml
+
+        job = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())["jobs"]["e2e"]
+        legs = job["strategy"]["matrix"]["shard"]
+        # Leg numbers are Playwright's 1-based shard indices, so the list must be
+        # 1..K: a gap or a repeat would leave part of the suite to no leg.
+        self.assertEqual(legs, list(range(1, len(legs) + 1)))
+        self.assertGreaterEqual(len(legs), 2)
+        # One red leg must not cancel the other: each reports its own part.
+        self.assertIs(job["strategy"]["fail-fast"], False)
+
+        def on_leg(text, leg):
+            """*text* as leg *leg* of the matrix sees it."""
+            values = {"matrix.shard": str(leg), "strategy.job-total": str(len(legs))}
+            return re.sub(r"\$\{\{\s*([\w.-]+)\s*\}\}", lambda m: values.get(m[1], m[0]), str(text))
+
+        def runs_on(step, leg):
+            """Whether a step limited by leg runs on *leg*; None when it is not limited."""
+            cond = re.fullmatch(r"\$\{\{\s*matrix\.shard\s*==\s*(\d+)\s*\}\}", str(step.get("if")))
+            return None if cond is None else int(cond[1]) == leg
+
+        steps = job["steps"]
+        self.assertEqual(len({on_leg(job["name"], leg) for leg in legs}), len(legs))
+        (suite,) = [s for s in steps if harness._SHARD_ENV in (s.get("env") or {})]
+        # The suite step runs on every leg, and what it hands the harness is that
+        # leg's own index out of the number of legs the matrix has.
+        self.assertNotIn("if", suite)
+        for leg in legs:
+            self.assertEqual(
+                harness._parse_shard(on_leg(suite["env"][harness._SHARD_ENV], leg)),
+                (leg, len(legs)),
+            )
+        # A step that names the leg in its condition runs on exactly one leg, and
+        # all of them on the same one, so each still runs once per pull request.
+        limited = [s for s in steps if "matrix.shard" in str(s.get("if", ""))]
+        self.assertTrue(limited)
+        homes = set()
+        for step in limited:
+            on = [leg for leg in legs if runs_on(step, leg)]
+            self.assertEqual(len(on), 1, step.get("name"))
+            homes.add(on[0])
+        self.assertEqual(len(homes), 1)
+        (home,) = homes
+        # The helper's lanes follow the same rule: a lane runs on every leg or on
+        # that one leg only, every lane runs somewhere, and unsharded all run.
+        module = runpy.run_path(str(HELPER))
+        lanes = {leg: module["_lanes"](f"{leg}/{len(legs)}") for leg in legs}
+        everywhere = set.intersection(*(set(v) for v in lanes.values()))
+        self.assertTrue(everywhere)
+        for leg, names in lanes.items():
+            expected = set(module["COMMANDS"]) if leg == home else everywhere
+            self.assertEqual(set(names), expected, leg)
+        for unsharded in (None, ""):
+            self.assertEqual(module["_lanes"](unsharded), list(module["COMMANDS"]))
+        # Two legs upload in one run, where an artifact name can be used once.
+        uploads = [
+            s for s in steps if str(s.get("uses", "")).startswith("actions/upload-artifact@")
+        ]
+        self.assertTrue(uploads)
+        names = [on_leg(u["with"]["name"], leg) for u in uploads for leg in legs]
+        self.assertEqual(len(set(names)), len(names), names)
+        # The report the harness keeps is uploaded from where the harness is told
+        # to put it, whatever the outcome of the suite step.
+        kept = suite["env"][harness._REPORT_DIR_ENV].rstrip("/")
+        (report,) = [u for u in uploads if u["with"]["path"].rstrip("/") == kept]
+        self.assertIn("always()", report["if"])
+
     def test_render_gate_is_its_own_job_with_the_base_resolved_before_it(self):
         import yaml
 
@@ -491,7 +575,14 @@ raise SystemExit(m['main']())
         self.assertNotIn("--no-vs-base", render["run"])
         # The render needs the browser the E2E job provisions the same way: the
         # exact revision @playwright/test pins, downloaded before the render.
-        install = next(s for s in steps if s.get("run") == "npx playwright install chromium")
+        # The install ends on `npx playwright install chromium`; a host guard for
+        # images Playwright has no entry for (ubuntu 26.04) may precede it.
+        install = next(
+            s
+            for s in steps
+            if str(s.get("run", "")).rstrip().splitlines()[-1:]
+            == ["npx playwright install chromium"]
+        )
         self.assertLess(steps.index(install), steps.index(render))
         self.assertEqual(install["timeout-minutes"], 6)
         # The gate runs nowhere else in the workflow: one job owns it.

@@ -32,6 +32,8 @@ if TYPE_CHECKING:
         loads_user_json,
         logger,
         managed_mcp,
+        mcp_sources,
+        platform_spec_hooks,
         redact_log,
         safe_context_call,
         saved_command_casing,
@@ -297,11 +299,23 @@ def _load_json(path: Path) -> dict[str, Any]:
     contain a top-level array after a hand-edit.  Normalizing to an empty
     dict here means every caller can safely do ``_load_json(p).get(key)``
     without an ``isinstance`` check at each call site.
+
+    The crew's own ``config.json`` reads as the load reads it: hooks, MCP servers and
+    connections built from it land in the agent spec, so where the sandbox seals it a
+    tampered, deleted or unreadable file reads as its gateway-endorsed copy
+    (``read_endorsed_config_text``).
     """
-    if not path.is_file():
+    from kiro_crew.config import loosening_provenance
+    from kiro_crew.config.loader_locations import read_endorsed_config_text
+
+    protected = loosening_provenance.leaf_for(path) is not None
+    if not protected and not path.is_file():
         return {}
     try:
-        data = loads_user_json(path.read_text(encoding="utf-8"))
+        text = read_endorsed_config_text(path) if protected else path.read_text(encoding="utf-8")
+        data = loads_user_json(text)
+    except FileNotFoundError:
+        return {}
     except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
         logger.warning("Ignoring invalid %s: %s", path, exc)
         return {}
@@ -576,7 +590,7 @@ def build_agent_config(*, gated_off: "frozenset[str] | None" = None) -> dict:
     # Strip Kiro Crew-internal keys (auto_approve_tools etc.) that kiro-cli  # brand-ok
     # rejects. _VALID_HOOK_EVENTS already unions in every non-internal bundled
     # event key, so this never drops a new event added to bundled defaults.
-    config["hooks"] = kiro_hooks._kiro_hooks_only(bundled_hooks)
+    config["hooks"] = platform_spec_hooks(kiro_hooks._kiro_hooks_only(bundled_hooks))
 
     # Strip the retired deniedCommands/autoAllowReadonly injection so a config
     # merged from a stale project defaults.json or user override cannot carry it.
@@ -597,9 +611,9 @@ def build_agent_config(*, gated_off: "frozenset[str] | None" = None) -> dict:
     # Edition-contributed MCP servers (PlatformContext).  ADD-only: standalone
     # contributes {} (unchanged), an internal companion adds the internal MCP server etc.
     # Entries are already kiro-spec-shaped, so we only extend the map — no spec
-    # restructuring, deny_unknown_fields invariant preserved.
-    for name, spec in _extra_mcp_servers().items():
-        mcp.setdefault(name, dict(spec))
+    # restructuring, deny_unknown_fields invariant preserved. Each carries the env
+    # the user set on it in the store, so every spec derived from this one does.
+    mcp_sources.seed_edition_servers(mcp)
 
     # Default-model tracking ("managed" vs frozen) is recorded in the
     # agent_state sidecar by the install path (rebuild_agent_config), never as

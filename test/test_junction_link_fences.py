@@ -123,14 +123,14 @@ class TestArtifactTrashDoesNotDeleteThroughALink:
         doomed.mkdir()
         (doomed / "held.txt").write_text("a locked store file", encoding="utf-8")
 
-        real_unlink = os.unlink
+        real_unlink = platform_compat.PinnedDirectory.unlink
 
-        def refuse_that_one(target, *a, **kw):  # type: ignore[no-untyped-def]
-            if os.path.basename(os.fspath(target)) == "held.txt":
+        def refuse_that_one(self, name):  # type: ignore[no-untyped-def]
+            if name == "held.txt":
                 raise PermissionError(32, "The process cannot access the file")
-            return real_unlink(target, *a, **kw)
+            return real_unlink(self, name)
 
-        with mock.patch.object(artifacts.os, "unlink", refuse_that_one):
+        with mock.patch.object(platform_compat.PinnedDirectory, "unlink", refuse_that_one):
             with pytest.raises(OSError):
                 artifacts.ArtifactStore._rmtree(doomed)
 
@@ -150,15 +150,15 @@ class TestArtifactTrashDoesNotDeleteThroughALink:
         (doomed / "nested").mkdir(parents=True)
         (doomed / "nested" / "held.txt").write_text("locked", encoding="utf-8")
 
-        real_unlink = os.unlink
+        real_unlink = platform_compat.PinnedDirectory.unlink
 
-        def refuse_that_one(target, *a, **kw):  # type: ignore[no-untyped-def]
-            if os.path.basename(os.fspath(target)) == "held.txt":
+        def refuse_that_one(self, name):  # type: ignore[no-untyped-def]
+            if name == "held.txt":
                 raise PermissionError(32, "The process cannot access the file")
-            return real_unlink(target, *a, **kw)
+            return real_unlink(self, name)
 
         with caplog.at_level("WARNING"):
-            with mock.patch.object(artifacts.os, "unlink", refuse_that_one):
+            with mock.patch.object(platform_compat.PinnedDirectory, "unlink", refuse_that_one):
                 with pytest.raises(OSError):
                     artifacts.ArtifactStore._rmtree(doomed)
 
@@ -406,7 +406,7 @@ class TestSnapshotImportDoesNotStripThroughALink:
         (swapme / "backups").mkdir(parents=True)
         (swapme / "backups" / "old.db").write_text("inside", encoding="utf-8")
 
-        real_pred = portability.is_host_local_store_state
+        real_pred = portability._is_host_local
         swapped: list[tuple[str, ...]] = []
 
         def swap_then_judge(rel):  # type: ignore[no-untyped-def]
@@ -416,7 +416,7 @@ class TestSnapshotImportDoesNotStripThroughALink:
                 make_dir_link(swapme, victim)
             return real_pred(rel)
 
-        with mock.patch.object(portability, "is_host_local_store_state", swap_then_judge):
+        with mock.patch.object(portability, "_is_host_local", swap_then_judge):
             portability._strip_host_local_store_state(snap)
 
         assert swapped, "the fixture never swapped the store, so nothing was proved"
@@ -444,7 +444,7 @@ class TestSnapshotImportDoesNotStripThroughALink:
         (store / "backups").mkdir(parents=True)
         (store / "backups" / "old.db").write_text("inside", encoding="utf-8")
 
-        real_pred = portability.is_host_local_store_state
+        real_pred = portability._is_host_local
         swapped: list[tuple[str, ...]] = []
         backups = store / "backups"
 
@@ -455,7 +455,7 @@ class TestSnapshotImportDoesNotStripThroughALink:
                 make_dir_link(backups, victim)
             return real_pred(rel)
 
-        with mock.patch.object(portability, "is_host_local_store_state", swap_then_judge):
+        with mock.patch.object(portability, "_is_host_local", swap_then_judge):
             portability._strip_host_local_store_state(snap)
 
         assert swapped, "the fixture never swapped the directory, so nothing was proved"

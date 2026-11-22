@@ -16,8 +16,8 @@ import useMoveUndo from '../../../hooks/useMoveUndo'
 import type { Slot } from '../types'
 import { sessionRefBlockReason } from '../../../utils/sessionRefs'
 import { boardColumnFromDroppableId } from '../../../utils/boardFolderCollapse'
-import { sessionDisplayTitle } from '../../../utils/sessionDisplayTitle'
-import { CHAT_PANE_DROP_TYPE } from './collision'
+import { isUntitledSession, sessionDisplayTitle } from '../../../utils/sessionDisplayTitle'
+import { CHAT_PANE_DROP_TYPE, SPLIT_PANE_DROP_TYPE } from './collision'
 import type { FolderSortModeRead } from '../../../hooks/useFolderSortMode'
 import type { FolderMutations } from '../folders'
 
@@ -433,9 +433,16 @@ export function useSidebarDragHandlers({ releaseHoverPin, setDragFrozen, hideFol
         haptic('light')
         onDropSessionRef?.({
           key: a.key,
-          title: src?.title && src.title !== src.key ? src.title : a.key,
+          title: src?.title && !isUntitledSession(src) ? src.title : a.key,
           messages: src?.messages,
         })
+        return
+      }
+      // A Split View pane: its zone carries `show`, null when refused, and a
+      // refused drop is swallowed so it never falls through to a folder.
+      if (o?.type === SPLIT_PANE_DROP_TYPE) {
+        const show = (over.data.current as { show?: ((key: string) => void) | null }).show
+        if (show) { haptic('light'); show(a.key) }
         return
       }
       if (o?.type === 'folder-drop') moveByDrag(a.key, o.folderId ?? null)

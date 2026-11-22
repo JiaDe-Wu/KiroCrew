@@ -30,7 +30,12 @@ from kiro_crew.relay_client.client import RelayClient
 from kiro_crew.relay_client.connection import RelayTimings
 from kiro_crew.relay_client.ingress import LoopbackIngress
 from kiro_crew.relay_client.protocol import WS_MESSAGE_MAX_BYTES
-from kiro_crew.relay_client.token_source import HostCredential, StaticHostTokenSource
+from kiro_crew.relay_client.token_source import (
+    ConnectedPeople,
+    HostCredential,
+    NewTokenCallback,
+    RelayConnected,
+)
 from kiro_crew.testing.wait import await_until
 
 FIXTURES = Path(__file__).parent / "fixtures" / "relay_protocol_v1"
@@ -38,6 +43,52 @@ TOKEN = "eyJ0eXAiOiJraXJvLXJlbGF5LWhvc3Qrand0In0.eyJ0ZXN0IjoxfQ.c2ln"
 #: The owner the request fixtures name, so a personal Crew honours them.
 OWNER = "u-0001.example-owner"
 CONTRACT = "Kiro Relay protocol v1"
+
+
+def drop_unanswered(request: web.Request) -> web.Response:
+    """Drop *request*'s connection with no response head; the server keeps its port."""
+    transport = request.transport
+    assert transport is not None
+    transport.abort()
+    return web.Response()
+
+
+class StaticHostTokenSource:
+    """One fixed credential, replaced only through :meth:`publish`.
+
+    :meth:`publish` stands in for a lease renewal that brought a new host token.
+    """
+
+    def __init__(self, credential: HostCredential) -> None:
+        self._credential = credential
+        self._callback: Optional[NewTokenCallback] = None
+        self.renewals: list[bool] = []
+
+    async def current(self) -> HostCredential:
+        return self._credential
+
+    async def renew(self, *, host_token_requested: bool) -> HostCredential:
+        self.renewals.append(host_token_requested)
+        return self._credential
+
+    def on_new_token(self, callback: Optional[NewTokenCallback]) -> None:
+        self._callback = callback
+
+    def track_relay(
+        self,
+        connected: Optional[RelayConnected],
+        people: Optional[ConnectedPeople] = None,
+    ) -> None:
+        return None
+
+    async def aclose(self) -> None:
+        return None
+
+    async def publish(self, credential: HostCredential) -> None:
+        """Hold *credential* from now on, and hand it to the client as a new token."""
+        self._credential = credential
+        if self._callback is not None:
+            await self._callback(credential)
 
 
 def fixture(name: str) -> Dict[str, Any]:
@@ -173,6 +224,8 @@ class FakeRelay:
         self.legs: asyncio.Queue[FakeHostLeg] = asyncio.Queue()
         self.refused: List[str] = []
         self.dials = 0
+        #: False drops every dial with no answer, while the server keeps its port.
+        self.reachable = True
         self._server: Optional[TestServer] = None
 
     @property
@@ -192,6 +245,8 @@ class FakeRelay:
             await self._server.close()
 
     async def _host(self, request: web.Request) -> web.StreamResponse:
+        if not self.reachable:
+            return drop_unanswered(request)
         self.dials += 1
         auth = request.headers.get("Authorization", "")
         token = auth[len("Bearer ") :] if auth.startswith("Bearer ") else ""

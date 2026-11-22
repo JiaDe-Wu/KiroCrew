@@ -1,8 +1,9 @@
 """Document text extraction for .docx, .pdf, and .pptx files.
 
 Uses stdlib zipfile plus a hardened XML parser (defusedxml) for .docx and
-.pptx since these are ZIP archives containing XML.  PDF extraction uses
-a best-effort binary text scan (no third-party deps required).
+.pptx since these are ZIP archives containing XML.  PDF extraction runs
+pdfplumber in the memory-bounded extractor child (``kiro_crew.pdf_extract``),
+the same path file-grep and knowledge ingest use.
 
 The XML comes from user-supplied uploads, so parsing goes through
 defusedxml rather than the stdlib xml.etree parser: the stdlib one resolves
@@ -20,10 +21,10 @@ import logging
 import os
 import posixpath
 import re
+import time
 import zipfile
-import zlib
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 # Optional so a stale install (git pull without `pip install -e .`) degrades
 # to "docx/pptx parsing unavailable" instead of killing every CLI entry at
@@ -34,6 +35,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover — exercised via monkeypatch
     _xml_fromstring = None  # type: ignore[assignment]
 
+from kiro_crew.bounded_read import bounded_read
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
 from kiro_crew.zip_vet import (
@@ -48,7 +50,11 @@ logger = logging.getLogger(__name__)
 # ── Size limits ──
 
 _MAX_ZIP_ENTRY = 50 * 1024 * 1024  # 50 MB per ZIP entry (decompressed)
-_MAX_DECOMPRESS = 50 * 1024 * 1024  # 50 MB for zlib decompression
+# PDF bounds for the extractor child when the caller passes no max_chars. The
+# child's own memory and CPU ceilings bound a Flate bomb; these bound the text
+# returned and the wall time. Same numbers as knowledge ingest.
+_PDF_MAX_CHARS = 4_000_000
+_PDF_WALL_SECS = 120.0
 # Inventory bound for OOXML containers. The per-entry cap above bounds what one
 # member can expand to; this bounds how MANY members an archive declares — and
 # ZipFile's construction allocates from the declared central-directory size
@@ -56,6 +62,12 @@ _MAX_DECOMPRESS = 50 * 1024 * 1024  # 50 MB for zlib decompression
 # real documents (a large deck with per-slide media is in the low thousands of
 # parts), so this refuses crafted inventories without narrowing legitimate ones.
 _MAX_ARCHIVE_MEMBERS = 20000
+# What a STRICT deck read (one whose caller indexes the result) may cost. The
+# per-entry cap bounds one part, but a deck can list thousands of slide parts,
+# and a part with no text never advances the character budget, so the parts
+# the walk inflates are also bounded together, and the walk by wall time.
+_STRICT_DECK_MAX_EXPANDED_BYTES = 200 * 1024 * 1024
+_STRICT_DECK_WALL_SECS = 120.0
 
 # ── Public API ──
 
@@ -105,8 +117,7 @@ def extract_text(
     the file first pass the same handle so the bytes parsed are exactly the
     bytes measured (no stat→open TOCTOU window). *path* is still used for
     sensitive-path screening, format detection and logging. PDF extraction
-    is byte-scan based and still reads *path*; no current fileobj caller
-    requests PDFs.
+    still opens *path*; no current fileobj caller requests PDFs.
     """
     fmt = _admit(path, mimetype, filename, operation="extract_text")
     if not fmt:
@@ -117,7 +128,7 @@ def extract_text(
         if fmt == "pptx":
             return _extract_pptx(path, max_chars=max_chars, fileobj=fileobj)
         if fmt == "pdf":
-            return _extract_pdf(path)
+            return _extract_pdf(path, max_chars=max_chars)
     except Exception:
         logger.warning("Failed to extract text from %s", path, exc_info=True)
     return ""
@@ -129,6 +140,7 @@ def extract_slides(
     filename: str = "",
     max_chars: int | None = None,
     fileobj: IO[bytes] | None = None,
+    strict: bool = False,
 ) -> list[tuple[int, str]]:
     """Extract a .pptx deck's text one slide at a time.
 
@@ -142,12 +154,21 @@ def extract_slides(
     gate), the same *max_chars* aggregate budget and the same *fileobj*
     contract as :func:`extract_text`, and the same failure shape: an empty
     list for a file that is not a .pptx, has no slide text, or fails to parse.
+
+    With *strict*, a deck that fails to parse or whose archive inventory is
+    refused raises instead, so a caller can tell an unreadable file from one
+    with no slide text. So does a deck whose parts expand past
+    ``_STRICT_DECK_MAX_EXPANDED_BYTES`` together, or whose walk outlasts
+    ``_STRICT_DECK_WALL_SECS``. A refused path or a missing XML parser still
+    returns the empty list: those are screened by the caller.
     """
     if _admit(path, mimetype, filename, operation="extract_slides") != "pptx":
         return []
     try:
-        return _extract_pptx_slides(path, max_chars=max_chars, fileobj=fileobj)
+        return _extract_pptx_slides(path, max_chars=max_chars, fileobj=fileobj, strict=strict)
     except Exception:
+        if strict:
+            raise
         logger.warning("Failed to extract slides from %s", path, exc_info=True)
     return []
 
@@ -184,20 +205,6 @@ def _admit(path: str, mimetype: str, filename: str, *, operation: str) -> str:
         )
         return ""
     return fmt
-
-
-# ── Decompression safety ──
-
-
-def _safe_decompress(data: bytes, max_size: int | None = None) -> bytes:
-    """Decompress zlib data with an output size limit to prevent zip bombs."""
-    if max_size is None:
-        max_size = _MAX_DECOMPRESS
-    dobj = zlib.decompressobj()
-    result = dobj.decompress(data, max_size)
-    if dobj.unconsumed_tail:
-        raise ValueError("decompressed stream exceeds size limit")
-    return result
 
 
 def _vet_archive_inventory(path: str, fileobj: IO[bytes] | None = None) -> bool:
@@ -256,7 +263,7 @@ def _read_zip_entry(
     if max_size is None:
         max_size = _MAX_ZIP_ENTRY
     with zf.open(name) as f:
-        data = f.read(max_size + 1)
+        data = bounded_read(f, max_size + 1)
         if len(data) > max_size:
             logger.warning("ZIP entry too large (actual): %s", name)
             return None
@@ -294,11 +301,21 @@ _SLIDE_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relatio
 _SLIDE_RE = re.compile(r"^ppt/slides/slide(\d+)\.xml$")
 
 
-def _pptx_slide_order(zf: zipfile.ZipFile) -> list[tuple[int, str]]:
-    """Resolve presentation positions to internal ZIP members, never filesystem paths."""
+def _pptx_slide_order(zf: zipfile.ZipFile, strict: bool = False) -> list[tuple[int, str]]:
+    """Resolve presentation positions to internal ZIP members, never filesystem paths.
+
+    With *strict*, a container without the presentation part or its
+    relationships raises: it is not a deck, and reading it as one with no
+    slides would let a caller replace a deck's indexed text with nothing. So
+    does a slide the presentation lists but the archive cannot supply (no
+    relationship, or no member behind it): reading the deck without it would
+    replace that slide's indexed text with nothing just the same.
+    """
     assert _xml_fromstring is not None
     names = set(zf.namelist())
     if "ppt/presentation.xml" not in names:
+        if strict:
+            raise ValueError("not a .pptx deck: no presentation part")
         # Keep best-effort extraction for incomplete containers without an order.
         return sorted(
             (int(match.group(1)), name)
@@ -308,6 +325,8 @@ def _pptx_slide_order(zf: zipfile.ZipFile) -> list[tuple[int, str]]:
     presentation = _read_zip_entry(zf, "ppt/presentation.xml")
     relationships = _read_zip_entry(zf, "ppt/_rels/presentation.xml.rels")
     if presentation is None or relationships is None:
+        if strict:
+            raise ValueError("not a readable .pptx deck: presentation part too large")
         return []
     root = _xml_fromstring(presentation)
     rels = _xml_fromstring(relationships)
@@ -325,12 +344,14 @@ def _pptx_slide_order(zf: zipfile.ZipFile) -> list[tuple[int, str]]:
     seen: set[str] = set()
     for number, slide in enumerate(root.iterfind(f"{_P_NS}sldIdLst/{_P_NS}sldId"), 1):
         rel_id = slide.get(f"{_R_NS}id")
-        if not rel_id:
-            # A sldId without an r:id references no relationship; resolving it
-            # would key targets under None and pull in an orphan part.
+        # A sldId without an r:id references no relationship; resolving it
+        # would key targets under None and pull in an orphan part.
+        target = targets.get(rel_id) if rel_id else None
+        if target is None or target not in names:
+            if strict:
+                raise ValueError(f"not a readable .pptx deck: slide {number} has no part")
             continue
-        target = targets.get(rel_id)
-        if target is not None and target in names and target not in seen:
+        if target not in seen:
             # A malformed manifest must not multiply decompression and retained
             # text beyond the vetted inventory by referencing one part repeatedly.
             seen.add(target)
@@ -359,8 +380,58 @@ def join_slides(slides: list[tuple[int, str]]) -> str:
     return "\n\n".join(f"--- Slide {num} ---\n{text}" for num, text in slides)
 
 
+def _slide_lines(root: Any) -> list[str]:
+    """The text lines of one parsed slide, in one pass over its elements.
+
+    *root* is the element ``_xml_fromstring`` returns. It is typed as ``Any``
+    so this module never imports the stdlib ``xml`` package, not even for a
+    type name: the module docstring says why only defusedxml parses here.
+
+    One line per paragraph: a word set in two formatting runs ("Micro" bold,
+    "services" plain) is one word on the slide, so the runs of a paragraph join
+    with nothing between them, and only a paragraph boundary or a line break
+    inside one starts a new line. A text element outside any paragraph is its
+    own line. A paragraph nested in another belongs to the outermost one, so
+    each text is kept once and crafted nesting costs no more than the slide's
+    size. An explicit stack walks it: nesting depth is attacker-chosen, so
+    recursion would hit the interpreter's limit. A slide's text never holds a
+    blank line: two line breaks in a row, or one that ends a paragraph, leave no
+    empty line, because file grep reads a blank line as the end of a slide.
+    """
+    lines: list[str] = []
+
+    def keep(text: str) -> None:
+        lines.extend(piece for piece in text.split("\n") if piece.strip())
+
+    parts: list[str] = []
+    depth = 0  # how many paragraphs enclose the node being visited
+    stack: list[tuple[Any, bool]] = [(root, False)]
+    while stack:
+        node, leaving = stack.pop()
+        if leaving:  # only a paragraph is revisited on the way out
+            depth -= 1
+            if depth == 0:
+                keep("".join(parts))
+                parts = []
+            continue
+        tag = node.tag
+        if tag == f"{_A_NS}p":
+            depth += 1
+            stack.append((node, True))
+        elif tag == f"{_A_NS}t" and node.text:
+            if depth:
+                parts.append(node.text)
+            else:
+                keep(node.text)
+        elif tag == f"{_A_NS}br" and depth:
+            parts.append("\n")
+        stack.extend((child, False) for child in reversed(node))
+    return lines
+
+
 def _extract_pptx_slides(
     path: str, max_chars: int | None = None, fileobj: IO[bytes] | None = None,
+    strict: bool = False,
 ) -> list[tuple[int, str]]:
     """Walk a .pptx (ZIP containing ppt/slides/*.xml) and collect each slide's text.
 
@@ -375,19 +446,23 @@ def _extract_pptx_slides(
     if is_sensitive_path(path):
         return []
     if not _vet_archive_inventory(path, fileobj):
+        if strict:
+            raise ValueError("not a readable .pptx archive")
         return []
     slides: list[tuple[int, str]] = []
     collected = 0
     with zipfile.ZipFile(fileobj if fileobj is not None else path, "r") as zf:
-        for num, slide_name in _pptx_slide_order(zf):
+        order = _pptx_slide_order(zf, strict=strict)
+        deadline = _admit_strict_deck(zf, order) if strict else None
+        for num, slide_name in order:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise ValueError("not a readable .pptx deck: the read ran out of time")
             data = _read_zip_entry(zf, slide_name)
             if data is None:
+                if strict:
+                    raise ValueError(f"not a readable .pptx deck: slide {num} is too large")
                 continue
-            root = _xml_fromstring(data)
-            texts: list[str] = []
-            for t_elem in root.iter(f"{_A_NS}t"):
-                if t_elem.text:
-                    texts.append(t_elem.text)
+            texts = _slide_lines(_xml_fromstring(data))
             if texts:
                 slide_text = "\n".join(texts)
                 slides.append((num, slide_text))
@@ -397,54 +472,52 @@ def _extract_pptx_slides(
     return slides
 
 
-# ── PDF parser (best-effort binary text extraction) ──
+def _admit_strict_deck(zf: zipfile.ZipFile, order: list[tuple[int, str]]) -> float:
+    """Bound a strict deck read before any slide part is inflated; return its deadline.
 
-# Matches text between BT (begin text) and ET (end text) PDF operators,
-# then extracts parenthesized string literals.  This is a rough heuristic
-# that works for many simple PDFs but won't handle CIDFont encodings or
-# compressed streams.
-_PDF_TEXT_RE = re.compile(rb"\(([^)]*)\)")
+    Every part the walk inflates (the presentation, its relationships and each
+    listed slide) is charged at its declared size, which is as far as ``zipfile``
+    inflates a member. One part over the per-entry cap, or all of them together
+    past ``_STRICT_DECK_MAX_EXPANDED_BYTES``, refuses the deck, so a deck of
+    thousands of large text-free parts is refused without parsing one.
+    """
+    parts = {"ppt/presentation.xml", "ppt/_rels/presentation.xml.rels"}
+    parts.update(name for _num, name in order)
+    sizes = [zf.getinfo(name).file_size for name in parts]
+    if max(sizes) > _MAX_ZIP_ENTRY:
+        raise ValueError("not a readable .pptx deck: a part is too large")
+    if sum(sizes) > _STRICT_DECK_MAX_EXPANDED_BYTES:
+        raise ValueError("not a readable .pptx deck: its parts expand past the ceiling")
+    return time.monotonic() + _STRICT_DECK_WALL_SECS
 
 
-def _extract_pdf(path: str) -> str:
-    """Best-effort text extraction from a PDF using binary scanning.
+# ── PDF parser ──
+
+
+def _extract_pdf(path: str, max_chars: int | None = None) -> str:
+    """Page text of a PDF, read by pdfplumber in the bounded extractor child.
+
+    pdfplumber walks the page content streams and decodes strings through each
+    font's /ToUnicode map, so subset / CID fonts (Chrome, LibreOffice, Word)
+    come back as text and font programs or images are never read as text. Any
+    extractor failure (unparseable file, missing pdfplumber, memory / CPU /
+    wall-clock ceiling) returns "" so the caller reports "could not extract".
 
     Must only be called from extract_text() which enforces is_sensitive_path().
     """
     if is_sensitive_path(path):
         return ""
-    raw = Path(path).read_bytes()
-    # Try to decompress FlateDecode streams first
-    chunks: list[bytes] = []
-    # Scan for stream..endstream blocks and try zlib decompression
-    stream_re = re.compile(rb"stream\r?\n(.*?)endstream", re.DOTALL)
-    for m in stream_re.finditer(raw):
-        try:
-            decompressed = _safe_decompress(m.group(1))
-            chunks.append(decompressed)
-        except (zlib.error, OSError):
-            # Not valid zlib — might be an uncompressed text stream
-            chunks.append(m.group(1))
-        except ValueError:
-            # Size limit exceeded — skip entirely (zip bomb defense)
-            logger.warning("PDF stream exceeded decompression limit in %s", path)
-    if not chunks:
-        chunks = [raw]
-    # Extract parenthesized text strings from all chunks
-    text_parts: list[str] = []
-    for chunk in chunks:
-        for m in _PDF_TEXT_RE.finditer(chunk):
-            try:
-                decoded = m.group(1).decode("utf-8", errors="replace")
-                # Skip very short fragments that are likely operators
-                if len(decoded) > 1:
-                    text_parts.append(decoded)
-            except Exception:
-                pass
-    if not text_parts:
+    # Imported here: the sandbox stack it pulls in is needed only when a PDF
+    # is actually parsed, and this module sits on the gateway's import path.
+    from kiro_crew.pdf_extract import extract_pdf_segments
+
+    with open(path, "rb") as fh:
+        outcome = extract_pdf_segments(
+            fh,
+            max_chars=max_chars or _PDF_MAX_CHARS,
+            deadline=time.monotonic() + _PDF_WALL_SECS,
+        )
+    if outcome.failure is not None:
+        logger.warning("PDF text extraction failed for %s: %s", path, outcome.failure)
         return ""
-    # Join and clean up
-    result = " ".join(text_parts)
-    # Collapse multiple spaces
-    result = re.sub(r" {2,}", " ", result)
-    return result.strip()
+    return "\n".join(text for _label, text in outcome.segments).strip()

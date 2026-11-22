@@ -54,8 +54,10 @@ from kiro_crew.dashboard.chat_delivery import (
     attachment_meta,
     banner_meta,
     find_written_steer_row,
+    knowledge_meta,
     queue_for_next_turn,
     quote_meta,
+    steer_origin_kwargs,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -407,6 +409,7 @@ def take_back(state: "DashboardState", slot: "_ChatSlot", record: SteerRetract) 
             attachments=attachment_meta(held),
             quote=quote_meta(held).get("quote"),
             banner=banner_meta(held).get(CHAT_BANNER_META_KEY, ""),
+            knowledge=knowledge_meta(held),
             admission=record.admission,
         )
         crew_steer_requeued(
@@ -505,7 +508,7 @@ async def _send_again(slot: "_ChatSlot", messages: list[str]) -> None:
         wire = responsive_chat.turn_state(slot).steers.get(message, message)
         slot._steer_rpc_in_flight.add(message)
         try:
-            sent = await client.steer(wire)
+            sent = await client.steer(wire, **steer_origin_kwargs(slot, message))
         except Exception as exc:
             sent = False
             if getattr(exc, "ambiguous_delivery", False) is True:

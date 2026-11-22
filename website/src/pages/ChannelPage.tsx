@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo, type ReactNode } from 'react'
 import Modal from '../components/Modal'
-import { Hourglass, Ear, Check, X, Wrench, Radio, VolumeX, User, MessageSquare, Users, Zap, RotateCcw, Loader2 } from 'lucide-react'
+import { Hourglass, Ear, Check, Circle, X, Wrench, Radio, VolumeX, User, MessageSquare, Users, Zap, RotateCcw, Loader2 } from 'lucide-react'
 import { useAppSelector, useAppDispatch } from '../store'
 import { triggerRefresh } from '../store/dashboardSlice'
 import type { RootState } from '../store'
@@ -8,6 +8,7 @@ import { api } from '../api/client'
 import { ApiError } from '../api/apiError'
 import ApprovalCard from '../components/ApprovalCard'
 import ErrorNotice from '../components/ErrorNotice'
+import { RadioChipGroup, radioChip } from '../components/RadioChipGroup'
 import { useConfirm } from '../components/ConfirmDialog'
 import { Btn, Input, Badge, EmptyState, PageHeader } from '../components/ui'
 import MarkdownRenderer from '../components/MarkdownRenderer'
@@ -60,6 +61,7 @@ export interface ApprovalMeta {
   command_grantable?: string
   base_derivable?: string
   base_command?: string
+  name_grants_refused?: string
 }
 
 interface Channel {
@@ -131,7 +133,7 @@ const agentColor = (idx: number) => AGENT_COLORS[idx % AGENT_COLORS.length]
  */
 const STATE_BADGE: Record<string, { variant: 'ok' | 'err' | 'warn'; label: ReactNode }> = {
   pending: { variant: 'warn', get label() { return <><Hourglass className="lucide-inline" /> {i18nT('pages.channelPage.state_pending')}</> } },
-  working: { variant: 'ok', get label() { return <>● {i18nT('pages.channelPage.state_working')}</> } },
+  working: { variant: 'ok', get label() { return <><Circle className="lucide-inline scale-75" fill="currentColor" strokeWidth={0} /> {i18nT('pages.channelPage.state_working')}</> } },
   listening: { variant: 'ok', get label() { return <><Ear className="lucide-inline" /> {i18nT('pages.channelPage.state_listening')}</> } },
   done: { variant: 'ok', get label() { return <><Check className="lucide-inline" /> {i18nT('pages.channelPage.state_done')}</> } },
   failed: { variant: 'err', get label() { return <><X className="lucide-inline" /> {i18nT('pages.channelPage.state_failed')}</> } },
@@ -155,13 +157,14 @@ function AgentBadge({ agent, index }: { agent: ChannelAgent; index: number }) {
 }
 
 /** Tool title embedded in a channel approval message by the backend
- * (`⚠️ Approval needed: **<name>**` + fenced input). Greedy up to the LAST
+ * (`Approval needed: **<name>**` + fenced input; older messages lead with a
+ * U+26A0 warning sign, which saved channels keep, so it is optional). Greedy up to the LAST
  * `**` before the input fence so a command containing `**` stays whole.
  * Empty when the message carries no name (legacy messages). The approval
  * card's TrustDropdown derives its trust_command / trust_base patterns from
  * this title, so it must be the tool's identity, never the agent role. */
 export function approvalToolTitle(content: string): string {
-  return /^⚠️ Approval needed: \*\*([\s\S]*)\*\*\n```/.exec(content)?.[1] || ''
+  return /^(?:\u26A0\uFE0F? )?Approval needed: \*\*([\s\S]*)\*\*\n```/u.exec(content)?.[1] || ''
 }
 
 /** What the approval card renders and which trust tiers it offers, from the
@@ -186,7 +189,7 @@ export function approvalCardProps(msg: Pick<ChannelMessage, 'content' | 'fromRol
     }
   }
   const title = approvalToolTitle(msg.content)
-  const toolInput = msg.content.replace(/^⚠️ Approval needed:.*\n```\n?/, '').replace(/\n?```$/, '')
+  const toolInput = msg.content.replace(/^(?:\u26A0\uFE0F? )?Approval needed:.*\n```\n?/u, '').replace(/\n?```$/, '')
   const hasCommand = title.startsWith('Running: ') && !/\[REDACTED/.test(toolInput)
   return { title: title || msg.fromRole, toolInput, hasCommand }
 }
@@ -197,6 +200,15 @@ const CHANNEL_TRUSTED_LABEL_KEYS = {
   trust: 'components.approvalCard.trusted_channel_all',
   trust_command: 'components.approvalCard.trusted_channel_command',
   trust_base: 'components.approvalCard.trusted_channel_base',
+} as const
+
+/** The same tiers when the server says this host refuses every name grant
+ *  (`meta.name_grants_refused`): the grant is recorded, but no later run is
+ *  auto-approved, so the confirmation says the agent will ask again. */
+const CHANNEL_REFUSED_LABEL_KEYS = {
+  ...CHANNEL_TRUSTED_LABEL_KEYS,
+  trust_command: 'components.approvalCard.trusted_channel_still_asks',
+  trust_base: 'components.approvalCard.trusted_channel_still_asks',
 } as const
 
 /** Exported for the capture entries only, alongside `approvalToolTitle`: an
@@ -248,7 +260,7 @@ export function MessageBubble({ msg, agents, onReply, onOpenThread, onApprove }:
               trustAllLabelKey="components.trustDropdown.trust_all_tools_channel"
               trustCommandLabelKey="components.trustDropdown.trust_this_command_channel"
               trustBaseLabelKey="components.trustDropdown.trust_all_base_channel"
-              trustedLabelKeys={CHANNEL_TRUSTED_LABEL_KEYS}
+              trustedLabelKeys={msg.meta?.name_grants_refused === '1' ? CHANNEL_REFUSED_LABEL_KEYS : CHANNEL_TRUSTED_LABEL_KEYS}
               labelValues={{ role: msg.fromRole }}
               onApprove={onApprove} />
           </div>
@@ -549,15 +561,18 @@ function NewChannelDialog({ onClose, onCreate, onClosedError, presets }: {
         className="w-full mb-4"
         placeholder={i18nT('pages.channelPage.e_g_investigate_gamma_deployment_failure')} />
       <span id="new-channel-preset-label" className="block text-[13px] font-medium text-muted mb-1">{i18nT('pages.channelPage.team_preset')}</span>
-      <div role="radiogroup" aria-labelledby="new-channel-preset-label" className="space-y-1.5">
+      {/* The shared group, not a bare role="radiogroup": it gives each option its
+          checked state and one Tab stop with arrow keys, so the picked preset is
+          announced, not shown by colour alone. */}
+      <RadioChipGroup ariaLabelledBy="new-channel-preset-label" className="space-y-1.5">
         {presets.map(p => (
-          <Btn key={p.id} onClick={() => { if (!save.saving) setPreset(p.id) }} aria-disabled={save.saving}
+          <Btn key={p.id} {...radioChip(preset === p.id)} onClick={() => { if (!save.saving) setPreset(p.id) }} aria-disabled={save.saving}
             className={`w-full text-left px-3 py-2 !rounded-lg text-sm ${preset === p.id ? '!border-accent bg-accent/10 text-text-strong' : '!border-border text-muted hover:bg-bg-hover'}`}>
             <span className="font-medium">{presetLabel(p)}</span>
             {p.agents.length > 0 && <span className="text-[13px] text-muted ml-2">({fmtList(p.agents.map(a => a.role))})</span>}
           </Btn>
         ))}
-      </div>
+      </RadioChipGroup>
     </Modal>
   )
 }
@@ -710,6 +725,12 @@ export default function ChannelPage() {
   // channel that is gone, the render falls back to `channels[0]`. Compared against the
   // RENDERED id because that is what decides whether a notice would be visible.
   const renderedIdRef = useRef<string | null>(null)
+  // `activeId` as of the last commit, for handlers that must tell a selection the user
+  // made while they waited from the automatic fallback to `channels[0]`.
+  const selectedIdRef = useRef<string | null>(null)
+  useEffect(() => { selectedIdRef.current = activeId }, [activeId])
+  const channelsRef = useRef<Channel[]>([])
+  useEffect(() => { channelsRef.current = channels }, [channels])
   const isOffscreenClearResult = useCallback(
     (channelId: string) => channelId !== renderedIdRef.current,
     [],
@@ -802,7 +823,7 @@ export default function ChannelPage() {
   // Keyed by thread id: a draft belongs to one thread, so switching threads or
   // channels neither discards it nor hands it to a different conversation.
   const [threadDrafts, setThreadDrafts] = useState<Record<string, string>>({})
-  const messagesEndRef = useRef<HTMLDivElement>(null)
+  const messagesRef = useRef<HTMLDivElement>(null)
 
   const channel = channels.find(c => c.id === activeId) || channels[0] || null
   // Mirrored into a ref because the clear-result callbacks are `[]`-dep and would otherwise
@@ -889,7 +910,16 @@ export default function ChannelPage() {
       const { type, data } = (e as CustomEvent).detail
       if (type === 'channel_message' && data.message) {
         const msg = mapMsg(data.message)
-        setChannels(prev => prev.map(c => c.id === data.channel_id ? { ...c, messages: [...c.messages, msg] } : c))
+        // The server bumps a thread parent's reply_count but broadcasts only the
+        // reply, so the parent's "N replies" button is kept in step here. A message
+        // already held (the channel read raced the event) is not counted twice.
+        setChannels(prev => prev.map(c => c.id !== data.channel_id || c.messages.some(m => m.id === msg.id) ? c : {
+          ...c,
+          messages: [
+            ...c.messages.map(m => msg.threadId && m.id === msg.threadId ? { ...m, replyCount: m.replyCount + 1 } : m),
+            msg,
+          ],
+        }))
       } else if (type === 'channel_agent_status') {
         setChannels(prev => prev.map(c => c.id === data.channel_id ? {
           ...c, agents: c.agents.map(a => a.id === data.agent_id ? { ...a, state: data.state } : a)
@@ -914,8 +944,11 @@ export default function ChannelPage() {
     return () => window.removeEventListener('kirocrew-channel', handler)
   }, [reload])
 
+  // Scroll the list itself: `scrollIntoView` would also scroll every scrollable
+  // ancestor, dragging the page past the composer.
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    const el = messagesRef.current
+    el?.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
   }, [channel?.messages.length, activeId])
 
   // Resolves true only when the post was accepted; callers keep the composer
@@ -1002,9 +1035,7 @@ export default function ChannelPage() {
   // disable the button on the one they moved to, which is a different operation.
   const clearBusyHere = channel?.id !== undefined && clearBusyTargets.includes(channel.id)
 
-  // NOT destructured as `confirm`: that shadows the global in this scope, and the close
-  // button's remaining `window.confirm` guard would then test a Promise, which is always truthy.
-  const { confirm: askConfirm, cancel: cancelConfirm, confirmDialog } = useConfirm()
+  const { confirm: askConfirm, cancel: cancelConfirm, confirmDialog, confirmOpen } = useConfirm()
   // The channel the open confirm was raised for. `channel` is recomputed every render, so
   // without pinning it a close mid-dialog redirects the confirm onto one nobody chose.
   // A per-agent confirm also pins its agent: a row that leaves mid-dialog withdraws it.
@@ -1069,7 +1100,7 @@ export default function ChannelPage() {
     }
   }
 
-  if (loading) return <div className="flex items-center justify-center h-full text-muted">{i18nT('pages.channelPage.loading_channels')}</div>
+  if (loading) return <>{confirmDialog}<div className="flex items-center justify-center h-full text-muted">{i18nT('pages.channelPage.loading_channels')}</div></>
 
   // The dialog stays open until the create lands (it then closes itself):
   // closing it first unmounted the typed topic and preset, so a refused create
@@ -1096,7 +1127,7 @@ export default function ChannelPage() {
   return (
     <>
       <PageHeader title={i18nT('pages.channelPage.channels')} subtitle={i18nT('pages.channelPage.multi_agent_collaboration_spaces')} />
-      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0 flex flex-col">
     {/* Failed create / add-agent / clear-context / load requests. Every input
         behind these was already submitted (or never existed), so the hand-off
         risks nothing; the composer's own failure renders beside it instead.
@@ -1122,7 +1153,7 @@ export default function ChannelPage() {
         />
       </div>
     </div>
-    <div className={`flex h-full relative ${isMobile ? '-mx-4 -mb-8' : ''}`}>
+    <div className={`flex flex-1 min-h-0 relative ${isMobile ? '-mx-4 -mb-8' : ''}`}>
       {showNew && <NewChannelDialog onClose={() => setShowNew(false)} presets={presets} onCreate={handleCreateChannel}
         onClosedError={message => failWithMessage('pages.channelPage.failed_to_create_channel', message)} />}
 
@@ -1156,7 +1187,7 @@ export default function ChannelPage() {
             <div className="flex items-center gap-1.5 shrink-0">
               <Btn onClick={() => { setShowAgents(v => !v); if (isMobile) setThreadId(null) }}>
                 <Users className="lucide-inline" /> {i18nT('pages.channelPage.agent_2', { count: channel.agents.length })}
-                {channel.agents.some(a => a.state === 'working' || a.state === 'tool_running') && <Badge variant="ok">●</Badge>}
+                {channel.agents.some(a => a.state === 'working' || a.state === 'tool_running') && <Badge variant="ok"><Circle className="lucide-inline scale-75" fill="currentColor" strokeWidth={0} aria-label={i18nT('pages.channelPage.state_working')} /></Badge>}
               </Btn>
               {/* `aria-disabled` plus an early return, NOT `disabled`: the dialog's focus trap
                   restores focus to this button on unmount, and its FOCUSABLE selector excludes
@@ -1172,16 +1203,30 @@ export default function ChannelPage() {
                   : <RotateCcw className="lucide-inline" />} {i18nT('pages.channelPage.clear_context_2')}
               </Btn>
               <Btn onClick={async () => {
-                if (!confirm(i18nT('pages.channelPage.close_this_channel_all_agents_will_be_dismissed'))) return
+                if (confirmOpen) return
+                const channelId = channel.id
+                const ok = await askConfirm({
+                  title: i18nT('pages.channelPage.close_channel'),
+                  body: i18nT('pages.channelPage.close_this_channel_all_agents_will_be_dismissed'),
+                  confirmLabel: i18nT('pages.channelPage.close'),
+                })
+                if (!ok) return
                 // A refused close keeps the channel in the list: removing it
                 // would show the action as done under a notice saying it failed.
-                try { await api.channelClose(channel.id) } catch (e) { fail('pages.channelPage.failed_to_close_channel', e); return }
-                setChannels(prev => prev.filter(c => c.id !== channel.id))
-                setActiveId(null)
+                try { await api.channelClose(channelId) } catch (e) { fail('pages.channelPage.failed_to_close_channel', e); return }
+                setChannels(prev => prev.filter(c => c.id !== channelId))
+                setActiveId(current => current === channelId ? null : current)
                 // Without this the narrow layout keeps the transcript pane while no
                 // channel exists: the list holding "+ New" stays hidden and the Back
-                // control unmounted with the channel, leaving no way out.
-                closeDetail()
+                // control unmounted with the channel, leaving no way out. A channel
+                // opened while the question or the close was pending keeps its pane.
+                // Decided by what the user selected, not by what is rendered: a
+                // `channel_closed` notice that beat this response already removed the
+                // channel, and the page then shows a fallback nobody picked.
+                const selected = selectedIdRef.current
+                const keepsPane = selected !== null && selected !== channelId
+                  && channelsRef.current.some(c => c.id === selected)
+                if (!keepsPane) closeDetail()
               }} danger title={i18nT('pages.channelPage.close_channel')}>
                 <X className="lucide-inline" /> {i18nT('pages.channelPage.close')}
               </Btn>
@@ -1219,7 +1264,7 @@ export default function ChannelPage() {
           </div>
 
           <div className="flex flex-1 min-h-0">
-            <div className={`flex-1 overflow-y-auto py-3 space-y-1 ${isMobile ? 'px-0' : 'px-2'} ${isMobile && (showAgents || threadId) ? 'hidden' : ''}`}>
+            <div ref={messagesRef} className={`flex-1 overflow-y-auto py-3 space-y-1 ${isMobile ? 'px-0' : 'px-2'} ${isMobile && (showAgents || threadId) ? 'hidden' : ''}`}>
               {topLevelMessages.length === 0 && (
                 <EmptyState icon={<Zap className="lucide-inline" />} title={i18nT('pages.channelPage.setting_up_channel')} subtitle={i18nT('pages.channelPage.agent_joining', { count: channel.agents.length })} />
               )}
@@ -1231,10 +1276,9 @@ export default function ChannelPage() {
               ))}
               {channel.agents.filter(a => a.state === 'working' || a.state === 'tool_running').map(a => (
                 <div key={a.id + '-typing'} className="flex items-center gap-2 px-3 py-1.5 text-[13px] text-muted animate-pulse">
-                  <Badge variant="ok">{a.state === 'tool_running' ? <Wrench className="lucide-inline" /> : '●'}</Badge> <span className="font-medium">{a.role}</span> {a.state === 'tool_running' ? i18nT('pages.channelPage.running_tool') : i18nT('pages.channelPage.is_working')}
+                  <Badge variant="ok">{a.state === 'tool_running' ? <Wrench className="lucide-inline" /> : <Circle className="lucide-inline scale-75" fill="currentColor" strokeWidth={0} />}</Badge> <span className="font-medium">{a.role}</span> {a.state === 'tool_running' ? i18nT('pages.channelPage.running_tool') : i18nT('pages.channelPage.is_working')}
                 </div>
               ))}
-              <div ref={messagesEndRef} />
             </div>
 
             {/* Thread panel */}
@@ -1268,7 +1312,7 @@ export default function ChannelPage() {
                     ))}
                     {channel.agents.filter(a => a.state === 'working' || a.state === 'tool_running').map(a => (
                       <div key={a.id + '-typing-t'} className="flex items-center gap-2 px-2 py-1 text-[13px] text-muted animate-pulse">
-                        <Badge variant="ok">{a.state === 'tool_running' ? <Wrench className="lucide-inline" /> : '●'}</Badge> <span className="font-medium">{a.role}</span> {a.state === 'tool_running' ? i18nT('pages.channelPage.running_tool') : i18nT('pages.channelPage.is_working')}
+                        <Badge variant="ok">{a.state === 'tool_running' ? <Wrench className="lucide-inline" /> : <Circle className="lucide-inline scale-75" fill="currentColor" strokeWidth={0} />}</Badge> <span className="font-medium">{a.role}</span> {a.state === 'tool_running' ? i18nT('pages.channelPage.running_tool') : i18nT('pages.channelPage.is_working')}
                       </div>
                     ))}
                   </div>

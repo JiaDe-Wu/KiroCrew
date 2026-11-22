@@ -31,6 +31,7 @@ from typing import BinaryIO, Callable, Iterator, Literal, Optional
 
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import replace_with_retry
+from kiro_crew.bounded_read import bounded_read
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.node_modules_txn import NodeModulesBackup
 
@@ -480,10 +481,15 @@ class FrontendBuildResult:
     tail: str = ""
 
     def failure_message(self) -> str:
-        """One message naming the failure, the log file and its last lines."""
+        """One message: the failure, its log file and last lines, or that no log was written."""
         message = "Frontend build did not complete — the dashboard still serves the previous bundle"
         if self.log_path is not None:
             message += f". Build output: {self.log_path}"
+        else:
+            message += (
+                ". No build log was written; run `npm ci` and `npm run build` in website/"
+                " to see the npm output"
+            )
         if self.tail:
             message += f"\n{self.tail}"
         return message
@@ -581,7 +587,7 @@ def _build_log_tail(build_log: Optional[BinaryIO]) -> str:
         if os.fstat(build_log.fileno()).st_size > _BUILD_LOG_REDACT_MAX_BYTES:
             return ""
         build_log.seek(0)
-        data = build_log.read(_BUILD_LOG_REDACT_MAX_BYTES + 1)
+        data = bounded_read(build_log, _BUILD_LOG_REDACT_MAX_BYTES + 1)
     except (OSError, ValueError):
         return ""
     if len(data) > _BUILD_LOG_REDACT_MAX_BYTES:
@@ -703,7 +709,7 @@ def _npm_build_and_stage_locked(
         try:
             platform_compat.kill_process_tree(proc.pid, platform_compat.SIGKILL)
         except (ProcessLookupError, OSError, ValueError) as exc:
-            log(f"  ⚠️  Could not reap the timed-out frontend build: {exc}")
+            log(f"  Warning: Could not reap the timed-out frontend build: {exc}")
         for child in descendants:
             try:
                 platform_compat.kill_process_tree(child, platform_compat.SIGKILL)
@@ -715,18 +721,18 @@ def _npm_build_and_stage_locked(
         try:
             proc.wait(timeout=_BUILD_KILL_GRACE)
         except subprocess.TimeoutExpired:
-            log("  ⚠️  Frontend build did not die after SIGKILL")
+            log("  Warning: Frontend build did not die after SIGKILL")
         log(
-            f"  ⚠️  Frontend build timed out after {_BUILD_TIMEOUT}s"
+            f"  Warning: Frontend build timed out after {_BUILD_TIMEOUT}s"
             " — dashboard may be stale"
         )
         return False
     if proc.returncode != 0:
-        log("  ⚠️  Frontend build failed — dashboard may be stale")
+        log("  Warning: Frontend build failed — dashboard may be stale")
         return False
     after = _index_identity(built_dist)
     if after is None or after == before:
-        log(f"  ⚠️  The build exited 0 but published no new {built_dist} — not staging")
+        log(f"  Warning: The build exited 0 but published no new {built_dist} — not staging")
         return False
     return _stage_dist_locked(built_dist, static_dist, log)
 
@@ -769,11 +775,11 @@ def build_and_stage(
     )
     website_dir = root / _DIR_NAME
     if not website_dir.is_dir():
-        log(f"  ⚠️  No {_DIR_NAME}/ directory at {root} — nothing to build")
+        log(f"  Warning: No {_DIR_NAME}/ directory at {root} — nothing to build")
         return False
     npm_bin = npm or shutil.which("npm")
     if not npm_bin:
-        log("  ⚠️  npm not found — cannot build the frontend")
+        log("  Warning: npm not found — cannot build the frontend")
         return False
     git_bin = git or shutil.which("git") or "git"
     try:
@@ -783,7 +789,7 @@ def build_and_stage(
                 _write_build_source_fingerprint(root, git_bin, log)
             return staged
     except OSError as exc:
-        log(f"  ⚠️  Could not acquire the static/dist staging lock: {exc}")
+        log(f"  Warning: Could not acquire the static/dist staging lock: {exc}")
         return False
 
 
@@ -835,7 +841,7 @@ def _write_build_source_fingerprint(root: Path, git_bin: str, log: Callable[[str
     refused = repo_exec_driver_reason(str(root), git=git_bin)  # the git spawned below
     if refused:
         log(
-            f"  ⚠️  {refused}; not fingerprinting the bundle, so the next "
+            f"  Warning: {refused}; not fingerprinting the bundle, so the next "
             "backend-only sync will rebuild"
         )
         return
@@ -853,7 +859,7 @@ def _write_build_source_fingerprint(root: Path, git_bin: str, log: Callable[[str
             # uncommitted changes, so HEAD:website does not describe what was
             # built. Either way, leave no fingerprint -> the next sync rebuilds.
             log(
-                "  ⚠️  website/ was not clean at build time; not fingerprinting "
+                "  Warning: website/ was not clean at build time; not fingerprinting "
                 "the bundle, so the next backend-only sync will rebuild"
             )
             return
@@ -866,7 +872,7 @@ def _write_build_source_fingerprint(root: Path, git_bin: str, log: Callable[[str
         )
         if proc.returncode != 0:
             log(
-                "  ⚠️  Could not fingerprint the built frontend source; the next "
+                "  Warning: Could not fingerprint the built frontend source; the next "
                 "backend-only sync will rebuild rather than skip"
             )
             return
@@ -881,7 +887,7 @@ def _write_build_source_fingerprint(root: Path, git_bin: str, log: Callable[[str
         (static_dist / _BUILD_SOURCE_FINGERPRINT).write_text(tree_id, encoding="utf-8")
     except (OSError, subprocess.TimeoutExpired) as exc:
         log(
-            f"  ⚠️  Could not write the build source fingerprint ({exc}); the next "
+            f"  Warning: Could not write the build source fingerprint ({exc}); the next "
             "backend-only sync will rebuild rather than skip"
         )
 
@@ -953,7 +959,7 @@ def _stage_dist(
             return _stage_dist_locked(built_dist, static_dist, log)
     except OSError as exc:
         log(
-            f"  ⚠️  Could not acquire the static/dist staging lock ({exc}) — a "
+            f"  Warning: Could not acquire the static/dist staging lock ({exc}) — a "
             "frontend build may hold it; static/dist was not changed"
         )
         return False
@@ -963,14 +969,14 @@ def _report_dev_link(built_dist: Path, log: Callable[[str], None]) -> bool:
     """The dev link already serves ``built_dist``: report it, nothing to copy."""
     reason = _incomplete_bundle_reason(built_dist)
     if reason:
-        log(f"  ⚠️  {built_dist} is not a complete build ({reason}) — not staging")
+        log(f"  Warning: {built_dist} is not a complete build ({reason}) — not staging")
         return False
     _log_nothing_to_copy(built_dist, log)
     return True
 
 
 def _log_nothing_to_copy(built_dist: Path, log: Callable[[str], None]) -> None:
-    log(f"  📦 static/dist links to the build at {built_dist} — nothing to copy")
+    log(f"  static/dist links to the build at {built_dist} — nothing to copy")
 
 
 def _is_staged_tree(path: Path, static_dist: Path) -> bool:
@@ -1020,7 +1026,10 @@ def _point_static_dist_at(static_dist: Path, target: Path) -> bool:
     another, so the old one is removed first: removing a junction does not touch
     the tree behind it, so no open handle refuses it and the gap is a single
     directory-entry operation. A real ``static/dist`` directory is renamed aside
-    once, to a name the next sweep removes.
+    once, to a name the next sweep removes. An overlay filesystem refuses that
+    rename with ``EXDEV`` for a directory from a lower (image) layer, so there it
+    is copied aside and then removed, and a removal that fails or is interrupted
+    part-way is undone from the copy.
 
     The link always carries an absolute target: a relative one would be read
     against the link's own directory, not the caller's working directory.
@@ -1040,7 +1049,25 @@ def _point_static_dist_at(static_dist: Path, target: Path) -> bool:
                 platform_compat.unlink_link_or_junction(static_dist)
         elif os.path.lexists(static_dist):
             retired = static_dist.with_name(_staged_name())
-            replace_with_retry(static_dist, retired)
+            try:
+                replace_with_retry(static_dist, retired)
+            except OSError as exc:
+                if exc.errno != errno.EXDEV:
+                    raise
+                shutil.copytree(static_dist, retired, symlinks=True)
+                try:
+                    shutil.rmtree(static_dist)
+                except BaseException:
+                    # Ctrl-C included. Put back only what the removal took: a
+                    # surviving file is the original.
+                    shutil.copytree(
+                        retired,
+                        static_dist,
+                        symlinks=True,
+                        dirs_exist_ok=True,
+                        copy_function=lambda s, d: os.path.lexists(d) or shutil.copy2(s, d),
+                    )
+                    raise
         replace_with_retry(tmp, static_dist)
     except OSError:
         if not os.path.lexists(static_dist):
@@ -1073,7 +1100,7 @@ def _report_served_dir_gone(gone: bool, log: Callable[[str], None]) -> None:
     """
     if gone:
         log(
-            "  ⚠️  static/dist no longer serves the directory it did: restart a "
+            "  Warning: static/dist no longer serves the directory it did: restart a "
             "gateway already running from this checkout if its dashboard comes up blank"
         )
 
@@ -1104,14 +1131,14 @@ def _stage_dist_locked(
     """
     _sweep_staged_locked(static_dist)
     if not built_dist.is_dir():
-        log(f"  ⚠️  Built dist not found at {built_dist} — dashboard may be stale")
+        log(f"  Warning: Built dist not found at {built_dist} — dashboard may be stale")
         return False
     reason = _incomplete_bundle_reason(built_dist)
     if reason:
         # An out-of-band build — one that takes no staging lock, such as pod
         # provisioning — can be observed mid-rebuild, and publishing that would
         # replace a good bundle with a broken one.
-        log(f"  ⚠️  {built_dist} is not a complete build ({reason}) — not staging")
+        log(f"  Warning: {built_dist} is not a complete build ({reason}) — not staging")
         return False
     if not edition_configured() and _publishes_atomically(built_dist):
         if _links_to(static_dist, built_dist):
@@ -1125,10 +1152,10 @@ def _stage_dist_locked(
             if _links_to(static_dist, built_dist):
                 _log_nothing_to_copy(built_dist, log)
                 return True
-            log(f"  ⚠️  Could not link static/dist to {built_dist} ({exc}); copying instead")
+            log(f"  Warning: Could not link static/dist to {built_dist} ({exc}); copying instead")
         else:
             _sweep_staged_locked(static_dist)
-            log(f"  📦 Linked static/dist → {built_dist}")
+            log(f"  Linked static/dist → {built_dist}")
             _report_served_dir_gone(retired, log)
             return True
     staged = static_dist.parent / _staged_name()
@@ -1137,7 +1164,7 @@ def _stage_dist_locked(
         name, rule = _STAGED_COPY_IGNORE
         (staged / name).write_text(rule, encoding="utf-8")
     except OSError as exc:
-        log(f"  ⚠️  Could not copy static/dist: {exc}")
+        log(f"  Warning: Could not copy static/dist: {exc}")
         _discard_path(staged)
         return False
     reason = _incomplete_bundle_reason(staged)
@@ -1145,7 +1172,7 @@ def _stage_dist_locked(
         # The source passed its pre-copy check but changed while being read — a
         # peer flow's build replacing website/dist mid-copy. Serving this would
         # replace a valid bundle with a partial one.
-        log(f"  ⚠️  Staged copy is incomplete ({reason}) — not publishing")
+        log(f"  Warning: Staged copy is incomplete ({reason}) — not publishing")
         _discard_path(staged)
         return False
     left_a_pinned_copy = not _publishes_atomically(built_dist) and _links_to_a_staged_copy(
@@ -1154,11 +1181,11 @@ def _stage_dist_locked(
     try:
         retired = _point_static_dist_at(static_dist, staged)
     except OSError as exc:
-        log(f"  ⚠️  Could not stage static/dist: {exc}")
+        log(f"  Warning: Could not stage static/dist: {exc}")
         _discard_path(staged)
         return False
     _sweep_staged_locked(static_dist)
-    log(f"  📦 Staged static/dist ← {built_dist}")
+    log(f"  Staged static/dist ← {built_dist}")
     _report_served_dir_gone(retired or left_a_pinned_copy, log)
     return True
 
@@ -1230,23 +1257,24 @@ def build_frontend_sync(
     edition rather than staging a stock bundle over it.
 
     Returns a :class:`FrontendBuildResult`; the install and build output is
-    written to ``<data home>/logs/frontend-build.log``, which it names.
+    written to ``<data home>/logs/frontend-build.log``, which it names. Where no
+    pinned walk exists (Windows) no log is opened and the output is discarded.
     """
     website_dir = proj_path / _DIR_NAME
     if not website_dir.is_dir():
-        log("  ⚠️  No website/ directory — skipping frontend build")
+        log("  Warning: No website/ directory — skipping frontend build")
         return _SKIPPED
     # Resolve to a full path: on Windows npm is ``npm.CMD``, which PATHEXT-aware
     # shutil.which finds but CreateProcess cannot spawn by the bare name "npm".
     npm = shutil.which("npm")
     if not npm:
-        log("  ⚠️  npm not found — skipping frontend build")
+        log("  Warning: npm not found — skipping frontend build")
         return _SKIPPED
     if edition_sources_missing():
-        log("  ⚠️  Edition frontend sources not present — keeping the shipped dashboard")
+        log("  Warning: Edition frontend sources not present — keeping the shipped dashboard")
         return _SKIPPED
 
-    log("  🔨 Building frontend (npm)…")
+    log("  Building frontend (npm)…")
     install_args = (
         ["ci", "--no-audit", "--no-fund"]
         if (website_dir / "package-lock.json").is_file()
@@ -1279,7 +1307,7 @@ def build_frontend_sync(
     # step runs from a generated stdlib-only script that cannot import kiro_crew
     # and so cannot take it. A Pull+Build install overlapping one of these is
     # therefore still possible; it is tracked separately rather than papered over.
-    backup = NodeModulesBackup(website_dir / "node_modules", lambda m: log(f"  ⚠️  {m}"))
+    backup = NodeModulesBackup(website_dir / "node_modules", lambda m: log(f"  Warning: {m}"))
 
     def _reap_tree(proc) -> None:
         """Kill the install's whole process group, then wait for it.
@@ -1328,7 +1356,7 @@ def build_frontend_sync(
                     )
                 except OSError as exc:
                     backup.rollback()
-                    log(f"  ⚠️  Frontend npm install could not start ({exc}) — tree left as it was")
+                    log(f"  Warning: Frontend npm install could not start ({exc}) — tree left as it was")
                     return _build_failed(log_path, build_log)
                 try:
                     proc.communicate(timeout=_INSTALL_TIMEOUT)
@@ -1339,13 +1367,13 @@ def build_frontend_sync(
                     _reap_tree(proc)
                     backup.rollback()
                     log(
-                        f"  ⚠️  Frontend npm install timed out after {_INSTALL_TIMEOUT}s"
+                        f"  Warning: Frontend npm install timed out after {_INSTALL_TIMEOUT}s"
                         " — the dependency tree was left as it was"
                     )
                     return _build_failed(log_path, build_log)
                 if proc.returncode != 0:
                     backup.rollback()
-                    log("  ⚠️  Frontend npm install failed — the dependency tree was left as it was")
+                    log("  Warning: Frontend npm install failed — the dependency tree was left as it was")
                     return _build_failed(log_path, build_log)
                 backup.commit()
             except BaseException:
@@ -1370,7 +1398,7 @@ def build_frontend_sync(
                 return FrontendBuildResult("built", log_path)
             return _build_failed(log_path, build_log)
     except OSError as exc:
-        log(f"  ⚠️  Could not acquire the static/dist staging lock: {exc}")
+        log(f"  Warning: Could not acquire the static/dist staging lock: {exc}")
         return _build_failed(log_path, build_log)
     finally:
         if build_log is not None:
@@ -1398,6 +1426,10 @@ async def build_frontend_async(
     Returns a :class:`FrontendBuildResult` like the sync helper, with the
     install and build output in the same log file.
     """
+    # Local import: the update seam loads the platform package, which the sync
+    # build and the `stage` entry point never need.
+    from kiro_crew.platform.update_provider import _start_installer
+
     proj_path = Path(proj)
     website_dir = proj_path / _DIR_NAME
 
@@ -1539,19 +1571,25 @@ async def build_frontend_async(
             return await _finish_log(False)
         await _offload(lambda: _log_step(build_log, install_args))
         try:
-            npm_i = await asyncio.create_subprocess_exec(
-                npm, *install_args,
-                cwd=str(website_dir),
-                stdout=build_log if build_log is not None else asyncio.subprocess.DEVNULL,
-                stderr=(
-                    asyncio.subprocess.STDOUT
-                    if build_log is not None
-                    else asyncio.subprocess.DEVNULL
+            # Through `_start_installer`: a cancel inside a bare spawn await kills
+            # npm's pid alone and leaves `npm_i` unset, so the cancellation arm
+            # below would have nothing to kill while the rollback clears the tree.
+            npm_i = await _start_installer(
+                asyncio.create_subprocess_exec(
+                    npm, *install_args,
+                    cwd=str(website_dir),
+                    stdout=build_log if build_log is not None else asyncio.subprocess.DEVNULL,
+                    stderr=(
+                        asyncio.subprocess.STDOUT
+                        if build_log is not None
+                        else asyncio.subprocess.DEVNULL
+                    ),
+                    # Its own group, so the whole install tree can be signalled --
+                    # see _kill_and_wait. No-op on the platform that lacks each half.
+                    start_new_session=platform_compat.IS_POSIX,
+                    creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
                 ),
-                # Its own group, so the whole install tree can be signalled --
-                # see _kill_and_wait. No-op on the platform that lacks each half.
-                start_new_session=platform_compat.IS_POSIX,
-                creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
+                stop=_kill_and_wait,
             )
         except OSError as exc:
             await _offload(backup.rollback)
@@ -1665,7 +1703,7 @@ async def build_frontend_async(
         # refusal / lock failure) rather than one generic line: without it the
         # update flow reports success and restarts while the dashboard still
         # serves the PREVIOUS bundle, so a user sees no reason it did not apply.
-        _warn(message.strip().lstrip("⚠️ ").strip() or "Frontend build/staging failed")
+        _warn(message.strip().removeprefix("Warning:").strip() or "Frontend build/staging failed")
     if not staged and not messages:
         _warn("Frontend build/staging failed -- dashboard may be stale")
     return result

@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -805,11 +806,14 @@ class TestWriteEnvUpdates:
         SecretVault(tmp_path).set_sync("SLACK_BOT_TOKEN", "placeholder-old")
 
         events: list[str] = []
+        test_thread = threading.get_ident()
         real_restrict = platform_compat.restrict_to_owner
         real_os_write = _os.write
 
         def _spy(path: Any) -> None:
-            events.append("restrict")
+            # This thread only: the SEL writer thread re-locks its non-empty log per append.
+            if threading.get_ident() == test_thread:
+                events.append("restrict")
             return real_restrict(path)
 
         def _tracking_write(fd: int, data: Any) -> int:
@@ -919,8 +923,13 @@ class TestTokenValidators:
         assert asyncio.run(mod._validate_telegram_token("tok")) == "Unauthorized"
 
     def test_telegram_falls_back_to_rejected(self, monkeypatch) -> None:
-        _fake_http(monkeypatch, _FakeResponse(200, ["not", "a", "dict"]))
+        _fake_http(monkeypatch, _FakeResponse(200, {"ok": False}))
         assert asyncio.run(mod._validate_telegram_token("tok")) == "rejected"
+
+    def test_telegram_non_bot_api_body_is_unverifiable(self, monkeypatch) -> None:
+        _fake_http(monkeypatch, _FakeResponse(200, ["not", "a", "dict"]))
+        with pytest.raises(ConnectionError):
+            asyncio.run(mod._validate_telegram_token("tok"))
 
     def test_webex_accepts_a_2xx(self, monkeypatch) -> None:
         _fake_http(monkeypatch, _FakeResponse(200))

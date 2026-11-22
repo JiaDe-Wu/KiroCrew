@@ -80,6 +80,7 @@ from kiro_crew.lesson_validation import (  # noqa: F401
     render_withheld_tier,
     tighter_lesson_budget,
 )
+from kiro_crew.memory_recall_filters import RecallFilters
 from kiro_crew.memory_stores import MEMORY_DB_FILE
 from kiro_crew.metrics.db_metrics import timed
 from kiro_crew.owner_only_files import owner_only_opener, prepare_owner_only_sqlite  # noqa: F401
@@ -128,6 +129,7 @@ from kiro_crew.vector_memory_runtime import embedding_repair as _embedding_repai
 from kiro_crew.vector_memory_runtime import episodic_search as _episodic_search
 from kiro_crew.vector_memory_runtime import episodic_write as _episodic_write
 from kiro_crew.vector_memory_runtime import faiss_index as _faiss_index
+from kiro_crew.vector_memory_runtime import lesson_candidates as _lesson_candidates  # noqa: F401
 from kiro_crew.vector_memory_runtime import lesson_write as _lesson_write
 from kiro_crew.vector_memory_runtime import lessons as _lessons
 from kiro_crew.vector_memory_runtime import migration as _migration
@@ -363,9 +365,6 @@ _BUILTIN_PREFIXES = [
 ]
 
 # ── Schema ──
-
-
-_MAX_BACKFILLS_PER_CALL = 5  # cap lazy embedding backfills to bound latency
 
 
 def _lesson_slug(rule: str) -> str:
@@ -773,6 +772,7 @@ class VectorMemoryStore:
     # ── bound from vector_memory_runtime/lesson_write.py ──
     write_lesson = _lesson_write.write_lesson
     embed_lesson = _lesson_write.embed_lesson
+    update_lesson_applies = _lesson_write.update_lesson_applies
 
     # ── bound from vector_memory_runtime/bulk_ingest.py ──
     migrate_from_markdown = _bulk_ingest.migrate_from_markdown
@@ -1173,17 +1173,25 @@ class VectorMemoryStore:
         return _semantic.get_preferences_context(self, query_text, cap)
 
     def get_semantic_context(
-        self, query_text: str = "", cap: int = 1500, *, facts_only: bool = False
+        self,
+        query_text: str = "",
+        cap: int = 1500,
+        *,
+        facts_only: bool = False,
+        relevance_rule: str = "off",
     ) -> str:
         """Format semantic memory for prompt injection with hybrid retrieval."""
         from kiro_crew import recall_pool as _recall_pool  # circular import at module level
 
-        pooled = _recall_pool.offload(
-            self, "semantic", {"query_text": query_text, "cap": cap, "facts_only": facts_only}
-        )
+        args: dict[str, object] = {"query_text": query_text, "cap": cap, "facts_only": facts_only}
+        if relevance_rule != "off":
+            args["relevance_rule"] = relevance_rule
+        pooled = _recall_pool.offload(self, "semantic", args)
         if pooled is not None:
             return pooled
-        return _semantic.get_semantic_context(self, query_text, cap, facts_only=facts_only)
+        return _semantic.get_semantic_context(
+            self, query_text, cap, facts_only=facts_only, relevance_rule=relevance_rule
+        )
 
     def _semantic_candidates_v2(
         self, query_text: str, *, recall_query: _RecallQuery | None = None
@@ -1315,11 +1323,10 @@ class VectorMemoryStore:
         tag_filter: list[str] | None,
         relevance_filter: bool,
         now: datetime,
-        blocked: set[str] | None = None,
     ) -> list[dict]:
         """Score, filter and rank from the resident set; resolve winner bodies."""
         return _episodic_search.rank_from_scoring_set(
-            self, scoring, q, limit, mmr, tag_filter, relevance_filter, now, blocked
+            self, scoring, q, limit, mmr, tag_filter, relevance_filter, now
         )
 
     def _episodic_candidate(self, r: sqlite3.Row, cosine_sim: float, now: datetime) -> dict:
@@ -1452,6 +1459,9 @@ class VectorMemoryStore:
         hard_cap: int = 0,
         directive_budget: int = 0,
         experience_budget: int = 0,
+        authority_order: str = "off",
+        lesson_fold: str = "off",
+        relevance_rule: str = "off",
     ) -> str:
         """Format lessons for prompt injection, most relevant first."""
         from kiro_crew import recall_pool as _recall_pool  # circular import at module level
@@ -1467,6 +1477,9 @@ class VectorMemoryStore:
                 hard_cap,
                 directive_budget,
                 experience_budget,
+                authority_order,
+                lesson_fold,
+                relevance_rule,
             )
             pooled = _recall_pool.offload(self, "lessons", job_args)
             if pooled is not None:
@@ -1481,6 +1494,9 @@ class VectorMemoryStore:
             hard_cap=hard_cap,
             directive_budget=directive_budget,
             experience_budget=experience_budget,
+            authority_order=authority_order,
+            lesson_fold=lesson_fold,
+            relevance_rule=relevance_rule,
         )
 
     def turn_lessons(
@@ -1518,9 +1534,11 @@ class VectorMemoryStore:
         """Order *entries* by hybrid relevance to *query_text*, most relevant first."""
         return _lessons.rank_lessons(self, entries, query_text, recall_query=recall_query)
 
-    def _any_lesson_overlap(self, entries: list[tuple[dict, str]], query_text: str) -> bool:
+    def _any_lesson_overlap(
+        self, entries: list[tuple[dict, str]], query_text: str, *, significant: bool = False
+    ) -> bool:
         """Whether ANY entry shares a stemmed word with *query_text*."""
-        return _lessons.any_lesson_overlap(self, entries, query_text)
+        return _lessons.any_lesson_overlap(self, entries, query_text, significant=significant)
 
     @staticmethod
     def _stored_similarity_scorer(
@@ -1764,6 +1782,7 @@ class VectorMemoryStore:
         project_dir: str | Path | None = None,
         keep: Callable[[list[dict]], list[dict] | None] | None = None,
         conversation_id: str = "",
+        filters: RecallFilters | None = None,
     ) -> dict:
         """Compute once; discard mixed-space results and retry keyword-only once."""
         return _recall.recall(
@@ -1773,6 +1792,7 @@ class VectorMemoryStore:
             project_dir=project_dir,
             keep=keep,
             conversation_id=conversation_id,
+            filters=filters,
             session_affinity=self._session_affinity,
             recency_boost=self._recency_boost,
         )

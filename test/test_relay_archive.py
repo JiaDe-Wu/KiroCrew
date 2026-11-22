@@ -17,7 +17,9 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_state
+from redaction_structured_cases import github_classic
 
+from kiro_crew.dashboard import relay_archive
 from kiro_crew.dashboard.chat_persistence import (
     _rehydrate_slot_from_history,
     _save_slot_to_history,
@@ -72,7 +74,7 @@ def _app(state, *, app_name: str = "") -> web.Application:
 def ready(monkeypatch):
     """Readiness is orthogonal to the archive guard; stub it so a 503 cannot mask it."""
 
-    async def _ok(_request):
+    async def _ok(_request, **_kwargs):
         return None
 
     monkeypatch.setattr("kiro_crew.dashboard.chat_regenerate.reject_if_kiro_unverified", _ok)
@@ -92,6 +94,63 @@ def test_the_refusal_keys_on_executor_alone(complete):
     refusal = relay_archive_refusal(_archive(complete=complete))
     assert refusal is not None and refusal.status == 409
     assert relay_archive_refusal(_ChatSlot("local")) is None
+
+
+@pytest.mark.parametrize(
+    "history_key,app,linked,read,marked",
+    [
+        ("cron_0a1b2c3d_writer", "", "", True, True),
+        ("cron:0a1b2c3d:1a2b3c4d", "", "", True, True),
+        ("dashboard:cron_0a1b2c3d_writer", "", "", True, False),
+        ("cron_0a1b2c3d", "", "", True, False),
+        ("cron_0A1B2C3D_writer", "", "", True, False),
+        ("cron_0a1b2c3d_writer", "notes", "", True, False),
+        ("cron_0a1b2c3d_writer", "", "cron:0a1b2c3d:writer", True, False),
+        ("cron_0a1b2c3d_writer", "", "", False, False),
+    ],
+    ids=[
+        "sequence-agent",
+        "stateless-run",
+        "own-tab",
+        "job-transcript",
+        "not-a-job-id",
+        "app",
+        "linked",
+        "not-read",
+    ],
+)
+def test_only_an_unlinked_cron_run_transcript_is_marked(history_key, app, linked, read, marked):
+    slot = _ChatSlot("tab")
+    slot.linked_session_key = linked
+    relay_archive.mark_cron_run_read_only(
+        slot, history_key=history_key, app=app, transcript_read=read
+    )
+    assert relay_archive.is_cron_run_read_only(slot) is marked
+    refusal = relay_archive_refusal(slot)
+    assert (refusal is not None) is marked
+    assert not is_relay_archive(slot)
+
+
+def test_a_mock_slot_is_never_read_only():
+    assert not relay_archive.is_cron_run_read_only(MagicMock())
+    assert relay_archive_refusal(MagicMock()) is None
+
+
+@pytest.mark.asyncio
+async def test_a_marked_slot_gets_its_own_code(tmp_path):
+    state = _make_state(tmp_path)
+    slot = _ChatSlot("cron_0a1b2c3d_writer")
+    slot.cron_run_read_only = True
+    _with_a_turn(state, slot)
+    before = list(slot.messages)
+
+    async with TestClient(TestServer(_app(state))) as client:
+        resp = await client.post("/api/chat/send", json={"slot": slot.key, "message": "again"})
+        assert resp.status == 409
+        assert (await resp.json())["code"] == "cron_run_read_only"
+
+    assert slot.messages == before
+    assert slot.task is None
 
 
 @pytest.mark.asyncio
@@ -217,8 +276,8 @@ def test_an_old_relay_slot_loads_as_a_read_only_archive(tmp_path):
 
 
 def test_peer_text_is_redacted_and_clean_text_passes_unchanged():
-    secret = "key AKIAIOSFODNN7EXAMPLE here"
-    assert "AKIAIOSFODNN7EXAMPLE" not in redact_peer_text(secret)
+    key = github_classic(seed=7)
+    assert key not in redact_peer_text(f"key {key} here")
     assert redact_peer_text("plain words") == "plain words"
 
 

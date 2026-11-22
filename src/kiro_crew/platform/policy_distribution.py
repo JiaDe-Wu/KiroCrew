@@ -109,7 +109,9 @@ import time
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
 
+from kiro_crew.asset_downloader import network_failure_cause
 from kiro_crew.atomic_write import atomic_write, read_bytes_with_retry  # noqa: F401 - re-export
+from kiro_crew.bounded_read import bounded_read  # noqa: F401 - re-export
 from kiro_crew.config.paths import config_dir  # noqa: F401 - re-export
 from kiro_crew.constants import ENV_TRUTHY  # noqa: F401 - re-export
 from kiro_crew.platform.context import PlatformCompositionError
@@ -365,8 +367,9 @@ def refresh_now(*, force: bool = False) -> RefreshOutcome:
             incident="rejected",
         )
     except Exception as exc:
+        why = network_failure_cause(exc) or exc
         return _refresh_failure(
-            REFRESH_UNREACHABLE, dist, f"could not fetch {dist.source}: {exc}", incident="refresh"
+            REFRESH_UNREACHABLE, dist, f"could not fetch {dist.source}: {why}", incident="refresh"
         )
 
     # A 304 is answered against the CACHE's validators, and the cache is written by
@@ -1154,6 +1157,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _redact_source,
         _request_header_secrets,
         _unavailable,
+        _without_legacy_terminal_refusal,
         central_ceiling_installed,
         effective_max_cache_age,
         effective_refresh_interval,
@@ -1198,8 +1202,8 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _fetch_file,
         _fetch_http,
         _fetcher_for,
-        _is_enterprise,
         _is_loopback,
+        _is_lts,
         _NoRedirects,
         _open,
         _opener_handlers,

@@ -42,12 +42,13 @@
 
 import { parseCssColor, relativeLuminance } from './iconContrast'
 import { TAILWIND_RUNTIME_PATH as TAILWIND_RUNTIME_PATH_ROOT } from './vendorPaths'
-import { withBase } from './basePath'
+import { BASE_PATH, withBase } from './basePath'
 /** The runtime's served path under this build's base (the bare path in the stock build). */
 const TAILWIND_RUNTIME_PATH = withBase(TAILWIND_RUNTIME_PATH_ROOT)
 import { sanitizeCssValue } from './cssSanitize'
 import { SWIPE_GESTURE_IDLE_MS } from './trackpadGesture'
 import { HEIGHT_REPORTER_BODY } from './widgetHeightReporter'
+import { FRAGMENT_SCROLL_BODY } from './widgetFragmentScroll'
 
 /** The sandbox grants for every frame that holds an agent-written page: saved
  * artifacts (`ArtifactBody`), library thumbnails (`ArtifactThumbs`), a teammate's
@@ -155,16 +156,25 @@ const TW_ERROR_EVENT = 'mc-tw-error'
 const TW_ERROR_INLINE_HANDLER =
   `window.__mcTwError=1;window.dispatchEvent(new Event('${TW_ERROR_EVENT}'))`
 
-/** Tailwind v4 browser build: dark mode is driven by a `.dark` class on <body>
- * (set below) via a custom variant — NOT the v3 `tailwind.config` global, which
- * v4 removed. The @tailwindcss/browser runtime auto-injects preflight + theme +
+/** The attribute that marks the frame's colour scheme on <body>: `data-mode="dark"`
+ * or `data-mode="light"`. An attribute and not a class, because the body shares the
+ * page's class namespace: a page that styles its own `.light` or `.dark` element (a
+ * status dot, a dark chip) would style the body too, in whichever theme matches the
+ * name, and lay the whole page out inside that rule. Mirrored by the gateway's
+ * `dashboard_frame.MODE_ATTRIBUTE`, so an offline run marks its body the same way. */
+export const FRAME_MODE_ATTRIBUTE = 'data-mode'
+
+/** Tailwind v4 browser build: dark mode is driven by the body's `data-mode`
+ * attribute (set below) via a custom variant — NOT the v3 `tailwind.config` global,
+ * which v4 removed. The @tailwindcss/browser runtime auto-injects preflight + theme +
  * utilities on load (verified via headless render: base reset AND utilities apply
  * without an explicit `@import "tailwindcss"`), so this block only registers the
  * dark variant. Injected as a `<style type="text/tailwindcss">` block the runtime
  * compiles on load; it must precede the runtime script so the variant registers
- * before first paint. */
+ * before first paint. Kept a plain literal: the gateway pins its own copy to this
+ * text (`dashboard_snapshot_look.TAILWIND_DIRECTIVES`). */
 const TAILWIND_V4_DIRECTIVES =
-  '@custom-variant dark (&:where(.dark, .dark *));'
+  '@custom-variant dark (&:where([data-mode=dark], [data-mode=dark] *));'
 
 /** Highlight + bubble CSS for anchored comments rendered inside the iframe. */
 const COMMENT_HIGHLIGHT_CSS =
@@ -412,27 +422,36 @@ const FRAME_TOUCH_RELAY_BODY = `(function(){
  * path, so one inside a shadow root (a web component) counts, not just its host.
  * Whether a scroller has room is the host's own rule (`room`, a copy of
  * lib/trackpadGesture `hasScrollRoomX`), right-to-left scrollers included. Every other run is posted, event by event, as
- * `{type: 'mc-frame-wheel', dx, dy, mode, t}`, where `t` is when the wheel
+ * `{type: 'mc-frame-wheel', dx, dy, mode, t, inv}`, where `t` is when the wheel
  * happened, as `performance.timeOrigin + timeStamp` (epoch ms): the host's
  * own receive time would squeeze a burst queued behind a stall into a few
- * ms, and read slow fingers as a flick. A leftward-scrolling event of such
- * a run (`deltaX < 0`, the fingers moving right) is also cancelled here: the
- * host can drive only its panel's close from this frame, which is that
- * direction, and a parent cannot cancel the browser's history swipe for a
- * wheel that landed in a frame.
+ * ms, and read slow fingers as a flick. `inv` is the wheel's own
+ * `webkitDirectionInvertedFromDevice` (WebKit only, else null), which the host
+ * needs to read the raw `dx` as the fingers. An event of such a run whose
+ * fingers move right is also cancelled here: the host can drive only its
+ * panel's close from this frame, which is that direction, and a parent cannot
+ * cancel the browser's history swipe for a wheel that landed in a frame. With
+ * Natural scrolling on that is `deltaX < 0`, with it off `deltaX > 0`
+ * (`sign`, a copy of lib/trackpadGesture `fingerSign`).
  *
  * Disarmed until the host says it is listening: the frame posts
  * `{type: 'mc-frame-wheel-hello'}` when it starts, and relays (and cancels)
- * only after the parent answers `{type: 'mc-frame-wheel-armed', on: true}`. The
+ * only after the parent answers `{type: 'mc-frame-wheel-armed', on: true}`,
+ * which also carries `natural`, the desktop shell's Natural scrolling (or
+ * null) for a wheel that does not say. The
  * host sends `on: false` when its swipe stops listening (a phone-width window,
  * a creation surface), so the frame then leaves every wheel to the browser
  * instead of cancelling a run nobody will act on. Only the parent may arm it. */
 const FRAME_WHEEL_RELAY_BODY = `(function(){
-  var armed=false;
+  var armed=false,natural=null;
   window.addEventListener('message',function(e){
     var d=e.data;
-    if(e.source===parent&&d&&d.type==='mc-frame-wheel-armed')armed=d.on===true;
+    if(e.source===parent&&d&&d.type==='mc-frame-wheel-armed'){armed=d.on===true;natural=typeof d.natural==='boolean'?d.natural:null;}
   });
+  function sign(inv){
+    var on=typeof inv==='boolean'?inv:natural;
+    return on===false?-1:1;
+  }
   parent.postMessage({type:'mc-frame-wheel-hello'},'*');
   function room(sl,m,rtl,dx){
     if(m<=1)return false;
@@ -463,8 +482,9 @@ const FRAME_WHEEL_RELAY_BODY = `(function(){
       else axis=Math.abs(dx)>Math.abs(dy)&&!scrolls(e,dx)?'x':'own';
     }
     if(axis!=='x'||e.ctrlKey)return;
-    parent.postMessage({type:'mc-frame-wheel',dx:dx,dy:dy,mode:e.deltaMode,t:performance.timeOrigin+e.timeStamp},'*');
-    if(dx<0&&Math.abs(dx)>Math.abs(dy))e.preventDefault();
+    var inv=typeof e.webkitDirectionInvertedFromDevice==='boolean'?e.webkitDirectionInvertedFromDevice:null;
+    parent.postMessage({type:'mc-frame-wheel',dx:dx,dy:dy,mode:e.deltaMode,t:performance.timeOrigin+e.timeStamp,inv:inv},'*');
+    if(sign(inv)*dx<0&&Math.abs(dx)>Math.abs(dy))e.preventDefault();
   },{passive:false,capture:true});
 })();`
 
@@ -719,7 +739,8 @@ const LINK_BRIDGE_SHIM_BODY = `(function(){
  * writes, holding the widget in an `AGENT_PAGE_SANDBOX` frame, so React and
  * `useFrameLinkBridge` are not there to answer the frame's open message. This
  * script is: the same checks (the message comes from the frame, the URL is an
- * absolute `http(s)` URL with no user name or password, the person just clicked
+ * `http(s)` URL with no user name or password, a dashboard path resolving
+ * against the dashboard as `webUrlOf` resolves it, the person just clicked
  * with the frame focused), then a `noopener,noreferrer` open, once per click,
  * when the click is tied to the frame: focus came into it from the tab, and no
  * click or key in the tab itself (a Tab into the frame) is still live. Otherwise
@@ -775,21 +796,26 @@ const POPOUT_LINK_BRIDGE_BODY = `(function(){
     var d = e.data;
     if (!d || typeof d !== 'object' || d.type !== T || typeof d.url !== 'string') return;
     if (!d.url) return;
+    // A dashboard path (/schedule) resolves against the dashboard, as in chat, and
+    // a dashboard URL takes its base, as the dashboard's window.open adds it (rebaseUrl).
     var u;
-    try { u = new URL(d.url); } catch (_) { return; }
+    try { u = new URL(d.url, ORIGIN); } catch (_) { return; }
     if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
     if (u.username || u.password) return;
+    if (BASE && u.origin === ORIGIN && u.pathname !== BASE && u.pathname.indexOf(BASE + '/') !== 0) u.pathname = BASE + u.pathname;
     if (!clicked()) return;
     if (entered && Date.now() - last >= LIFE) go(f, u.href);
     else offer(u.href, u.host);
   });
 })();`
 
-/** The popped-out widget tab's link bridge: fixed first-party text and the
- * button's localized *label*, in which `%HOST%` stands for the link's host. No
- * widget content. */
-export function popoutLinkBridgeScript(label: string): string {
-  return `var LABEL = ${JSON.stringify(label).replace(/</g, '\\u003c')};\n${POPOUT_LINK_BRIDGE_BODY}`
+/** The popped-out widget tab's link bridge: fixed first-party text, the
+ * button's localized *label*, in which `%HOST%` stands for the link's host, and
+ * the *origin* and *base* of the dashboard that builds the tab. No widget
+ * content. */
+export function popoutLinkBridgeScript(label: string, origin: string = window.location.origin, base: string = BASE_PATH): string {
+  const literal = (s: string) => JSON.stringify(s).replace(/</g, '\\u003c')
+  return `var LABEL = ${literal(label)}, ORIGIN = ${literal(origin)}, BASE = ${literal(base)};\n${POPOUT_LINK_BRIDGE_BODY}`
 }
 
 /** In-iframe comment bridge. Vanilla JS string — no LLM/user
@@ -1369,7 +1395,7 @@ export function buildSrcdoc({
 }: BuildSrcdocOptions): string {
   // A widget hardcoded for a light canvas renders on a light canvas even when
   // the dashboard is dark -- see resolveWidgetTheme. Resolved once here so the
-  // DOM and SSR paths, the :root vars, color-scheme and the body class agree.
+  // DOM and SSR paths, the :root vars, color-scheme and the body's mode attribute agree.
   const { themeVars, mode } = resolveWidgetTheme(html, requestedThemeVars, requestedMode)
 
   // SSR / unit-test fallback: when there's no DOM (Node.js, vitest before
@@ -1493,8 +1519,9 @@ export function buildSrcdoc({
     head.appendChild(overlayStyle)
   }
 
-  // <body class="dark|light">
-  body.className = mode
+  // <body data-mode="dark|light">, the attribute the dark variant above reads. The
+  // body gets no class: see FRAME_MODE_ATTRIBUTE.
+  body.setAttribute(FRAME_MODE_ATTRIBUTE, mode)
 
   // Clipboard write-fallback shim. Installed BEFORE the LLM html below so an
   // on-load attempt sees the wrapper too; without user activation its fallback
@@ -1606,6 +1633,11 @@ export function buildSrcdoc({
     const reporter = hostScript()
     reporter.textContent = HEIGHT_REPORTER_BODY
     body.appendChild(reporter)
+    // A self-sized frame cannot scroll to its own fragment links; this asks the
+    // host to (lib/widgetFragmentScroll.ts).
+    const fragmentScroll = hostScript()
+    fragmentScroll.textContent = FRAGMENT_SCROLL_BODY
+    body.appendChild(fragmentScroll)
   }
 
   // Unsafe-centering guard: keeps the top of flex/grid-centered artifact
@@ -1694,7 +1726,7 @@ function buildSrcdocSSR({ html, themeVars, mode, includeHeightReporter }: BuildS
     // document unthemed — and painted white — until the script lands.
     `<style>${styleCss}</style>` +
     `<script src="${TAILWIND_RUNTIME_PATH}" crossorigin="anonymous" onerror="${TW_ERROR_INLINE_HANDLER}"><\/script>` +
-    `</head><body class="${mode}">` +
+    `</head><body ${FRAME_MODE_ATTRIBUTE}="${mode}">` +
     `<!-- SSR fallback: LLM body omitted -->` +
     // NO clipboard shim here. This SSR builder is unreachable in production
     // (buildSrcdoc only enters it when there is no DOM — i.e. pre-jsdom unit

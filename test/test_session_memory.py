@@ -12,6 +12,7 @@ import pytest
 
 from kiro_crew import resource_status as sm_rs
 from kiro_crew.dashboard import session_memory as sm
+from kiro_crew.testing.synthetic_credentials import github_classic
 
 
 class _FakeSlot:
@@ -89,10 +90,11 @@ def test_a_credential_in_a_title_is_redacted_at_the_output_boundary() -> None:
     client-supplied body["title"] to slot.title with no scan, so a title can reach
     this serializer unredacted. running_agents_for redacts task text in the same
     payload; titles must not be treated more loosely."""
-    leaky = "Debug AKIAIOSFODNN7EXAMPLE rotation"
+    token = github_classic(seed=320)
+    leaky = f"Debug {token} rotation"
     out = sm.session_title("dashboard:chat-9", lambda k: _FakeSlot(leaky))
 
-    assert "AKIAIOSFODNN7EXAMPLE" not in str(out["title"])
+    assert token not in str(out["title"])
     assert out["title"] == "Debug [REDACTED: credential] rotation"
 
 
@@ -449,16 +451,24 @@ class _FakeRuntime:
         return self._alive
 
 
-def test_runtime_pids_includes_runtimes_held_only_on_the_manager() -> None:
+def test_runtime_pids_includes_runtimes_held_only_on_the_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """``_bg_runtime`` and companion runtimes are real trees, not rounding error.
 
     Both live only as SessionManager attributes, outside ``_sessions``; skipping them
     understates "Kiro Crew Used" by 200-400 MB per runtime.
     """
-    import time as _time
+    import types
+
+    # Both clocks the projection reads are pinned through the facade, so the age is
+    # exact and no pause between the stamp and the read can move it.
+    wall, monotonic = 1_000_000.0, 5_000.0
+    clock = types.SimpleNamespace(time=lambda: wall, monotonic=lambda: monotonic)
+    monkeypatch.setattr("kiro_crew.session_allocation.time", clock)
 
     mgr = _manager()
-    mgr._bg_runtime = _FakeRuntime(4711, spawn=_time.monotonic() - 90.0)
+    mgr._bg_runtime = _FakeRuntime(4711, spawn=monotonic - 90.0)
     mgr._subagent_runtimes = {"dashboard:parent": _FakeRuntime(4712)}
 
     rows = {r["key"]: r for r in mgr.runtime_pids()}
@@ -472,7 +482,7 @@ def test_runtime_pids_includes_runtimes_held_only_on_the_manager() -> None:
     # the consumer's `now - created_at` yields a real age.
     created = rows["Background runtime"]["created_at"]
     assert isinstance(created, float)
-    assert 85.0 < (_time.time() - created) < 95.0
+    assert created == wall - 90.0
     # A runtime with no spawn stamp reads as unknown uptime, never as "just now".
     assert rows["Subagent runtime (dashboard:parent)"]["created_at"] is None
 
@@ -709,7 +719,7 @@ def test_slot_spend_cache_invalidates_on_shard_growth(
     assert third["dashboard:chat-7-333"]["turns"] == 2
 
 
-# ── Regression: Sessions table and Spend tab share the same window ─────────
+# ── Sessions table and Spend tab share the same window ─────────────────────
 
 
 def test_slot_spend_window_matches_cost_breakdown_window() -> None:
@@ -1171,3 +1181,125 @@ async def test_an_unreadable_slice_is_never_confirmed_healthy_or_faulted(
     assert sli["readable"] is False
     assert sli["confirmed"] is False
     assert sli["healthy"] is False
+
+
+# ── macOS columns and the whole-product breakdown ──────────────────────────
+
+
+def test_macos_counts_procs_and_stubs_and_times_cpu_from_the_libproc_map(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On macOS the parent map comes from libproc's child lists, so the Procs,
+    MCP stubs, CPU and memory figures are all measured over that one walked tree
+    instead of the counts reading as unknown."""
+    monkeypatch.setattr(sm.sys, "platform", "darwin")
+    children = {7: [107, 207]}
+    sizes = {7: 600, 107: 200, 207: 100}
+    monkeypatch.setattr(sm, "_pid_memory_bytes", lambda pid: sizes[pid] * 1024 * 1024)
+    argv = {107: ["python3.12", "-m", sm._STUB_MARKER], 207: ["node", "server.js"]}
+    monkeypatch.setattr(sm, "darwin_process_argv", lambda pid: argv.get(pid, ["kiro-cli"]))
+    nanos = iter([1_000_000_000, 0, 0, 3_000_000_000, 0, 0])
+    monkeypatch.setattr(sm, "proc_cpu_nanos_for_pid", lambda pid: next(nanos))
+    sampler = sm.SessionMemorySampler()
+
+    first = sampler._sample_pid(7, 100.0, children=children)
+    second = sampler._sample_pid(7, 102.0, children=children)
+
+    # The memory total is summed over the same walked tree as the counts.
+    assert first["rss_mb"] == 900.0
+    assert first["procs"] == 3
+    assert first["mcp"] == 1
+    assert first["cpu_cores"] is None  # the first sample only seeds the baseline
+    assert second["cpu_cores"] == pytest.approx(1.0)
+
+
+def test_without_a_parent_map_the_columns_stay_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sm.sys, "platform", "win32")
+    monkeypatch.setattr(sm, "_get_rss_tree_mb", lambda pid, **kw: 900.0)
+
+    out = sm.SessionMemorySampler()._sample_pid(7, 100.0, children=None)
+
+    assert out["rss_mb"] == 900.0
+    assert out["procs"] is None
+    assert out["mcp"] is None
+    assert out["cpu_cores"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_breakdown_rides_the_payload_and_adds_the_rest_of_the_product(
+    monkeypatch: pytest.MonkeyPatch, stub_proc: None
+) -> None:
+    """The footer total covers the warm pool and the gateway's own processes,
+    while ``rss_mb`` keeps meaning the sessions' total."""
+    gateway = sm.os.getpid()
+    monkeypatch.setattr(
+        sm, "proc_child_map", lambda: {1: [gateway], gateway: [7, 50, 60], 60: [61]}
+    )
+    sizes = {gateway: 1000, 50: 400, 60: 30, 61: 20}
+    monkeypatch.setattr(sm, "_pid_memory_bytes", lambda pid: sizes.get(pid, 0) * 1024 * 1024)
+    sessions = _FakeSessions([_row("dashboard:a", 7)])
+    sessions._pool_pids = lambda: {50}  # type: ignore[attr-defined]
+
+    out = await sm.SessionMemorySampler().sample(sessions, None, breakdown=True)
+
+    totals = out["totals"]
+    assert totals["rss_mb"] == 3238.0  # type: ignore[index]
+    breakdown = totals["breakdown"]  # type: ignore[index]
+    parts = {c["id"]: c for c in breakdown["categories"]}
+    assert parts["sessions"]["mb"] == 3238.0
+    assert parts["warm_pool"]["mb"] == 400.0
+    assert parts["gateway"]["mb"] == 1000.0
+    assert parts["gateway_helpers"]["mb"] == 50.0
+    assert parts["gateway_helpers"]["procs"] == 2
+    assert breakdown["total_mb"] == 3238.0 + 400.0 + 1000.0 + 50.0
+    assert breakdown["host_pct"] == pytest.approx(
+        breakdown["total_mb"] / (124.0 * 1024) * 100, abs=0.01
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_breakdown_leaves_the_page_with_the_sessions_total(
+    monkeypatch: pytest.MonkeyPatch, stub_proc: None
+) -> None:
+    def _boom(*_a: object, **_kw: object) -> dict[str, object]:
+        raise RuntimeError("process table vanished")
+
+    monkeypatch.setattr(sm.memory_breakdown, "build", _boom)
+    out = await sm.SessionMemorySampler().sample(
+        _FakeSessions([_row("dashboard:a", 7)]), None, breakdown=True
+    )
+
+    assert out["totals"]["breakdown"] is None  # type: ignore[index]
+    assert out["totals"]["rss_mb"] == 3238.0  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_a_caller_that_does_not_ask_for_the_breakdown_does_not_pay_for_it(
+    monkeypatch: pytest.MonkeyPatch, stub_proc: None
+) -> None:
+    """The agent-scope route reads session rows only; walking every process the
+    product runs on its behalf would be cost with no reader."""
+
+    def _never(*_a: object, **_kw: object) -> dict[str, object]:
+        raise AssertionError("the breakdown was measured for a caller that did not ask")
+
+    monkeypatch.setattr(sm.memory_breakdown, "build", _never)
+    out = await sm.SessionMemorySampler().sample(_FakeSessions([_row("dashboard:a", 7)]), None)
+
+    assert out["totals"]["breakdown"] is None  # type: ignore[index]
+
+
+def test_the_macos_parent_map_walks_the_kernels_child_lists_from_launchd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One unreadable child list costs that process's subtree, not the map."""
+    lists = {1: [10, 20], 10: [11], 11: [], 20: None}
+    monkeypatch.setattr(sm, "darwin_child_pids", lambda pid: lists.get(pid, []))
+
+    assert sm._darwin_child_map() == {1: [10, 20], 10: [11]}
+
+
+def test_without_launchds_child_list_there_is_no_macos_map(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sm, "darwin_child_pids", lambda pid: None)
+
+    assert sm._darwin_child_map() is None

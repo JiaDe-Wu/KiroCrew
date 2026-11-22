@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, onTestFinished, vi } from 'vitest'
+vi.mock('@radix-ui/react-select', async () => await import('./__mocks__/@radix-ui/react-select'))
 import { render as rtlRender, fireEvent, screen, act } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -80,6 +81,53 @@ describe('NotificationsPanel', () => {
     fireEvent.click(toggle)
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY)!)
     expect(saved.enabled).toBe(false)
+  })
+
+  it('mutes sounds until a chosen time, reads Off once the mute runs out, and Off ends one early', () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+    onTestFinished(() => { vi.useRealTimers() })
+    const start = new Date(2026, 10, 6, 21, 0).getTime()
+    vi.setSystemTime(start)
+    render(<NotificationsPanel />)
+    const mute = () => screen.getByRole('combobox', { name: 'Mute sounds' })
+    const choose = (name: RegExp) => { fireEvent.click(mute()); fireEvent.click(screen.getByRole('option', { name })) }
+    expect(mute().textContent).toBe('Off')
+
+    choose(/^For 1 hour$/)
+    expect(loadSoundSettings().mutedUntil).toBe(start + 3_600_000)
+    expect(mute().textContent).toMatch(/^Muted until /)
+    act(() => { vi.advanceTimersByTime(3_600_000) })
+    expect(mute().textContent).toBe('Off')
+
+    choose(/^Until /)
+    expect(loadSoundSettings().mutedUntil).toBe(new Date(2026, 10, 7, 8, 0).getTime())
+    choose(/^Off$/)
+    expect(loadSoundSettings().mutedUntil).toBeUndefined()
+    expect(mute().textContent).toBe('Off')
+  })
+
+  it('chooses the shortest turn that earns a desktop toast, stays locked until the toast is on, and keeps a saved odd value visible', () => {
+    render(<NotificationsPanel />, 'alerts')
+    const minTurn = () => screen.getByRole('combobox', { name: 'Only notify for longer turns' })
+    expect(minTurn().textContent).toBe('Every turn')
+    expect(minTurn().hasAttribute('data-disabled')).toBe(true)
+
+    fireEvent.click(screen.getByRole('switch', { name: /Notify when a background chat finishes/i }))
+    expect(minTurn().hasAttribute('data-disabled')).toBe(false)
+    fireEvent.click(minTurn())
+    fireEvent.click(screen.getByRole('option', { name: /1\s+minute/ }))
+    expect(localStorage.getItem('mc-notify-min-turn-seconds')).toBe('60')
+    expect(minTurn().textContent).toMatch(/1\s+minute/)
+
+    fireEvent.click(minTurn())
+    fireEvent.click(screen.getByRole('option', { name: /^Every turn$/ }))
+    expect(localStorage.getItem('mc-notify-min-turn-seconds')).toBe('0')
+  })
+
+  it('shows a saved length that is not one of the presets', () => {
+    localStorage.setItem('mc-notify-min-turn-seconds', '45')
+    render(<NotificationsPanel />, 'alerts')
+    expect(screen.getByRole('combobox', { name: 'Only notify for longer turns' }).textContent).toMatch(/45\s+seconds/)
   })
 
   it('changing volume persists the new value (0.5) to localStorage', () => {
@@ -383,7 +431,8 @@ describe('NotificationsPanel', () => {
       expect(toggle.getAttribute('aria-disabled')).toBe('true')
       const describedBy = toggle.getAttribute('aria-describedby')
       expect(describedBy).toBeTruthy()
-      const hint = document.getElementById(describedBy!)
+      // The row's own text is described first; the blocked hint is the last id.
+      const hint = document.getElementById(describedBy!.split(' ').pop()!)
       // The hint is a SHORT back-reference to the System notifications row above
       // (#23984), not a second copy of that row's full "blocked" sentence: the
       // same page already shows the full sentence once, and repeating it read

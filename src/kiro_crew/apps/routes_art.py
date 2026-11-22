@@ -39,6 +39,7 @@ from kiro_crew.apps.registry import (
     _git_fetch_branch,
     _git_target_is_unsupported,
     _loggable_git_transport_output,
+    _mkdtemp_settled,
     _owner_designated_repo_target,
     _repo_key_owner_count,
     _sel_credential_grant,
@@ -49,6 +50,7 @@ from kiro_crew.apps.registry import (
     minimal_env,
 )
 from kiro_crew.apps.registry_pipeline.checkout import _HOOKS_NEUTRALIZER_ARGV
+from kiro_crew.apps.registry_pipeline.git_targets import _lfs_endpoint_pin_argv
 from kiro_crew.apps.registry_pipeline.subprocess_env import (
     _git_network_env,
     _proxy_env_has_credentials,
@@ -130,6 +132,9 @@ def _read_declared_art(name: str, file_path: str) -> tuple[bytes, str] | None:
     stat and read — because every part is a blocking syscall and the gateway runs on
     one event loop (``no-blocking-call-on-event-loop``).
     """
+    # Local import: a module-level name would be served by this module's facade.
+    from kiro_crew.bounded_read import bounded_read
+
     if file_path not in _declared_art_paths(name):
         return None
     root = apps_dir() / name
@@ -232,7 +237,7 @@ def _read_declared_art(name: str, file_path: str) -> tuple[bytes, str] | None:
         if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size > _ART_MAX_BYTES:
             return None
         with os.fdopen(fd, "rb", closefd=False) as fh:
-            data = fh.read(_ART_MAX_BYTES + 1)
+            data = bounded_read(fh, _ART_MAX_BYTES + 1)
     except OSError:
         return None
     finally:
@@ -487,11 +492,9 @@ async def _fetch_git_blob(
         )
         return False
 
-    import tempfile
-
     tmp_root: str | None = None
     try:
-        tmp_root = await asyncio.to_thread(tempfile.mkdtemp, prefix="kirocrew-blob-")
+        tmp_root = await _mkdtemp_settled("kirocrew-blob-")
         # Credential posture for the browse-time icon/blob clone.  By default
         # this is an index-originated automatic clone, so it forces the strict
         # sandbox (~/.ssh hidden) and a credential-free env: a trusted-host repo
@@ -555,6 +558,7 @@ async def _fetch_git_blob(
             clone_cmd = [
                 "git",
                 *_HOOKS_NEUTRALIZER_ARGV,
+                *_lfs_endpoint_pin_argv(git_url),
                 "clone",
                 "--depth",
                 "1",

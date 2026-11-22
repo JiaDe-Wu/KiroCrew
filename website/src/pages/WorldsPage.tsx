@@ -1,6 +1,6 @@
 import { safeSetItem } from '../utils/safeStorage'
 import { useState, useEffect } from 'react'
-import { Sparkles, PictureInPicture2 } from 'lucide-react'
+import { ChevronDown, ChevronUp, Sparkles, PictureInPicture2 } from 'lucide-react'
 import { useAgentSync } from '../hooks/useAgentSync'
 import { usePopoutSync } from '../hooks/usePopoutSync'
 import { SCENES, SCENE_STORAGE_KEY, SCENE_LAYOUT_SCALE, type SceneKey } from './scenes/config'
@@ -12,7 +12,8 @@ import { RadioChipGroup, radioChip } from '../components/RadioChipGroup'
 export default function WorldsPage() {
   const [scene, setScene] = useState<SceneKey>(() => {
     const saved = localStorage.getItem(SCENE_STORAGE_KEY)
-    return (saved as SceneKey) || 'office'
+    // A key another build saved names no scene here, and would hide them all.
+    return SCENES.find(s => s.key === saved)?.key ?? 'office'
   })
   const [collapsed, setCollapsed] = useState(false)
   const { agents, maxAgents } = useAgentSync()
@@ -106,7 +107,7 @@ export default function WorldsPage() {
                 color: 'var(--text-muted, #999)', fontSize: 16, lineHeight: 1,
               }}
             >
-              {collapsed ? '▼' : '▲'}
+              {collapsed ? <ChevronDown size={16} /> : <ChevronUp size={16} />}
             </button>
             <button
               onClick={openPopout}

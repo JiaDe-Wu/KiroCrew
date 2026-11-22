@@ -20,12 +20,15 @@ from kiro_crew.metrics import events as ev
 class _CapturingRecorder:
     def __init__(self) -> None:
         self.counters: list = []
+        self.histograms: list = []
 
     def counter(self, name, value=1, *, attrs=None, **kwargs) -> None:
         self.counters.append({"name": name, "value": value, "attrs": dict(attrs or {})})
 
-    def histogram(self, name, value, **kwargs) -> None:  # pragma: no cover - unused
-        pass
+    def histogram(self, name, value, *, unit="1", attrs=None, **kwargs) -> None:
+        self.histograms.append(
+            {"name": name, "value": value, "unit": unit, "attrs": dict(attrs or {})}
+        )
 
 
 @pytest.fixture
@@ -206,11 +209,15 @@ class TestCompactions:
 
         from kiro_crew.session_compaction import CompactionCoordinator
 
+        async def _aflush() -> None:
+            return None
+
         coordinator = CompactionCoordinator.__new__(CompactionCoordinator)
         stub = cast(Any, coordinator)
         stub._owner = SimpleNamespace(
             _recycling={"k": object()} if recycling else {},
             mark_needs_reinjection=lambda key: None,
+            _session_map=SimpleNamespace(aflush=_aflush),
         )
         # ``uncompactable_recycles`` is the set that tells a "nothing could compact
         # this" recycle apart from a "the compaction failed" one, which the callback
@@ -395,6 +402,14 @@ class TestOverloadSeriesNames:
 
     def test_emit_histogram_never_raises(self, rec):
         ev.emit_histogram(ev.RECOVERY_DURATION_SECS, 1.5, {"layer": "L1_tool_call"}, unit="s")
+        assert rec.histograms == [
+            {
+                "name": ev.RECOVERY_DURATION_SECS,
+                "value": 1.5,
+                "unit": "s",
+                "attrs": {"layer": "L1_tool_call"},
+            }
+        ]
         with patch("kiro_crew.metrics.provider.get_recorder", side_effect=RuntimeError("x")):
             ev.emit_histogram(ev.TASKQ_DEPTH, 1.0, {"state": "queued"})
 

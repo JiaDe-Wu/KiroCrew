@@ -25,6 +25,7 @@ import urllib.request
 from pathlib import Path
 
 from kiro_crew import dep_sync, platform_compat
+from kiro_crew._bootstrap import _source_checkout_root
 from kiro_crew.beacon import distribution
 from kiro_crew.cli_server_peer import (
     _CLI_LOOPBACK,
@@ -39,6 +40,7 @@ from kiro_crew.git_divergence import (
     DivergenceUnreadable,
     count_divergence_sync,
 )
+from kiro_crew.git_tmp_packs import UPDATE_FETCH_TIMEOUT_S, reap_stale_tmp_packs
 from kiro_crew.kiro_cli import PATH_ONLY_INSTALL_NOTE, is_bundled_kiro_cli, pin_kiro_cli
 from kiro_crew.platform import release_apply
 from kiro_crew.platform.update_capability import (
@@ -124,6 +126,85 @@ def _detached_upstream_branch(proj: str, fetch_env: dict[str, str]) -> str:
     sys.exit(1)
 
 
+def _untracked_collisions(proj: str, target: str, env: dict[str, str]) -> list[str] | None:
+    """Untracked paths a hard reset to *target* would overwrite, or ``None`` if unreadable.
+
+    Renames are not detected, so a rename destination lists as the added path it is.
+    A path *target* adds is absent from HEAD, so an entry on disk there is an
+    untracked (or ignored) file. So is a non-directory standing where *target*
+    needs a directory, unless HEAD tracks it: the diff lists that one as deleted,
+    and the reset replaces it like any tracked change. A directory standing where
+    *target* adds a file is a collision only when it holds a file the reset does
+    not delete. A path the reset deletes under another spelling of the same name
+    (a case-only rename) is not one on a filesystem where both spellings are one file.
+    """
+    try:
+        changed = subprocess.run(
+            ["git", "diff", "--name-status", "-z", "--no-renames", "HEAD", target],
+            cwd=proj,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    if changed.returncode != 0:
+        return None
+    fields = [f.decode("utf-8", "surrogateescape") for f in changed.stdout.split(b"\0") if f]
+    added: list[str] = []
+    removed: set[str] = set()
+    for status, name in zip(fields[0::2], fields[1::2]):
+        if status.startswith("A"):
+            added.append(name)
+        elif status.startswith("D"):
+            removed.add(name)
+    root = Path(proj)
+    by_fold = {n.casefold(): n for n in removed}
+
+    def _removed(path: str) -> bool:
+        """Whether the reset deletes what sits at *path* on disk, under any case."""
+        if path in removed:
+            return True
+        twin = by_fold.get(path.casefold())
+        if twin is None:
+            return False
+        # On a case-insensitive filesystem the two spellings are one file; on a
+        # case-sensitive one they are two, and the added spelling is the untracked one.
+        try:
+            return os.path.samefile(root / path, root / twin)
+        except OSError:
+            return False
+
+    def _all_removed_below(directory: Path) -> bool:
+        """Whether every file under *directory* is one the reset deletes."""
+        for here, _dirs, files in os.walk(directory):
+            for file_name in files:
+                if not _removed(Path(here, file_name).relative_to(root).as_posix()):
+                    return False
+        return True
+
+    found: list[str] = []
+    for name in added:
+        parts = Path(name).parts
+        for end in range(1, len(parts)):
+            ancestor = "/".join(parts[:end])
+            at = root / ancestor
+            if _removed(ancestor):
+                continue
+            if os.path.lexists(at) and (at.is_symlink() or not at.is_dir()):
+                found.append(ancestor)
+                break
+        else:
+            at = root / name
+            if not os.path.lexists(at) or _removed(name):
+                continue
+            if at.is_dir() and not at.is_symlink() and _all_removed_below(at):
+                continue
+            found.append(name)
+    return list(dict.fromkeys(found))
+
+
 def _update(force: bool = False) -> None:
     """Update Kiro Crew — dispatches based on install layout.
 
@@ -171,7 +252,9 @@ def _update(force: bool = False) -> None:
             sys.exit(1)
         return
 
-    proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
+    # Run outside the clone with no saved project dir, a source install has no
+    # KIROCREW_PROJECT_DIR; the checkout its code loads from is still the one to update.
+    proj = os.environ.get("KIROCREW_PROJECT_DIR", "") or str(_source_checkout_root() or "")
     # Dispatch on the shared derivation, not on the git probe alone. The probe
     # answers "is this a working tree", which is NOT the same question as "who
     # owns updating this install": a container or a desktop bundle pointed at a
@@ -285,15 +368,20 @@ def _update(force: bool = False) -> None:
             env=_fetch_env,
             stdin=subprocess.DEVNULL,
             capture_output=True,
-            timeout=60,
+            timeout=UPDATE_FETCH_TIMEOUT_S,
             **UTF8_TEXT,
         )
     except subprocess.TimeoutExpired as exc:
         logging.getLogger("kiro_crew.cli_server").warning(
             "git fetch timed out after %ss during update", exc.timeout
         )
-        print(f"  ❌ git fetch timed out after {exc.timeout}s")
+        print(f"  ❌ git fetch timed out after {exc.timeout:g}s and kept nothing it downloaded.")
+        print("  Run `kirocrew update` again to retry the fetch.")
         sys.exit(1)
+    finally:
+        # A killed fetch leaves its partial pack. The update check's reaper takes
+        # every one older than its threshold, so this run's goes on a later run.
+        reap_stale_tmp_packs(proj)
     if result.returncode != 0:
         print(f"  ❌ git fetch failed:\n{result.stderr.strip()}")
         sys.exit(1)
@@ -471,16 +559,37 @@ def _update(force: bool = False) -> None:
         # refuse the reset — same stance as the unreadable-divergence guard.
         print("  ❌ Could not check for local changes (git status timed out)")
         sys.exit(1)
+    if status.returncode != 0:
+        # A failed status prints nothing, which would read as a clean tree and
+        # skip the prompt. Refuse, like the timeout above.
+        print(f"  ❌ Could not check for local changes (git status exited {status.returncode})")
+        detail = (status.stderr or "").strip()
+        if detail:
+            print(f"      {detail.splitlines()[0]}")
+        sys.exit(1)
     tracked_changes = [
         line for line in status.stdout.strip().splitlines() if not line.startswith("??")
     ]
     if tracked_changes:
-        print("  ⚠️  Local tracked-file changes will be discarded:")
+        count = len(tracked_changes)
+        files = "1 file" if count == 1 else f"{count} files"
+        rerun = "kirocrew update --force" if force else "kirocrew update"
+        print(f"  ⚠️  You have uncommitted changes in {files}. Updating will discard them:")
         for line in tracked_changes[:10]:
             print(f"      {line}")
-        resp = input("  Continue? [y/N] ").strip().lower()
+        if count > 10:
+            print(f"      … and {count - 10} more")
+        # The folder goes on a line of its own, not into a command: no one
+        # quoting keeps every legal path literal in sh, cmd.exe and PowerShell.
+        print("  Answer N to keep them. To keep them and still update, go to the checkout:")
+        print(f"      {proj}")
+        print("  and run there:")
+        print("      git stash")
+        print(f"      {rerun}")
+        print("      git stash pop")
+        resp = input("  Discard these changes and update anyway? [y/N] ").strip().lower()
         if resp != "y":
-            print("  Aborted.")
+            print("  Aborted. Your changes were kept; nothing was updated.")
             sys.exit(0)
 
     # Re-classify immediately before the reset. The verdict above is a
@@ -513,6 +622,22 @@ def _update(force: bool = False) -> None:
     if _exec_config:
         print(f"  🛡️  Update refused: {_exec_config}, which git would run during the reset.")
         print("      Remove it from the checkout's git config, then retry.")
+        sys.exit(1)
+
+    collisions = _untracked_collisions(proj, target, _git_env)
+    if collisions is None:
+        print("  ❌ Could not check for untracked files the update would overwrite")
+        sys.exit(1)
+    if collisions:
+        # `git reset --hard` replaces an untracked file at a path the target adds
+        # without a word, and the `??` lines skipped above never named it.
+        print("  ❌ Refusing to update: untracked files would be overwritten:")
+        for name in collisions[:10]:
+            print(f"      {name}")
+        print(
+            "  ❌ Update refused: move or remove these untracked files: "
+            + ", ".join(collisions[:10])
+        )
         sys.exit(1)
 
     _snapshot_memory_or_exit()
@@ -548,11 +673,28 @@ def _update(force: bool = False) -> None:
     # lays down for the new release's pin (``release_apply``). Decided before the
     # kiro-cli pin so a host without kiro-cli prints the reason, not a PATH note.
     # Local import: this body runs on the ``cli_server`` facade's globals.
+    from kiro_crew import crewmate_harness
     from kiro_crew.agent_sdk import kas_bundle
+    from kiro_crew.config import KiroCrewConfig
 
+    # No configured harness choice (main, crewmate, a Bot's pin, an enabled failover
+    # chain) spawns kiro-cli. An unreadable config reads as "one does", so the step
+    # keeps running as it did.
+    try:
+        no_kiro_cli_role = not crewmate_harness.kiro_cli_runs_anywhere(KiroCrewConfig.load())
+    except Exception:
+        no_kiro_cli_role = False
     if kas_bundle.kas_bundle_route():
         print(
             "  ℹ️  kiro-cli update skipped: KAS runs Kiro Crew's own engine bundle, not kiro-cli."
+        )
+        kiro_cli_bin, unpinned_kiro_cli = None, False
+    elif no_kiro_cli_role:
+        # The self-update has no result this install reads, and a slow link makes
+        # it run to its 120 s timeout while the gateway is down.
+        print(
+            "  ℹ️  kiro-cli update skipped: no selected backend runs kiro-cli "
+            "(run `kiro-cli update` by hand if an agent spec pins it)."
         )
         kiro_cli_bin, unpinned_kiro_cli = None, False
     else:
@@ -615,7 +757,8 @@ def _update(force: bool = False) -> None:
         sys.exit(1)
     if build.outcome == "failed":
         print(f"  ❌ {build.failure_message()}")
-        print("      Do not restart the gateway until the dashboard builds; see the log above.")
+        see_log = "; see the log above" if build.tail else ""
+        print(f"      Do not restart the gateway until the dashboard builds{see_log}.")
         sys.exit(1)
 
     print("\n✅ Kiro Crew updated!")
@@ -740,8 +883,8 @@ def _refresh_agent_config(proj: str) -> None:
 def _update_wheel(layout) -> None:
     """Update a wheel/cli.sh install by checking the release feed and re-running the installer.
 
-    This is the path taken when KIROCREW_PROJECT_DIR is unset or has no .git —
-    the standard state for ``curl | sh`` installs where the venv at
+    This is the path taken when ``derive_capability`` hands the update to Kiro Crew's
+    own installer — the standard state for ``curl | sh`` installs where the venv at
     ``~/.kiro/crew-venv`` has no source tree.
     """
 
@@ -784,6 +927,8 @@ def _update_wheel(layout) -> None:
     if not feed_url.startswith("https://"):
         print(f"  ❌ Refusing non-HTTPS feed URL: {shown_feed_url}")
         sys.exit(1)
+    from kiro_crew.asset_downloader import network_failure_cause
+
     try:
         req = urllib.request.Request(feed_url, headers={"User-Agent": "kirocrew-update/1"})
         with urllib.request.urlopen(  # nosemgrep: dynamic-urllib-use-detected
@@ -791,7 +936,7 @@ def _update_wheel(layout) -> None:
         ) as resp:
             raw = resp.read(65536 + 1)
     except (urllib.error.URLError, OSError, ValueError) as e:
-        print(f"  ❌ Could not reach release feed: {e}")
+        print(f"  ❌ Could not reach release feed: {network_failure_cause(e) or e}")
         print("\n  To update manually, run:")
         print(f"    {wheel_update_command(channel)}")
         sys.exit(1)
@@ -834,7 +979,7 @@ def _update_wheel(layout) -> None:
     if newer is None:
         print("  ⚠️  Could not compare versions — updating anyway to be safe")
     elif not newer:
-        print("\n✅ Already on the latest version!")
+        _report_already_latest(local_version)
         return
 
     # The managed-venv shape takes the shadow path: the new version is built
@@ -949,6 +1094,46 @@ def _update_wheel(layout) -> None:
     print("    kirocrew restart")
 
 
+def _report_already_latest(local_version: str) -> None:
+    """The "nothing to install" outcome, checked against the running gateway.
+
+    An update never restarts a running gateway, so the newest version can be on
+    disk while the gateway still serves an older one (the reading ``kirocrew
+    doctor``'s ``running:`` row makes). Then the next step is a restart, and this
+    says so; a gateway that is down, does not name its version, or runs this same
+    version gets the plain "already on the latest" line.
+    """
+    from kiro_crew.dashboard.handlers.updates import _is_newer
+    from kiro_crew.doctor_checks.services import _running_gateway_version
+
+    running = _running_gateway_version(resolve_client_port(None))
+    if running is not None and _is_newer(local_version, running):
+        print(f"\n✅ {local_version} is installed, but the running gateway is still {running}.")
+        print("   Restart the gateway to switch to it:")
+        print("     kirocrew restart")
+        return
+    print("\n✅ Already on the latest version!")
+
+
+def _gateway_holds_update_lock() -> bool:
+    """Is the update lock held by this home's running gateway?
+
+    Compares the update lock's holder with the gateway lock's holder; either one
+    unknown answers ``False``.
+    """
+    from kiro_crew import gateway_lock
+    from kiro_crew.config.loader import config_dir
+    from kiro_crew.platform.wheel_engine import update_lock_holder_pid
+
+    holder = update_lock_holder_pid()
+    if holder is None:
+        return False
+    try:
+        return gateway_lock.lock_holder(config_dir()).pid == holder
+    except gateway_lock.LockProbeError:
+        return False
+
+
 def _update_managed_venv(
     channel: str, feed_base: str, artifact_base: str, remote_version: str
 ) -> None:
@@ -1012,6 +1197,15 @@ def _update_managed_venv(
     # credentials from a token-bearing KIROCREW_CDN_BASE.
     message = wheel_apply.shown_failure_text(str(failure), limit=None)
     if outcome.status == "busy":
+        if _gateway_holds_update_lock():
+            # Not a failure, but the gateway never restarts onto its own update.
+            print("\n  ⏳ The running gateway is already installing an update. It does not")
+            print("     restart itself: once the install finishes, restart it to switch to")
+            print("     the new version:")
+            print("       kirocrew restart")
+            print("     If `kirocrew --version` has not changed when it is done, run")
+            print("     `kirocrew update` again.")
+            return
         print(f"\n  ⏳ {message}")
         print("     Another update (possibly the gateway's own) is in progress. Wait for it")
         print("     to finish, then run `kirocrew update` again.")

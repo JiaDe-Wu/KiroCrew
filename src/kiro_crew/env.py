@@ -18,7 +18,7 @@ from collections.abc import Iterable, Mapping, MutableMapping
 from pathlib import Path
 from typing import Any
 
-from kiro_crew import env_node_windows, env_own_kirocrew, platform_compat
+from kiro_crew import env_node_pins, env_node_windows, env_own_kirocrew, platform_compat
 from kiro_crew.config.paths import data_home
 from kiro_crew.env_krb5_keyring import (  # noqa: F401  (re-exported from env)
     KRB5_KEYRING_REMEDY,
@@ -90,6 +90,8 @@ _EXTRA_PATH_DIRS = (
 # resolution alone would exit rc=127. :func:`mcp_runtime_path` wraps
 # :func:`augmented_path` rather than altering it, and nothing is persisted.
 # Exception 2, the agent child (kiro-cli): see :func:`append_mcp_path_dirs`.
+# A script or command cron child gets the same PATH as the agent child
+# (``cron_script_child_env._clean_cron_env``).
 #
 # Liveness: resolution callers read the current snapshot on every call. The
 # daemon's PATH is fixed when ``manager._spawn_once`` spawns it, and an ADOPTED
@@ -721,14 +723,18 @@ def ensure_node(timeout: float = 180.0) -> str | None:
 
 @functools.lru_cache(maxsize=1)
 def is_toolbox_install() -> bool:
-    """Return True if the running kirocrew binary was installed via Toolbox."""
+    """Return True if the running kirocrew binary was installed via Toolbox.
+
+    Toolbox installs every tool under its root: ``~/.toolbox`` on POSIX, and on
+    Windows ``%LOCALAPPDATA%\\Toolbox`` (:func:`_windows_toolbox_root`).
+    """
     exe = Path(sys.executable).resolve()
-    toolbox_dir = (Path.home() / ".toolbox").resolve()
-    try:
-        exe.relative_to(toolbox_dir)
-        return True
-    except ValueError:
-        return False
+    roots = [Path.home() / ".toolbox"]
+    if platform_compat.IS_WINDOWS and (
+        windows_root := _windows_toolbox_root(os.path.expanduser("~"), None)
+    ):
+        roots.append(Path(windows_root))
+    return any(exe.is_relative_to(root.resolve()) for root in roots)
 
 
 @functools.lru_cache(maxsize=1)
@@ -776,6 +782,20 @@ def _own_kirocrew_dirs() -> list[str]:
     return env_own_kirocrew.own_kirocrew_dirs(_validated_bin_dir)
 
 
+def _windows_toolbox_root(resolved_home: str, pinned_home: str | None) -> str | None:
+    """Builder Toolbox's Windows root, ``%LOCALAPPDATA%\\Toolbox``.
+
+    The Windows counterpart of ``~/.toolbox``: its ``bin`` directory
+    (:func:`_windows_toolbox_bin_dir`) and the tools Toolbox installs live under it.
+
+    ``LOCALAPPDATA`` names the account running this process, so a caller that
+    pinned another account's *pinned_home* gets that home's ``AppData\\Local``.
+    """
+    local = os.environ.get("LOCALAPPDATA", "") if pinned_home is None else ""
+    base = local or os.path.join(resolved_home, "AppData", "Local")
+    return _validated_bin_dir(os.path.join(base, "Toolbox"))
+
+
 def _windows_toolbox_bin_dir(resolved_home: str, pinned_home: str | None) -> str | None:
     """Builder Toolbox's Windows bin dir, ``%LOCALAPPDATA%\\Toolbox\\bin``.
 
@@ -785,12 +805,10 @@ def _windows_toolbox_bin_dir(resolved_home: str, pinned_home: str | None) -> str
     that edit (or by a launcher that does not read it) never sees. So the Agent
     Harness probe reported a Toolbox-installed Claude Code as not installed.
 
-    ``LOCALAPPDATA`` names the account running this process, so a caller that
-    pinned another account's *pinned_home* gets that home's ``AppData\\Local``.
+    It is ``bin`` under :func:`_windows_toolbox_root`, which resolves the account.
     """
-    local = os.environ.get("LOCALAPPDATA", "") if pinned_home is None else ""
-    base = local or os.path.join(resolved_home, "AppData", "Local")
-    return _validated_bin_dir(os.path.join(base, "Toolbox", "bin"))
+    root = _windows_toolbox_root(resolved_home, pinned_home)
+    return os.path.join(root, "bin") if root else None
 
 
 def user_tool_bin_dirs(home: str) -> list[str]:
@@ -810,9 +828,22 @@ def user_tool_bin_dirs(home: str) -> list[str]:
     mise_data = mise_data_dir(home)
     return [
         e
-        for d in _EXTRA_PATH_DIRS
+        for d in _extra_path_templates()
         if (e := _validated_bin_dir(os.path.normpath(d.format(home=home, mise_data=mise_data))))
     ]
+
+
+def _extra_path_templates() -> tuple[str, ...]:
+    """:data:`_EXTRA_PATH_DIRS`, minus the fixed POSIX roots on Windows.
+
+    ``/opt/homebrew/bin`` and ``/usr/local/bin`` name nothing on Windows, where
+    Python 3.12's ``isabs`` still accepts them and they resolve against the
+    current drive (``C:\\opt\\homebrew\\bin``), a folder any local account can
+    create. Every ``{home}``/``{mise_data}`` template stays.
+    """
+    if platform_compat.IS_WINDOWS:
+        return tuple(d for d in _EXTRA_PATH_DIRS if not d.startswith("/"))
+    return _EXTRA_PATH_DIRS
 
 
 # Where a POSIX PATH's system section starts. An inherited well-known dir only
@@ -830,6 +861,15 @@ def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
     ``PATH`` without dirs like ``~/.local/bin``; the MCP probe and the kiro-cli
     spawn share this one augmentation. ``home`` pins user-relative candidates to
     a specific account instead of the process owner.
+
+    Node (:mod:`kiro_crew.env_node_pins`): an operator's ``KIROCREW_NODE_BIN_DIR``
+    follows :func:`_own_kirocrew_dirs` and is always prepended, ahead of every
+    guess and every inherited entry: it is never an anchor, and a *base_path*
+    copy of it is dropped. The data
+    home's glibc-2.17 tree sits just ahead of the per-version manager dirs, so
+    an ``npx`` server and its ``#!/usr/bin/env node`` reach a Node chosen for
+    this host before nvm's newest, which may not load (Amazon Linux 2). Each
+    must hold an executable ``node``; a pinned ``home`` gets neither.
 
     The interpreter's own dir and its console-scripts dir (they differ only on
     the Windows desktop backend, ``python.exe`` at the root and scripts in
@@ -857,13 +897,24 @@ def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
     """
     resolved_home = home or os.path.expanduser("~")
     mise_data = mise_data_dir(resolved_home)
+    own = home is None
     # Absolute-only (_validated_bin_dir): a relative MISE_DATA_DIR would put a
     # relative shims entry on PATH, re-resolved against the CHILD's cwd, so a
     # work-dir-relative executable could shadow the configured command.
-    extra = _own_kirocrew_dirs() if home is None else []
+    extra = _own_kirocrew_dirs() if own else []
+    pinned = (
+        env_node_pins.override_bin_dirs(_NODE_BIN_DIR_ENV, _validated_bin_dir, _has_node)
+        if own
+        else []
+    )
+    # With an override, this install's own dirs lead with it: an inherited copy of
+    # either (a PATH this function already built) is dropped and both are
+    # prepended in this order, so the override's own ``kirocrew`` never shadows it.
+    lead = extra + pinned if pinned else []
+    extra += pinned
     extra += [
         e
-        for d in _EXTRA_PATH_DIRS
+        for d in _extra_path_templates()
         if (e := _validated_bin_dir(d.format(home=resolved_home, mise_data=mise_data)))
     ]
     if platform_compat.IS_WINDOWS and (
@@ -871,13 +922,17 @@ def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
     ):
         extra.append(toolbox_bin)
     extra += env_node_windows.manager_dirs(resolved_home, home)
+    if own:
+        extra += env_node_pins.data_home_tree_dirs(
+            _NODE_TREE_DATA_HOME_DIRS, _validated_bin_dir, _has_node
+        )
     windows_globs = env_node_windows.manager_globs(resolved_home, home)
     extra += _node_all_bin_dirs(
         resolved_home, mise_data, _xdg_config_dir(resolved_home), windows_globs
     )
     # No anchors on Windows: System32 comes first there and _SYSTEM_BIN_DIRS never
     # matches, so anchoring would push every extra behind System32.
-    entries = base_path.split(os.pathsep) if base_path else []
+    entries = env_node_pins.without_dirs(base_path.split(os.pathsep) if base_path else [], lead)
     anchors: dict[str, int] = {}
     for i, p in enumerate(entries if not platform_compat.IS_WINDOWS else ()):
         n = os.path.normcase(os.path.normpath(p)) if p else ""
@@ -894,7 +949,7 @@ def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
             # Never move back left: a lower-ranked extra stays behind every
             # higher-ranked anchor, whatever order the user listed them in.
             anchor = anchors[n] if anchor is None else max(anchor, anchors[n])
-        elif anchor is None:
+        elif anchor is None or e in lead:
             before.append(e)
         else:
             after.setdefault(anchor, []).append(e)
@@ -1045,8 +1100,69 @@ def spec_env_path(env_path: str) -> str:
     if not isinstance(env_path, str):
         logger.debug("ignoring non-string MCP spec PATH: %s", type(env_path).__name__)
         env_path = ""
-    parts = [*_spec_path_entries(env_path), augmented_path(os.environ.get("PATH", ""))]
-    return dedup_path(os.pathsep.join(filter(None, parts)))
+    return _joined_spec_path(_spec_path_entries(env_path), gateway_spec_path())
+
+
+#: The gateway part this process is fixed to (:func:`pin_gateway_spec_path`).
+_PINNED_GATEWAY_SPEC_PATH: str | None = None
+
+
+def gateway_spec_path() -> str:
+    """The part of an expanded spec ``PATH`` that comes from this process.
+
+    :func:`spec_env_path` appends it after the spec's own entries. It is this
+    process's own ``PATH`` plus the well-known MCP directories, so it moves when
+    the service unit is re-rendered or a package installer adds a version
+    directory, while the spec's own entries stay as written. The launch
+    approval hash (``mcp_gateway.hashing``) reads it from here, so the writer
+    and the hash use one composition. A pinned part stays fixed whatever this
+    process's ``PATH`` does, so a live ``.env`` ``PATH`` edit or an added ``ffmpeg``
+    directory reaches a declared spec ``PATH`` at the next gateway start, as it
+    reaches a pooled backend's inherited env.
+    """
+    if _PINNED_GATEWAY_SPEC_PATH is not None:
+        return _PINNED_GATEWAY_SPEC_PATH
+    return augmented_path(os.environ.get("PATH", ""))
+
+
+def pin_gateway_spec_path(value: str) -> None:
+    """Fix this process's gateway part to *value*.
+
+    The gateway pins it when its MCP broker starts and hands it to gatewayd,
+    so the rewriter, the dashboard and gatewayd fold one composition
+    (:func:`spec_path_own_entries`) for the life of the daemon.
+    """
+    global _PINNED_GATEWAY_SPEC_PATH
+    _PINNED_GATEWAY_SPEC_PATH = value
+
+
+def pinned_gateway_spec_path() -> str | None:
+    """The part :func:`pin_gateway_spec_path` fixed, or ``None``; never scans."""
+    return _PINNED_GATEWAY_SPEC_PATH
+
+
+def _joined_spec_path(own: list[str], gateway_part: str) -> str:
+    return dedup_path(os.pathsep.join(filter(None, [*own, gateway_part])))
+
+
+def spec_path_own_entries(value: str, gateway_part: str) -> list[str] | None:
+    """The spec's own leading entries of an expanded *value*, or ``None``.
+
+    The shortest prefix of *value* that :func:`spec_env_path`, given
+    *gateway_part* as this process's part, expands back to exactly *value*.
+    ``None`` when no prefix does, so *value* is not this composition (a
+    hand-written ``PATH``, or one expanded under another gateway ``PATH``).
+    Shortest, so a spec entry that also leads *gateway_part* in the same order
+    counts as the gateway's; that can only cost a re-approval later, since the
+    child's ``PATH`` is the same either way.
+    """
+    if not gateway_part:
+        return None
+    entries = value.split(os.pathsep)
+    for k in range(len(entries) + 1):
+        if _joined_spec_path(entries[:k], gateway_part) == value:
+            return entries[:k]
+    return None
 
 
 def mcp_search_path(env_path: str) -> str:
@@ -1493,6 +1609,10 @@ def expand_spec_args(args: Any, *, server: str | None = None) -> Any:
     text substitution, never a shell. The import is function-local because the
     rewriter imports this module.
 
+    On Windows a missing ``HOME``/``USER`` is filled from ``USERPROFILE``/
+    ``USERNAME``, so a POSIX-written ``${HOME}`` resolves to the same home
+    ``Path.home()`` uses there instead of reaching the child literally.
+
     Returns a NEW list, leaving the caller's config untouched. Non-string
     elements and a non-list ``args`` pass through, so a malformed spec keeps
     its own error.
@@ -1502,6 +1622,16 @@ def expand_spec_args(args: Any, *, server: str | None = None) -> Any:
     from kiro_crew.mcp_gateway.rewriter import _expand_env_placeholders
 
     source = {name: value for name in _SPEC_ARG_VARS if (value := os.environ.get(name))}
+    # On Windows the home and login-name live under USERPROFILE/USERNAME, not
+    # HOME/USER, so a POSIX-written ``${HOME}``/``${USER}`` would stay literal
+    # (the process has no HOME). Fill each missing name from its Windows twin so
+    # the one home Path.home() already resolves there (see managed_mcp.py's
+    # _HOME_DERIVING_ENV_KEYS) reaches the spec. A set HOME/USER still wins, and
+    # no name outside _SPEC_ARG_VARS is read, so no other value reaches argv.
+    if platform_compat.IS_WINDOWS:
+        for name, twin in (("HOME", "USERPROFILE"), ("USER", "USERNAME")):
+            if name not in source and (value := source.get(twin)):
+                source[name] = value
     return [
         _expand_env_placeholders(a, source=source, server=server) if isinstance(a, str) else a
         for a in args

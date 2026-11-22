@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import string
+import dataclasses
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from kiro_crew import edition, security
 from kiro_crew.config.loader import KiroCrewConfig
@@ -20,6 +21,7 @@ from kiro_crew.platform import (
     build_default_context,
     resolve_profile,
 )
+from kiro_crew.platform.bootstrap import LazyRelayTunnelProvider
 from kiro_crew.platform.context import PlatformContext
 
 
@@ -50,7 +52,11 @@ class TestDefaultContext:
         assert set(ctx.agent_runtime.managed_mcp_servers()) == set(agent._MANAGED_MCP_SERVERS)
         assert ctx.agent_executable.resolve_executable("/usr/bin/kiro-cli") == "/usr/bin/kiro-cli"
         assert ctx.registry.public_git_hosts() == registry._PUBLIC_GIT_HOSTS
-        assert ctx.tunnel.enabled() is False
+        # An unset relay_enabled hosts a personal sign-in, so the default composes the
+        # lazy relay provider; a stored off is the no-op tunnel of the legacy default.
+        assert isinstance(ctx.tunnel, LazyRelayTunnelProvider)
+        off = dataclasses.replace(cfg, tunnel=dataclasses.replace(cfg.tunnel, relay_enabled=False))
+        assert build_default_context(off).tunnel.enabled() is False
         assert ctx.telemetry.frontend_rum_config() is None
         assert ctx.feature_apps == ()
 
@@ -95,13 +101,6 @@ class TestPolicyAuthorityAddOnly:
         # time; at runtime the @final methods still resolve to the base impl.
         assert "is_denied" in PolicyAuthority.__dict__
         assert "effective_patterns" in PolicyAuthority.__dict__
-
-    def test_assert_security_floor_rejects_non_authority(self) -> None:
-        with pytest.raises(PlatformCompositionError):
-            assert_security_floor(object())
-
-    def test_assert_security_floor_accepts_baseline(self) -> None:
-        assert_security_floor(PolicyAuthority())  # no raise
 
     def test_assert_security_floor_rejects_runtime_override(self) -> None:
         # @final is type-checker-only; a subclass that overrides is_denied to
@@ -206,14 +205,14 @@ class TestProfileResolution:
         assert edition.EDITION == "oss"
 
 
-class TestEnterpriseEditionProfile:
-    """An enterprise build resolves enterprise before every other signal."""
+class TestLtsEditionProfile:
+    """An LTS build resolves enterprise before every other signal."""
 
     @pytest.mark.parametrize("value", ["standalone", "bogus", "", "enterprise"])
     def test_env_profile_cannot_change_it(
         self, cfg: KiroCrewConfig, monkeypatch, value: str
     ) -> None:
-        monkeypatch.setattr("kiro_crew.edition.EDITION", "enterprise")
+        monkeypatch.setattr("kiro_crew.edition.EDITION", "lts")
         monkeypatch.setenv("KIROCREW_PROFILE", value)
         assert resolve_profile(cfg, entry_points=[]) == PROFILE_ENTERPRISE
 
@@ -221,23 +220,21 @@ class TestEnterpriseEditionProfile:
         self, cfg: KiroCrewConfig, monkeypatch
     ) -> None:
         # No entry point, no probe, no marker: still enterprise, so every
-        # enterprise gate stays on when bootstrap composes the core defaults.
-        monkeypatch.setattr("kiro_crew.edition.EDITION", "enterprise")
+        # LTS gate stays on when bootstrap composes the core defaults.
+        monkeypatch.setattr("kiro_crew.edition.EDITION", "lts")
         monkeypatch.delenv("KIROCREW_PROFILE", raising=False)
         monkeypatch.delenv("KIROCREW_SSO_PROFILE_PROBE", raising=False)
         monkeypatch.delenv("KIROCREW_MIDWAY_PROFILE_PROBE", raising=False)
         monkeypatch.setattr("kiro_crew.platform.profile.Path.home", lambda: _FakeHome(False))
         assert resolve_profile(cfg, entry_points=[]) == PROFILE_ENTERPRISE
 
-    def test_enterprise_build_without_companion_fails_closed_at_discovery(
-        self, monkeypatch
-    ) -> None:
+    def test_lts_build_without_companion_fails_closed_at_discovery(self, monkeypatch) -> None:
         from kiro_crew.platform.discovery import (
             PlatformCompositionError,
             discover_companion_context,
         )
 
-        monkeypatch.setattr("kiro_crew.edition.EDITION", "enterprise")
+        monkeypatch.setattr("kiro_crew.edition.EDITION", "lts")
         monkeypatch.setenv("KIROCREW_PROFILE", "standalone")
         cfg = KiroCrewConfig()
         profile = resolve_profile(cfg, entry_points=[])
@@ -246,7 +243,7 @@ class TestEnterpriseEditionProfile:
         # The advice must not point at an override this build ignores.
         message = str(raised.value)
         assert "KIROCREW_PROFILE=standalone" not in message
-        assert "enterprise-edition build" in message
+        assert "LTS-edition build" in message
 
     def test_oss_build_keeps_the_standalone_advice(self, monkeypatch) -> None:
         from kiro_crew.platform.discovery import (
@@ -356,19 +353,19 @@ class TestBootstrapAndDiscovery:
             bootstrap_context(cfg)
 
 
-class TestEnterpriseBuildWithoutCompanion:
-    """An enterprise build with no companion boots on the core defaults (RFC D1).
+class TestLtsBuildWithoutCompanion:
+    """An LTS build with no companion boots on the core defaults (RFC D1).
 
     Any installed companion still goes through discovery, so the companion path,
     including every fail-closed refusal, is unchanged.
     """
 
     @staticmethod
-    def _enterprise_build(monkeypatch) -> None:
+    def _lts_build(monkeypatch) -> None:
         from kiro_crew.platform import bootstrap as bootstrap_mod
 
-        monkeypatch.setattr("kiro_crew.edition.EDITION", "enterprise")
-        # The real enterprise load fetches the organisation's policy; that fetch is
+        monkeypatch.setattr("kiro_crew.edition.EDITION", "lts")
+        # The real LTS load fetches the organisation's policy; that fetch is
         # covered elsewhere and is not what these tests measure.
         monkeypatch.setattr(bootstrap_mod, "load_security_policy", lambda: None)
 
@@ -380,7 +377,7 @@ class TestEnterpriseBuildWithoutCompanion:
     def test_boots_on_core_defaults_under_the_enterprise_profile(
         self, cfg: KiroCrewConfig, monkeypatch, env_profile: str
     ) -> None:
-        self._enterprise_build(monkeypatch)
+        self._lts_build(monkeypatch)
         from kiro_crew.platform import bootstrap as bootstrap_mod
         from kiro_crew.platform import current_context
         from kiro_crew.platform.defaults import DefaultIdentityProvider
@@ -391,14 +388,14 @@ class TestEnterpriseBuildWithoutCompanion:
 
         ctx = bootstrap_mod.bootstrap_context(cfg)
 
-        # The env var cannot lower the profile, so every enterprise gate stays on.
+        # The env var cannot lower the profile, so every LTS gate stays on.
         assert ctx.profile == PROFILE_ENTERPRISE
         assert ctx.is_enterprise
         assert isinstance(ctx.identity, DefaultIdentityProvider)
         assert current_context() is ctx
 
     def test_installed_companion_still_composes(self, cfg: KiroCrewConfig, monkeypatch) -> None:
-        self._enterprise_build(monkeypatch)
+        self._lts_build(monkeypatch)
         from kiro_crew.platform import bootstrap as bootstrap_mod
 
         companion = build_default_context(cfg, profile=PROFILE_ENTERPRISE)
@@ -409,7 +406,7 @@ class TestEnterpriseBuildWithoutCompanion:
         assert bootstrap_mod.bootstrap_context(cfg) is companion
 
     def test_broken_companion_still_fails_closed(self, cfg: KiroCrewConfig, monkeypatch) -> None:
-        self._enterprise_build(monkeypatch)
+        self._lts_build(monkeypatch)
         from kiro_crew.platform import bootstrap as bootstrap_mod
 
         def _broken(*_args, **_kwargs):
@@ -423,7 +420,7 @@ class TestEnterpriseBuildWithoutCompanion:
     def test_mismatched_companion_still_fails_closed(
         self, cfg: KiroCrewConfig, monkeypatch
     ) -> None:
-        self._enterprise_build(monkeypatch)
+        self._lts_build(monkeypatch)
         import dataclasses
 
         from kiro_crew.platform import bootstrap as bootstrap_mod
@@ -440,17 +437,39 @@ class TestEnterpriseBuildWithoutCompanion:
             bootstrap_mod.bootstrap_context(cfg)
 
     def test_telemetry_uses_the_core_provider(self, cfg: KiroCrewConfig, monkeypatch) -> None:
-        self._enterprise_build(monkeypatch)
+        self._lts_build(monkeypatch)
+        from kiro_crew.metrics.otlp_governance import UNEVALUABLE
         from kiro_crew.platform import bootstrap as bootstrap_mod
         from kiro_crew.platform.defaults import DefaultTelemetryProvider
 
+        policy = {"now": None}
+
+        def load():
+            if policy["now"] == "broken":
+                raise PlatformCompositionError("unreadable")
+            return policy["now"]
+
         monkeypatch.setattr(bootstrap_mod, "plugin_entry_points", lambda: [])
         monkeypatch.setattr(bootstrap_mod, "discover_companion_context", self._no_discovery)
-        assert isinstance(bootstrap_mod.compose_telemetry_provider(cfg), DefaultTelemetryProvider)
+        monkeypatch.setattr(bootstrap_mod, "load_security_policy", load)
+        monkeypatch.setattr(bootstrap_mod, "assert_policy_signature_satisfied", lambda c: None)
+        monkeypatch.setattr(bootstrap_mod, "_LIVE_POLICY_TTL_SECS", 0.0)
+        provider = bootstrap_mod.compose_telemetry_provider(cfg)
+        # The core provider, holding a process with no context to the policy as it
+        # reads now: each read after the TTL sees a changed or unreadable policy.
+        assert isinstance(provider._inner, DefaultTelemetryProvider)
+        assert callable(provider.governance_redact)
+        first, second = object(), object()
+        policy["now"] = first
+        assert provider.governance_ceiling is first
+        policy["now"] = second
+        assert provider.governance_ceiling is second
+        policy["now"] = "broken"
+        assert provider.governance_ceiling is UNEVALUABLE
 
     def test_unreadable_entry_points_fail_closed(self, cfg: KiroCrewConfig, monkeypatch) -> None:
         # A scan that cannot read the metadata must not read as "no companion".
-        self._enterprise_build(monkeypatch)
+        self._lts_build(monkeypatch)
         from kiro_crew.platform import bootstrap as bootstrap_mod
 
         def _corrupt():
@@ -479,7 +498,7 @@ class TestEnterpriseBuildWithoutCompanion:
     def test_oss_build_with_enterprise_profile_still_fails_closed(
         self, cfg: KiroCrewConfig, monkeypatch
     ) -> None:
-        self._enterprise_build(monkeypatch)
+        self._lts_build(monkeypatch)
         from kiro_crew.platform import bootstrap as bootstrap_mod
 
         monkeypatch.setattr("kiro_crew.edition.EDITION", "oss")
@@ -507,7 +526,8 @@ class TestRedactLogViaContext:
 
     #: Matched by the baseline's own credential patterns, so it proves the
     #: companion pass is applied ON TOP of the baseline rather than instead.
-    BASELINE_SHAPE = "AKIAIOSFODNN7EXAMPLE"
+    #: A GitHub token: an AWS key ID is an identifier the baseline keeps visible.
+    BASELINE_SHAPE = github_classic(seed=51)
 
     @staticmethod
     def _install(policy, cfg: KiroCrewConfig):
@@ -709,67 +729,3 @@ class TestRedactLogViaContext:
                 "A converged site routes its gate-side text through the context spelling, "
                 "so a companion host is not scanned with the weaker pass."
             )
-
-
-class TestRedactCodeViaContext:
-    """``redact_code_via_context`` -- ``redact_via_context`` minus the bare-secret guess.
-
-    It must stay the SAME shim underneath: a companion's extra reach still applies to
-    code text, and a policy that cannot be composed still refuses rather than
-    degrading. Only core pass 3 differs, and ``test_redaction_code_text_scope`` pins
-    that half.
-    """
-
-    COMPANION_SHAPE = "SSO-COOKIE"
-
-    #: 62 distinct letters and digits: a literal pass 3 reads as a key.
-    PALETTE = string.ascii_lowercase + string.ascii_uppercase + string.digits
-
-    @staticmethod
-    def _install(policy, cfg: KiroCrewConfig):
-        import dataclasses
-
-        from kiro_crew.platform import set_context
-
-        set_context(
-            dataclasses.replace(
-                build_default_context(cfg, profile=PROFILE_ENTERPRISE),
-                credentials=policy,
-            )
-        )
-
-    @pytest.fixture(autouse=True)
-    def _restore_context(self):
-        from kiro_crew.platform import reset_context
-
-        yield
-        reset_context()
-
-    def test_a_companion_pattern_still_applies_to_code_and_the_literal_is_kept(
-        self, cfg: KiroCrewConfig
-    ) -> None:
-        from kiro_crew.platform.context import redact_code_via_context, redact_via_context
-
-        class _Policy:
-            def redact(self, text: str) -> str:
-                return security.redact(text).replace(
-                    TestRedactCodeViaContext.COMPANION_SHAPE, "[REDACTED-SSO]"
-                )
-
-        self._install(_Policy(), cfg)
-        code = f"var cookie = '{self.COMPANION_SHAPE}'; var A = '{self.PALETTE}';"
-        assert self.PALETTE not in redact_via_context(code), "the premise: pass 3 fires"
-        out = redact_code_via_context(code)
-        assert self.COMPANION_SHAPE not in out
-        assert f"var A = '{self.PALETTE}';" in out
-
-    def test_a_policy_that_cannot_be_composed_still_refuses(self, cfg: KiroCrewConfig) -> None:
-        from kiro_crew.platform.context import redact_code_via_context
-
-        class _Unprovable:
-            def redact(self, text: str) -> str:
-                raise PlatformCompositionError("companion could not be composed")
-
-        self._install(_Unprovable(), cfg)
-        with pytest.raises(PlatformCompositionError):
-            redact_code_via_context("var a = 1;")

@@ -59,10 +59,13 @@ from kiro_crew.apps.registry_pipeline.caches import (
     _EXTERNAL_REGISTRY_CACHE_TTL,
     _MANIFEST_CACHE_TTL,
     _blob_cache_dir,
+    _clear_prewarm_budget_mark,
     _installed_manifest_cache_path,
     _manifest_cache_path,
     _read_manifest_cache,
+    _read_prewarm_budget_mark,
     _write_manifest_cache,
+    _write_prewarm_budget_mark,
 )
 from kiro_crew.apps.registry_pipeline.checkout import (
     _KILL_GRACE_PERIOD,
@@ -96,6 +99,7 @@ from kiro_crew.pinned_fs import (
     is_reparse_point,
     open_pinned_descendant_dir,
 )
+from kiro_crew.user_json import loads_user_json
 
 logger = logging.getLogger(_FACADE)
 
@@ -603,7 +607,7 @@ def _read_clone_failure(entry: dict[str, Any]) -> float | None:
     data, _mtime = result
     try:
         recorded = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         return None
     if not isinstance(recorded, dict):
         return None
@@ -778,6 +782,9 @@ def _open_pinned_asset_stat(
     by-path ``OSError`` produced before, so callers record the asset unobtainable
     identically. Every descriptor is closed before returning.
     """
+    # Local import: a module-level name would be served by this module's facade.
+    from kiro_crew.bounded_read import bounded_read_fd
+
     if not rel_parts:
         return None
     name = rel_parts[-1]
@@ -840,12 +847,7 @@ def _open_pinned_asset_stat(
                     return None
                 if fst.st_size > max_bytes:
                     return None
-                data = os.read(fd, max_bytes + 1)
-                while len(data) <= max_bytes:
-                    chunk = os.read(fd, max_bytes + 1 - len(data))
-                    if not chunk:
-                        break
-                    data += chunk
+                data = bounded_read_fd(fd, max_bytes + 1)
                 if len(data) > max_bytes:
                     return None
                 return data, fst
@@ -1219,7 +1221,8 @@ async def _fetch_owner_tier_store_assets(entry: dict[str, Any], registry_name: s
             # clone attempt each interval. Record it (credential-free reason) so the
             # prewarm pre-filter backs the row off for _CLONE_FAILURE_BACKOFF. A
             # budget cancellation is NOT this path -- it raises CancelledError, caught
-            # below and re-raised -- so a cancelled row records nothing.
+            # below and re-raised -- so it writes no clone-failure record; the
+            # prewarm worker marks the row instead, which only re-ranks it.
             await asyncio.to_thread(_write_clone_failure, entry, _clone_failure_reason(err))
             return False
         # The clone reached the repo. Any earlier clone-failure record described a
@@ -1252,7 +1255,7 @@ async def _fetch_owner_tier_store_assets(entry: dict[str, Any], registry_name: s
             # A non-UTF-8 manifest is as unusable as malformed JSON; refuse it here so
             # the failure is a plain skip, not an exception mid-read.
             return False
-        manifest = json.loads(content)
+        manifest = loads_user_json(content)
         if not isinstance(manifest, dict):
             return False
         # Persist before publishing: art copied for a manifest that never reached the
@@ -1441,7 +1444,7 @@ _PREWARM_ROW_FIELDS = ("name", "gitUrl", "repo", "branch", "subdirectory", "comm
 _PREWARM_FIELD_MAX_LEN = 2048
 
 
-def _slim_prewarm_row(entry: dict[str, Any]) -> dict[str, Any] | None:
+def _slim_prewarm_row(entry: dict[str, Any], *, allow_none: bool = False) -> dict[str, Any] | None:
     """Project *entry* to the fields a prewarm clone needs, or ``None`` to reject it.
 
     :func:`_fetch_owner_tier_store_assets` reads ``name``/``gitUrl``/``repo``/
@@ -1458,12 +1461,17 @@ def _slim_prewarm_row(entry: dict[str, Any]) -> dict[str, Any] | None:
     rejected and never appended to ``todo``, rather than retained with an unbounded
     string that would sit in memory for the batch's life and feed a cache key or a
     clone argv. A missing field is not a rejection: the projection just omits it.
+    With *allow_none*, a field that is ``None`` is kept as ``None`` instead of
+    rejecting the row.
     """
     slim: dict[str, Any] = {}
     for key in _PREWARM_ROW_FIELDS:
         if key not in entry:
             continue
         value = entry[key]
+        if value is None and allow_none:
+            slim[key] = None
+            continue
         if not isinstance(value, str) or len(value) > _PREWARM_FIELD_MAX_LEN:
             return None
         slim[key] = value
@@ -1528,10 +1536,11 @@ async def _prewarm_owner_tier_store_assets(reg: Any, entries: list[dict[str, Any
     the listing path's cache miss and the explicit refresh -- pass exactly that.
     Any other registry tier returns 0 without a clone. Rows already warm are
     skipped, and rows whose art is missing are queued ahead of rows that are only
-    stale (:func:`_stale_row_art_present`); every failure is per-row and logged,
-    never raised, because the store listing that triggered the fetch must render
-    whatever art did land. The batch as a whole is bounded by
-    :data:`_PREWARM_BATCH_BUDGET`, for the same reason.
+    stale (:func:`_stale_row_art_present`); inside each of those groups, rows the
+    budget cancelled on an earlier batch go after the rest (oldest mark first, never
+    skipped). Every failure is per-row and logged, never raised, because the store
+    listing that triggered the fetch must render whatever art did land. The batch as
+    a whole is bounded by :data:`_PREWARM_BATCH_BUDGET`, for the same reason.
 
     Returns the number of rows whose manifest was fetched this call.
     """
@@ -1556,6 +1565,9 @@ async def _prewarm_owner_tier_store_assets(reg: Any, entries: list[dict[str, Any
     stale: list[dict[str, Any]] = []
     # Rows of apps installed from this source; queued ahead of everything.
     installed: list[dict[str, Any]] = []
+    # (mark time, row) of rows the budget cancelled on an earlier batch, by art group.
+    cold_marked: list[tuple[float, dict[str, Any]]] = []
+    stale_marked: list[tuple[float, dict[str, Any]]] = []
     overflow = 0
     field_rejects = 0
     examined = 0
@@ -1662,13 +1674,27 @@ async def _prewarm_owner_tier_store_assets(reg: Any, entries: list[dict[str, Any
         # cache), so this clone is the only reader of what its branch now publishes,
         # and without it the store and the app's update status stay on the installed
         # version. Few rows are installed, so this does not starve the others.
+        # A row the budget cancelled on an earlier batch goes after the unmarked rows
+        # of its own group (cold or stale), oldest mark first, so slow rows stop
+        # taking every slot from rows not yet tried; it is never skipped.
         if await asyncio.to_thread(_installed_manifest_cache_path(entry).is_file):
             installed.append(slim)
-        elif await asyncio.to_thread(_stale_row_art_present, entry):
+            continue
+        art_present = await asyncio.to_thread(_stale_row_art_present, entry)
+        marked_at = await asyncio.to_thread(_read_prewarm_budget_mark, entry)
+        if marked_at is not None:
+            (stale_marked if art_present else cold_marked).append((marked_at, slim))
+        elif art_present:
             stale.append(slim)
         else:
             todo.append(slim)
-    todo = installed + todo + stale
+    todo = (
+        installed
+        + todo
+        + [slim for _at, slim in sorted(cold_marked, key=lambda pair: pair[0])]
+        + stale
+        + [slim for _at, slim in sorted(stale_marked, key=lambda pair: pair[0])]
+    )
     if field_rejects:
         logger.warning(
             "store art prewarm: registry %r skipped %d row(s) with a non-string or "
@@ -1705,6 +1731,8 @@ async def _prewarm_owner_tier_store_assets(reg: Any, entries: list[dict[str, Any
     for entry in todo:
         queue.put_nowait(entry)
     landed: list[str] = []
+    # Set once the batch budget runs out, before the workers are cancelled.
+    budget_spent: list[bool] = []
 
     async def _worker() -> None:
         while True:
@@ -1715,8 +1743,11 @@ async def _prewarm_owner_tier_store_assets(reg: Any, entries: list[dict[str, Any
             try:
                 ok = await _fetch_owner_tier_store_assets(entry, registry_name)
             except asyncio.CancelledError:
-                # Budget cancellation: let it propagate so the batch unwinds and the
-                # in-flight clone's own cleanup runs.
+                # On a budget cancellation, mark the row so the next batch tries the
+                # rows it has not tried first; an outer cancel marks nothing. Then
+                # propagate.
+                if budget_spent:
+                    await asyncio.to_thread(_write_prewarm_budget_mark, entry)
                 raise
             except BaseException as exc:  # per-row failure, logged not raised
                 logger.warning(
@@ -1728,6 +1759,7 @@ async def _prewarm_owner_tier_store_assets(reg: Any, entries: list[dict[str, Any
                 continue
             if ok:
                 landed.append(entry.get("name", ""))
+                await asyncio.to_thread(_clear_prewarm_budget_mark, entry)
 
     worker_count = min(_PREWARM_CONCURRENCY, len(todo))
     # The workers run as one gather task so the batch budget and the post-budget
@@ -1793,6 +1825,7 @@ async def _prewarm_owner_tier_store_assets(reg: Any, entries: list[dict[str, Any
     # ``done`` while an OUTER cancellation propagates out of the ``await`` naturally.
     # A cleanup still running at the deadline (``batch`` not in ``done``) is DETACHED
     # so the request returns now.
+    budget_spent.append(True)
     batch.cancel()
     done, _pending = await asyncio.wait({batch}, timeout=_PREWARM_CLEANUP_BUDGET)
     if batch not in done:

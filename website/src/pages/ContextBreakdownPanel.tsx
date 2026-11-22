@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react'
+import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 
@@ -11,8 +11,13 @@ import { fmtNumber } from '../i18n/format'
 import { i18nT } from '../i18n/t'
 import type { SubagentActivity } from '../types'
 import { breakdownOf, Headline, headlineFigure, MESSAGE_COLOR, TurnBreakdown, type CrewCategory, type LatestTurn } from './ContextEngineBreakdown'
+import { PromptAsSent } from './PromptAsSent'
 import { SessionBreakdownTree } from './SessionBreakdownTree'
 import { CATEGORY_FILL } from './contextSourceColors'
+
+// Its own chunk: the list renders below the fold of a side tab, so the App
+// chunk does not carry it.
+const ChatSteeringList = lazy(() => import('./ChatSteeringList').then(m => ({ default: m.ChatSteeringList })))
 
 /**
  * What one kept turn sent, by block name, as GET /api/telemetry/context-trace returns
@@ -750,7 +755,7 @@ function ContextBreakdownCard({
   const startsBefore = start && firstShown && start.turn < firstShown.displayN ? 1 : 0
   const earlierText =
     startsBefore > 0
-      ? i18nT('pages.contextBreakdown.earlier_range_starts', { first: fmtN(1), last: fmtN(lastEarlier), count: startsBefore })
+      ? i18nT('pages.contextBreakdown.earlier_range_starts', { first: fmtN(1), last: fmtN(lastEarlier), count: startsBefore, n: fmtN(startsBefore) })
       : lastEarlier === 1
         ? i18nT('pages.contextBreakdown.earlier_single', { n: fmtN(1) })
         : i18nT('pages.contextBreakdown.earlier_range', { first: fmtN(1), last: fmtN(lastEarlier) })
@@ -867,6 +872,7 @@ function ContextBreakdownCard({
           ) : null}
           <TurnBreakdown breakdown={breakdown} engine={turn.engine} ttft={turn.ttft_ms} charsPerToken={trace.chars_per_token} />
           <BlockList turn={turn} />
+          <PromptAsSent slot={trace.slot} turn={turn.turn} version={rowVersion(trace, turn.turn)} />
         </div>
       ) : null}
 
@@ -884,8 +890,8 @@ function ContextBreakdownCard({
             <div className="flex items-center justify-between gap-3 mb-2">
               <span className="text-[13px] font-semibold text-text">
                 {lastEarlier > 0
-                  ? i18nT('pages.contextBreakdown.scope_turns', { count: shown.length })
-                  : i18nT('pages.contextBreakdown.scope_all_turns', { count: shown.length })}
+                  ? i18nT('pages.contextBreakdown.scope_turns', { count: shown.length, n: fmtN(shown.length) })
+                  : i18nT('pages.contextBreakdown.scope_all_turns', { count: shown.length, n: fmtN(shown.length) })}
               </span>
               <span className="text-[12px] text-muted" data-testid="chart-unit">
                 {tokenChart ? i18nT('pages.contextBreakdown.scope_unit_tokens') : i18nT('pages.contextBreakdown.scope_unit')}
@@ -922,7 +928,7 @@ function ContextBreakdownCard({
               ))}
             </div>
             <p className="m-0 mt-2 text-[12px] text-muted">
-              {i18nT('pages.contextBreakdown.pick_hint')} {i18nT('pages.contextBreakdown.chart_note')}
+              {i18nT('pages.contextBreakdown.pick_hint_chart_note')}
               {noTotal ? <span data-testid="chart-no-total"> {i18nT('pages.contextBreakdown.chart_no_total')}</span> : null}
             </p>
             {running ? (
@@ -1024,6 +1030,9 @@ function ContextBreakdownTabFor({ slot, subagents }: { slot: string; subagents?:
       {/* Without the harness the panel cannot say where a split comes from. */}
       <ErrorNotice message={capsError} askAgent className="mb-3" />
       <ContextBreakdownPanel trace={data} isLoading={isLoading} harness={harness} pastTurn={pastTurn} onPastTurn={setPastOrdinal} />
+      <Suspense fallback={null}>
+        <ChatSteeringList slot={slot} revision={data?.revision} />
+      </Suspense>
     </div>
   )
 }

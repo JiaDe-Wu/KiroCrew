@@ -101,7 +101,7 @@ describe('buildDashboardDownload', () => {
     expect(doc).toContain('data-dashboard-field="open"')
     expect(doc).toContain('--bg')
     expect(doc).toContain('#101010')
-    expect(doc).toContain('<body class="dark"')
+    expect(doc).toContain('<body data-mode="dark"')
     expect(doc).toMatch(/http-equiv="Content-Security-Policy"/)
     expect(doc).toContain("connect-src 'none'")
   })
@@ -179,6 +179,14 @@ describe('applyPushedRead', () => {
     expect(next.version).toBe(3)
     // Kept from the held read, as the frame keeps them.
     expect(next.last_user_at).toBe('yesterday')
+  })
+
+  it('keeps an in-order patch\'s stale_after, and adds none when the patch has none', () => {
+    // Preview `dashboard_stale_fields`: the bootstrap's mergePatch keeps the patch's map,
+    // so a page saved after a patch still marks its out-of-date fields.
+    const at = { open: '2030-01-01T00:00:00+00:00' }
+    expect(applyPushedRead(HELD, { ...patch(3, { open: 7 }), stale_after: at }).stale_after).toEqual(at)
+    expect('stale_after' in applyPushedRead(HELD, patch(3, { open: 7 }))).toBe(false)
   })
 
   it('drops a patch that skips a version or comes from another generation', () => {

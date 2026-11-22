@@ -26,10 +26,12 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.state import DashboardState
 
 
-# Global ceiling across ALL chats' terminal tabs. Each chat's activity bar caps
-# its own terminals (frontend MAX_TERMINALS_PER_CHAT); this is the server-side
-# backstop. Override via config.json dashboard.terminal.max_sessions.
+# Global ceiling across ALL chats' terminal tabs. The dashboard sets no count
+# cap of its own, so this is the only one. Override via config.json
+# dashboard.terminal.max_sessions.
 _MAX_SESSIONS = 12
+# Error code for an open or create refused at that ceiling.
+_TERMINAL_MAX_SESSIONS = "terminal_max_sessions"
 
 
 # Bound on a ``{session_id}`` URL path param, applied by BOTH routes that read
@@ -196,13 +198,45 @@ def _is_enabled(request: web.Request) -> bool:
     {"dashboard": {"terminal": {"enabled": false}}}
     Cached for 30s to avoid disk I/O per request.
     """
+    # The policy is read every call: a refusal installed inside the cache window binds now.
+    if _policy_refuses_terminal():
+        return False
     now = time.monotonic()
     if now - _enabled_cache[1] < 30:
         return _enabled_cache[0]
-    result = bool(_get_config(request).get("enabled", True))
+    result = _terminal_enabled(_get_config(request))
     _enabled_cache[0] = result
     _enabled_cache[1] = now
     return result
+
+
+def _terminal_enabled(cfg: dict) -> bool:
+    """Whether a ``dashboard.terminal`` object leaves the panel on (the default).
+
+    A security policy whose ``boot.allow_terminal`` is stated and not a JSON
+    ``true`` turns it off whatever the config says.
+    """
+    if _policy_refuses_terminal():
+        return False
+    return bool(cfg.get("enabled", True))
+
+
+def _policy_refuses_terminal() -> bool:
+    """Whether the active security policy refuses the dashboard terminal.
+
+    A policy that leaves ``allow_terminal`` out has no opinion (``None``). A
+    lookup that fails reads as a refusal: this gate fails closed.
+    """
+    # Deferred import: this package never imports the platform package at module load.
+    from kiro_crew.platform.context import current_context, safe_context_call
+
+    def _read() -> bool:
+        boot = getattr(current_context().governance, "boot", None)
+        return boot is not None and boot.allow_terminal is False
+
+    return safe_context_call(
+        _read, fallback=True, log_message="security policy read failed; terminal refused"
+    )
 
 
 _enabled_cache: list = [True, 0.0]  # [value, timestamp]

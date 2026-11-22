@@ -202,11 +202,47 @@ def _read_managed_tool_universe() -> tuple[set[str], list[str]]:
     return universe, unreadable
 
 
-def app_can_manage_session_approvals(app_name: str) -> bool:
-    """Return whether an enabled app holds the user-session control grant.
+class SessionControlGrant(NamedTuple):
+    """An app's user-session control grant and its member-thread scope, judged together.
+
+    ``granted`` is :func:`app_can_manage_session_approvals`. ``member_threads``
+    is held only when ``granted`` is, and only when the manifest that grant was
+    judged against declares ``permissions.memberThreads``: the scope is a
+    property of that one manifest, never of a later read.
+    """
+
+    granted: bool
+    member_threads: bool
+
+
+NO_SESSION_CONTROL = SessionControlGrant(granted=False, member_threads=False)
+
+
+#: Why an app does not hold the user-session control grant, as
+#: :func:`session_approval_denial_cause` names it.
+SESSION_APPROVAL_NOT_DECLARED = "not_declared"
+SESSION_APPROVAL_CONSENT_PENDING = "consent_pending"
+SESSION_APPROVAL_DISABLED = "disabled"
+SESSION_APPROVAL_UNAVAILABLE = "unavailable"
+
+
+def session_approval_denial_cause(app_name: str, *, manifest: AppManifest | None = None) -> str:
+    """Why *app_name* does not hold the user-session control grant, ``""`` when it does.
+
+    The one decision behind :func:`app_can_manage_session_approvals`. The cause
+    names who can clear it: ``not_declared`` (the manifest lacks
+    ``permissions.sessionApproval``), ``consent_pending`` (declared, but the owner
+    has not allowed it), ``disabled`` (the app is off), ``unavailable`` (nothing
+    could be read, or the state moved between reads).
 
     Read the live manifest on every decision. App tokens can outlive an enable
     cycle, so a cached grant must not survive a disable or manifest edit.
+
+    *manifest* is the live manifest the caller already read, as
+    ``_read_installed`` takes it: :func:`app_session_control_grant` passes the
+    one it derives the member-thread scope from, so grant, consent, enabled
+    state and scope are all judged against a single read. Left out, it is read
+    here.
 
     Manifest FIRST, then ``enabled``. ``installed.json`` lives inside the app
     directory and is retired together with the old tree, so while an update
@@ -215,11 +251,14 @@ def app_can_manage_session_approvals(app_name: str) -> bool:
     at least as new and cannot pair a widened grant with the pre-update state.
     """
     if not app_name:
-        return False
+        return SESSION_APPROVAL_UNAVAILABLE
     try:
-        manifest = get_app_manifest(app_name)
-        if not (manifest and manifest.permissions.sessionApproval):
-            return False
+        if manifest is None:
+            manifest = get_app_manifest(app_name)
+        if manifest is None:
+            return SESSION_APPROVAL_UNAVAILABLE
+        if not manifest.permissions.sessionApproval:
+            return SESSION_APPROVAL_NOT_DECLARED
         # One record read, judged against the manifest read above, decides
         # consent and enablement together. A grant still waiting for its
         # consent moment is not held: a record written before the consent
@@ -227,16 +266,88 @@ def app_can_manage_session_approvals(app_name: str) -> bool:
         # An unreadable record is not evidence of consent either. The later
         # enablement read can only refuse, never grant.
         meta = _read_installed(app_name, manifest=manifest)
-        if meta is None or meta.sessionApprovalConsentPending or not meta.enabled:
-            return False
-        return is_app_enabled(app_name)
+        if meta is None:
+            return SESSION_APPROVAL_UNAVAILABLE
+        if meta.sessionApprovalConsentPending:
+            return SESSION_APPROVAL_CONSENT_PENDING
+        if not meta.enabled:
+            return SESSION_APPROVAL_DISABLED
+        # The record said enabled and this read says not: the state moved under
+        # the two reads, so name no cause a retry would not confirm.
+        return "" if is_app_enabled(app_name) else SESSION_APPROVAL_UNAVAILABLE
     except Exception:
         logger.warning(
             "Could not resolve user-session control permission for app %s",
             app_name,
             exc_info=True,
         )
-        return False
+        return SESSION_APPROVAL_UNAVAILABLE
+
+
+def app_can_manage_session_approvals(app_name: str, *, manifest: AppManifest | None = None) -> bool:
+    """Return whether an enabled app holds the user-session control grant.
+
+    Granted only when :func:`session_approval_denial_cause` names no cause.
+    *manifest* is passed through to it unchanged.
+    """
+    return session_approval_denial_cause(app_name, manifest=manifest) == ""
+
+
+def app_session_control_grant(app_name: str) -> SessionControlGrant:
+    """The app's user-session control grant and its member-thread scope, from ONE read.
+
+    ``permissions.memberThreads`` is a SCOPE of the grant: it reaches nothing
+    without it, and the consent the grant carries covers it only when the record
+    says so. An enable records ``memberThreadsConsented`` while the manifest
+    declares the scope, a manifest that newly declares it re-opens that consent
+    (``manager_records._session_control_widening``), and a consented record
+    without the marker (one written by a host that ignored the scope) reads
+    pending (``manager_records._session_approval_consent_unrecorded``), so the
+    grant is refused outright rather than held without its scope's consent.
+    So the scope belongs to the
+    manifest the grant was judged against, and it is taken from that read and no
+    other: the manifest is read once here, :func:`app_can_manage_session_approvals`
+    judges consent and enablement against it, and the scope is its flag. Read as
+    two separate manifest reads, a request overlapping a manifest update could
+    pair the consented, enabled record of the old manifest with the scope the
+    new one declares and reach a member thread before the owner re-consented.
+    Read live, like the grant, so removing the flag revokes the reach at once.
+    Any read fault refuses both; a manifest absent here carries no scope, so if
+    the judge's own read then finds one, it can only grant without the scope.
+    """
+    if not app_name:
+        return NO_SESSION_CONTROL
+    try:
+        manifest = get_app_manifest(app_name)
+    except Exception:
+        logger.warning(
+            "Could not resolve user-session control permission for app %s",
+            app_name,
+            exc_info=True,
+        )
+        return NO_SESSION_CONTROL
+    if not app_can_manage_session_approvals(app_name, manifest=manifest):
+        return NO_SESSION_CONTROL
+    return SessionControlGrant(
+        granted=True,
+        member_threads=bool(manifest and manifest.permissions.memberThreads),
+    )
+
+
+#: How the install summary words each ``permissions.desktopCapabilities`` entry.
+_DESKTOP_CAPABILITY_WORDS = {
+    "screenCapture": "capture your screen",
+    "localFiles": "show and open your local files",
+    "gatewayChoice": "switch among your gateways",
+}
+
+#: How the install summary words each ``permissions.browser`` verb. An install
+#: approves none of them: the owner approves each on the app's page.
+_BROWSER_VERB_WORDS = {
+    "view": "see the page you and the Bot are browsing",
+    "read": "read that page",
+    "act": "click and type for you",
+}
 
 
 def format_permissions_summary(manifest: AppManifest) -> str:
@@ -252,10 +363,39 @@ def format_permissions_summary(manifest: AppManifest) -> str:
         lines.append("  Storage:   app-scoped data directory")
     if perms.network:
         lines.append("  Network:   outbound HTTP access")
-    if perms.memory:
+    # A JSON ``false`` or ``null`` is stored as the text "False" / "None" (the stored
+    # form is signed, so it stays): neither requests memory, the same rule as the
+    # store page's ``memoryRequested``.
+    if perms.memory.strip().lower() not in ("", "false", "none"):
         lines.append(f"  Memory:    {perms.memory}")
     if perms.cron:
         lines.append("  Cron:      scheduled agent jobs")
+    if perms.chatSlots:
+        lines.append("  Chat:      runs its own chat sessions, listed under the app")
+    if perms.hiddenSessions:
+        lines.append("  Chat list: keeps its own chats out of your session list")
+    if perms.chatLaunch is not None:
+        launch = perms.chatLaunch
+        where = f" in the {launch.folder!r} folder" if launch.folder else ""
+        lines.append(f"  Chats:     may open chats for you with {', '.join(launch.agents)}{where}")
+        modes = ", ".join(launch.memory_modes)
+        lines.append(f"             chat keys start with {launch.key_prefix!r}; memory: {modes}")
+    if perms.workerAutoApprove:
+        lines.append("  Auto-approve: tool calls in its own background sessions (bounded)")
+    if perms.reachableByUserSessions:
+        verbs = " and ".join(perms.reachableByUserSessions)
+        lines.append(f"  Your chats: may {verbs} the sessions this app runs")
+    if perms.desktopCapabilities:
+        words = ", ".join(_DESKTOP_CAPABILITY_WORDS[c] for c in perms.desktopCapabilities)
+        lines.append(f"  Desktop:   may {words}")
+    if perms.browser:
+        words = ", ".join(_BROWSER_VERB_WORDS[v] for v in perms.browser)
+        lines.append(f"  Browser:   asks to {words} (approved later on the app's page)")
+    if perms.webhookSource:
+        lines.append(
+            f"  Webhooks:  accepts requests from outside services, which can start work"
+            f" (security-policy name {manifest.name!r})"
+        )
 
     if not lines:
         return "  No special permissions required"

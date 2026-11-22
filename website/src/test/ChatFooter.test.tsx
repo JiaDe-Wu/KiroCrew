@@ -1,7 +1,8 @@
 import { describe, it, expect, afterEach, onTestFinished, vi } from 'vitest'
 import type { ReactElement } from 'react'
 import { render, screen, act, fireEvent } from '@testing-library/react'
-import ChatFooter, { pickDistinct, resolveLoader, resolveLoaderIcons, SwapCarousel, STREAM_IDLE_MS, STALL_MS, transcriptActivityKey, turnSentHere } from '../pages/chat/ChatFooter'
+import ChatFooter, { pickDistinct, resolveLoader, resolveLoaderIcons, SwapCarousel, STREAM_IDLE_MS, STALL_MS, allToolCallsReturned, transcriptActivityKey, turnSentHere } from '../pages/chat/ChatFooter'
+import { TOOL_LOG_CAP } from '../pages/chat/types'
 import { GHOST_POSE_ICONS, GHOST_POSE_URLS } from '../components/GhostPoses'
 import { registerThemeBranding } from '../themeBranding'
 import { THEME_LOADER_ICONS } from '../themeLoaderIcons'
@@ -568,15 +569,35 @@ describe('ChatFooter stall notice', () => {
 
   it('stays off for a turn already running when the view opens (reload, split pane) until it moves once', () => {
     fakeClock()
-    // The empty or short cached transcript a pane shows before its page lands
-    // is no baseline, so the page landing is not movement.
+    // A host passes no key until its page lands, so the page landing is not movement.
     const loaded = [{ role: 'user', content: 'q' }, { role: 'assistant', content: 'on it' }, { role: 'tool', content: 'build' }]
-    const { rerender } = render(<ChatFooter {...quiet} activityKey={transcriptActivityKey([])} />)
-    rerender(<ChatFooter {...quiet} activityKey={transcriptActivityKey(loaded.slice(-1))} />)
+    const { rerender } = render(<ChatFooter {...quiet} />)
     rerender(<ChatFooter {...quiet} activityKey={transcriptActivityKey(loaded)} />)
     act(() => { vi.advanceTimersByTime(STALL_MS * 4) })
     expect(screen.queryByTestId('chat-footer-stall')).toBeNull()
     rerender(<ChatFooter {...quiet} activityKey={transcriptActivityKey([...loaded, { role: 'assistant', content: 'built' }])} />)
+    act(() => { vi.advanceTimersByTime(STALL_MS) })
+    expect(screen.getByTestId('chat-footer-stall')).toBeTruthy()
+  })
+
+  it('never baselines an empty transcript, so a page restored after a failed switch is not movement', () => {
+    fakeClock()
+    const page = [{ role: 'user', content: 'q' }, { role: 'streaming', content: 'Hel' }]
+    const { rerender } = render(<ChatFooter {...quiet} activityKey={transcriptActivityKey([])} />)
+    rerender(<ChatFooter {...quiet} activityKey={transcriptActivityKey(page)} />)
+    act(() => { vi.advanceTimersByTime(STALL_MS * 4) })
+    expect(screen.queryByTestId('chat-footer-stall')).toBeNull()
+  })
+
+  it('watches a short restored turn once it moves (a first reply with no tool rows)', () => {
+    fakeClock()
+    // A reload during a first, tool-free reply: only the opener and the
+    // streaming row, and later chunks grow that same row.
+    const turn = (text: string) => [{ role: 'user', content: 'q' }, { role: 'streaming', content: text }]
+    const { rerender } = render(<ChatFooter {...quiet} activityKey={transcriptActivityKey(turn('Hel'))} />)
+    act(() => { vi.advanceTimersByTime(STALL_MS * 2) })
+    expect(screen.queryByTestId('chat-footer-stall')).toBeNull()
+    rerender(<ChatFooter {...quiet} activityKey={transcriptActivityKey(turn('Hello, here is'))} />)
     act(() => { vi.advanceTimersByTime(STALL_MS) })
     expect(screen.getByTestId('chat-footer-stall')).toBeTruthy()
   })
@@ -604,6 +625,37 @@ describe('ChatFooter stall notice', () => {
     rerender(<ChatFooter {...quiet} />)
     act(() => { vi.advanceTimersByTime(STALL_MS * 4) })
     expect(screen.queryByTestId('chat-footer-stall')).toBeNull()
+  })
+
+  // The slot reads tool_running from a tool row until the next text chunk, so
+  // only the tool log can say the call returned and the quiet is the model's.
+  it('watches a turn still reading tool_running once every tool call returned', () => {
+    const call = { type: 'tool', text: 'read', ts: 1 }
+    expect(allToolCallsReturned([])).toBe(false)
+    expect(allToolCallsReturned([{ ...call, output: 'ok' }, call])).toBe(false)
+    expect(allToolCallsReturned([{ ...call, output: 'stdout so far', output_partial: true }])).toBe(false)
+    expect(allToolCallsReturned([{ ...call, output: 'ok' }, { ...call, output_partial: false }, { ...call, rejected: true }, { type: 'approval', text: 'run', ts: 2 }])).toBe(true)
+    fakeClock()
+    renderLive(r => <ChatFooter {...quiet} running={r} state="tool_running" lastRole="tool" activityKey={'3:tool:10'} toolsReturned />)
+    act(() => { vi.advanceTimersByTime(STALL_MS) })
+    expect(screen.getByTestId('chat-footer-stall')).toBeTruthy()
+  })
+
+  // An auto-approved call is logged twice under one id and only the newest of
+  // the two takes the result, so the older one stays open for good.
+  it('judges each tool call by its newest log entry', () => {
+    const call = { type: 'tool', text: 'read', ts: 1, tool_call_id: 'c1' }
+    expect(allToolCallsReturned([call, { ...call, output: 'ok' }])).toBe(true)
+    expect(allToolCallsReturned([{ ...call, output: 'ok' }, call])).toBe(false)
+    expect(allToolCallsReturned([call, { ...call, output: 'ok' }, { type: 'tool', text: 'read', ts: 2 }])).toBe(false)
+  })
+
+  // The log drops its oldest entries past the cap, so a call still running may
+  // be gone from a full log while every entry left reads returned.
+  it('does not trust a tool log full enough to have dropped a running call', () => {
+    const returned = { type: 'tool', text: 'read', ts: 1, output: 'ok' }
+    expect(allToolCallsReturned(Array(TOOL_LOG_CAP).fill(returned))).toBe(false)
+    expect(allToolCallsReturned(Array(TOOL_LOG_CAP - 1).fill(returned))).toBe(true)
   })
 
   // A turn parked on the person's approval or question is healthy: no frames

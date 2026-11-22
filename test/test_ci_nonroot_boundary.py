@@ -7,13 +7,17 @@ from pathlib import Path
 
 import pytest
 import yaml
+from test_ci_fleet_routing_expression_parity import (
+    _CANONICAL_CONSUMER_EXPR,
+    _CANONICAL_CONSUMER_EXPR_LARGE,
+)
 
 from conftest import _find_posix_test_shell
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _ACTION_REF = "./.github/actions/run-as-runner"
 _CI_SHELL = "/usr/local/bin/ci-shell {0}"
-_LARGE = "${{ needs.changes.outputs.linux_runner_large || 'ubuntu-latest' }}"
+_LARGE = _CANONICAL_CONSUMER_EXPR_LARGE
 # A hosted lane that stays off the CodeBuild fleet but takes the organization's
 # larger-runner group where it can reach one.
 _GROUP_LINUX_ELSE_HOSTED = (
@@ -127,9 +131,15 @@ def test_all_linux_shards_and_memory_heavy_jobs_use_large(jobs):
     )
     assert "if" not in lint
     assert "continue-on-error" not in lint
+    # flake8 and mypy share one step, where each is the command a script line
+    # hands to its `timed` wrapper rather than the whole `run:`.
     for command in ("isort --check-only", "flake8 ", "mypy "):
         assert any(
-            s.get("run", "").startswith(command) and not s.get("continue-on-error")
+            any(
+                line.strip().removeprefix("timed ").startswith(command)
+                for line in s.get("run", "").splitlines()
+            )
+            and not s.get("continue-on-error")
             for s in jobs["backend-lint"]["steps"]
         )
     assert any(
@@ -310,7 +320,7 @@ def test_e2e_runs_on_the_fleet_behind_the_boundary(jobs):
 
 def test_real_adapter_contract_runs_on_the_fleet_behind_the_boundary(jobs):
     job = jobs["real-adapter-contract"]
-    assert job["runs-on"] == "${{ needs.changes.outputs.linux_runner || 'ubuntu-latest' }}"
+    assert job["runs-on"] == _CANONICAL_CONSUMER_EXPR
     steps = job["steps"]
     provision = next(i for i, step in enumerate(steps) if step.get("uses") == _ACTION_REF)
     setups = [
@@ -339,3 +349,16 @@ def test_boundary_ratchet_rejects_world_writable_chmod(action, line):
     changed[0]["run"] += "\n" + line
     with pytest.raises(AssertionError):
         test_privilege_transition_only_goes_down_and_temp_stays_root_owned(changed)
+
+
+def test_docs_contract_tests_hands_over_the_workspace_last(jobs):
+    # run-as-runner chowns the checkout to the unprivileged user, so a later
+    # root-shell step that runs git there (resolve-i18n-base.sh in the
+    # frontend step) dies on "detected dubious ownership". Every step after
+    # the hand-over runs through ci-shell.
+    steps = jobs["docs-contract-tests"]["steps"]
+    provision = next(i for i, step in enumerate(steps) if step.get("uses") == _ACTION_REF)
+    after = [step for step in steps[provision + 1 :] if "run" in step]
+    assert after
+    for step in after:
+        assert step.get("shell") == _CI_SHELL, step.get("name")

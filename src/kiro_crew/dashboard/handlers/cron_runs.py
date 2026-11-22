@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from datetime import datetime, timezone
 from typing import Any
 
 from aiohttp import web
@@ -19,10 +20,14 @@ from kiro_crew.cron import CronPauseNotSaved, CronStoreBusy, CronStoreUnreadable
 from kiro_crew.dashboard.chat_persistence import _restore_dismissed_source_links
 from kiro_crew.dashboard.cron_inject import (
     apply_cron_turn_timeout,
+    chat_folder_exists,
+    chat_folder_refuses_store,
     hydrate_slot_from_history,
     inject_cron_result_to_dashboard,
     prefetch_cron_dismissed,
+    read_cron_tab_rows,
     restore_cron_turn_timeout,
+    stored_cron_folder,
 )
 from kiro_crew.dashboard.cron_note_ack import (
     cron_item_already_recorded,
@@ -50,6 +55,38 @@ from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from ._shared import guard_owner_surface_routes, read_bounded_json
 
 
+async def _run_target_missing(state: DashboardState, job_id: str) -> web.Response:
+    """The 404 for a run of a missing job, naming its last run when history kept one.
+
+    A one-shot is removed after it runs but keeps its run history, so a trigger
+    after the run can say the job ran rather than that it never existed.
+    """
+    # Local: a module-level name here would be served by the ``cron`` facade.
+    from kiro_crew.cron_trigger import RAN_AND_REMOVED_CODE
+
+    try:
+        rows, _total = await state.crons.get_history().get_job_history(job_id, 0, 1)
+    except ValueError:
+        rows = []
+    started = rows[0].get("started_at") if rows else None
+    when = ""
+    if isinstance(started, (int, float)) and not isinstance(started, bool) and started > 0:
+        try:
+            when = datetime.fromtimestamp(started, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        except (OverflowError, OSError, ValueError):
+            when = ""
+    if not when:
+        return web.json_response({"error": "job not found", "code": "job_not_found"}, status=404)
+    return web.json_response(
+        {
+            "error": f"job not found: it already ran at {when} and was removed",
+            "code": RAN_AND_REMOVED_CODE,
+            "last_run_at": started,
+        },
+        status=404,
+    )
+
+
 async def api_cron_run(request: web.Request) -> web.Response:
     """POST /api/crons/{id}/run — trigger immediate execution."""
     if request.get("app") == "":
@@ -72,32 +109,11 @@ async def api_cron_run(request: web.Request) -> web.Response:
     # not blocked.
     job = await state.crons.get_job_async(job_id)
     if not job:
-        return web.json_response({"error": "job not found"}, status=404)
-    # Reject if a run is already in flight: a second overlapping run would
-    # orphan the prior task's handle (nothing could track, cancel
-    # or join it). The check-and-claim below is atomic: there is no await between
-    # the guard, run_job's claim and attach_run_task, so the single-threaded
-    # event loop cannot interleave a second request into this critical section.
-    # (The lookup above awaits, so two concurrent requests can both reach the
-    # guard — but only one can pass it, because the guard and the claim are not
-    # separated by an await.)
-    #
-    # A tracked task that has already finished is NOT a run in flight, whatever
-    # the claim says: a run whose task ends without reaching
-    # _run_job_isolated's finally leaves its claim stored with nothing on that
-    # path to release it, and this guard alone would then refuse every manual
-    # run of the job until the reaper sweep meets the finished task (it does
-    # the same release, once a sweep). Drop such leftovers first; the call is
-    # synchronous, so the check-and-claim stays await-free, and a task still
-    # running keeps the 409 below.
-    state.crons.discard_finished_run(job_id)
-    if state.crons.is_running(job_id):
+        return await _run_target_missing(state, job_id)
+    # trigger_run is await-free, so although the lookup above awaits and two
+    # concurrent requests can both reach it, only one passes its guard.
+    if not state.crons.trigger_run(job_id):
         return web.json_response({"error": "job is already running"}, status=409)
-    # run_job claims the job synchronously while the call is evaluated; the
-    # wrapper task is handed to the claim on the same line so cancel() can
-    # reach a run still parked in its store refresh.
-    task = asyncio.create_task(state.crons.run_job(job_id))
-    state.crons.attach_run_task(job_id, task)
     state.push_refresh("crons")
     safe_name = redact_credentials(redact_exfiltration_urls(job.name)[0])[0]
     return web.json_response({"ok": True, "name": safe_name})
@@ -158,10 +174,10 @@ async def api_cron_to_chat(request: web.Request) -> web.Response:
     jobs = state.crons.list_jobs(include_disabled=True)
     job = next((j for j in jobs if j.id == job_id), None)
     if job:
-        history = (
-            await asyncio.to_thread(state.conversation_log.read_messages, f"cron:{job.id}")
+        tab = (
+            await asyncio.to_thread(read_cron_tab_rows, state.conversation_log, f"cron:{job.id}")
             if state.conversation_log
-            else []
+            else None
         )
         # Re-surfacing a stored result, not delivering a fresh run: the prompt
         # that produced it is not recoverable from live config -- see
@@ -170,20 +186,24 @@ async def api_cron_to_chat(request: web.Request) -> web.Response:
             state,
             job,
             job.last_result or "",
-            history=history,
+            history=tab,
             dismissed=await prefetch_cron_dismissed(state, job.id),
+            stored_folder=await stored_cron_folder(state, job.id),
             include_prompt=False,
         )
         await restore_cron_turn_timeout(state, job.id)
     else:
         # Job deleted (one-shot with delete_after_run). Create slot from history or notification.
         session_key = f"cron:{job_id}"
-        history = (
-            await asyncio.to_thread(state.conversation_log.read_messages, session_key)
+        history, hidden = (
+            await asyncio.to_thread(read_cron_tab_rows, state.conversation_log, session_key)
             if state.conversation_log
-            else []
+            else ([], (0, 0))
         )
         if history:
+            # Read before the mint, so the folder is on the tab before any await
+            # (a flush there would otherwise save the tab unfiled).
+            folder = await stored_cron_folder(state, job_id)
             slot = state.get_or_create_slot(name=slot_name, agent="", origin=SlotOrigin.CRON)
             if not slot.linked_session_key:
                 slot.linked_session_key = session_key
@@ -191,10 +211,13 @@ async def api_cron_to_chat(request: web.Request) -> web.Response:
                 # in practice -- it is here so that EVERY assignment site reaches the
                 # recorder and the derived pin needs no exception for this one.
                 note_crew_log_class(state, slot)
-                from kiro_crew.dashboard.transcript_binding import bind_transcript
+                from kiro_crew.dashboard.transcript_binding import (
+                    bind_transcript,
+                    mark_turn_timeout_unread,
+                )
 
                 bind_transcript(state, slot)
-                hydrate_slot_from_history(slot, history)
+                hydrate_slot_from_history(slot, history, hidden)
                 # Mark dismissed-UNHYDRATED before the off-loop read: the slot is
                 # now bound + dirty with an empty in-memory set, and a periodic
                 # flush during the await would otherwise serialize [] over the
@@ -216,8 +239,14 @@ async def api_cron_to_chat(request: web.Request) -> web.Response:
                 slot._dismissed_hydrated = False
                 # The tab's own turn time limit is unread for the same reason:
                 # its saves carry the on-disk value until the read below lands.
-                slot.turn_timeout_secs = None
-                slot._turn_timeout_hydrated = False
+                mark_turn_timeout_unread(state, slot)
+                # The folder the closed tab was filed in, set before the read below
+                # so a flush during it keeps it; dropped when gone or refusing the store.
+                store = str(getattr(slot, "memory_store", "") or "")
+                if chat_folder_exists(state, folder) and not chat_folder_refuses_store(
+                    state, folder, store
+                ):
+                    slot.folder_id = folder
                 if state.conversation_log is not None:
                     try:
                         _meta, _readable = await asyncio.to_thread(
@@ -291,7 +320,11 @@ async def api_cron_ack(request: web.Request) -> web.Response:
             return _owner_denial_response(request)
     if not notification_ts:
         ok, refused = await _ack_job(state, job_id, summary, "")
-        return refused or web.json_response({"ok": ok})
+        # No such job: nothing was saved and no retry can save it, which
+        # ``code`` tells the client apart from a busy store.
+        return refused or web.json_response(
+            {"ok": True} if ok else {"ok": False, "code": "job_not_found"}
+        )
     # The check, the store write and the record are one step per note, so two
     # overlapping acks (a double click) cannot both pass the check.
     async with cron_note_transition(state, notification_ts):
@@ -305,10 +338,13 @@ async def api_cron_ack(request: web.Request) -> web.Response:
         ok, refused = await _ack_job(state, job_id, summary, ack_id)
         if refused is not None:
             return refused
-        if ok:
-            mark_cron_item_recorded(state, notification_ts, job_id, ack_id)
+        if not ok:
+            # Nothing was saved (the job is gone), so the note stays unread:
+            # marking it read would show "Acknowledged" on the next load.
+            return web.json_response({"ok": False, "code": "job_not_found"})
+        mark_cron_item_recorded(state, notification_ts, job_id, ack_id)
         await state.ack_notification(notification_ts)
-    return web.json_response({"ok": ok})
+    return web.json_response({"ok": True})
 
 
 async def _ack_job(
@@ -350,7 +386,11 @@ def _history_page(request: web.Request) -> tuple[int, int]:
 
 
 async def api_cron_history(request: web.Request) -> web.Response:
-    """GET /api/crons/{id}/history — paginated execution history (no trace)."""
+    """GET /api/crons/{id}/history — paginated execution history (no trace).
+
+    ``hide_idle=1`` leaves out scheduled script runs that ended in Skip() and
+    counts them in ``idle_hidden``.
+    """
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
     if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
@@ -359,14 +399,22 @@ async def api_cron_history(request: web.Request) -> web.Response:
     if app_denied is not None:
         return app_denied
     limit, offset = _history_page(request)
-    runs, total = await state.crons.get_history().get_job_history(
-        job_id, limit=limit, offset=offset
-    )
+    history = state.crons.get_history()
+    idle_hidden = 0
+    if request.query.get("hide_idle") == "1":
+        # Filtered before paging, so page 1 starts at the newest run that did
+        # something. A manual run stays: someone asked to see it.
+        rows, _ = await history.get_job_history(job_id, limit=sys.maxsize, offset=0)
+        shown = [r for r in rows if not (r.get("idle") and r.get("trigger") != "manual")]
+        idle_hidden = len(rows) - len(shown)
+        runs, total = shown[offset : offset + limit], len(shown)
+    else:
+        runs, total = await history.get_job_history(job_id, limit=limit, offset=offset)
     for run in runs:
         for key in ("summary", "error"):
             if run.get(key):
                 run[key] = redact_credentials(redact_exfiltration_urls(run[key])[0])[0]
-    return web.json_response({"runs": runs, "total": total})
+    return web.json_response({"runs": runs, "total": total, "idle_hidden": idle_hidden})
 
 
 async def api_cron_history_detail(request: web.Request) -> web.Response:
@@ -398,10 +446,11 @@ async def api_cron_history_all(request: web.Request) -> web.Response:
     app = _app_caller(request)
     if app:
         # An app sees only the runs of jobs it owns, judged by the same
-        # ``created_by`` stamp ``_refuse_foreign_app_job`` reads. The filter
-        # runs before pagination so ``total`` counts the app's own runs; the
-        # index is capped by ``cron_max_index_records``, so the full read is
-        # bounded. Function-local import for the reason ``api_crons`` gives.
+        # ``created_by`` stamp ``_refuse_foreign_app_job`` reads. The store
+        # filters before pagination so ``total`` counts the app's own runs; the
+        # read is bounded because each job file is capped by
+        # ``cron_max_records_per_job`` and the index by ``cron_max_index_records``.
+        # Function-local import for the reason ``api_crons`` gives.
         from kiro_crew.apps.cron_sdk import app_owner_name
 
         owned = {
@@ -409,12 +458,9 @@ async def api_cron_history_all(request: web.Request) -> web.Response:
             for j in state.crons.list_jobs(include_disabled=True)
             if app_owner_name(j.created_by) == app
         }
-        rows, _ = await state.crons.get_history().get_all_history(
-            job_id=job_id, limit=sys.maxsize, offset=0
+        runs, total = await state.crons.get_history().get_all_history(
+            job_ids=owned & {job_id} if job_id else owned, limit=limit, offset=offset
         )
-        rows = [row for row in rows if row.get("job_id") in owned]
-        total = len(rows)
-        runs = rows[offset : offset + limit]
         # Record the ownership scoping decision: this branch applies an
         # access-control filter to an app token's read, and token-auth events
         # log only authentication while dashboard GET auditing is excluded, so
@@ -423,7 +469,7 @@ async def api_cron_history_all(request: web.Request) -> web.Response:
         _audit_app_cron(app, "crons.history_all", "allowed", f"rows={total}")
     else:
         runs, total = await state.crons.get_history().get_all_history(
-            job_id=job_id, limit=limit, offset=offset
+            job_ids=[job_id] if job_id else None, limit=limit, offset=offset
         )
     # Enrich with job_name
     jobs_by_id = {j.id: j for j in state.crons.list_jobs(include_disabled=True)}

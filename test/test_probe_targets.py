@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 
-from kiro_crew.probes import GH_PR
+from kiro_crew.probes import GH_PR, WORK_LEDGER, targets
 from kiro_crew.probes.targets import infer
 
 
@@ -168,6 +168,34 @@ def test_the_url_and_shorthand_for_one_pr_are_one_subject():
     )
     assert target is not None
     assert target.subject == "kirodotdev/KiroCrew#7491"
+
+
+def test_one_pr_spelled_in_two_cases_is_one_subject():
+    """GitHub slugs are case-insensitive, so a case difference is not a second PR.
+
+    A person types the shorthand lower-case and pastes the URL as GitHub spells it.
+    Reading those as two subjects refuses the gate and leaves the loop on its timer.
+    """
+    shorthand = infer(
+        "Drive kirodotdev/kirocrew#7491 -- "
+        "https://github.com/kirodotdev/KiroCrew/pull/7491 -- to review-ready."
+    )
+    assert shorthand is not None
+    assert shorthand.subject == "kirodotdev/KiroCrew#7491"
+
+    two_urls = infer(
+        "https://github.com/kirodotdev/KiroCrew/pull/7491 "
+        "(also https://github.com/KiroDotDev/kirocrew/pull/7491)"
+    )
+    assert two_urls is not None
+    assert two_urls.subject == "kirodotdev/KiroCrew#7491"
+
+
+def test_a_case_difference_never_hides_a_different_number():
+    assert (
+        infer("Drive kirodotdev/kirocrew#42 -- https://github.com/kirodotdev/KiroCrew/pull/7")
+        is None
+    )
 
 
 def test_two_distinct_pull_requests_refuse_rather_than_pick_one():
@@ -376,3 +404,12 @@ def test_a_pull_request_url_spelling_a_different_number_in_the_text_is_not_bare(
     url = "https://github.com/kirodotdev/KiroCrew/pull/7"
     target = infer(f"Babysit PR 14361; blocked on {url}", context=_refusing_context())
     assert target is not None and target.subject == "kirodotdev/KiroCrew#7"
+
+
+def test_only_a_pull_request_subject_compares_case_folded():
+    """A slug's case is not identity; its number, its kind and a session key are."""
+    same = targets.same_subject
+    assert same(GH_PR, "kirodotdev/KiroCrew#42", GH_PR, "kirodotdev/kirocrew#42")
+    assert not same(GH_PR, "kirodotdev/KiroCrew#42", GH_PR, "kirodotdev/KiroCrew#43")
+    assert not same(GH_PR, "chat-A", WORK_LEDGER, "chat-A")
+    assert not same(WORK_LEDGER, "chat-A", WORK_LEDGER, "chat-a")

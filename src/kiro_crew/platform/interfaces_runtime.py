@@ -89,7 +89,9 @@ class TunnelProvider(Protocol):
 
         Edition-neutral primitives only (no import of ``kiro_crew.tunnel``): keys
         ``state`` (a ``TunnelState`` value string), ``url``, ``error``,
-        ``started_at``, ``connected_at``, ``reconnect_attempt``.  The Default
+        ``started_at``, ``connected_at``, ``reconnect_attempt``, and optionally
+        ``cannot_host_yet`` (the error is a wait on the Crew's own eligibility,
+        not a fault on the way to the tunnel).  The Default
         returns ``None`` so the stub ``TunnelManager`` keeps reporting its own
         local status (byte-identical standalone); a companion returns its live
         snapshot so ``/api/tunnel/status`` reflects the real tunnel.
@@ -226,15 +228,17 @@ class CloudInstancePolicy:
 
     Some organizations require each EC2 instance to run a host agent (monitoring,
     inventory, patch compliance) whose permissions come from a managed policy that
-    already exists in every account. The built-in launcher attaches only Session
-    Manager's policy, and its permissions boundary caps the role to that, so such
-    an instance is non-compliant from the moment it boots. This descriptor is how
+    the organization puts into its accounts. The built-in launcher attaches only
+    Session Manager's policy, and its permissions boundary caps the role to that,
+    so such an instance is non-compliant from the moment it boots. This descriptor is how
     an edition says what those organizations need, without the public build naming
     any one of them.
 
     ``managed_policy_arns`` are attached to the instance role beside Session
     Manager's. Each is a full IAM policy ARN; ``{account}`` stands for the launch
-    account's id, for a policy that exists at the same path in every account.
+    account's id, for a policy kept at the same path in each account. A launch
+    into an account that holds no policy at one of these ARNs is refused before
+    its stack is deployed (``host_policy.require_managed_policies``).
 
     ``boundary_statements`` are ``Allow`` statements appended to the instance
     permissions boundary. A boundary is a ceiling, so without them an attached
@@ -483,10 +487,11 @@ class BrowserCredentialTarget:
 
     ``kind`` is always ``"kiro_chromium"`` when the provider is called (the core
     never asks for the person's own Chrome or Edge); ``headless`` says whether it
-    has a window; ``reason`` is ``"start"`` (a launch or relaunch) or
+    has a window; ``reason`` is ``"start"`` (a launch or relaunch),
     ``"source_changed"`` (an agent navigation found
     :meth:`BrowserCredentialProvider.fingerprint` or ``browser.credentials``
-    changed since the last apply).
+    changed since the last apply), ``"context"`` (a chat's new browser context) or
+    ``"sign_in"`` (the optional ``complete_sign_in`` is asked about a landed page).
     """
 
     kind: str
@@ -502,7 +507,8 @@ class BrowserCredentialProvider(Protocol):
     session for its own sites supplies it here. WIRED:
     ``browser_harness.supervisor.HarnessSupervisor`` (the gateway, outside every
     sandbox) calls it at each start of Kiro's Chromium and before an agent
-    navigation when :meth:`fingerprint` or the settings changed, then writes the
+    navigation when :meth:`fingerprint` or the settings changed, or a cookie it
+    supplied has reached its ``expires``, then writes the
     cookies with CDP ``Storage.setCookies`` on the gateway's own connection to the
     browser -- never through the agent's ``browser`` tool -- before the daemon (and
     so any agent op) is up. Never called for the person's own Chrome or Edge.
@@ -525,6 +531,25 @@ class BrowserCredentialProvider(Protocol):
     A raise or a timeout is reduced to a fixed reason code and the browser starts
     without the cookies: never put a secret in an exception message, and never
     log a value yourself.
+
+    OPTIONAL ``complete_sign_in(target, url) -> Optional[str]``: not a member of
+    this Protocol, so a provider without it (the public Default has none) still
+    satisfies it; the gateway reads it with ``getattr`` and a missing,
+    non-callable or raising one means "no completion". v1 addition (no
+    ``CONTRACT_VERSION`` bump). WIRED: ``browser_harness.sign_in``, after an agent
+    ``navigate`` committed on an ``https`` page whose host is in BOTH
+    :meth:`domains` and ``browser.credentials.domains`` (same opt-in and same
+    browser as the cookies; ``target.reason`` is ``"sign_in"``), at most once per
+    op, in a worker thread bounded at 15 s (``budgets.SIGN_IN_PROVIDER_S``). *url*
+    is the page the tab landed on. Answer ``None`` when it is not your sign-in page
+    or you cannot finish it, and answer that from memory: it is asked on every such
+    landing. Otherwise answer a URL that finishes the sign-in when opened in that
+    tab: ``https``, on a host in :meth:`domains`, and SINGLE-USE (the secret it
+    carries is spent by the site on first load), because the tab's address,
+    history and later ``tabs`` listings are the page's to show. The gateway opens
+    it only past the browser's URL gate and both domain lists, and never shows it
+    to the agent or writes it to the SEL. A raise or a timeout is a fixed code;
+    never put a secret in an exception message.
 
     The agent must not be able to read whatever this provider reads from. The
     provider runs in the gateway, so its own files need no sandbox access; the
@@ -558,7 +583,9 @@ class BrowserCredentialProvider(Protocol):
         seconds) has passed, or with a control character or a non-boolean flag, is
         dropped, not the batch. Each is set as a SESSION cookie (``expires``
         removed, so nothing reaches the profile on disk and it is gone when the
-        browser closes). Raise
+        browser closes). The gateway remembers ``expires`` in memory and deletes
+        the cookie from the browser once it passes, and deletes one that a later
+        call that succeeded leaves out. Raise
         ``browser_harness.credential_files.CredentialSourceError`` for a missing or
         refused source: it becomes the status code, ``needs_refresh`` for a
         missing one.
@@ -686,6 +713,14 @@ class SttProvider(Protocol):
     mixed-language picker for it; the provider reads the candidates from
     ``stt_config.transcribe_language_identification`` itself.
 
+    :meth:`transcribe_file` gets the clip as it was recorded (webm from the
+    dashboard, ogg/Opus from Slack). A provider that reads only 16 kHz mono 16-bit
+    PCM WAV may set an optional ``needs_pcm_wav = True``. Core then converts any
+    other clip with its own audio decoder and passes the copy; with no decoder, a
+    container that decoder does not recognize by file suffix, or a clip over
+    ``transcribe._MAX_AUDIO_SECS`` (an hour), the transcription fails without
+    calling the provider.
+
     A streaming provider whose backend decides how long one session runs may set
     an optional ``owns_session_limit = True``. Core then applies no duration cap
     to its sessions and advertises no ``max_duration_ms``: the backend's limit is
@@ -806,7 +841,9 @@ class TelemetryProvider(Protocol):
         ``telemetry.otlp_endpoint`` first when it is a non-empty string (with no
         narrowing, byte-identical to the endpoint-only exporter this replaced),
         then each enabled ``telemetry.otlp_endpoints`` entry
-        (``metrics/otlp_endpoints.py``).  Nothing when neither is set.
+        (``metrics/otlp_endpoints.py``), then the built-in ``kiro-telemetry``
+        destination (``metrics/kiro_export.py``) once its privacy notice is
+        acknowledged.  Nothing when none of these applies.
 
         An edition that overrides it and should keep the operator's entries
         returns ``metrics.otlp_endpoints.config_destinations(cfg)`` first and its
@@ -876,6 +913,18 @@ class DashboardContributor(Protocol):
 
     def sso_login_handler(self) -> Optional[Callable]:
         """Return the SSO-login WS handler, or ``None`` to keep the core stub."""
+        ...
+
+    def company_sign_in_defaults(self) -> Dict[str, str]:
+        """The start URL and region the Company SSO sign-in form starts with.
+
+        ``{"start_url": ..., "region": ...}``; either may be omitted. WIRED:
+        ``auth/company_sign_in.py`` reads it for ``GET /api/kas-login`` only when
+        the person has not saved ``agent.kas_sso_start_url``, and drops a URL or
+        region that sign-in would refuse. The form stays editable. ``{}`` (the
+        Default) leaves the field empty. v1 method addition (no
+        ``CONTRACT_VERSION`` bump); a contributor without it supplies nothing.
+        """
         ...
 
     def mixed_internal_api_paths(self) -> "frozenset[str]":

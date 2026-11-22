@@ -1132,6 +1132,24 @@ describe('project-report: the page the gateway ships', () => {
     })
   })
 
+  // ------------------------- a long choice is shown and sent whole
+  describe('a long choice on a needs-you card', () => {
+    const LONG = 'Publish rev 22 with the argument-order fix and the memory print, then watch the dry run'
+
+    it('shows the whole option on its button and posts the whole option', () => {
+      const posted = vi.spyOn(window, 'postMessage').mockImplementation(() => {})
+      try {
+        mount({ items: [], for_you: [{ text: 'Rev 22 is ready', ask: 'decide', options: [LONG, 'Hold rev 22'], workstream: '' }] })
+        const button = all('.pr-todo-opt').find((b) => b.textContent === LONG) as HTMLButtonElement
+        expect(button).toBeTruthy()
+        button.click()
+        expect(posted).toHaveBeenCalledWith({ type: 'kirocrew-dashboard:send', text: `"Rev 22 is ready": ${LONG}` }, '*')
+      } finally {
+        posted.mockRestore()
+      }
+    })
+  })
+
   // ------------------------- cards asked before the person wrote in the chat fold
   describe('cards asked before the person wrote in the chat', () => {
     // A reply typed in the chat, an option clicked there and a steer into the running
@@ -1196,7 +1214,7 @@ describe('project-report: the page the gateway ships', () => {
       expect(needsKpi()).toBe('0')
       expect(needsSub()).toBe('2 asked before you wrote in chat')
       mount(quiet, { written_at: { for_you: WROTE } })
-      expect(needsSub()).toBe('2 of them raised by the Bot')
+      expect(needsSub()).toBe('2 of them raised by the bot')
     })
 
     it('takes them out of every Needs-you count, and only them', () => {
@@ -1207,7 +1225,7 @@ describe('project-report: the page the gateway ships', () => {
       expect(needsKpi()).toBe('1')
       expect(text('#pr-sentence')).toContain('1 needs you')
       // None of the one left was raised by the crewmate, and nothing is "not shown".
-      expect(text('.pr-kpis')).not.toContain('raised by the Bot')
+      expect(text('.pr-kpis')).not.toContain('raised by the bot')
       expect(text('#pr-view')).not.toContain('more not shown')
     })
 
@@ -1599,7 +1617,7 @@ describe('project-report: the page the gateway ships', () => {
     })
 
     it('says once that only a publish is shown, with no zero counters above it', () => {
-      const HINT = 'Below is what this Bot last published.'
+      const HINT = 'Below is what this bot last published.'
       mount({ items: [], published })
       expect(document.body.textContent).toContain(HINT)
       expect(document.body.textContent).not.toContain('No workstream yet.')

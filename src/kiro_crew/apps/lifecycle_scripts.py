@@ -32,6 +32,7 @@ from kiro_crew.apps.execution import app_execution_denied
 from kiro_crew.apps.manager import apps_dir
 from kiro_crew.apps.registry import NATIVE_WINDOWS_HOOK_REFUSAL, minimal_env
 from kiro_crew.sandbox import (
+    app_backend_secret_mask_targets,
     cgroup_scope_argv,
     create_subprocess_limited,
     wrap_argv,
@@ -70,7 +71,7 @@ async def run_lifecycle_script(
         logger.warning("Refusing app %s lifecycle action %s: %s", app_name, action, denied)
         return {"output": denied, "failed": True, "denied": True}
 
-    if not app_root.is_dir():
+    if not await asyncio.to_thread(app_root.is_dir):
         return {"output": f"app directory not found: {app_root}", "failed": True}
 
     # Native-Windows policy: these lifecycle hooks are a POSIX-only capability.
@@ -96,7 +97,13 @@ async def run_lifecycle_script(
 
     safe_script = f"set -euo pipefail\n{script}"
     base_cmd = ["/bin/bash", "-c", safe_script]
-    sandboxed_cmd, cleanup = await wrap_argv_async(base_cmd, mode="standard", _prepare=wrap_argv)
+    # The script is app-authored text: it must not read the gateway's secret files.
+    sandboxed_cmd, cleanup = await wrap_argv_async(
+        base_cmd,
+        mode="standard",
+        _prepare=wrap_argv,
+        extra_hidden_dirs=await asyncio.to_thread(app_backend_secret_mask_targets),
+    )
     sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
     env = minimal_env(NONINTERACTIVE="1")
     if extra_env:
@@ -107,15 +114,23 @@ async def run_lifecycle_script(
         # fleet): start_new_session=True is a no-op on Windows, creationflags is 0
         # (no-op) on POSIX. (App lifecycle scripts are bash; on Windows without bash
         # they fail gracefully rather than crash here.)
-        proc = await create_subprocess_limited(
-            *sandboxed_cmd,
-            cwd=str(app_root),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=env,
-            start_new_session=platform_compat.IS_POSIX,
-            creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
-        )
+        try:
+            proc = await create_subprocess_limited(
+                *sandboxed_cmd,
+                cwd=str(app_root),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+                start_new_session=platform_compat.IS_POSIX,
+                creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
+            )
+        except OSError as exc:
+            # A spawn that fails (no shell, EAGAIN, ENOMEM) is a failed script, not an
+            # exception: every caller already handles ``failed`` -- enable rolls back,
+            # an update notes it, uninstall and teardown carry on -- while a raise here
+            # left an enable half-done and an uninstall stopped after its crons went.
+            logger.warning("App %s lifecycle action %s could not start", app_name, action)
+            return {"output": f"script could not be started: {exc}", "failed": True}
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             output = (stdout or b"").decode(errors="replace").strip()

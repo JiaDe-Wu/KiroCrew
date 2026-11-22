@@ -10,7 +10,7 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from _hot_reload_helpers import write_config as _write
@@ -55,7 +55,10 @@ class TestServerAppliers:
         """The workflow ceiling and the channel caps are bound by their OWNERS'
         constructors (``live.bind``), so the dashboard registers nothing for them."""
         subs = self._register(SimpleNamespace(workflow_service=None, channel_manager=None))
-        assert not any("workflow_run_timeout" in n or "channel" in n for n in subs)
+        # `dashboard.channels_enabled` is the Channels page's sidebar switch, a plain
+        # dashboard setting whose applier only pushes a refresh frame; no owner binds it.
+        owner_bound = [n for n in subs if n != "dashboard.channels_enabled"]
+        assert not any("workflow_run_timeout" in n or "channel" in n for n in owner_bound)
 
     @pytest.mark.asyncio
     async def test_browser_settings_written_outside_the_dashboard_push_a_refresh(self) -> None:
@@ -223,6 +226,57 @@ class TestServerAppliers:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("outcome", ["raised", "unreadable"])
+    async def test_a_background_model_rebuild_that_did_not_land_defers_for_retry(
+        self, outcome: str
+    ) -> None:
+        """ConfigWatch retries only an applier that raises. A swallowed failure, or
+        an unwritten rebuild logged as rebuilt, left the lite and heartbeat specs
+        on the previous background model until a restart."""
+        state = SimpleNamespace(workflow_service=None, channel_manager=None)
+        apply = self._register(state)["agent.role_models.background"].callback()
+
+        def _rebuild() -> tuple[Path, bool]:
+            if outcome == "raised":
+                raise OSError("spec directory is read-only")
+            return (Path("/home/x/.kiro/agents/kirocrew.json"), False)
+
+        with (
+            # Mocked so the code on main, which calls this one, touches no real spec.
+            patch("kiro_crew.agent.rebuild_agent_config", MagicMock()),
+            patch("kiro_crew.agent.rebuild_agent_config_reporting", _rebuild),
+            pytest.raises((OSError, RuntimeError)),
+        ):
+            await apply(
+                ConfigChange(
+                    old=KiroCrewConfig(),
+                    new=KiroCrewConfig(),
+                    changed=frozenset({"agent.role_models.background"}),
+                )
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_shared_home_refusal_is_audited_by_the_rebuild_and_retried(self) -> None:
+        """A refusal goes through the rebuild, whose guard writes the denied audit
+        row, and is deferred for retry like any unwritten rebuild: the same
+        contract the agent.model applier runs under."""
+        state = SimpleNamespace(workflow_service=None, channel_manager=None)
+        apply = self._register(state)["agent.role_models.background"].callback()
+        spec = Path("/home/x/.kiro/agents/kirocrew.json")
+        change = ConfigChange(
+            old=KiroCrewConfig(),
+            new=KiroCrewConfig(),
+            changed=frozenset({"agent.role_models.background"}),
+        )
+        rebuild = MagicMock(return_value=(spec, False))
+        with (
+            patch("kiro_crew.agent.rebuild_agent_config_reporting", rebuild),
+            pytest.raises(RuntimeError, match="shared agent home"),
+        ):
+            await apply(change)
+        rebuild.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_successful_retry_notifies_that_the_saved_model_is_active(self) -> None:
         """Recovery must resolve the operator-visible failure state."""
         state = SimpleNamespace(
@@ -349,10 +403,72 @@ class TestServerAppliers:
         state.push_refresh.assert_not_called()
         apply(
             ConfigChange(
-                old=cfg, new=cfg, changed=frozenset({"dashboard.feature_previews.crew_mode"})
+                old=cfg, new=cfg, changed=frozenset({"dashboard.feature_previews.explore"})
             )
         )
         state.push_refresh.assert_called_once_with("config")
+
+    def test_a_command_bar_switch_change_tells_every_dashboard_to_refresh(self) -> None:
+        """`kirocrew config set dashboard.command_bar_enabled` reaches open dashboards.
+
+        The shell picks what the shortcut opens from a config query that never goes
+        stale on its own, so only a refresh frame makes it re-read the switch. An
+        unrelated dashboard write pushes nothing.
+        """
+        state = SimpleNamespace(
+            workflow_service=None, channel_manager=None, push_refresh=MagicMock()
+        )
+        sub = self._register(state)["dashboard.command_bar_enabled"]
+        assert sub.prefixes == ("dashboard.command_bar_enabled",)
+        apply = sub.callback()
+        cfg = KiroCrewConfig()
+        apply(ConfigChange(old=cfg, new=cfg, changed=frozenset({"dashboard.folder_sort"})))
+        state.push_refresh.assert_not_called()
+        apply(ConfigChange(old=cfg, new=cfg, changed=frozenset({"dashboard.command_bar_enabled"})))
+        state.push_refresh.assert_called_once_with("config")
+
+    def test_a_channels_switch_change_tells_every_dashboard_to_refresh(self) -> None:
+        """`kirocrew app enable channels` reaches open dashboards.
+
+        Channels' sidebar row and Settings row read a config query that never goes
+        stale on its own, so only a refresh frame makes them re-read the switch.
+        """
+        state = SimpleNamespace(
+            workflow_service=None, channel_manager=None, push_refresh=MagicMock()
+        )
+        sub = self._register(state)["dashboard.channels_enabled"]
+        assert sub.prefixes == ("dashboard.channels_enabled",)
+        apply = sub.callback()
+        cfg = KiroCrewConfig()
+        apply(ConfigChange(old=cfg, new=cfg, changed=frozenset({"dashboard.folder_sort"})))
+        state.push_refresh.assert_not_called()
+        apply(ConfigChange(old=cfg, new=cfg, changed=frozenset({"dashboard.channels_enabled"})))
+        state.push_refresh.assert_called_once_with("config")
+
+    @pytest.mark.asyncio
+    async def test_a_failed_stale_wake_job_sync_reaches_the_watcher(self) -> None:
+        """The stale-wake applier lets a cron store failure raise, so ConfigWatch
+        records it as stale and retries, instead of reading a swallowed error as
+        applied."""
+
+        class _BrokenCrons:
+            async def list_jobs_async(self, include_disabled: bool = False) -> list[Any]:
+                raise OSError("cron store is read-only")
+
+        state = SimpleNamespace(workflow_service=None, channel_manager=None, crons=_BrokenCrons())
+        apply = self._register(state)["dashboard.stale_wake"].callback()
+        cfg = KiroCrewConfig()
+        with (
+            patch("kiro_crew.dashboard.stale_wake.enabled", lambda: True),
+            pytest.raises(OSError, match="cron store is read-only"),
+        ):
+            await apply(
+                ConfigChange(
+                    old=cfg,
+                    new=cfg,
+                    changed=frozenset({"dashboard.feature_previews.dashboard_stale_wake"}),
+                )
+            )
 
     def test_an_app_mute_change_tells_every_dashboard_to_refresh(self) -> None:
         """An app muted from one dashboard is muted in the other open ones too.
@@ -371,6 +487,51 @@ class TestServerAppliers:
         state.push_refresh.assert_not_called()
         apply(ConfigChange(old=cfg, new=cfg, changed=frozenset({"apps.notes.mute_sessions"})))
         state.push_refresh.assert_called_once_with("config")
+
+    @pytest.mark.asyncio
+    async def test_switching_the_terminal_off_ends_every_registered_shell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``dashboard.terminal.enabled`` going false ends each registered shell at once,
+        rather than leaving it to the orphan sweep, and closes its tab with the
+        shell-exited code; a redial is refused at once despite the 30 s gate cache.
+        Switching it back on ends nothing."""
+        from kiro_crew.dashboard.handlers import terminal
+
+        ws = AsyncMock()
+        ws.closed = False
+        first = terminal._TerminalSession(
+            session_id="s1", master_fd=-1, ws=ws  # wokeignore:rule=master
+        )
+        second = terminal._TerminalSession(session_id="s2", master_fd=-1)  # wokeignore:rule=master
+        registry: dict[str, Any] = {"s1": first, "s2": second, "s3": None}
+        state = SimpleNamespace(
+            workflow_service=None,
+            channel_manager=None,
+            _terminal_sessions=registry,
+            _background_tasks=set(),
+        )
+        apply = self._register(state)["dashboard.terminal.enabled"].callback()
+        kill = AsyncMock()
+        monkeypatch.setattr(terminal, "_kill_session", kill)
+        monkeypatch.setattr(terminal, "_enabled_cache", [True, float("inf")])
+        monkeypatch.setattr(terminal, "_get_config", lambda request: {"enabled": False})
+        on, off = KiroCrewConfig(), KiroCrewConfig()
+        off.dashboard.terminal = {"enabled": False}
+
+        async def dispatch(old: KiroCrewConfig, new: KiroCrewConfig) -> None:
+            changed = frozenset({"dashboard.terminal.enabled"})
+            await apply(ConfigChange(old=old, new=new, changed=changed))
+            await asyncio.gather(*state._background_tasks)
+
+        await dispatch(off, on)
+        kill.assert_not_awaited()
+        await dispatch(on, off)
+
+        assert kill.await_args_list == [call(first), call(second)]
+        assert registry == {"s3": None}, "a reservation has no shell to end"
+        ws.close.assert_awaited_once_with(code=4001)
+        assert terminal._is_enabled(object()) is False
 
     @pytest.mark.asyncio
     async def test_the_provider_switch_runs_off_the_watcher_cycle_exactly_once(self) -> None:
@@ -469,17 +630,30 @@ class TestServerAppliers:
         assert calls == [newer, scheduled]
 
     def test_every_applier_is_registered_and_scoped(self) -> None:
+        import ast
+        import inspect
+
+        from kiro_crew.dashboard.server_runtime import config_watch
+
         subs = self._register(SimpleNamespace(workflow_service=None, channel_manager=None))
-        assert set(subs) == {
-            "agent.provider",
-            "agent.model",
-            "agent.role_models.background",
-            "agent.log_level",
-            "browser.settings",
-            "agent.crew_mode_agent",
-            "dashboard.feature_previews",
-            "apps",
+        assert subs, "no config-watch subscription was registered"
+        # Every applier closure ``_register_config_watch`` defines is some
+        # subscription's callback, so an applier written but left out of the
+        # subscription list fails here.
+        (register,) = [
+            node
+            for node in ast.walk(ast.parse(inspect.getsource(config_watch)))
+            if isinstance(node, ast.FunctionDef) and node.name == "_register_config_watch"
+        ]
+        appliers = {
+            node.name
+            for node in register.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith(("_apply_", "_push_", "_sync_", "_count_", "_alarm_"))
         }
+        assert appliers, "no applier closure was found in _register_config_watch"
+        registered = {getattr(sub.callback(), "__name__", "") for sub in subs.values()}
+        assert sorted(appliers - registered) == []
         # None of them is a catch-all: an unrelated write must dispatch nothing.
         for sub in subs.values():
             assert sub.prefixes, f"{sub.name} would fire on every reload"

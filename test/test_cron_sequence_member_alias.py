@@ -82,7 +82,7 @@ async def test_each_crew_in_a_sequence_is_dispatched_as_itself(monkeypatch, tmp_
 
     # The schedule was created as alpha, so it carries alpha's captured execution.
     captured = ExecutionContext(
-        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", ""
     )
     job = CronJob(
         id="seq",
@@ -126,7 +126,7 @@ async def test_sequence_step_binds_its_spawn_policy_to_the_captured_store(monkey
 
     _gw, callback = await _cron_callback(monkeypatch, cfg)
     captured = ExecutionContext(
-        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", ""
     )
     job = CronJob(
         id="seq-authz",
@@ -159,7 +159,7 @@ async def test_second_sequence_fire_rebinds_a_prior_captured_execution(monkeypat
 
     _gw, callback = await _cron_callback(monkeypatch, cfg)
     captured = ExecutionContext(
-        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", ""
     )
     job = CronJob(
         id="seq-refire",
@@ -201,7 +201,7 @@ async def test_first_step_agent_mismatch_defers_the_whole_sequence(monkeypatch):
         )
     )
     captured = ExecutionContext(
-        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", ""
     )
     job = CronJob(
         id="seq-first-mismatch",
@@ -236,7 +236,7 @@ async def test_later_step_agent_mismatch_defers_before_first_dispatch(monkeypatc
         )
     )
     captured = ExecutionContext(
-        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", ""
     )
     job = CronJob(
         id="seq-later-mismatch",
@@ -268,7 +268,7 @@ async def test_an_empty_sequence_step_aborts_a_member_captured_cron(monkeypatch)
 
     gw, callback = await _cron_callback(monkeypatch, cfg)
     captured = ExecutionContext(
-        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", ""
     )
     job = CronJob(
         id="seq-empty-step",
@@ -296,7 +296,7 @@ async def test_an_empty_step_does_not_consume_a_delete_after_run_oneshot(monkeyp
 
     gw, callback = await _cron_callback(monkeypatch, cfg)
     captured = ExecutionContext(
-        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", ""
     )
     job = CronJob(
         id="seq-empty-step-oneshot",
@@ -364,7 +364,7 @@ async def test_a_crew_edit_after_the_sweep_does_not_change_the_dispatch(monkeypa
 
     gw.sessions._get_session_agent = MagicMock(side_effect=edit_beta_after_the_sweep)
     captured = ExecutionContext(
-        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", ""
     )
     job = CronJob(
         id="seq-live-edit",
@@ -409,7 +409,7 @@ async def test_each_sequence_step_is_resolved_exactly_once_per_fire(monkeypatch)
     gw, callback = await _cron_callback(monkeypatch, cfg)
     _let_sequence_complete(monkeypatch, gw)
     captured = ExecutionContext(
-        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", ""
     )
     job = CronJob(
         id="seq-one-resolve",
@@ -433,7 +433,7 @@ async def test_a_sequence_repeating_one_crew_dispatches_it_twice(monkeypatch):
     gw, callback = await _cron_callback(monkeypatch, cfg)
     _let_sequence_complete(monkeypatch, gw)
     captured = ExecutionContext(
-        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", ""
     )
     job = CronJob(
         id="seq-repeat",
@@ -473,7 +473,7 @@ async def test_a_config_write_between_resolve_and_dispatch_keeps_the_dispatched_
         ]
     )
     captured = ExecutionContext(
-        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", ""
     )
     job = CronJob(
         id="seq-config-write",
@@ -522,7 +522,7 @@ async def test_each_sequence_step_streams_under_the_runs_task_and_ends_its_conti
 
     monkeypatch.setattr(gateway, "_cron_stream_with_posttoken_resume", stream)
     captured = ExecutionContext(
-        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", ""
     )
     job = CronJob(
         id="seq-holding",
@@ -543,6 +543,41 @@ async def test_each_sequence_step_streams_under_the_runs_task_and_ends_its_conti
 
 
 @pytest.mark.asyncio
+async def test_a_refusal_in_an_earlier_sequence_step_leads_the_runs_result(monkeypatch):
+    """Each step's reply replaces the previous one, so a person-only directive
+    refused in step one would vanish with step one's text; the refusals are
+    run-scoped and lead the stored result."""
+    from kiro_crew.slack import gateway
+
+    write_member_home(config_dir(), "alpha", "beta")
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+    gw, callback = await _cron_callback(monkeypatch, cfg)
+    _let_sequence_complete(monkeypatch, gw)
+
+    async def stream(_client, _message, **kw):
+        if kw["session_key"].endswith(":beta"):
+            kw["directive_refusals"].append("Error: set_project refused.")
+            return "beta's reply", 0
+        return "alpha's reply", 0
+
+    monkeypatch.setattr(gateway, "_cron_stream_with_posttoken_resume", stream)
+    captured = ExecutionContext(
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", ""
+    )
+    job = CronJob(
+        id="seq-refusal",
+        name="sequence refusal",
+        message="task",
+        agent_sequence=["beta", "alpha"],
+        execution_context=captured.to_record(),
+    )
+
+    await callback(job)
+    assert job.last_result == "Error: set_project refused.\n\nalpha's reply"
+
+
+@pytest.mark.asyncio
 async def test_each_sequence_step_marks_its_key_finished_just_before_it_releases_it(monkeypatch):
     """A step's finally tells the cron service the run is done with that step's key
     (``finish_session_key``) as it hands the session back, so the last sub-agent's
@@ -560,7 +595,7 @@ async def test_each_sequence_step_marks_its_key_finished_just_before_it_releases
     )
     gw.sessions.release.side_effect = lambda key: order.append(("release", key))
     captured = ExecutionContext(
-        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", ""
     )
     job = CronJob(
         id="seq-finish",
@@ -610,7 +645,7 @@ async def test_sequence_steps_build_context_from_their_dispatched_template(monke
     _let_sequence_complete(monkeypatch, gw)
     seen = _context_templates(monkeypatch)
     captured = ExecutionContext(
-        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", ""
     )
     job = CronJob(
         id="seq-context",
@@ -646,7 +681,7 @@ async def test_each_sequence_step_hands_the_gate_its_alias_not_its_template(monk
 
     monkeypatch.setattr(gateway, "_cron_stream_with_posttoken_resume", stream)
     captured = ExecutionContext(
-        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", ""
     )
     job = CronJob(
         id="seq-gate",
@@ -696,7 +731,7 @@ async def test_single_agent_cron_builds_context_from_its_dispatched_template(
             "member",
             member,
             "persistent",
-            "app",
+            "",
         ).to_record()
     job = CronJob(
         id="single-context",
@@ -732,7 +767,7 @@ async def test_a_sequence_with_a_project_path_runs_every_step_there(monkeypatch,
 
     gw, callback = await _cron_callback(monkeypatch, cfg)
     captured = ExecutionContext(
-        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", ""
     )
     job = CronJob(
         id="seq-proj",

@@ -47,7 +47,7 @@ def create_skill(loader: SkillsLoader, name: str, content: str) -> bool:
             skill_dir.mkdir(parents=True, exist_ok=False)
         except FileExistsError:
             return False
-        (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
+        _write_new_skill_md(skill_dir, content)
         loader._invalidate_iter_cache()  # so the new skill shows in list_skills() now
         logger.info("Created skill: %s", name)
         return True
@@ -73,6 +73,32 @@ def create_skill(loader: SkillsLoader, name: str, content: str) -> bool:
         return loader._create_skill_pinned(name, content, skill_dir, parent_fd)
     finally:
         os.close(parent_fd)
+
+
+def _write_new_skill_md(skill_dir: Path, content: str) -> None:
+    """Write ``SKILL.md`` into *skill_dir*, a directory the caller just made, by name.
+
+    On any failure the file and the directory are removed, each only if it is still
+    what this call made (the file by identity, the directory only while empty), and
+    the original exception is re-raised, so the name can be created again. The bytes
+    and mode match ``write_text``.
+    """
+    from kiro_crew import skills as sk  # circular import: the facade imports this module
+
+    ident: tuple[int, int] | None = None
+    try:
+        with (skill_dir / "SKILL.md").open("x", encoding="utf-8") as f:
+            info = os.fstat(f.fileno())
+            ident = (info.st_dev, info.st_ino)
+            f.write(content)
+    except BaseException:
+        # After the with: Windows refuses to unlink an open file.
+        if ident is not None:
+            with suppress(OSError):
+                sk.pinned_fs.unlink_verified_by_name(skill_dir, "SKILL.md", ident)
+        with suppress(OSError):
+            skill_dir.rmdir()
+        raise
 
 
 def _create_skill_pinned(
@@ -422,9 +448,13 @@ def set_inject_on_trigger(loader: SkillsLoader, name: str, inject: bool) -> bool
         content = skill_file.read_bytes().decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return False
-    new_content = rewrite_inject_on_trigger(content, inject)
+    # The loader reads a UTF-8 byte-order mark as part of the encoding, so a
+    # Notepad-saved SKILL.md is a valid skill; keep the mark and edit after it.
+    bom = "\ufeff" if content.startswith("\ufeff") else ""
+    new_content = rewrite_inject_on_trigger(content[len(bom) :], inject)
     if new_content is None:
         return False
+    new_content = bom + new_content
     # The same atomic, access-control-carrying replace update_skill uses: the
     # file's mode AND its named ACL entries are taken from the inode being
     # replaced. Mode bits alone would keep 0644 but drop a named-user deny, and

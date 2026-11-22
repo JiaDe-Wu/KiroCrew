@@ -113,6 +113,8 @@ def register(app: web.Application) -> None:
     # Bulk delete of folders that hold no live session (dry run first). A literal
     # path, registered before the "{id}" delete for the same reason as reorder.
     app.router.add_post("/api/chat/folders/cleanup", chat.api_chat_folders_cleanup)
+    # The sidebar's "Collapse all folders": one write, same literal-path rule.
+    app.router.add_post("/api/chat/folders/collapse-all", chat.api_chat_folders_collapse_all)
     app.router.add_delete("/api/chat/folders/{id}", chat.api_chat_folder_delete)
     app.router.add_patch("/api/chat/slots/{slot}/folder", chat.api_chat_slot_folder)
     app.router.add_patch("/api/chat/slots/{slot}/pin", chat.api_chat_slot_pin)
@@ -146,6 +148,14 @@ def register(app: web.Application) -> None:
         "/api/chat/slots/{slot}/environment/file",
         session_environment_handlers.api_chat_slot_environment_file_put,
     )
+    # Connected computers (feature preview): the connector socket and the
+    # enrolled computers' list, Disconnect and Remove. Every path is literal and under
+    # its own /api/connected-computers/ prefix, so nothing here is shadowed.
+    # Registered with the preview off too; the handlers import the socket, broker
+    # and credential code on first request, never here.
+    from kiro_crew.connected_computers.remote_routes import register_all as _connected_computers
+
+    _connected_computers(app)
     app.router.add_post(
         "/api/session-environments/check",
         session_environment_handlers.api_session_environments_check,
@@ -190,6 +200,7 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/chat/slots/{slot}/mirror-unlink", chat.api_chat_slot_mirror_unlink)
     app.router.add_post("/api/chat/slots/{slot}/mirror-pause", chat.api_chat_slot_mirror_pause)
     app.router.add_get("/api/chat/channel-targets", chat.api_channel_targets)
+    app.router.add_get("/api/chat/channel-topics", chat.api_channel_topics)
     app.router.add_get("/api/slack/channels", chat.api_slack_channels)
 
     # OpenAI-compatible API

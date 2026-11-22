@@ -27,6 +27,8 @@ import {
 vi.mock('../../api/client', () => ({
   api: {
     members: vi.fn(),
+    // The owner check behind Import from file (`useViewerIsNotOwner`): the owner.
+    viewerOwnerOk: vi.fn(() => Promise.resolve(true)),
     // The roster's team grouping reads the team list; "no teams" keeps the
     // list flat, which is the shape every case here was written against.
     teams: { list: vi.fn(() => Promise.resolve({ teams: [] })), create: vi.fn(), update: vi.fn(), remove: vi.fn() },
@@ -542,7 +544,8 @@ describe('MembersPage identity pill and Profile entry', () => {
     fireEvent.click(await rosterRow('oncall'))
     const pill = await screen.findByTestId('member-identity-pill')
     expect(pill.tagName).toBe('BUTTON')
-    expect(pill.className).toContain('liquid-glass')
+    // The stack is the button; its name chip is the Glass pane under the face.
+    expect(pill.querySelector('.liquid-glass')).toContainElement(screen.getByTestId('member-pill-name'))
     expect(pill).toHaveAccessibleName(expect.stringContaining('oncall'))
     expect(pill).toHaveAccessibleDescription('Profile')
 
@@ -665,7 +668,7 @@ describe('MembersPage identity pill and Profile entry', () => {
     await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
     fireEvent.click(await rosterRow('oncall'))
     const header = await screen.findByTestId('member-thread-header')
-    expect(within(header).queryByLabelText('Edit Bot')).toBeNull()
+    expect(within(header).queryByLabelText('Edit bot')).toBeNull()
 
     fireEvent.click(screen.getByTestId('member-identity-pill'))
     fireEvent.click(await screen.findByTestId('crew-profile-edit'))

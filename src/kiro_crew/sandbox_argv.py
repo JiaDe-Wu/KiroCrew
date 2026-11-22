@@ -33,6 +33,9 @@ from kiro_crew.config.paths import config_dir
 from kiro_crew.config.write_provenance import launcher_record as _published_file_record
 from kiro_crew.platform import current_context
 from kiro_crew.sandbox_aliases import (
+    _app_declared_leaves,
+    _app_declared_readonly_leaves,
+    _establish_app_readonly_dirs,
     _referent_identity,
     _refuse_aliased_masked_leaves,
     _refuse_multilinked_credential_leaves,
@@ -40,9 +43,11 @@ from kiro_crew.sandbox_aliases import (
 from kiro_crew.sandbox_leaves import (
     _CREW_HIDDEN_DIRS,
     _CREW_HIDDEN_LEAVES,
+    _CREW_HOME_PREFIXES,
     _CREW_READONLY_LEAVES,
     _CREW_READONLY_TARGETS,
     _CREW_UNREADABLE_MASK_LEAVES,
+    _MD_NOTEBOOK_RETIRED_STATE_LEAVES,
     _RELOCATED_CREW_HIDDEN_LEAVES,
 )
 from kiro_crew.sandbox_plan import scrub_prefixes as _agent_scrub_prefixes
@@ -52,11 +57,13 @@ from kiro_crew.sandbox_seals import (
     _refuse_linked_models_leaf,
 )
 from kiro_crew.sandbox_staging import (
+    _materialize_declared_mask_dirs,
     _materialize_env_mask_target,
     _materialize_live_target_mask_target,
     _materialize_maskable_dirs,
     _materialize_md_notebook_mask_targets,
     _materialize_refresh_chains_mask_target,
+    _materialize_signing_key_mask_target,
     _md_notebook_degraded_mask_dirs,
     _member_records_move,
     _migrate_md_notebook_legacy_state,
@@ -81,6 +88,7 @@ from kiro_crew.sandbox_tiers import (
     _resolved_install_root_targets,
     _resolved_kiro_agents_targets,
     _sandbox_policy,
+    configured_readonly_layer,
 )
 from kiro_crew.sandbox_workspace import (
     _literal_ancestor_guards,
@@ -330,6 +338,42 @@ def _carveout_probes(candidates: tuple[str, ...]) -> dict[str, sandbox_plan.Carv
     return probes
 
 
+def _operator_layer_probes(
+    entries: tuple[str, ...], *, keep_unprobeable: bool
+) -> tuple[sandbox_plan.CarveoutProbe, ...]:
+    """What this host says about each operator read-only entry, relative ones included.
+
+    A relative entry is carried unprobed, so the plan refuses it by name rather than
+    this adapter dropping it silently. With *keep_unprobeable*, an entry whose ``stat``
+    fails for any reason but absence (``EACCES`` from a parent the agent ran ``chmod``
+    on, an I/O error) is kept as present rather than dropped as "not a directory": the
+    launcher then seals it, or refuses the spawn if it cannot pin it, and Seatbelt
+    denies the path either way. Exceptions pass ``False``: an unprobeable exception is
+    refused and its path stays read-only.
+    """
+    probes: dict[str, sandbox_plan.CarveoutProbe] = {}
+    for raw in entries:
+        if raw in probes:
+            continue
+        if not raw or not os.path.isabs(raw):
+            probes[raw] = sandbox_plan.CarveoutProbe(
+                raw=raw, lexical=raw, canonical=raw, is_dir=False
+            )
+            continue
+        lexical = os.path.normpath(raw)
+        canonical = os.path.realpath(lexical)
+        try:
+            is_dir = stat.S_ISDIR(os.stat(canonical).st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            is_dir = False
+        except OSError:
+            is_dir = keep_unprobeable
+        probes[raw] = sandbox_plan.CarveoutProbe(
+            raw=raw, lexical=lexical, canonical=canonical, is_dir=is_dir
+        )
+    return tuple(probes.values())
+
+
 def _plan_cwd(request: sandbox_plan.SandboxRequest, host_paths: list[str]) -> str:
     """The working directory a relative path in the plan resolves against.
 
@@ -371,8 +415,19 @@ def _live_plan_host(request: sandbox_plan.SandboxRequest) -> sandbox_plan.PlanHo
         tier_dirs = tuple(_sandbox_policy().cc_dirs())
     else:
         tier_dirs = tuple(_sandbox_policy().strict_dirs())
+    # The leaves apps declare in ``credentialMasks`` join the crew-home hidden leaves in
+    # every tier, spelled the same way, so each one is masked, write-sealed on Seatbelt and
+    # re-anchored under a relocated data home exactly as a core HIDDEN leaf is. Read now,
+    # so a manifest changed since the last spawn is seen by this one.
+    app_leaves = tuple(leaf for leaf in _app_declared_leaves() if leaf not in _CREW_HIDDEN_LEAVES)
+    app_hidden = tuple(
+        entry
+        for entry in (f"{prefix}/{leaf}" for prefix in _CREW_HOME_PREFIXES for leaf in app_leaves)
+        if entry not in tier_dirs
+    )
+    tier_dirs = (*tier_dirs, *app_hidden)
     relocated_crew_hidden = tuple(
-        _relocated_crew_targets((*_CREW_HIDDEN_LEAVES, *_RELOCATED_CREW_HIDDEN_LEAVES))
+        _relocated_crew_targets((*_CREW_HIDDEN_LEAVES, *_RELOCATED_CREW_HIDDEN_LEAVES, *app_leaves))
     )
     # The pod's remapped home, gated on ``KIROCREW_POD == "1"`` exactly as
     # ``config.paths`` gates the resolver, so a non-pod session's mask is unchanged.
@@ -384,7 +439,40 @@ def _live_plan_host(request: sandbox_plan.SandboxRequest) -> sandbox_plan.PlanHo
     voice_runtime_roots = tuple(_voice_runtime_sandbox_paths())
     voice_runtime_parents = tuple(_voice_runtime_parent_paths())
     voice_runtime_ancestor_guards = () if namespace else tuple(_voice_runtime_ancestor_guards())
-    relocated_crew_readonly = tuple(_relocated_crew_targets(_CREW_READONLY_LEAVES))
+    # The directories apps declare in ``agentReadOnlyDirs`` join the crew-home READONLY
+    # targets in every tier, spelled the same way, so each one is sealed, its parents are
+    # guarded against rename and it is re-anchored under a relocated data home exactly as
+    # a core READONLY leaf is. The one spawn that names a declared spelling exactly in
+    # ``extra_visible_dirs`` (its own app's backend, ``app_declared_readonly_targets``)
+    # gets that spelling unsealed; nothing else lifts one, and a declared spelling that a
+    # mask covers stays masked (the plan keeps a mask over a seal).
+    # Compared after folding a linked data-home spelling onto its canonical root, as the
+    # namespace plan folds the seals, so a lifted canonical spelling is not sealed again
+    # through its alias.
+    aliases = request.crew_home_aliases
+    lifted = frozenset(
+        sandbox_plan.fold_crew_home_alias(path, aliases) for path in request.extra_visible_dirs
+    )
+
+    def _sealed(path: str) -> bool:
+        return sandbox_plan.fold_crew_home_alias(path, aliases) not in lifted
+
+    app_readonly_leaves = tuple(
+        leaf for leaf in _app_declared_readonly_leaves() if leaf not in _CREW_READONLY_LEAVES
+    )
+    app_readonly = tuple(
+        entry
+        for entry in (
+            f"{prefix}/{leaf}" for prefix in _CREW_HOME_PREFIXES for leaf in app_readonly_leaves
+        )
+        if _sealed(os.path.join(home, entry))
+    )
+    relocated_crew_readonly = tuple(
+        (
+            *_relocated_crew_targets(_CREW_READONLY_LEAVES),
+            *(t for t in _relocated_crew_targets(app_readonly_leaves) if _sealed(t)),
+        )
+    )
     kiro_agents_targets = tuple(_resolved_kiro_agents_targets())
     install_root_targets = tuple(_resolved_install_root_targets())
     # A renamed parent carries a seal away on both backends, so every entry resolving a
@@ -397,18 +485,163 @@ def _live_plan_host(request: sandbox_plan.SandboxRequest) -> sandbox_plan.PlanHo
         for target in (
             *voice_runtime_parents,
             *kiro_agents_targets,
-            *(os.path.join(home, rel) for rel in _CREW_READONLY_TARGETS),
+            *(os.path.join(home, rel) for rel in (*_CREW_READONLY_TARGETS, *app_readonly)),
             *relocated_crew_readonly,
             *install_root_targets,
         )
         for entry in (os.path.dirname(os.path.normpath(target)), *_resolution_entries(target))
     )
-    readonly_ancestor_guards = (
-        _renameable_ancestor_guards(seal_parents, uid)
-        if namespace
-        else _literal_ancestor_guards(seal_parents)
+    # Renaming a parent of a hidden crew-home leaf carries the leaf out from under its mask:
+    # on Seatbelt the mask is a path rule, so the renamed tree is readable at once, and on
+    # Linux the mask is a mount that moves with the parent, so the NEXT spawn reads the leaf
+    # under the new name. So every parent of every hidden spelling, core or app-declared, is
+    # guarded against rename on both backends. Only the directory entries; what is inside
+    # them stays writable. A leaf this spawn lifts (its own app's backend, the leaf's
+    # reader) leaves its parents unguarded here, so the backend can create, rotate and
+    # remove the folders it keeps them in. A retired leaf, which nothing writes any more,
+    # guards its parents only while they exist: an absent folder holds no leaf to carry
+    # away, and a Seatbelt deny on the absent name would stop a sandboxed backend creating
+    # it (md-notebook's own home is ``workspace/md-notebook``).
+    hidden_leaves = (*_CREW_HIDDEN_LEAVES, *app_leaves)
+    hidden_targets = (
+        *(
+            (leaf, os.path.join(home, f"{prefix}/{leaf}"))
+            for prefix in _CREW_HOME_PREFIXES
+            for leaf in hidden_leaves
+        ),
+        *(
+            (leaf, target)
+            for leaf in (*hidden_leaves, *_RELOCATED_CREW_HIDDEN_LEAVES)
+            for target in _relocated_crew_targets((leaf,))
+        ),
     )
+    hidden_leaf_parents = tuple(
+        parent
+        for leaf, target in hidden_targets
+        if not sandbox_plan.hidden_path_contains_visible_path(target, request.extra_visible_dirs)
+        for parent in (os.path.dirname(os.path.normpath(target)),)
+        if leaf not in _MD_NOTEBOOK_RETIRED_STATE_LEAVES or os.path.lexists(parent)
+    )
+    readonly_ancestor_guards = (
+        _renameable_ancestor_guards((*seal_parents, *hidden_leaf_parents), uid)
+        if namespace
+        else _literal_ancestor_guards((*seal_parents, *hidden_leaf_parents))
+    )
+    # On the namespace backend, the folder of each app that declares a credential mask,
+    # ``apps/<app>``, is pinned AFTER every mask instead of with the other pins before
+    # them; the set of pinned folders stays the same. An update replaces that folder from
+    # the gateway's namespace and renames ``data/`` into the new one. A mount placed
+    # through a pin of the old folder stays on the old folder's mount, so a running
+    # session would read the restored credential plain. With the app folder unpinned
+    # while the rest are placed, ``data/``'s pin and the masks sit on the mount the rename
+    # keeps, and the app folder's pin, bound last, only adds one copy of them: one pin per
+    # app spelling, nothing pinned above another after the masks.
+    # shortcut: the replacement ``apps/<app>`` an update creates is not pinned in a
+    # session already running, so that session can rename it until its next spawn;
+    # closing that needs a layout change (one top-level credentials folder).
+    # Matched by the folder each guard resolves to, not by its spelling: a linked data
+    # home, or a seal walked through its link, reaches the same folder under another name.
+    # One spelling per folder: a second bind of the same folder would stack on the first
+    # and copy it, and either spelling's pin already refuses the rename.
+    app_dir_pins: dict[str, str] = {}
+    app_dir_ids: set[str] = set()
+
+    def _is_app_dir_pin(pin: str) -> bool:
+        # A link entry is pinned as itself (moving it retargets what resolves through
+        # it), so it stays with the pins placed first; only the directory moves.
+        return not os.path.islink(pin) and os.path.realpath(pin) in app_dir_ids
+
+    if namespace:
+        # A declared leaf is ``apps/<app>/data/<entry>`` (crew-relative, ``/``-separated
+        # by contract), read by its fixed components, so an app named ``data`` is found
+        # too; the move-aside spelling's folder is renamed, never replaced.
+        app_dirs = {
+            f"apps/{name}"
+            for name, _sep, rest in (
+                leaf.removeprefix("apps/").partition("/")
+                for leaf in app_leaves
+                if leaf.startswith("apps/")
+            )
+            if name and not name.startswith(".") and rest.startswith("data/")
+        }
+        app_dir_ids = {
+            os.path.realpath(target)
+            for target in (
+                *(
+                    os.path.join(home, f"{prefix}/{rel}")
+                    for prefix in _CREW_HOME_PREFIXES
+                    for rel in app_dirs
+                ),
+                *_relocated_crew_targets(tuple(sorted(app_dirs))),
+            )
+        }
+        after_masks = {g for g in readonly_ancestor_guards if _is_app_dir_pin(g)}
+        for guard in readonly_ancestor_guards:
+            if guard in after_masks:
+                app_dir_pins.setdefault(os.path.realpath(guard), guard)
+        readonly_ancestor_guards = tuple(
+            g for g in readonly_ancestor_guards if g not in after_masks
+        )
+    # A caller mask is guarded like a built-in hidden leaf on both backends: each directory
+    # above it that exists is guarded against rename (a missing one is skipped, see
+    # ``hidden_leaf_parents``); the namespace backend keeps only those this uid could rename.
+    caller_parents = tuple(
+        parent
+        for entry in request.extra_hidden_dirs
+        for parent in (os.path.dirname(os.path.abspath(entry)),)
+        if os.path.lexists(parent)
+    )
+    caller_ancestor_guards = (
+        _renameable_ancestor_guards(caller_parents, uid)
+        if namespace
+        else _literal_ancestor_guards(caller_parents)
+    )
+    # An app's folder is pinned AFTER the masks whichever list it came from (see above).
+    caller_after_masks = {g for g in caller_ancestor_guards if app_dir_ids and _is_app_dir_pin(g)}
+    for guard in caller_ancestor_guards:
+        if guard in caller_after_masks:
+            app_dir_pins.setdefault(os.path.realpath(guard), guard)
+    caller_ancestor_guards = tuple(g for g in caller_ancestor_guards if g not in caller_after_masks)
     carveout_probes = tuple(_carveout_probes(sandbox_plan.carveout_candidates(request)).values())
+    operator_paths, operator_exceptions = configured_readonly_layer()
+    operator_readonly_probes = _operator_layer_probes(operator_paths, keep_unprobeable=True)
+    # The same pins for each operator read-only entry, keyed by the canonical spelling
+    # the namespace plan accepts it under: a session's bind moves with its directory,
+    # but the next session resolves the entry by name again, so a parent renamed in
+    # between would leave the real tree unsealed. The plan pins only the entries it
+    # accepts; Seatbelt guards them through ``operator_ancestor_guards`` instead.
+    operator_parent_pins = (
+        tuple(
+            (
+                probe.canonical,
+                _renameable_ancestor_guards(
+                    (
+                        os.path.dirname(probe.lexical),
+                        *_resolution_entries(probe.lexical),
+                    ),
+                    uid,
+                ),
+            )
+            for probe in operator_readonly_probes
+            if os.path.isabs(probe.lexical)
+        )
+        if namespace
+        else ()
+    )
+    # A declaring app's folder among them is pinned after the masks too, for the reason
+    # above, whether or not the plan accepts the entry: one more pin costs one mount.
+    if app_dir_ids:
+        operator_app_dirs = tuple(
+            pin for _entry, pins in operator_parent_pins for pin in pins if _is_app_dir_pin(pin)
+        )
+        for pin in operator_app_dirs:
+            app_dir_pins.setdefault(os.path.realpath(pin), pin)
+        operator_parent_pins = tuple(
+            (entry, tuple(pin for pin in pins if pin not in operator_app_dirs))
+            for entry, pins in operator_parent_pins
+        )
+    mask_parent_pins = tuple(app_dir_pins.values())
+    operator_exception_probes = _operator_layer_probes(operator_exceptions, keep_unprobeable=False)
     host_paths = [
         home,
         *([pod_os_home] if pod_os_home else []),
@@ -429,8 +662,8 @@ def _live_plan_host(request: sandbox_plan.SandboxRequest) -> sandbox_plan.PlanHo
         tier_dirs=tier_dirs,
         cc_files=tuple(_CC_FILES),
         cc_expose_files=tuple(_CC_EXPOSE_FILES),
-        crew_readonly_targets=tuple(_CREW_READONLY_TARGETS),
-        crew_hidden_dirs=tuple(_CREW_HIDDEN_DIRS),
+        crew_readonly_targets=(*_CREW_READONLY_TARGETS, *app_readonly),
+        crew_hidden_dirs=(*_CREW_HIDDEN_DIRS, *app_hidden),
         unreadable_mask_leaves=tuple(_CREW_UNREADABLE_MASK_LEAVES),
         sensitive_env_prefixes=tuple(_SENSITIVE_ENV_PREFIXES),
         agent_denied_env_keys=tuple(_AGENT_DENIED_ENV_KEYS),
@@ -448,7 +681,12 @@ def _live_plan_host(request: sandbox_plan.SandboxRequest) -> sandbox_plan.PlanHo
         kiro_agents_targets=kiro_agents_targets,
         install_root_targets=install_root_targets,
         readonly_ancestor_guards=readonly_ancestor_guards,
+        caller_ancestor_guards=caller_ancestor_guards,
+        mask_parent_pins=mask_parent_pins,
         carveout_probes=carveout_probes,
+        operator_readonly_probes=operator_readonly_probes,
+        operator_exception_probes=operator_exception_probes,
+        operator_parent_pins=operator_parent_pins,
         uid=uid,
         gid=gid,
         ssh_accept_new=_ssh_supports_accept_new() if namespace else False,
@@ -652,7 +890,12 @@ def namespace_argv(
     # The Notes move runs BEFORE the stubs below: it reads real state at the bare names
     # (and empties the legacy PAT in place), and the materialiser then plants the stub
     # the launcher masks at any bare name left absent. A failed move is logged, not raised.
+    # It also creates Notes' declared ``data/state/`` until its own move seals, so it runs
+    # before the declared directories are established, and every spawn names that one.
     _migrate_md_notebook_legacy_state()
+    # The same for the directories apps declare in ``credentialMasks``, under their own
+    # ``data/``: a directory the backend creates after this spawn would otherwise be in view.
+    _materialize_declared_mask_dirs(_required_targets)
     # The crewmate records' one-time move out of ``trust/`` runs here too, so it is
     # done before an agent of this build starts. Unlike the Notes move, one that did not
     # finish while old records remain REFUSES the spawn (``SandboxCeilingUnsealable``).
@@ -666,10 +909,14 @@ def namespace_argv(
     # creatable from any sandbox simply because the data-home ROOT is writable there and
     # an absent name has no mask. Publishing the stub first makes the mask non-vacuous.
     _materialize_live_target_mask_target(_required_targets)
-    # The channel-credential file and the refresh-chain store have the same gap: an
-    # absent name gets no mask.
+    # The channel-credential file, the refresh-chain store and the signing key have the
+    # same gap: an absent name gets no mask.
     _materialize_env_mask_target(_required_targets)
     _materialize_refresh_chains_mask_target(_required_targets)
+    _materialize_signing_key_mask_target(_required_targets)
+    # The directories apps declare read-only to agents: a linked one refuses the spawn, and
+    # an absent one is created so its seal is never vacuous.
+    _establish_app_readonly_dirs(_required_targets)
     # CLEANUP BEFORE THE REFUSAL, and this order is a contract rather than a preference.
     # Both sweeps and the reconciliation remove names that are themselves hard links to a
     # masked credential leaf -- a pre-upgrade orphan is a link to the signing key by
@@ -884,6 +1131,9 @@ def sandbox_exec_argv(
     # AFTER the cleanup above, which is the ordering the namespace path also establishes: a
     # link the cleanup would have removed must not be what refuses.
     alias_masks = _refuse_multilinked_credential_leaves(masks_are_path_only=True)
+    # A Seatbelt seal is a path rule, so a declared read-only directory reached through a
+    # link is refused here too; an absent one needs no creating, the rule holds for it.
+    _establish_app_readonly_dirs()
 
     # A caller that pins a window to an inode is asking for a guarantee no path-rule
     # profile can make in full: the allow names a MUTABLE pathname, and a same-UID peer
@@ -1234,8 +1484,12 @@ def cleanup_stale_sandbox_profiles(*, data_home: Path, legacy_dir: str | None = 
 
 
 # Absolute paths only: the shim that drops the locators again must not be
-# resolvable through a caller- or agent-influenced PATH.
+# resolvable through a caller- or agent-influenced PATH. Empty on Windows, which
+# resolves ``/usr/bin/env`` against the current drive.
+_ENV_BINARY_CANDIDATES: tuple[str, ...]
 _ENV_BINARY_CANDIDATES = ("/usr/bin/env", "/bin/env")
+if platform_compat.IS_WINDOWS:
+    _ENV_BINARY_CANDIDATES = ()
 
 
 def _unset_env_argv(keys: tuple[str, ...]) -> list[str] | None:

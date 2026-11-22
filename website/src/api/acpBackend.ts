@@ -26,12 +26,22 @@ export const ACP_BACKEND_KAS = 'kas'
 /** kiro-cli and its KAS relay: the harnesses backed by the Kiro service. */
 export const KIRO_HARNESS_BACKENDS: readonly string[] = [ACP_BACKEND_KIRO, ACP_BACKEND_KAS]
 
+/** Claude Code's id (`ACP_BACKEND_CLAUDE` on the gateway). */
+export const ACP_BACKEND_CLAUDE = 'claude'
+
+/** The harnesses whose turns record a dollar cost (`TurnUsage.cost_usd`).
+ *  shortcut: Claude Code only, the one harness a live capture shows reporting
+ *  cost; add another once its capture shows the same. */
+export const DOLLAR_HARNESS_BACKENDS: readonly string[] = [ACP_BACKEND_CLAUDE]
+
 /** The harness an install runs when it holds no choice (absent or `''`). */
 export const DEFAULT_ACP_BACKEND = ACP_BACKEND_KAS
 
 /** The slice of the config body this check reads. */
 export interface AcpBackendConfig {
   agent?: { acp_backend?: string }
+  /** Whether any session here runs on KAS, Bots included (`crewmate_harness.kas_runs_here`). */
+  kas_in_use?: boolean
 }
 
 /**
@@ -43,6 +53,17 @@ export function configuredAcpBackend(cfg: AcpBackendConfig): string {
 }
 
 /**
+ * Whether anything on a LOADED config runs on KAS, and so signs in with the Kiro
+ * sign-in: the main harness, the Bot harness, or a Bot pinned to KAS. The gateway
+ * decides (`kas_in_use`); a gateway that predates the field is read by its main
+ * harness alone, and a body with no `agent` section names no harness at all, so
+ * it is not KAS. The one rule every Kiro sign-in shortcut is shown by.
+ */
+export function kasInUse(cfg: AcpBackendConfig): boolean {
+  return cfg.kas_in_use ?? (cfg.agent !== undefined && configuredAcpBackend(cfg) === ACP_BACKEND_KAS)
+}
+
+/**
  * True only when a LOADED config names the kiro-cli backend. `undefined` (the
  * config has not loaded, or failed to) is not kiro: nothing Kiro-only should
  * render on a guess.
@@ -50,18 +71,6 @@ export function configuredAcpBackend(cfg: AcpBackendConfig): string {
 export function isKiroBackend(cfg: AcpBackendConfig | undefined): boolean {
   if (cfg === undefined) return false
   return configuredAcpBackend(cfg) === ACP_BACKEND_KIRO
-}
-
-/**
- * True only when a LOADED config runs KAS. A Settings MCP sign-in lands in
- * kiro-cli's own sign-in cache, which a KAS chat never reads: the chat asks for
- * its own sign-in with the Authorize card (#24693). That holds with
- * `agent.kas_persist_mcp_sign_in` on too, since its vault is filled only by the
- * engine itself, so the setting does not enter this check.
- */
-export function kasChatOwnsMcpSignIn(cfg: AcpBackendConfig | undefined): boolean {
-  if (cfg === undefined) return false
-  return configuredAcpBackend(cfg) === ACP_BACKEND_KAS
 }
 
 /**
@@ -76,6 +85,17 @@ export function kasChatOwnsMcpSignIn(cfg: AcpBackendConfig | undefined): boolean
 export function reportsCredits(cfg: AcpBackendConfig | undefined): boolean {
   if (cfg === undefined) return false
   return KIRO_HARNESS_BACKENDS.includes(configuredAcpBackend(cfg))
+}
+
+/**
+ * True only when a LOADED config names a harness in `DOLLAR_HARNESS_BACKENDS`,
+ * whose turns record tokens and a dollar cost. Named positively, like
+ * `reportsCredits`: a harness that reports neither (codex, pi) shows no token
+ * or dollar figures rather than zeros. `undefined` (not loaded, or failed) is
+ * neither, so nothing renders on a guess.
+ */
+export function reportsDollars(cfg: AcpBackendConfig | undefined): boolean {
+  return cfg !== undefined && DOLLAR_HARNESS_BACKENDS.includes(configuredAcpBackend(cfg))
 }
 
 /**
@@ -98,10 +118,12 @@ export function acpBackendName(backend: { id: string; policy_id?: string }): str
     case ACP_BACKEND_KIRO: return i18nT('pages.developer.agentBackendTab.kiro_cli')
     case 'claude': return i18nT('pages.developer.agentBackendTab.claude_code')
     case ACP_BACKEND_KAS: return i18nT('pages.developer.agentBackendTab.kas_kiro_agent')
+    case 'antigravity': return i18nT('pages.developer.agentBackendTab.antigravity')
     case 'codex': return i18nT('pages.developer.agentBackendTab.codex')
     case 'copilot': return i18nT('pages.developer.agentBackendTab.copilot')
     case 'deepseek': return i18nT('pages.developer.agentBackendTab.deepseek')
     case 'goose': return i18nT('pages.developer.agentBackendTab.goose')
+    case 'mimocode': return i18nT('pages.developer.agentBackendTab.mimocode')
     case 'opencode': return i18nT('pages.developer.agentBackendTab.opencode')
     case 'pi': return i18nT('pages.developer.agentBackendTab.pi')
     case 'strands': return i18nT('pages.developer.agentBackendTab.strands')
@@ -219,7 +241,7 @@ export function agentChoiceSaved(error: unknown): boolean {
 
 /**
  * What ONE `GET /api/acp-backends` row says about starting its harness, on its
- * own — no host, sandbox or setup facts.
+ * own — no setup facts.
  *
  * First-run setup and Settings > Agent Harness both decide from this, so the two
  * cannot drift on what a probe row means (#14517). Each keeps the checks only it
@@ -228,6 +250,8 @@ export function agentChoiceSaved(error: unknown): boolean {
  *
  * - `unprobed`: no row (query in flight, 403/404, or the payload omits it).
  * - `unselectable`: this build or policy refuses it; a switch would be rejected.
+ * - `sandbox_refused`: every session start refuses it on this host (the row's
+ *   `sandbox_refusal`), so installing, restarting or re-checking cannot help.
  * - `missing`: its components are not installed on this machine.
  * - `restart_required`: installed, but this gateway cached its absence, so a
  *   session started now still fails until the cache is dropped.
@@ -242,6 +266,7 @@ export function agentChoiceSaved(error: unknown): boolean {
 export type AcpProbeState =
   | 'unprobed'
   | 'unselectable'
+  | 'sandbox_refused'
   | 'missing'
   | 'restart_required'
   | 'unknown'
@@ -250,6 +275,7 @@ export type AcpProbeState =
 export function acpProbeState(probe: AcpBackendProbe | undefined): AcpProbeState {
   if (!probe) return 'unprobed'
   if (probe.selectable === false) return 'unselectable'
+  if (probe.sandbox_refusal) return 'sandbox_refused'
   if (probe.installed === 'missing') return 'missing'
   if (probe.restart_required) return 'restart_required'
   if (probe.installed === 'unknown') return 'unknown'
@@ -264,7 +290,12 @@ export function acpProbeState(probe: AcpBackendProbe | undefined): AcpProbeState
  */
 export function acpProbeBlocksUse(probe: AcpBackendProbe | undefined): boolean {
   const state = acpProbeState(probe)
-  return state === 'unselectable' || state === 'missing' || state === 'restart_required'
+  return (
+    state === 'unselectable' ||
+    state === 'sandbox_refused' ||
+    state === 'missing' ||
+    state === 'restart_required'
+  )
 }
 
 /**

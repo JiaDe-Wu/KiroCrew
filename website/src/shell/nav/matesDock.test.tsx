@@ -1,34 +1,35 @@
 // @vitest-environment jsdom
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import { MemoryRouter, useLocation } from 'react-router-dom'
 import type { ComponentProps } from 'react'
-import type { DndContext, DragEndEvent } from '@dnd-kit/core'
+import type { DndContext, DragEndEvent, DragStartEvent } from '@dnd-kit/core'
 
 import { api, ApiError, type MemberRosterRow } from '../../api/client'
 import { MEMBERS_ROSTER_QUERY_KEY } from '../../api/membersQuery'
 import dashboardReducer, { markSlotRead, markSlotUnread, sseSlots } from '../../store/dashboardSlice'
+import { setGatewayConnected } from '../../utils/errorReport'
 import chatReducer, { sseSubagentQueued } from '../../store/chatSlice'
 import notificationsReducer from '../../store/notificationsSlice'
 import instancesReducer from '../../store/instancesSlice'
 import type { ChatSlot } from '../../types'
-import { MORE_BELOW_MASK } from '../../components/ModelEffortDropdown'
 import { attachReport, type ErrorReport } from '../../utils/errorReport'
+import { NavigationLeaveGuardProvider, useRegisterNavigationLeaveGuard } from '../../components/NavigationLeaveGuard'
 import { DockMatesSection, DockMatesTiles } from './matesDock'
 
 // Keep real sortable context; deliver drops at its callback boundary instead
 // of depending on layout measurements that the test DOM does not implement.
-const dnd = vi.hoisted(() => ({ props: null as ComponentProps<typeof DndContext> | null }))
+const dnd = vi.hoisted(() => ({ props: null as ComponentProps<typeof DndContext> | null, started: [] as string[] }))
 vi.mock('@dnd-kit/core', async importOriginal => {
   const actual = await importOriginal<typeof import('@dnd-kit/core')>()
   return {
     ...actual,
     DndContext: (props: ComponentProps<typeof DndContext>) => {
       dnd.props = props
-      return <actual.DndContext {...props} />
+      return <actual.DndContext {...props} onDragStart={e => { dnd.started.push(String(e.active.id)); props.onDragStart?.(e) }} />
     },
   }
 })
@@ -47,7 +48,7 @@ vi.mock('../../components/CrewAvatar', () => ({
 }))
 
 const clients: QueryClient[] = []
-beforeEach(() => { dnd.props = null; handoff.prompts.length = 0; localStorage.removeItem('mc-dock-mates-expanded') })
+beforeEach(() => { dnd.props = null; dnd.started.length = 0; handoff.prompts.length = 0; localStorage.removeItem('mc-dock-mates-expanded') })
 afterEach(() => {
   cleanup()
   for (const client of clients) client.clear()
@@ -67,17 +68,31 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
+/** Applies a cache change and lets it reach the screen: react-query hands
+ *  observers the change on a zero timeout, so a check right after a bare
+ *  `act` would still read the previous render. */
+const settleCache = (change: () => void) =>
+  act(async () => { change(); await new Promise(done => setTimeout(done, 0)) })
+
 /** Prints the router's current address, so a test can read where a click went. */
 function Where() {
   const loc = useLocation()
-  return <output data-testid="where">{loc.pathname + loc.search}</output>
+  return <output data-testid="where" data-state={JSON.stringify(loc.state ?? null)}>{loc.pathname + loc.search}</output>
+}
+
+/** A page on screen whose leave guard answers `guard`. */
+function LeaveGuard({ guard }: { guard: () => boolean }) {
+  useRegisterNavigationLeaveGuard(guard)
+  return null
 }
 
 /** Seeds the roster cache unless the test needs to exercise its first read. */
-function renderDock(roster: MemberRosterRow[] | undefined, { url = '/schedule', collapsed = false, surface = 'section' }: {
-  url?: string; collapsed?: boolean; surface?: 'section' | 'tiles' | 'both'
+function renderDock(roster: MemberRosterRow[] | undefined, { url = '/schedule', collapsed = false, isMobile = false, surface = 'section', guard, onDragActiveChange }: {
+  url?: string; collapsed?: boolean; isMobile?: boolean; surface?: 'section' | 'tiles' | 'both'; guard?: () => boolean; onDragActiveChange?: (active: boolean) => void
 } = {}) {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } })
+  // The roster read retries on its own (`retryThroughRestart`); no backoff, so
+  // a read that keeps failing shows its notice at once.
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false, retryDelay: 0, staleTime: Infinity } } })
   clients.push(qc)
   if (roster !== undefined) qc.setQueryData(MEMBERS_ROSTER_QUERY_KEY, roster)
   const liveStore = configureStore({ reducer: {
@@ -90,9 +105,15 @@ function renderDock(roster: MemberRosterRow[] | undefined, { url = '/schedule', 
     <Provider store={liveStore}>
       <QueryClientProvider client={qc}>
         <MemoryRouter initialEntries={[url]}>
-          {visibleSurface !== 'tiles' && <DockMatesSection collapsed={collapsed} isMobile={false} />}
-          {visibleSurface !== 'section' && <DockMatesTiles onActivate={() => {}} />}
-          {visibleSurface !== 'tiles' && <Where />}
+          <NavigationLeaveGuardProvider>
+            {guard && <LeaveGuard guard={guard} />}
+            {/* The rail's own landmark, which the row menu's focus move looks inside. */}
+            <div role="navigation">
+              {visibleSurface !== 'tiles' && <DockMatesSection collapsed={collapsed} isMobile={isMobile} onDragActiveChange={onDragActiveChange} />}
+              {visibleSurface !== 'section' && <DockMatesTiles onActivate={() => {}} />}
+            </div>
+            {visibleSurface !== 'tiles' && <Where />}
+          </NavigationLeaveGuardProvider>
         </MemoryRouter>
       </QueryClientProvider>
     </Provider>
@@ -104,6 +125,26 @@ function renderDock(roster: MemberRosterRow[] | undefined, { url = '/schedule', 
 const dockNames = () =>
   screen.queryAllByTestId(/^dock-mate-/).map(el => el.getAttribute('data-testid')!.replace('dock-mate-', ''))
 
+function dragStart(active: string) {
+  expect(dnd.props?.onDragStart).toBeTypeOf('function')
+  dnd.props!.onDragStart!({ active: { id: active } } as DragStartEvent)
+}
+
+/** A dock row's own button: the row also holds its "..." trigger. */
+const mateRowButton = (slug: string) =>
+  screen.getByTestId(`dock-mate-${slug}`).querySelector<HTMLElement>(`[data-onboarding-nav="mate-${slug}"]`)!
+
+/** Whether a click gets past dnd-kit's capture listener, which a drag puts on
+ *  the document and only takes off on a timer after the drag ends. */
+function clickReachesDocument() {
+  let reached = false
+  const seen = () => { reached = true }
+  document.addEventListener('click', seen)
+  document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+  document.removeEventListener('click', seen)
+  return reached
+}
+
 function drop(active: string, over: string) {
   expect(dnd.props?.onDragEnd).toBeTypeOf('function')
   dnd.props!.onDragEnd!({ active: { id: active }, over: { id: over } } as DragEndEvent)
@@ -113,14 +154,6 @@ function drop(active: string, over: string) {
 function failedRequest(message: string, endpoint: string, status: number) {
   const report: ErrorReport = { id: `err-${endpoint}`, at: 0, source: 'api', message, endpoint, status, code: 'unavailable', route: '/schedule' }
   return attachReport(new Error(message), report)
-}
-
-/** Stub a scroller's geometry (jsdom does no layout), then let its listener read it. */
-function setOverflow(el: HTMLElement, hidden: number) {
-  Object.defineProperty(el, 'clientHeight', { configurable: true, get: () => 100 })
-  Object.defineProperty(el, 'scrollHeight', { configurable: true, get: () => 100 + hidden })
-  Object.defineProperty(el, 'scrollTop', { configurable: true, get: () => 0 })
-  act(() => { el.dispatchEvent(new Event('scroll')) })
 }
 
 const saved = {} as Awaited<ReturnType<typeof api.updateKirocrewAgent>>
@@ -184,26 +217,47 @@ describe('DockMatesSection', () => {
   it('keeps the open mate on screen while folded, and lights it', () => {
     renderDock(['a', 'b', 'c', 'd', 'e'].map((n, i) => row(n, { starred: true, star_order: i + 1 })), { url: '/members?member=e' })
     expect(dockNames()).toEqual(['a', 'b', 'c', 'e'])
-    expect(within(screen.getByTestId('dock-mate-e')).getByRole('button')).toHaveAttribute('aria-current', 'page')
+    expect(mateRowButton('e')).toHaveAttribute('aria-current', 'page')
     expect(within(screen.getByTestId('dock-mates-more')).getByRole('button')).toHaveAccessibleName('1 more')
   })
 
   it('links each row to its mate chat', () => {
     renderDock([row('Issue Triage', { slug: 'triage', starred: true })])
-    fireEvent.click(within(screen.getByTestId('dock-mate-triage')).getByRole('button'))
+    fireEvent.click(mateRowButton('triage'))
     expect(screen.getByTestId('where')).toHaveTextContent('/members?member=Issue%20Triage')
   })
 
   it('lights the row of the mate whose chat is open', () => {
     renderDock([row('a', { starred: true }), row('b', { starred: true })], { url: '/members?member=b' })
-    expect(within(screen.getByTestId('dock-mate-b')).getByRole('button')).toHaveAttribute('aria-current', 'page')
-    expect(within(screen.getByTestId('dock-mate-a')).getByRole('button')).not.toHaveAttribute('aria-current')
+    expect(mateRowButton('b')).toHaveAttribute('aria-current', 'page')
+    expect(mateRowButton('a')).not.toHaveAttribute('aria-current')
   })
 
-  it('marks a working mate before live slot data arrives', () => {
+  it('marks a working mate on its face, not with a dot, before live slot data arrives', () => {
     renderDock([row('busy', { starred: true, running: true }), row('idle', { starred: true })])
-    expect(within(screen.getByTestId('dock-mate-busy')).getByRole('status')).toBeInTheDocument()
-    expect(within(screen.getByTestId('dock-mate-idle')).queryByRole('status')).toBeNull()
+    expect(within(screen.getByTestId('dock-mate-busy')).getByTestId('face-busy')).toHaveAttribute('data-working', 'subtle')
+    expect(within(screen.getByTestId('dock-mate-busy')).queryByRole('status')).toBeNull()
+    expect(within(screen.getByTestId('dock-mate-idle')).getByTestId('face-idle')).toHaveAttribute('data-working', 'idle')
+  })
+
+  // jsdom computes no layout, so this pins the structure that makes overlap
+  // impossible: an in-flow dot after the truncating name, in one flex line.
+  it('gives the wide row\'s dot its own space after the name, so a long name truncates before it', () => {
+    const { liveStore } = renderDock([row('a', { starred: true, slot_key: 'member-a', display_name: 'Kiro Web Development' })])
+    act(() => { liveStore.dispatch(sseSlots([slot('a', false)])); liveStore.dispatch(markSlotUnread('member-a')) })
+    const dot = within(screen.getByTestId('dock-mate-a')).getByRole('status', { name: 'Unread message' })
+    const name = within(screen.getByTestId('dock-mate-a')).getByText('Kiro Web Development')
+    expect(dot).not.toHaveClass('absolute')
+    expect(dot).toHaveClass('shrink-0')
+    expect(name).toHaveClass('truncate')
+    expect(dot.parentElement).toBe(name.parentElement)
+    expect(name.compareDocumentPosition(dot) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('keeps the narrow row\'s dot in the face\'s corner, where no name is drawn', () => {
+    const { liveStore } = renderDock([row('a', { starred: true, slot_key: 'member-a' })], { collapsed: true })
+    act(() => { liveStore.dispatch(sseSlots([slot('a', false)])); liveStore.dispatch(markSlotUnread('member-a')) })
+    expect(within(screen.getByTestId('dock-mate-a')).getByRole('status', { name: 'Unread message' })).toHaveClass('absolute')
   })
 
   it('ignores overlapping drops until writes and the confirming roster read settle', async () => {
@@ -258,12 +312,28 @@ describe('DockMatesSection', () => {
     expect(dockNames()).toEqual(['a', 'c', 'b'])
   })
 
+  it('says nothing while the gateway is offline, and re-reads once it is back (Bug Bash row 50)', async () => {
+    setGatewayConnected(false)
+    try {
+      const members = vi.spyOn(api, 'members').mockRejectedValue(new TypeError('Failed to fetch'))
+      const { qc } = renderDock(undefined, { collapsed: true, surface: 'both' })
+      await waitFor(() => expect(qc.getQueryState(MEMBERS_ROSTER_QUERY_KEY)?.status).toBe('error'))
+      expect(screen.queryByTestId('dock-mates-load-error')).toBeNull()
+      members.mockResolvedValue(membersReply([row('a', { starred: true })]))
+      act(() => setGatewayConnected(true))
+      await waitFor(() => expect(qc.getQueryState(MEMBERS_ROSTER_QUERY_KEY)?.status).toBe('success'))
+      expect(screen.queryByTestId('dock-mates-load-error')).toBeNull()
+    } finally {
+      setGatewayConnected(true)
+    }
+  })
+
   it('shows one dismissible load failure with agent hand-off when no roster is cached', async () => {
     vi.spyOn(api, 'members').mockRejectedValue(new Error('roster unavailable'))
     renderDock(undefined, { collapsed: true, surface: 'both' })
     const notice = await screen.findByTestId('dock-mates-load-error')
     expect(screen.getAllByRole('alert')).toHaveLength(1)
-    expect(within(notice).getByRole('alert')).toHaveTextContent("Couldn't load your starred Bots.")
+    expect(within(notice).getByRole('alert')).toHaveTextContent("Couldn't load your starred bots.")
     expect(within(notice).getByRole('button', { name: /ask.*agent/i })).toBeInTheDocument()
     fireEvent.click(within(notice).getByRole('button', { name: /dismiss/i }))
     expect(screen.queryByTestId('dock-mates-load-error')).toBeNull()
@@ -290,6 +360,19 @@ describe('DockMatesSection', () => {
     expect(screen.queryAllByTestId(/^rail-mate-/)).toHaveLength(0)
   })
 
+  it('never asks again for the roster a guest is refused', async () => {
+    vi.useFakeTimers()
+    onTestFinished(() => { vi.useRealTimers() })
+    const members = vi.spyOn(api, 'members').mockRejectedValue(new ApiError(403, 'owner only', '{"code":"owner_only"}'))
+    renderDock(undefined, { surface: 'both' })
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
+    expect(members).toHaveBeenCalledTimes(1)
+    // Two 30s re-read periods pass with no further request.
+    await act(async () => { await vi.advanceTimersByTimeAsync(61_000) })
+    expect(members).toHaveBeenCalledTimes(1)
+    expect(screen.queryByTestId('dock-mates-load-error')).toBeNull()
+  })
+
   it('still shows the notice for an expired session, which is not a guest refusal', async () => {
     vi.spyOn(api, 'members').mockRejectedValue(new ApiError(403, 'Session expired', '{"code":"owner_only"}', true))
     renderDock(undefined)
@@ -308,16 +391,21 @@ describe('DockMatesSection', () => {
     expect(handoff.prompts[0]).toContain('/api/kirocrew/agents/b -> HTTP 409')
   })
 
-  it('fades the bottom edge only while rows are scrolled out of sight', () => {
+  it('does not scroll on its own, so the rail scrolls it with the rows around it', () => {
     renderDock(['a', 'b', 'c', 'd'].map((n, i) => row(n, { starred: true, star_order: i + 1 })))
     const group = screen.getByTestId('dock-mates')
-    const mask = MORE_BELOW_MASK.split(' ')[0]
-    setOverflow(group, 0)
-    expect(group.className).not.toContain(mask)
-    setOverflow(group, 60)
-    expect(group.className).toContain(mask)
-    setOverflow(group, 0)
-    expect(group.className).not.toContain(mask)
+    expect(group.className).not.toContain('overflow-y-auto')
+    expect(group.className).toContain('shrink-0')
+  })
+
+  it('reports a live row drag to the rail, and its end', () => {
+    const onDragActiveChange = vi.fn()
+    renderDock(['a', 'b'].map((n, i) => row(n, { starred: true, star_order: i + 1 })), { onDragActiveChange })
+    expect(onDragActiveChange).toHaveBeenLastCalledWith(false)
+    act(() => dragStart('a'))
+    expect(onDragActiveChange).toHaveBeenLastCalledWith(true)
+    act(() => drop('a', 'a'))
+    expect(onDragActiveChange).toHaveBeenLastCalledWith(false)
   })
 
   it.each(['section', 'tiles', 'both'] as const)('keeps cached shortcuts alongside one background failure notice on %s', async surface => {
@@ -332,67 +420,124 @@ describe('DockMatesSection', () => {
     if (surface !== 'tiles') expect(dockNames()).toEqual(['a'])
     if (surface !== 'section') expect(screen.getByTestId('rail-mate-a')).toBeInTheDocument()
     expect(screen.getAllByRole('alert')).toHaveLength(1)
-    expect(within(notice).getByRole('alert')).toHaveTextContent("Couldn't load your starred Bots.")
+    expect(within(notice).getByRole('alert')).toHaveTextContent("Couldn't load your starred bots.")
     fireEvent.click(within(notice).getByRole('button', { name: /ask.*agent/i }))
     expect(handoff.prompts).toHaveLength(1)
     expect(handoff.prompts[0]).toContain('/api/members -> HTTP 503')
   })
+
+  it('rides out a short network drop: a re-read that fails twice and then lands shows no notice', async () => {
+    const roster = [row('a', { starred: true })]
+    const linkDown = () => new TypeError('Failed to fetch')
+    const members = vi.spyOn(api, 'members')
+      .mockRejectedValueOnce(linkDown())
+      .mockRejectedValueOnce(linkDown())
+      .mockResolvedValue(membersReply([...roster, row('b', { starred: true })]))
+    const { qc } = renderDock(roster)
+    await act(async () => { await qc.invalidateQueries({ queryKey: MEMBERS_ROSTER_QUERY_KEY }) })
+    // Wait for the read to settle on screen, whichever way it went.
+    await waitFor(() => expect(screen.queryByTestId('dock-mates-load-error') ?? screen.queryByTestId('dock-mate-b')).not.toBeNull())
+    expect(screen.queryByTestId('dock-mates-load-error')).toBeNull()
+    expect(members).toHaveBeenCalledTimes(3)
+    expect(qc.getQueryState(MEMBERS_ROSTER_QUERY_KEY)?.status).toBe('success')
+    expect(dockNames()).toEqual(['a', 'b'])
+  })
+
+  it('re-reads a roster that stays failed every 30s, so its notice clears once a read lands', async () => {
+    vi.useFakeTimers()
+    onTestFinished(() => { vi.useRealTimers() })
+    const roster = [row('a', { starred: true })]
+    const members = vi.spyOn(api, 'members').mockRejectedValue(new TypeError('Failed to fetch'))
+    const { qc } = renderDock(roster)
+    await act(async () => {
+      void qc.invalidateQueries({ queryKey: MEMBERS_ROSTER_QUERY_KEY })
+      await vi.advanceTimersByTimeAsync(1_000)
+    })
+    // The ladder is spent: the first read and its three retries all failed.
+    expect(members).toHaveBeenCalledTimes(4)
+    expect(screen.getByTestId('dock-mates-load-error')).toBeInTheDocument()
+    // Nothing else re-reads an idle page while the socket stays up.
+    members.mockResolvedValue(membersReply([...roster, row('b', { starred: true })]))
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+    expect(members).toHaveBeenCalledTimes(5)
+    expect(screen.queryByTestId('dock-mates-load-error')).toBeNull()
+    expect(dockNames()).toEqual(['a', 'b'])
+  })
+
+  it('keeps a dismissed notice away through a failed 30s re-read', async () => {
+    vi.useFakeTimers()
+    onTestFinished(() => { vi.useRealTimers() })
+    const roster = [row('a', { starred: true })]
+    const members = vi.spyOn(api, 'members').mockRejectedValue(new TypeError('Failed to fetch'))
+    const { qc } = renderDock(roster)
+    await act(async () => {
+      void qc.invalidateQueries({ queryKey: MEMBERS_ROSTER_QUERY_KEY })
+      await vi.advanceTimersByTimeAsync(1_000)
+    })
+    expect(members).toHaveBeenCalledTimes(4)
+    const notice = screen.getByTestId('dock-mates-load-error')
+    fireEvent.click(within(notice).getByRole('button', { name: /dismiss/i }))
+    expect(screen.queryByTestId('dock-mates-load-error')).toBeNull()
+    // The re-read and its retries fail too: a new failure in the same outage.
+    await act(async () => { await vi.advanceTimersByTimeAsync(31_000) })
+    expect(members).toHaveBeenCalledTimes(8)
+    expect(qc.getQueryState(MEMBERS_ROSTER_QUERY_KEY)?.status).toBe('error')
+    expect(screen.queryByTestId('dock-mates-load-error')).toBeNull()
+    expect(dockNames()).toEqual(['a'])
+  })
 })
 
 describe.each(['section', 'tiles'] as const)('live presence in %s', surface => {
-  it('updates both the dot and face from live activity rather than the HTTP snapshot', () => {
+  it('updates the face from live activity rather than the HTTP snapshot, with no dot for working', () => {
     const { liveStore } = renderDock([row('a', { starred: true, slot_key: 'member-a', running: true })], { surface })
     const mate = screen.getByTestId(surface === 'section' ? 'dock-mate-a' : 'rail-mate-a')
-    expect(within(mate).getByRole('status')).toBeInTheDocument()
+    expect(within(mate).getByTestId('face-a')).toHaveAttribute('data-working', 'subtle')
     act(() => { liveStore.dispatch(sseSlots([slot('a', false)])) })
-    expect(within(mate).queryByRole('status')).toBeNull()
     expect(within(mate).getByTestId('face-a')).toHaveAttribute('data-working', 'idle')
     act(() => { liveStore.dispatch(sseSlots([slot('a', true)])) })
-    expect(within(mate).getByRole('status')).toBeInTheDocument()
     expect(within(mate).getByTestId('face-a')).toHaveAttribute('data-working', 'subtle')
+    expect(within(mate).queryByRole('status')).toBeNull()
   })
 
-  it('resolves a new member slot by name and includes live child work', () => {
+  it('resolves a new member slot by name and includes live child work on the face', () => {
     const { liveStore } = renderDock([row('a', { starred: true })], { surface })
     const mate = screen.getByTestId(surface === 'section' ? 'dock-mate-a' : 'rail-mate-a')
-    expect(within(mate).queryByRole('status')).toBeNull()
+    expect(within(mate).getByTestId('face-a')).toHaveAttribute('data-working', 'idle')
     act(() => { liveStore.dispatch(sseSlots([slot('a', false, { subagents_running: 1 })])) })
-    expect(within(mate).getByRole('status')).toBeInTheDocument()
     expect(within(mate).getByTestId('face-a')).toHaveAttribute('data-working', 'subtle')
     act(() => {
       liveStore.dispatch(sseSlots([slot('a', false)]))
       liveStore.dispatch(sseSubagentQueued({ slot: 'member-a', queued: 1 }))
     })
-    expect(within(mate).getByRole('status')).toBeInTheDocument()
+    expect(within(mate).getByTestId('face-a')).toHaveAttribute('data-working', 'subtle')
     act(() => { liveStore.dispatch(sseSubagentQueued({ slot: 'member-a', queued: 0 })) })
+    expect(within(mate).getByTestId('face-a')).toHaveAttribute('data-working', 'idle')
     expect(within(mate).queryByRole('status')).toBeNull()
   })
 
-  it('shows its one dot for an unread reply or a turn waiting on the person, and drops it after', () => {
+  it('shows the dot only for an unread reply, and drops it once read even while still working', () => {
     const { liveStore } = renderDock([row('a', { starred: true, slot_key: 'member-a' })], { surface })
     const mate = screen.getByTestId(surface === 'section' ? 'dock-mate-a' : 'rail-mate-a')
     act(() => { liveStore.dispatch(sseSlots([slot('a', false)])) })
     expect(within(mate).queryByRole('status')).toBeNull()
     act(() => { liveStore.dispatch(markSlotUnread('member-a')) })
     expect(within(mate).getByRole('status', { name: 'Unread message' })).toBeInTheDocument()
-    act(() => { liveStore.dispatch(sseSlots([slot('a', false, { needs_input: true })])) })
-    expect(within(mate).getAllByRole('status')).toHaveLength(1)
-    expect(within(mate).getByRole('status', { name: 'Needs your approval or answer' })).toBeInTheDocument()
-    act(() => { liveStore.dispatch(sseSlots([slot('a', false)])) })
+    act(() => { liveStore.dispatch(sseSlots([slot('a', false, { subagents_running: 1 })])) })
     act(() => { liveStore.dispatch(markSlotRead('member-a')) })
     expect(within(mate).queryByRole('status')).toBeNull()
+    expect(within(mate).getByTestId('face-a')).toHaveAttribute('data-working', 'subtle')
   })
 
-  it('marks the mate when a session it dispatched waits on an approval', () => {
+  it('puts no dot on a mate whose turn or dispatched session waits on the person', () => {
     const { liveStore } = renderDock([row('a', { starred: true, slot_key: 'member-a' })], { surface })
     const mate = screen.getByTestId(surface === 'section' ? 'dock-mate-a' : 'rail-mate-a')
     act(() => {
       liveStore.dispatch(sseSlots([
-        slot('a', false),
+        slot('a', false, { needs_input: true }),
         { key: 'chat-worker', agent: 'kirocrew', running: false, mate_root: 'member-a', pending_approval: true } as ChatSlot,
       ]))
     })
-    expect(within(mate).getByRole('status', { name: 'Needs your approval or answer' })).toBeInTheDocument()
+    expect(within(mate).queryByRole('status')).toBeNull()
   })
 })
 
@@ -402,7 +547,7 @@ describe('DockMatesTiles', () => {
     renderDock(undefined, { url: '/chat', surface: 'tiles' })
     const notice = await screen.findByTestId('dock-mates-load-error')
     expect(screen.getAllByRole('alert')).toHaveLength(1)
-    expect(within(notice).getByRole('alert')).toHaveTextContent("Couldn't load your starred Bots.")
+    expect(within(notice).getByRole('alert')).toHaveTextContent("Couldn't load your starred bots.")
     expect(notice).toHaveStyle({ left: '16px' })
     fireEvent.click(within(notice).getByRole('button', { name: /ask.*agent/i }))
     expect(handoff.prompts).toHaveLength(1)
@@ -433,9 +578,16 @@ describe('DockMatesTiles', () => {
     expect(screen.queryByRole('alert')).toBeNull()
     showSurface(first)
     expect(screen.queryByRole('alert')).toBeNull()
-    // A distinct failure timestamp, without relying on wall-clock timing.
+    // Distinct timestamps, without relying on wall-clock timing. Another
+    // failure in the same outage keeps the dismiss.
     const query = qc.getQueryCache().find({ queryKey: MEMBERS_ROSTER_QUERY_KEY })!
-    act(() => { query.setState({ errorUpdatedAt: query.state.errorUpdatedAt + 1 }) })
+    const failedAt = query.state.errorUpdatedAt
+    await settleCache(() => query.setState({ errorUpdatedAt: failedAt + 1 }))
+    expect(screen.queryByRole('alert')).toBeNull()
+    // A good read ends the outage; a failure after it shows the notice again.
+    await settleCache(() => query.setState({ status: 'success', error: null, data: query.state.data ?? [], dataUpdatedAt: failedAt + 2 }))
+    expect(screen.queryByRole('alert')).toBeNull()
+    await settleCache(() => query.setState({ status: 'error', error: new Error('roster unavailable'), errorUpdatedAt: failedAt + 3 }))
     await screen.findByTestId('dock-mates-load-error')
     expect(screen.getAllByRole('alert')).toHaveLength(1)
   })
@@ -446,7 +598,7 @@ describe('DockMatesTiles', () => {
 
   it('renders nothing when no mate is starred', () => {
     const { container } = renderTiles([row('a')])
-    expect(container).toBeEmptyDOMElement()
+    expect(within(container).getByRole('navigation')).toBeEmptyDOMElement()
   })
 
   it('shows the same three mates in dock order and no "N more" tile', () => {
@@ -462,5 +614,117 @@ describe('DockMatesTiles', () => {
     expect(screen.queryAllByTestId(/^rail-mate-/).map(el => el.getAttribute('data-testid'))).toEqual([
       'rail-mate-a', 'rail-mate-b', 'rail-mate-c', 'rail-mate-d',
     ])
+  })
+
+  describe('row menu', () => {
+    const starredRows = (...names: string[]) => names.map((n, i) => row(n, { starred: true, star_order: i + 1 }))
+    const trigger = (slug: string) => within(screen.getByTestId(`dock-mate-${slug}`)).getByTestId('mate-row-menu-trigger')
+    const openMenu = async (slug: string) => {
+      fireEvent.pointerDown(trigger(slug), { button: 0, ctrlKey: false, pointerType: 'mouse' })
+      return screen.findByRole('menu')
+    }
+
+    it('gives a bot row a "..." trigger beside the row, revealed on hover and focus, whose menu lists Profile and Remove', async () => {
+      renderDock(starredRows('a', 'b'))
+      const button = trigger('a')
+      expect(button).toHaveAccessibleName('More actions for a')
+      // A sibling of the row's own button, never inside it.
+      expect(mateRowButton('a').contains(button)).toBe(false)
+      expect(button.parentElement).toBe(mateRowButton('a').parentElement)
+      expect(button.parentElement?.className).toContain('group/approw')
+      expect(button.className).toContain('group-hover/approw:opacity-100')
+      expect(button.className).toContain('focus-visible:opacity-100')
+      expect(button.className).toContain('[@media(hover:none)]:opacity-100')
+      const menu = await openMenu('a')
+      expect(within(menu).getAllByRole('menuitem').map(item => item.textContent?.trim())).toEqual(['Profile', 'Remove from the sidebar'])
+    })
+
+    it('opens the bot on its Profile tab through the guarded leave', async () => {
+      renderDock(starredRows('a', 'b'), { guard: () => true })
+      const menu = await openMenu('b')
+      fireEvent.click(within(menu).getByRole('menuitem', { name: 'Profile' }))
+      expect(screen.getByTestId('where')).toHaveTextContent('/members?member=b')
+      expect(JSON.parse(screen.getByTestId('where').dataset.state!)).toEqual({ openMateSessions: true, tab: 'profile', leaveGranted: true })
+    })
+
+    it('stays put when the page on screen refuses the leave', async () => {
+      const guard = vi.fn(() => false)
+      renderDock(starredRows('a', 'b'), { guard })
+      const menu = await openMenu('b')
+      fireEvent.click(within(menu).getByRole('menuitem', { name: 'Profile' }))
+      expect(guard).toHaveBeenCalledTimes(1)
+      expect(screen.getByTestId('where')).toHaveTextContent('/schedule')
+    })
+
+    it('unstars the bot with its slot cleared, takes the row off the dock and focuses the next one', async () => {
+      const write = vi.spyOn(api, 'updateKirocrewAgent').mockResolvedValue({ ok: true } as never)
+      const roster = starredRows('a', 'b', 'c')
+      vi.spyOn(api, 'members').mockResolvedValue(membersReply(roster.map(r => (r.name === 'a' ? { ...r, starred: false, star_order: 0 } : r))))
+      const { qc } = renderDock(roster)
+      const menu = await openMenu('a')
+      fireEvent.click(within(menu).getByRole('menuitem', { name: 'Remove from the sidebar' }))
+      await waitFor(() => expect(dockNames()).toEqual(['b', 'c']))
+      expect(write).toHaveBeenCalledWith('a', { starred: false })
+      expect(qc.getQueryData<MemberRosterRow[]>(MEMBERS_ROSTER_QUERY_KEY)?.find(r => r.name === 'a')).toMatchObject({ starred: false, star_order: 0 })
+      await waitFor(() => expect(document.activeElement).toBe(mateRowButton('b')))
+    })
+
+    it('puts the row back and says so when the unstar fails', async () => {
+      const roster = starredRows('a', 'b')
+      const written = deferred<void>()
+      vi.spyOn(api, 'updateKirocrewAgent').mockImplementation(() => written.promise.then(() => { throw failedRequest('write failed', '/api/kirocrew/agents/a', 500) }))
+      vi.spyOn(api, 'members').mockResolvedValue(membersReply(roster))
+      const { qc } = renderDock(roster)
+      const menu = await openMenu('a')
+      fireEvent.click(within(menu).getByRole('menuitem', { name: 'Remove from the sidebar' }))
+      await waitFor(() => expect(dockNames()).toEqual(['b']))
+      await act(async () => { written.resolve() })
+      const notice = await screen.findByTestId('dock-mates-unstar-error')
+      expect(notice).toHaveTextContent("Couldn't remove this bot from the sidebar.")
+      expect(dockNames()).toEqual(['a', 'b'])
+      expect(qc.getQueryData<MemberRosterRow[]>(MEMBERS_ROSTER_QUERY_KEY)?.find(r => r.name === 'a')).toMatchObject({ starred: true, star_order: 1 })
+    })
+
+    it('starts no drag and no navigation from a press on the trigger', async () => {
+      renderDock(starredRows('a', 'b'))
+      // The row itself still picks up on a press-and-move: the harness can see a drag start.
+      fireEvent.mouseDown(mateRowButton('b'), { button: 0, clientX: 10, clientY: 10 })
+      fireEvent.mouseMove(document, { clientX: 10, clientY: 40 })
+      fireEvent.mouseUp(document, { clientX: 10, clientY: 40 })
+      await waitFor(() => expect(dnd.started).toEqual(['b']))
+      // A finished drag keeps swallowing clicks at the document for a moment;
+      // wait it out so the click below is real and none of the next test's is lost.
+      await waitFor(() => expect(clickReachesDocument()).toBe(true))
+      dnd.started.length = 0
+      const button = trigger('a')
+      fireEvent.mouseDown(button, { button: 0, clientX: 10, clientY: 10 })
+      fireEvent.touchStart(button, { touches: [{ clientX: 10, clientY: 10 }] })
+      fireEvent.mouseMove(document, { clientX: 10, clientY: 40 })
+      fireEvent.mouseUp(document, { clientX: 10, clientY: 40 })
+      fireEvent.click(button)
+      expect(dnd.started).toEqual([])
+      expect(screen.getByTestId('where')).toHaveTextContent('/schedule')
+    })
+
+    it('starts no drag from a press-and-move on an item of the open menu', async () => {
+      renderDock(starredRows('a', 'b'))
+      const item = within(await openMenu('a')).getByRole('menuitem', { name: 'Profile' })
+      fireEvent.mouseDown(item, { button: 0, clientX: 10, clientY: 10 })
+      fireEvent.touchStart(item, { touches: [{ clientX: 10, clientY: 10 }] })
+      fireEvent.mouseMove(document, { clientX: 10, clientY: 40 })
+      fireEvent.mouseUp(document, { clientX: 10, clientY: 40 })
+      expect(dnd.started).toEqual([])
+      expect(screen.getByRole('menu')).toBeInTheDocument()
+    })
+
+    it.each([
+      ['the collapsed rail', { collapsed: true }],
+      ['the phone drawer', { isMobile: true }],
+      ['the phone tiles', { url: '/chat', surface: 'tiles' as const }],
+    ])('offers no trigger on %s', (_where, options) => {
+      renderDock(starredRows('a', 'b'), options)
+      expect(screen.queryAllByTestId(/^rail-mate-|^dock-mate-/).length).toBeGreaterThan(0)
+      expect(screen.queryByTestId('mate-row-menu-trigger')).toBeNull()
+    })
   })
 })

@@ -13,6 +13,37 @@ The frontend pack-author contract (the CSS-var surface and the
 [`website/docs/theming-contract.md`](../../../website/docs/theming-contract.md);
 where the two overlap, this spec governs.
 
+## Browser toolbar colour
+
+`useTheme` updates the existing `theme-color` meta tag from the resolved `--bg`
+token after theme changes, including installed-palette refreshes. It reads the
+target token rather than the body's in-progress colour transition. Before CSS
+supplies a token, the HTML boot colour remains in place. Browsers decide whether
+and where to use this hint; it does not change the page's colours.
+
+## A relay Crew in front
+
+A relay Crew's pane fills the desktop window under the local top bar, so the
+local dashboard around it (the top bar, the rail, anything docked, menus) takes
+that Crew's mode while it is in front, as an SSH Crew's header does by being the
+pane's own. The Windows caption buttons follow it too: the dashboard pushes its
+painted mode (`setTitleBarOverlayTheme`), and the shell stores it on that
+window only (`_mcCaptionMode`, `runtime/window/chrome.js`), so a zoom step or a
+focus re-sync repaints the stored mode, no other window takes it, and
+`nativeTheme.themeSource` keeps the person's own. The shell reads the pane page's `data-mode`
+when the pane shows and again on each theme colour change
+(`did-change-theme-color`; the colour itself, a palette's background, is not
+read as a mode), and tells the dashboard only whether it is dark;
+`RelayCrewPaneHost` sets `hooks/themeModeOverride.ts` once the pane's page has
+drawn (before that its colour is the boot page's), and `useTheme` paints that
+mode over the person's own, and publishes it as the context's `theme`, without
+saving it. Only the caption push carries that mode to the shell; the native
+theme and the splash accent keep the person's own: the splash accent is not
+reported meanwhile, and a Scheduled preference is handed to the shell as the
+own resolved mode (`data-mode-pref`), since the shell reads `data-mode` for that
+preference. Local, or a pane closing, clears
+it. Only the mode follows, not the palette.
+
 ## Capability Tiers
 
 `theme.json` MUST declare `"formatVersion": 1` (required integer major,
@@ -29,13 +60,25 @@ and an appearance pack's `manifest.json`) are read with
 editor that writes one (Windows Notepad does) must not turn a valid hand-edited
 file into "not valid JSON" or drop the pack from the list.
 
+A pack's text files (`persona.md`, `styles/overrides.css`, overlay and top-bar
+HTML) are read as bytes and checked with `user_json.wide_bom_reason` before they
+are decoded. A file saved as UTF-16 or UTF-32 (Windows PowerShell 5.1's `>` writes
+UTF-16LE with a mark), marked or, for UTF-16, unmarked, is refused at install with
+`<file>: it is saved as UTF-16; re-save it as UTF-8`. Re-reading a pack that is
+already installed (the theme-detail route) does not apply the refusal, so a pack
+that predates it keeps loading. Decoding it as UTF-8 would
+hand the validators a NUL after every character, so `persona.md` would be refused
+for wording it contains and `overrides.css` would install with no effect. UTF-8
+with or without a mark keeps installing. The asset descriptor does not surface
+`personaInfo` for such a file.
+
 `theme.json` also declares a `level` (0/1/2) that gates which asset categories
 a pack may ship. Validation is tier-scaled to payload trust.
 
 | Tier | `level` | Surface unlocked |
 |---|---|---|
-| **L0 Color** | 0 | the 60 theme CSS variables (dark + light) only |
-| **L1 Branded** | 1 | + `branding/` (logo, favicon, wordmark, welcome), `styles/fonts/`, scoped `overrides.css`, `loader/*.png\|webp\|gif\|svg` |
+| **L0 Color** | 0 | the 61 theme CSS variables (dark + light) only |
+| **L1 Branded** | 1 | + `branding/` (logo, favicon, wordmark, welcome, splash), `styles/fonts/`, scoped `overrides.css`, `loader/*.png\|webp\|gif\|svg` |
 | **L2 Experience** | 2 | + `overlays/` + `topbar/` sandboxed HTML, `audio/`, `persona.md` |
 
 Level-1 and Level-2 manifests may also declare `loaderIcons`: 4–8 distinct
@@ -82,7 +125,30 @@ and rendered like the loader art through `PackLoaderImage`, so an animated image
 plays in place and holds its first frame under `prefers-reduced-motion: reduce`).
 Precedence: compiled `registerThemeBranding()` `logo` → pack welcome image →
 pack `logo` → the stock ghost. So a pack that ships only a logo shows it there
-too, matching the left rail.
+too, matching the left rail. The left rail and the narrow-screen header draw the
+logo through `PackLoaderImage` as well, so an animated logo holds its first frame
+under reduced motion.
+
+The desktop app's boot splash (`website/electron/loading.html`, the "waiting for
+gateway" screen) paints before any gateway can serve a pack, so a Level-1 pack's
+`branding/splash.svg|png` (512 KB) reaches it through the shell. Each time the
+active theme's branding is applied, `reportThemeSplash`
+(`website/src/hooks/themeSplash.ts`) fetches the image and hands its bytes to the
+main process, or hands it `null` when the theme ships none; a custom selection
+whose detail has not loaded, or an image download that fails (an expired session
+mid-refresh, a network blip), hands over nothing, so a slow or failed load keeps
+the stored art, as it keeps the render cache.
+`website/electron/theme-splash.js` keeps the last one as `theme-splash.png|svg`
+in the shell's own userData directory and refuses any other type, an empty body
+or one over 512 KB, which clears the stored art. `splashQuery` passes the file as
+`?splash=` on every splash paint, cold boot and reconnect alike. The art takes the
+place of the ghosts and of the closing wordmark, over the theme accent the splash
+already follows; with no art, or art that fails to load, the stock ghosts play.
+Under `prefers-reduced-motion: reduce` the art's `<img>` stays hidden and only
+decodes it, and one frame is painted onto a canvas, as the dashboard's
+`PackLoaderImage` does, so an animated SVG holds still.
+Like the accent, it is the last value any dashboard window reported, so it shows
+from the launch after the theme is picked.
 
 Constants (`dashboard/theme_validate.py`): `_THEME_MAX_LEVEL=2`,
 `_THEME_MAX_FONTS=6`, `_THEME_MAX_OVERLAYS=5`, `_THEME_PERSONA_MAX_CHARS=2000`,
@@ -235,6 +301,16 @@ dashboard load into header-only round trips.
   `pointer-events: none` on it. Routes without the shell (`/popout/`, `/embed/`)
   have no behind slot and skip `behind` overlays, since nothing there would
   cover them.
+- **The composer stays uncovered** — the decor slot carries a `clip-path`
+  with a hole for each box marked `data-guide-keep-clear` (the chat
+  composer and the notice rows each composer host draws beside it), so an `above` overlay, a pack's or a registered theme's, is cut
+  where it meets the composer at every width and looks tucked behind it
+  (`website/src/lib/themeDecorKeepClear.ts`). The clip is on the slot, so an
+  overlay cannot opt out of it. It is measured only while the slot holds a
+  decoration, and only on a window resize, a marked box or one of its
+  containers resizing (how a box that moves at the same size is seen), or a
+  marked box coming or going; a reply streaming into the transcript does not
+  re-measure.
 - **Locked CSP** — overlay/topbar responses carry a fixed
   `Content-Security-Policy` including a `sandbox` directive; asset responses
   carry `X-Content-Type-Options: nosniff` and a content-type allowlist.
@@ -301,6 +377,19 @@ dashboard load into header-only round trips.
   the record (full or disabled), the answer is kept for that tab only with the
   persona off and no grant; when it refuses the grant, the persona is saved as
   off, since chat sends only a stored grant.
+
+  A registered theme whose branding declares `overlays` (see *One theme, one
+  picker row* below) has one part, **Overlays**, on the same record keyed by
+  its slug, so light and dark share it, as does an installed pack of that slug,
+  which is never in the picker beside it. Like an overlays-only pack it shows
+  them without asking, and the Experience section lists Overlays alone for it;
+  turned off, the shell unmounts those overlays (`App.tsx`). Its top-bar
+  elements and its own CSS are not part of it. The overlays portal into the
+  shell's decor slot, as a pack's do (the slot is click-through, so a part
+  that must take clicks, such as a close button, sets `pointer-events: auto`
+  on itself), and they also unmount while a remote
+  Crew is shown: they follow this dashboard's theme, and the remote pane
+  draws its own theme's overlays.
 
   **Consent gate (what it actually guarantees — and what it does not).** The
   persona grant is a separate key, `mc-theme-consent-<slug>`, holding
@@ -376,8 +465,36 @@ dashboard load into header-only round trips.
 | Loader | `website/src/hooks/useTheme.tsx` | Applies CSS vars; `applyThemeOverrides` → `scopeOverridesCss` + `rewriteOverridesUrls` (`themeCss.ts`); `injectThemeFonts`; pre-apply self-repair; `themeSwitching` state |
 | Render cache | `website/src/hooks/themeRenderCache.ts` | Persists the active pack's detail under `localStorage["mc-theme-data"]` and reads it back synchronously at `ThemeProvider` mount so the first paint is themed |
 | Experience layer | `website/src/components/ThemeExperienceLayer.tsx` | Mounts sandboxed overlay/topbar iframes + audio; enforces the postMessage allowlist |
-| Settings UI | `website/src/pages/settings/DisplayPanel.tsx` | Single Theme dropdown + install-from-GitHub/local folder/uploaded `.zip` + remove + "Applying…" status indicator; the Experience section listing the active Level-2 pack's parts (Sounds, Overlays, Persona) as toggles (`ThemeExperienceSettings.tsx`); the catalog-failure and unstyled-theme notices with Retry (see *Catalog failure* below) |
+| Settings UI | `website/src/pages/settings/DisplayPanel.tsx` | Mode switch (Auto / Light / Dark / Scheduled, with Scheduled's two times) + single Theme dropdown + install-from-GitHub/local folder/uploaded `.zip` + remove + "Applying…" status indicator; the Experience section listing the active Level-2 pack's parts (Sounds, Overlays, Persona), or a registered theme's Overlays alone, as toggles (`ThemeExperienceSettings.tsx`); the catalog-failure and unstyled-theme notices with Retry (see *Catalog failure* below) |
 | Utility bridge | `website/src/tailwind-theme.css` | Tailwind v4 `@theme` mapping each utility (`bg-accent`, `text-muted/40`, `rounded-md`, `shadow-sm`, `font-mono`) onto the runtime CSS variable of the same stem, plus the `dark:` variant keyed on `[data-theme="dark"]`. A pack changes what a utility renders by writing the variable; it never touches this file. |
+
+### Mode preference
+
+`useTheme` holds one mode preference, workspace-backed as `dashboard.theme_mode`
+(config.md, *Dashboard theme persistence*): `system` (Auto) follows
+`prefers-color-scheme`, `light` and `dark` are fixed, and `schedule` (Scheduled)
+is light from `theme_schedule_light` until `theme_schedule_dark` on the device's
+own clock and time zone, wrapping past midnight, 07:00 and 19:00 when unset.
+A manual pick replaces the schedule and keeps its times. First run's look step
+offers Auto, Light and Dark only, because Scheduled needs the two times. A
+schedule save the workspace refuses shows an inline notice under the two times;
+this device keeps the new times, and leaving a time field saves them again.
+
+- **One resolver.** `website/src/utils/themeSchedule.ts` has no imports, so the
+  crew companion and Mochi windows, which paint from `localStorage["mc-theme"]`,
+  resolve `schedule` the same way from the `mc-theme-schedule` copy.
+- **A minute tick, not a timer to the next switch.** While Scheduled is active
+  the dashboard (`useThemeSchedule.ts`) re-reads the clock every minute, so the
+  switch lands within a minute of each time and of the device waking from sleep.
+- **The desktop shell.** `nativeTheme.themeSource` has no scheduled value, so
+  under Scheduled the shell is sent the resolved `light` or `dark`. That re-pin
+  fires `prefers-color-scheme` change events, which is how a switch reaches the
+  companion and Mochi windows; they hold no clock of their own. The shell takes
+  that push only while no other dashboard window has focus: `themeSource` is
+  process-wide and the focused window re-syncs it when it gains focus, so a
+  background window's switch cannot re-pin the focused one.
+- **Toggle Theme** from Scheduled picks the appearance not on screen, a manual
+  pick like any other, rather than stepping to Auto, which often looks the same.
 
 ### Boot sequence: themed first paint
 

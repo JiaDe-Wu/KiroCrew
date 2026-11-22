@@ -5,7 +5,7 @@ import { useMutation } from '@tanstack/react-query'
 import { Command, MessageSquarePlus, SunMoon, Keyboard, Pin } from 'lucide-react'
 
 import { useAppDispatch, useAppSelector, useAppStore } from '../../../store'
-import { createChatForView, showCreatedChat } from '../../../lib/createdChatView'
+import { createChatForView, reportCreateFailure, showCreatedChat } from '../../../lib/createdChatView'
 import { useAskingNavigate } from '../../NavigationLeaveGuard'
 import { useSessionActions } from '../../../hooks/useSessionActions'
 import { useTheme } from '../../../hooks/useTheme'
@@ -31,7 +31,8 @@ import { slotRowByKey } from '../../../store/slotIndex'
  * as injected callbacks so it stays free of React hooks and is unit-testable
  * with plain spies. {@link useActionsProvider} wires the real implementations:
  * `New session` dispatches the `createSlot` chat thunk, `Toggle theme` calls
- * the theme context's `cycle()` (light → dark → system), and `Open Shortcuts`
+ * the theme context's `cycle()` (light → dark → system; from Scheduled, the
+ * appearance not on screen), and `Open Shortcuts`
  * is supplied by the palette host (the `ShortcutsModal` open state lives in the
  * app shell, mirroring `useKeyboardShortcuts`'s `onToggleShortcutsModal`).
  */
@@ -198,10 +199,12 @@ export function useActionsProvider(opts: { openShortcuts: () => void }): Resourc
   // "New session" is a write (createSlot); route it through useMutation for
   // error/loading state and consistency with paletteActions.ts's createSlot
   // mutation (`use-react-query` lint rule). onSuccess brings the user to the
-  // new session, unless they moved to another session or page meanwhile.
+  // new session, unless they moved to another session or page meanwhile; a
+  // failure goes to the shell notice, as the palette has closed.
   const { mutate: doNewSession } = useMutation({
-    mutationFn: () => createChatForView(dispatch, store.getState, { defaultFolder: true }),
+    mutationFn: () => createChatForView(dispatch, store.getState, { defaultFolder: true, crewModeDefault: true }),
     onSuccess: (view) => { showCreatedChat(view, navigate) },
+    onError: (err) => reportCreateFailure(dispatch, err),
   })
 
   return useMemo(

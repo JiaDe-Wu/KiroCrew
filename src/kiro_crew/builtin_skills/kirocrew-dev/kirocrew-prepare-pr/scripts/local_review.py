@@ -36,8 +36,10 @@ commit message) wrapped in the workflow's own UNTRUSTED framing block.
 This script NEVER calls a model. It only assembles inputs and prints where they
 landed; the skill dispatches the reviewers with them.
 
-Nothing is written inside the worktree: the staging tree lives under the system
-temp dir and every relative path the workflows use (`.review-base-rules/...`,
+Nothing is written inside the worktree: the briefs and the staging tree live
+under ``$KIROCREW_SCRATCH`` when it names a directory (the reviewer subagents
+cannot read a Kiro Crew process's own ``$TMPDIR``), else under the system temp
+dir, and every relative path the workflows use (`.review-base-rules/...`,
 `.review-prompts/...`, `.review-candidates.md`) is rewritten in the extracted
 text to its absolute staged twin. A local review therefore cannot dirty the tree
 that Phase 3 is about to push.
@@ -108,9 +110,12 @@ def err(msg: str) -> None:
 
 def run(args: list[str], cwd: Optional[str] = None) -> tuple[int, str, str]:
     """Run a command; return (rc, stdout, stderr). Never raises."""
+    argv, refused = _tool_argv.resolve(args)
+    if refused:
+        return refused
     try:
         p = subprocess.run(
-            args, cwd=cwd, capture_output=True, text=True,
+            argv, cwd=cwd, capture_output=True, text=True,
             encoding="utf-8", errors="replace",
         )
         return p.returncode, p.stdout, p.stderr
@@ -140,6 +145,10 @@ def _load_sibling(module_name: str, filename: str) -> Any:
     finally:
         sys.dont_write_bytecode = previous
     return module
+
+
+# argv[0] resolution and the batch-launcher guard ``run`` applies.
+_tool_argv = _load_sibling("_lr_tool_argv", "_tool_argv.py")
 
 
 # --------------------------------------------------------------------------
@@ -1596,11 +1605,39 @@ def _pr_number(worktree: str) -> Optional[str]:
     return None if number is None else str(number)
 
 
-def _shell_join(args: list[str]) -> str:
-    """One pasteable command line for this host's shell."""
-    if os.name == "nt":
-        return subprocess.list2cmdline(args)
-    return shlex.join(args)
+#: Every character PowerShell reads as a single quote: the ASCII apostrophe and
+#: U+2018 to U+201B. A doubled one stands for itself.
+_POWERSHELL_SINGLE_QUOTES = frozenset("'\u2018\u2019\u201a\u201b")
+
+
+def _powershell_quoted(word: str) -> str:
+    return "'{}'".format("".join(ch * 2 if ch in _POWERSHELL_SINGLE_QUOTES else ch for ch in word))
+
+
+def _cmd_quoted(word: str) -> str:
+    # A backslash before the closing quote would escape it, so trailing ones are doubled.
+    trailing = len(word) - len(word.rstrip("\\"))
+    return '"{}{}"'.format(word, "\\" * trailing)
+
+
+def _shell_lines(commands: list[list[str]], windows: bool) -> list[str]:
+    """Indented lines that run ``commands`` in order, under a label per Windows shell.
+
+    PowerShell reads a line that opens with a quoted path as a string, so its lines
+    put the call operator before single-quoted words. cmd.exe gets every word
+    double-quoted, and no lines when a word holds ``%`` or ``!``, which it expands
+    even inside quotes, or a ``"``, which would end the quoting. The quoting follows
+    the launcher hints in ``kiro_prerequisite_status.py``, which this stdlib-only
+    script cannot import.
+    """
+    if not windows:
+        return ["    " + shlex.join(command) for command in commands]
+    lines = ["In PowerShell:"]
+    lines += ["    & " + " ".join(map(_powershell_quoted, command)) for command in commands]
+    if not any(ch in word for command in commands for word in command for ch in '%!"'):
+        lines.append("In cmd.exe:")
+        lines += ["    " + " ".join(map(_cmd_quoted, command)) for command in commands]
+    return lines
 
 
 def _read_text(path: str) -> Optional[str]:
@@ -1650,12 +1687,10 @@ def stale_copy_hint(worktree: str, base_sha: str, base_ref: str) -> Optional[lis
     # `git worktree add` accepts an existing empty directory.
     detached = tempfile.mkdtemp(prefix="kirocrew-prepare-pr-base-")
     commands = [
-        _shell_join(["git", "-C", worktree, "worktree", "add", "--detach", detached, base_sha]),
-        _shell_join(
-            [sys.executable, os.path.join(detached, *_SCRIPT_PARTS),
-             "--worktree", worktree, "--base", base_ref]
-        ),
-        _shell_join(["git", "-C", worktree, "worktree", "remove", detached]),
+        ["git", "-C", worktree, "worktree", "add", "--detach", detached, base_sha],
+        [sys.executable, os.path.join(detached, *_SCRIPT_PARTS),
+         "--worktree", worktree, "--base", base_ref],
+        ["git", "-C", worktree, "worktree", "remove", detached],
     ]
     return [
         "The local_review.py running here ({}) is not the base commit's copy "
@@ -1663,11 +1698,25 @@ def stale_copy_hint(worktree: str, base_sha: str, base_ref: str) -> Optional[lis
         "another release can fail parity on a shape the base's own copy "
         "handles.".format(running, relpath, base_sha[:12]),
         "Run the base commit's copy instead:",
-    ] + ["    " + command for command in commands] + [
+    ] + _shell_lines(commands, windows=os.name == "nt") + [
         "If the installed skill is older than the base, update Kiro Crew to bring "
         "it up to date. Do not fall back to the hand-written charters for this "
         "failure.",
     ]
+
+
+def _default_run_dir(prefix: str) -> str:
+    """Create a fresh, private directory for one run's briefs or staged inputs.
+
+    The reviewers that read these files are subagents. In a Kiro Crew session
+    ``$TMPDIR`` is private to each process, so a brief under it is invisible to
+    them; ``$KIROCREW_SCRATCH`` is the directory they share with this one.
+    Outside such a session the system temp dir is used.
+    """
+    scratch = os.environ.get("KIROCREW_SCRATCH", "")
+    if scratch and os.path.isdir(scratch):
+        return tempfile.mkdtemp(prefix=prefix, dir=os.path.abspath(scratch))
+    return tempfile.mkdtemp(prefix=prefix)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -1697,11 +1746,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.out_dir:
         out_dir = os.path.abspath(args.out_dir)
     else:
-        out_dir = tempfile.mkdtemp(prefix="local-review-out-")
+        out_dir = _default_run_dir("local-review-out-")
     if args.stage_dir:
         stage_dir = os.path.abspath(args.stage_dir)
     else:
-        stage_dir = tempfile.mkdtemp(prefix="local-review-stage-")
+        stage_dir = _default_run_dir("local-review-stage-")
 
     resolved: dict[str, str] = {}
     try:

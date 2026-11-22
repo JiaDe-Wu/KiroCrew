@@ -15,6 +15,7 @@ import re
 from pathlib import Path
 
 import pytest
+import source_corpus
 
 from kiro_crew import extras
 
@@ -25,6 +26,10 @@ LOCALES = _REPO_ROOT / "website" / "src" / "i18n" / "locales"
 #: Extras a running gateway advises installing. ``dev`` is test tooling, which
 #: no user-facing surface ever offers.
 USER_FACING = ("otlp", "perf", "teams", "whatsapp", "feishu", "voice-aws", "voice")
+
+#: Where a user copies a ``pip install`` line from: the guides and skills the
+#: package ships, and the repository docs.
+DOC_TREES = ("src/kiro_crew/docs/", "src/kiro_crew/builtin_skills/", "docs/")
 
 
 def _declared_extras() -> dict[str, list[str]]:
@@ -100,13 +105,11 @@ def test_every_declared_extra_is_covered() -> None:
     ), f"extras declared in setup.cfg but absent from REQUIREMENTS: {sorted(missing)}"
 
 
-# ── The pins embedded in the UI catalogs ──
+# ── No pin embedded in the UI catalogs ──
 #
-# The Feishu guide spells a command out inside its translated prose, so that
-# specifier is a SECOND copy of the pin that no Python caller reads. Without
-# this test, bumping setup.cfg leaves the same panel showing two different
-# commands -- the generated one and a stale hand-written one -- across 13
-# locale files.
+# Every optional-SDK channel takes its install step from the gateway's card
+# (the command naming the gateway's interpreter, or the desktop app's Install
+# button). A pin spelled out in catalog prose would be a second, stale copy.
 
 
 def _embedded_specs(text: str, package: str) -> set[str]:
@@ -124,25 +127,9 @@ def _embedded_specs(text: str, package: str) -> set[str]:
     return {package + m.group(1).rstrip("<>=,") for m in re.finditer(pattern, text)}
 
 
-@pytest.mark.parametrize(
-    ("extra", "package"),
-    [("feishu", "lark-oapi")],
-)
-def test_locale_catalogs_carry_the_declared_pin(extra: str, package: str) -> None:
-    expected = extras.REQUIREMENTS[extra][0]
-    seen_anywhere = False
-    for path in sorted(LOCALES.glob("*.json")):
-        found = _embedded_specs(path.read_text(encoding="utf-8"), package)
-        assert found <= {
-            expected
-        }, f"{path.name} embeds {sorted(found - {expected})}, expected {expected}"
-        seen_anywhere = seen_anywhere or bool(found)
-    assert seen_anywhere, f"no locale embeds a {package} pin; did the key move?"
-
-
-@pytest.mark.parametrize("package", ["PyJWT", "neonize"])
+@pytest.mark.parametrize("package", ["PyJWT", "neonize", "lark-oapi"])
 def test_locale_catalogs_embed_no_pin_for_card_channels(package: str) -> None:
-    """Teams and WhatsApp take their install command from the gateway's
+    """Feishu, Teams and WhatsApp take their install command from the gateway's
     optional-SDK card, which names the gateway's interpreter. A pin spelled out
     in catalog prose would be a bare ``pip install`` beside it."""
     for path in sorted(LOCALES.glob("*.json")):
@@ -281,6 +268,25 @@ def test_specifiers_hold_no_powershell_metacharacters(extra: str) -> None:
         assert "$" not in req
         assert "`" not in req
         assert '"' not in req
+
+
+def test_docs_never_single_quote_a_pip_specifier() -> None:
+    """A copied ``pip install`` line has to work in the reader's shell, unknown here.
+
+    cmd does not treat ``'`` as a quote, so a single-quoted pin reaches pip with
+    its quotes, or redirects on the ``<`` of a bound and pip never runs. The docs
+    use the double-quoted form :func:`extras.quote_spec` gives Windows, which
+    bash, zsh, cmd and PowerShell all accept.
+    """
+    root = source_corpus.repo_root()
+    offenders = [
+        f"{rel}:{number}"
+        for path in source_corpus.repo_files()
+        if path.suffix == ".md" and (rel := path.relative_to(root).as_posix()).startswith(DOC_TREES)
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if "pip install '" in line
+    ]
+    assert offenders == []
 
 
 def test_windows_uses_powershell_literal_quoting(monkeypatch: pytest.MonkeyPatch) -> None:

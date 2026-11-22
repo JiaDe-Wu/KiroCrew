@@ -10,6 +10,10 @@ declare global {
     platform?: string
     isElectron?: boolean
     linuxFrameless?: boolean
+    /** This shell answers frameless-Linux application-menu IPC. Optional:
+     *  absent on a shell older than the feature, whose `menuItems` guard is
+     *  still Windows-only and returns `[]` for a Linux window. */
+    linuxAppMenu?: boolean
     getPathForFile?: (file: File) => string
     windowControl?: (action: string) => void
   }
@@ -32,6 +36,17 @@ declare global {
     label: string
     accelerator: string
     enabled: boolean
+    /**
+     * True when THIS ROW was disabled by the app-menu:* per-action gate
+     * (LOCAL_ONLY_* set membership and a remote sender). False when a row is
+     * disabled for any other reason — Electron's own dispatch marks role
+     * items disabled based on runtime state (an `undo` role with no history,
+     * a `paste` role for a WebContents that lost text-selection focus,
+     * etc.). The renderer scopes its "unavailable from this window —
+     * shortcut still works here" affordance to `gated: true` rows only,
+     * because that message is only accurate for gate-caused disables.
+     */
+    gated: boolean
     checked: boolean
   }
 
@@ -49,6 +64,9 @@ declare global {
     onBootReady: (cb: () => void) => () => void
     bootComplete: () => void
     setThemeAccent: (hex: string) => void
+    /** Hand the shell the active theme pack's boot-splash art, or null when it
+     *  ships none. Optional: absent on a shell older than the feature. */
+    setThemeSplash?: (image: { type: string; bytes: Uint8Array } | null) => void
     setThemeMode: (pref: string) => void
     setTitleBarOverlayTheme: (mode: string) => void
     setFocusModeChrome: (visible: boolean) => void
@@ -60,10 +78,20 @@ declare global {
     watchCursorAway?: (cb: (away: boolean) => void) => (() => void) | undefined
     setDevMode: (enabled: boolean) => void
     getAppMenuItems: (id: string) => Promise<ElectronAppMenuItem[]>
-    executeAppMenuItem: (id: string, index: number) => void
+    /**
+     * Answers whether the per-action gate dispatched the click. Returns `void`
+     * on a shell older than that gate, whose bridge is still a fire-and-forget
+     * `send` — it has already forwarded the command and cannot answer. A
+     * caller must therefore treat a non-thenable answer as dispatched and
+     * require strict `true` only of one that acknowledges.
+     */
+    executeAppMenuItem: (id: string, index: number) => Promise<boolean> | void
     onNavigate: (cb: (path: string) => void) => () => void
     /** View > Toggle Focus Mode. Optional: absent on a shell older than the menu item. */
     onToggleFocusMode?: (cb: () => void) => () => void
+    /** The OS session locked (macOS and Windows only). Optional: absent in a
+     *  browser and on an older shell. */
+    onSessionLocked?: (cb: () => void) => () => void
     /** A macOS swipe the shell relays as one route-history step (-1 Back,
      *  1 Forward). Optional: absent in a browser and on an older shell. */
     onHistoryStep?: (cb: (delta: unknown) => void) => () => void
@@ -71,6 +99,10 @@ declare global {
      *  Chromium's gesture-scroll events (macOS only). Optional: absent in a
      *  browser and on an older shell. See lib/scrollTouch. */
     onScrollTouch?: (cb: (phase: unknown) => void) => () => void
+    /** macOS Natural scrolling: `true` on, `false` off, `null` not known yet
+     *  (macOS only). Optional: absent in a browser and on an older shell. See
+     *  lib/scrollTouch `shellNaturalScrolling`. */
+    getNaturalScrolling?: () => unknown
     /** `menuBarOverlap` is false when macOS placed the fullscreen window below
      *  the menu bar (a notched display), so no band needs keeping clear. */
     onFullScreenChanged: (cb: (isFullScreen: boolean, menuBarOverlap: boolean) => void) => () => void
@@ -109,6 +141,20 @@ declare global {
     set: (show: boolean) => Promise<TrayIconState>
   }
 
+  /** Whether minimizing hides the window to the tray. Offered on Windows, and
+   *  on Linux when the desktop has a tray; it can be turned on only while the
+   *  tray icon shows. */
+  interface MinimizeToTrayState {
+    on: boolean
+    offered: boolean
+    canEnable: boolean
+  }
+
+  interface MinimizeToTrayAPI {
+    get: () => Promise<MinimizeToTrayState>
+    set: (on: boolean) => Promise<MinimizeToTrayState>
+  }
+
   /** First-run setup's "connect to a crew on another machine" exit. `start`
    *  opens the desktop app's remote-crew form; on "switching" the window is
    *  about to leave this page for the crew's dashboard. */
@@ -117,8 +163,34 @@ declare global {
     start: () => Promise<'switching' | 'cancelled' | 'unavailable'>
   }
 
+  /** Settings → About's Restart gateway for the gateway this desktop app runs.
+   *  `available` is true only where `restart` can work; "restarting" means the
+   *  app is replacing this page with its splash and will reconnect. Absent in
+   *  plain browsers and in windows on another machine's gateway. */
+  interface GatewayRestartAPI {
+    available: () => Promise<boolean>
+    restart: () => Promise<'restarting' | 'unavailable'>
+  }
+
+  /** Remote Crew pane ports the desktop app's managed SSH forward carries in
+   *  client-only mode. `forwardPorts` names the ports this window's panes load
+   *  and resolves once each has been tried: `up` or `down` per port, or null
+   *  where the app keeps no forward. See lib/paneForward.ts. */
+  interface RemoteCrewPaneAPI {
+    forwardPorts: (ports: number[]) => Promise<Record<string, 'up' | 'down'> | null>
+  }
+
+  /** The count of new crashes and the newest one's time, never a path, file
+   *  name, module name, exception code or logs directory. */
+  interface CrashReportsSummary {
+    newCount: number
+    /** ISO 8601 UTC time of the newest new crash, or null when none parses.
+     *  Optional: absent on an older shell. */
+    lastCrashAt?: string | null
+  }
+
   interface CrashReportsAPI {
-    get: () => Promise<{ newCount: number }>
+    get: () => Promise<CrashReportsSummary>
     reveal: () => Promise<{ ok: boolean; error?: string }>
   }
 
@@ -250,6 +322,12 @@ declare global {
     version?: string
     notes?: string
     pubDate?: string
+    // On the feed lane's `found`: whether the automatic download follows, as the
+    // main process decided it. Absent from an older shell and from the managed lane.
+    autoDownload?: boolean
+    // On `downloaded`: the user armed this update, so it installs when they quit
+    // (never while the app runs). Absent from an older shell.
+    armed?: boolean
     channel?: string
     message?: string
     phase?: 'check' | 'download' | 'install'
@@ -268,6 +346,11 @@ declare global {
      *  local bundled gateway's policy provider was accepted via the three-gate
      *  assertLocalDashboard check. False for remote (SSH-tunneled) gateways. */
     policyGoverned?: boolean
+    /** `'edition'`: the install's EXTERNALLY-MANAGED marker says the edition's
+     *  own update widget is the update surface, so the core opens neither its
+     *  "update available" popup nor its "update ready" dialog for this lane.
+     *  Absent on every other install. */
+    updatePrompts?: 'edition'
   }
 
   interface UpdateInfo {
@@ -275,7 +358,7 @@ declare global {
     channel?: string
     stampedChannel?: string | null
     channelSwitchable?: boolean
-    // The organization's policy sets the channel (an enterprise build).
+    // The organization's policy sets the channel (an LTS build).
     channelLockedByPolicy?: boolean
     // The channel the policy requires, "" when none.
     requiredChannel?: string
@@ -287,6 +370,8 @@ declare global {
     disabled?: string
     managedBy?: string
     updateCommand?: string
+    /** Same as `UpdateState.updatePrompts`. */
+    updatePrompts?: 'edition'
     laneVersion?: string
     runningAheadOfLane?: boolean | null
     /** The main process's confirmed policy governance verdict — true only when
@@ -305,7 +390,17 @@ declare global {
     onState: (cb: (state: UpdateState) => void) => () => void
     check: () => Promise<UpdateResult>
     download?: () => Promise<UpdateResult>
+    /** True when `install` only arms the update. Absent on an older shell, whose
+     *  `install` applies the update at once and stops the gateway. */
+    armsOnQuit?: boolean
+    /** Arms the update: it installs when the user quits, never while the app runs. */
     install: () => Promise<UpdateResult>
+    /** A plain quit and relaunch with no update command of its own; an armed
+     *  update is applied by the quit it triggers. Absent on an older shell. */
+    relaunch?: () => Promise<UpdateResult>
+    /** Whether `relaunch` would be accepted from this window: false where the
+     *  shell's local-dashboard gate refuses it. Absent on an older shell. */
+    canRelaunch?: () => Promise<boolean>
     getInfo?: () => Promise<(UpdateInfo & { lastState?: UpdateState | null }) | undefined>
     setChannel?: (channel: string) => Promise<UpdateResult>
     setAutoDownload?: (enabled: boolean) => Promise<UpdateResult>
@@ -321,7 +416,10 @@ declare global {
     localGatewayAPI?: LocalGatewayAPI
     closeActionAPI?: CloseActionAPI
     trayIconAPI?: TrayIconAPI
+    minimizeToTrayAPI?: MinimizeToTrayAPI
     remoteCrewSetupAPI?: RemoteCrewSetupAPI
+    gatewayRestartAPI?: GatewayRestartAPI
+    remoteCrewPaneAPI?: RemoteCrewPaneAPI
     crashReportsAPI?: CrashReportsAPI
     wslAPI?: WslAPI
     folderPickAPI?: FolderPickAPI

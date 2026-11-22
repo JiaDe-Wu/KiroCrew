@@ -6,23 +6,33 @@ import argparse
 import base64
 import errno
 import json
+import math
 import os
+import re
+import shutil
+import signal
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from kiro_crew import beacon
-from kiro_crew.config import KiroCrewConfig
+from kiro_crew.config import KiroCrewConfig, loader, loosening_provenance
 from kiro_crew.config.loader import (
     ConfigReadError,
     ConfigWriteRefused,
-    config_local_path,
-    config_path,
+    ResourceLimitsConfig,
     read_config_text,
+    read_endorsed_config_text,
     update_config_locked,
     workspace_dir_from_entry,
 )
-from kiro_crew.config.resolution import _SECTION_KEYS_EMITTED_ELSEWHERE, drop_extra_section_keys
+from kiro_crew.config.paths import config_dir
+from kiro_crew.config.resolution import (
+    _SECTION_KEYS_EMITTED_ELSEWHERE,
+    drop_extra_section_keys,
+)
 from kiro_crew.config.sections import _migrate_workspaces, _sanitize_bot_name
 from kiro_crew.config.sections_tailnet import TAILNET_OPENING_PATHS
 from kiro_crew.config.superseded_defaults import (
@@ -44,11 +54,28 @@ from kiro_crew.config.superseded_defaults import (
 from kiro_crew.config.write_provenance import record_path
 from kiro_crew.hooks import safe_read_file
 from kiro_crew.sel import sel
+from kiro_crew.user_json import strict_json_equal, strip_utf8_bom
 
 if TYPE_CHECKING:
     from kiro_crew.config.schema import ConfigEntry
 
 _MISSING = object()
+
+
+def config_path() -> Path:
+    """The base ``config.json``, looked up on the loader at call time.
+
+    A name bound by ``from loader import config_path`` keeps whatever object the loader
+    held at this module's first import, so a substitute in force then (a test's
+    monkeypatch) would outlive its own undo and redirect every later save.
+    """
+    return loader.config_path()
+
+
+def config_local_path() -> Path:
+    """The ``config.local.json`` overlay, looked up on the loader at call time."""
+    return loader.config_local_path()
+
 
 #: How the OS sandbox refuses a write to a sealed config file: Seatbelt answers
 #: ``EPERM``, and a Linux read-only file bind answers ``EROFS`` for an in-place write
@@ -57,20 +84,23 @@ _SEALED_CONFIG_ERRNOS = frozenset({errno.EPERM, errno.EACCES, errno.EROFS, errno
 
 
 def _names_sealed_config(exc: OSError) -> bool:
-    """Whether *exc* was raised against ``config.json``, ``config.local.json`` or its record.
+    """Whether *exc* was raised against ``config.json``, ``config.local.json`` or their provenance.
 
     The publishing ``os.replace(tmp, path)`` reports the temp as ``filename`` and the
     destination as ``filename2``; an in-place ``open(path, "w")`` reports only
     ``filename``. Either way the sealed file is one of the two. A failure that names
-    neither -- ``config edit``'s ``execvp`` of an editor, a temp the data home itself
+    neither -- ``config edit``'s launch of an editor, a temp the data home itself
     refused -- is the caller's to report as what it is.
     """
-    # The config writer records each save in the publication record first, and that
-    # record is sealed the same way, so a sandboxed save is refused there.
-    sealed = {os.path.realpath(p) for p in (config_path(), config_local_path(), record_path())}
+    # Before it publishes, the config writer stores the endorsed copy and the publication
+    # record inside the ``config-provenance`` directory, which is sealed the same way, so
+    # a sandboxed save is refused there first, against a temp file of its own.
+    sealed = {os.path.realpath(p) for p in (config_path(), config_local_path())}
+    provenance = Path(os.path.realpath(record_path().parent))
     for name in (exc.filename, exc.filename2):
         if isinstance(name, (str, bytes, os.PathLike)):
-            if os.path.realpath(os.fsdecode(name)) in sealed:
+            resolved = os.path.realpath(os.fsdecode(name))
+            if resolved in sealed or Path(resolved).is_relative_to(provenance):
                 return True
     return False
 
@@ -82,11 +112,12 @@ def _sandboxed_config_write_hint(exc: OSError) -> str | None:
     (``sandbox._CREW_READONLY_LEAVES``) because they carry the switches that loosen
     confinement. Without this the refusal surfaces as a bare errno, which reads like a
     broken install. Decided from the failure itself -- a denial errno against one of
-    the two sealed files -- and not from ``KIROCREW_SANDBOX_ACTIVE``: ``cli.main()``
-    pops that marker before dispatch so an inherited value can never buy a sandbox
-    bypass, which means it is never set by the time this runs. ``None`` for any other
-    failure, so the caller's own error path still reports a genuinely read-only or
-    full data home, or an editor the sandbox would not exec.
+    the two sealed files or a path in their sealed ``config-provenance`` directory --
+    and not from ``KIROCREW_SANDBOX_ACTIVE``: ``cli.main()`` pops that marker before
+    dispatch so an inherited value can never buy a sandbox bypass, which means it is
+    never set by the time this runs. ``None`` for any other failure, so the caller's
+    own error path still reports a genuinely read-only or full data home, or an editor
+    the sandbox would not exec.
     """
     if exc.errno not in _SEALED_CONFIG_ERRNOS:
         return None
@@ -138,6 +169,22 @@ def _ack_explicit_config_write(key: str, value: object) -> None:
             _ack_explicit_config_write(f"{key}.{child}", child_value)
 
 
+def _ack_edited_values(prefix: str, old: object, new: object) -> None:
+    """Ack each value of *new* that differs from *old*, as ``config set`` acks what it writes.
+
+    Values the edit left as they were are not acked: they are not a choice made now.
+    """
+    if isinstance(old, dict) and isinstance(new, dict):
+        for child, child_value in new.items():
+            key = f"{prefix}.{child}" if prefix else child
+            if child in old:
+                _ack_edited_values(key, old[child], child_value)
+            else:
+                _ack_explicit_config_write(key, child_value)
+    elif not strict_json_equal(old, new):
+        _ack_explicit_config_write(prefix, new)
+
+
 def _warn_if_bot_name_altered(key: str, parsed: object) -> None:
     """Warn when a stored ``agent.bot_name`` will load differently from the typed value.
 
@@ -165,6 +212,89 @@ def _warn_if_bot_name_altered(key: str, parsed: object) -> None:
         print(
             f"⚠️  {key} will load as empty — the loader drops every character of "
             f"{json.dumps(parsed)}, so the default name is used instead.",
+            file=sys.stderr,
+        )
+
+
+_ADDRESS_SPACE_KEY = "resource_limits.max_address_space_mb"
+
+
+def _non_finite_paths(key: str, parsed: object) -> list[str]:
+    """Each dotted path under *key* whose value is a NaN or infinite float."""
+    if isinstance(parsed, float) and not math.isfinite(parsed):
+        return [key]
+    if isinstance(parsed, dict):
+        return [p for k, v in parsed.items() for p in _non_finite_paths(f"{key}.{k}", v)]
+    if isinstance(parsed, list):
+        return [p for i, v in enumerate(parsed) for p in _non_finite_paths(f"{key}[{i}]", v)]
+    return []
+
+
+def _warn_if_not_finite(key: str, parsed: object) -> None:
+    """Warn when a write stores ``NaN`` or ``Infinity``, which the setting never uses.
+
+    ``nan``, ``inf`` and an overflowing ``1e999`` parse as floats, pass the declared
+    number type, and are written as the non-standard JSON tokens ``NaN`` and
+    ``Infinity``. The loader's number reader (``config.fields._safe_float`` / ``_safe_int``) then
+    replaces a non-finite value with the key's default, so the ``✅`` line names a
+    value that never takes effect. Advice only: the write itself already succeeded.
+    """
+    for path in _non_finite_paths(key, parsed):
+        print(
+            f"⚠️  {path} is not a finite number: it is saved, but a number setting "
+            "loads it as its default, so it will not take effect.",
+            file=sys.stderr,
+        )
+
+
+def _warn_if_address_space_capped(key: str, parsed: object) -> None:
+    """Warn when a write turns on the ``RLIMIT_AS`` cap, ``max_address_space_mb``.
+
+    The cap is on VIRTUAL memory, applied soft == hard to every spawned tool, so
+    a number that reads like a generous memory ceiling stops Node/V8 and GraalVM
+    native binaries from starting at all. The resident cap most writers mean is
+    ``max_memory_mb``. Covers the leaf write and a whole ``resource_limits``
+    object. Advice only: the write itself already succeeded.
+    """
+    if key == "resource_limits":
+        section = parsed
+    elif key == _ADDRESS_SPACE_KEY:
+        section = {"max_address_space_mb": parsed}
+    else:
+        return
+    if not ResourceLimitsConfig.from_raw(section).max_address_space_mb:
+        return
+    print(
+        f"⚠️  {_ADDRESS_SPACE_KEY} caps VIRTUAL address space (RLIMIT_AS) on every "
+        "spawned tool, not resident memory. Node/V8 (kiro-cli, npx MCP servers) and "
+        "GraalVM native binaries reserve far more than they use and can fail to "
+        "start below about 64 GiB (65536). To cap resident memory, set "
+        "resource_limits.max_memory_mb instead.",
+        file=sys.stderr,
+    )
+
+
+#: The dotted key whose names the gateway shares only once their launch is approved.
+_SHARE_LIST_KEY = "mcp_gateway.stub_servers"
+
+
+def _warn_unapproved_share_names(key: str, parsed: object) -> None:
+    """Name each server written to the share list whose launch nobody approved.
+
+    The share list names servers, but what a shared server runs is approved by
+    content in MCP Management. The next gateway start refuses a listed server
+    with no approved launch, and only the dashboard says so; the ``✅`` line
+    alone reads as if sharing were on. The write itself still succeeded, so
+    this is advice, not a refusal.
+    """
+    if key != _SHARE_LIST_KEY or not isinstance(parsed, list):
+        return
+    from kiro_crew.mcp_gateway.launch_approval import unapproved_share_names
+
+    for name in unapproved_share_names(parsed):
+        print(
+            f"⚠️  {name} has no approved launch, so the gateway will not share it until "
+            "you approve it in MCP Servers.",
             file=sys.stderr,
         )
 
@@ -215,7 +345,18 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
         if encoded is not None and file_path:
             print("❌ --value-base64 cannot be combined with --file", file=sys.stderr)
             sys.exit(1)
+        if file_path and args.key is not None:
+            # ``--file`` replaces the whole document, so a positional key/value
+            # alongside it has nothing well-defined to apply to. Keep the
+            # ``--file`` write (the behaviour today) and say the key/value was
+            # ignored, rather than silently dropping it.
+            print(
+                f"⚠️  ignoring the key/value ({args.key}) given with --file: "
+                "--file replaces the whole document",
+                file=sys.stderr,
+            )
         if file_path:
+            use_local = getattr(args, "local", False)
             fp = Path(file_path).expanduser().resolve()
 
             try:
@@ -237,18 +378,63 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
                 )
                 sys.exit(1)
 
+            local_warnings: list[str] = []
+
             def _mutate_from_file(cur: dict) -> dict:
-                _refuse_missing_workspace_dirs(data, cur)
+                local_warnings.clear()
+                # Every new or changed workspace dir must exist, as on a base write.
+                # The overlay wins over config.json, so for ``--local`` an entry is
+                # "unchanged" against what is in force now: the base with this
+                # overlay over it. An overlay entry with no ``dir`` keeps the base dir.
+                if not use_local:
+                    _refuse_missing_workspace_dirs(data, cur)
+                else:
+                    try:
+                        base = json.loads(read_endorsed_config_text(config_path()))
+                    except (OSError, ValueError):
+                        base = {}
+                    if not isinstance(base, dict):
+                        base = {}
+                    base_ws = base.get("workspaces")
+                    over_ws = cur.get("workspaces")
+                    current = {
+                        "workspaces": {
+                            **(base_ws if isinstance(base_ws, dict) else {}),
+                            **(over_ws if isinstance(over_ws, dict) else {}),
+                        }
+                    }
+                    # Per workspace: an entry the base already binds to this dir
+                    # passes the base-only check, so save it and warn rather than refuse.
+                    workspaces = data.get("workspaces")
+                    entries = workspaces.items() if isinstance(workspaces, dict) else ()
+                    for name, entry in entries:
+                        one = {"workspaces": {name: entry}}
+                        try:
+                            _refuse_missing_workspace_dirs(one, current)
+                        except ConfigWriteRefused as e:
+                            _refuse_missing_workspace_dirs(one, base)
+                            local_warnings.append(str(e))
                 for key, value in data.items():
                     _ack_explicit_config_write(key, value)
                 return data
 
+            # ``--local`` writes the overlay (config.local.json), whose values win
+            # over config.json, instead of replacing the base. The overlay is a
+            # partial document and is not meta-stamped, the same as the keyed
+            # ``config set --local`` path above.
+            target = config_local_path() if use_local else config_path()
             try:
                 update_config_locked(
-                    config_path(),
+                    target,
                     mutate=_mutate_from_file,
                     on_corrupt="reset",
+                    stamp_meta=not use_local,
                 )
+            except ConfigReadError as e:
+                # The file cannot be read, so its bytes cannot be kept before the
+                # reset replaces them: nothing was written.
+                print(f"Error: {fp}: {e}", file=sys.stderr)
+                sys.exit(1)
             except ConfigWriteRefused as e:
                 # Third writer behind the publish floor, same report as the keyed
                 # paths: nothing was written. The message names an env-var key
@@ -258,12 +444,21 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
                 sys.exit(1)
             sel().log_api_access(
                 caller="cli",
-                operation="config_set_file",
+                operation="config_set_local_file" if use_local else "config_set_file",
                 outcome="allowed",
                 source="cli",
                 resources=str(fp),
             )
-            print(f"✅ Config loaded from {file_path}")
+            dest = "config.local.json" if use_local else file_path
+            if use_local:
+                print(f"✅ Overlay loaded from {file_path} (saved to {dest})")
+                for warning in local_warnings:
+                    print(f"⚠  {warning}", file=sys.stderr)
+            else:
+                print(f"✅ Config loaded from {file_path}")
+            gateway_section = data.get("mcp_gateway")
+            if isinstance(gateway_section, dict):
+                _warn_unapproved_share_names(_SHARE_LIST_KEY, gateway_section.get("stub_servers"))
         else:
             key = args.key
             value = args.value
@@ -389,6 +584,10 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
             # looks like a pinned setting and silently does nothing
             # (kirodotdev/KiroCrew#9909: `config set --local memory.enabled false`).
             _refuse_unknown_key(key, parsed, overlay=use_local)
+            model_error = _extraction_model_error(key, parsed)
+            if model_error:
+                print(f"❌ {key}: {model_error}", file=sys.stderr)
+                sys.exit(1)
             if use_local:
                 p = config_local_path()
 
@@ -415,6 +614,11 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
                     update_config_locked(
                         p, mutate=_mutate_local_overlay, stamp_meta=False, on_corrupt="reset"
                     )
+                except ConfigReadError as e:
+                    # The overlay cannot be read, so its bytes cannot be kept before
+                    # the reset replaces them: nothing was written.
+                    print(f"Error: {key}: {e}", file=sys.stderr)
+                    sys.exit(1)
                 except ConfigWriteRefused as e:
                     # The publish floor refused the document before writing it; the
                     # message names the offending env-var key and never its value.
@@ -432,6 +636,9 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
                 if dropped:
                     _print_dropped_overlay_keys(key, dropped)
                 _warn_if_bot_name_altered(key, parsed)
+                _warn_if_address_space_capped(key, parsed)
+                _warn_unapproved_share_names(key, parsed)
+                _warn_if_not_finite(key, parsed)
             else:
 
                 def _mutate_base(existing: dict) -> dict:
@@ -466,7 +673,17 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
                     resources=f"{key}={json.dumps(parsed)}",
                 )
                 print(f"✅ {key} = {json.dumps(parsed)}")
-                _warn_if_bot_name_altered(key, parsed)
+                shadowed = _overlay_shadowing_keys(_written_leaf_paths(key, parsed))
+                if shadowed:
+                    _print_overlay_shadowed_keys(sorted({_addressable_key(s) for s in shadowed}))
+                bot_name = ("agent", "bot_name")
+                if not any(bot_name[: len(s)] == s for s in shadowed):
+                    # A shadowed name never loads, so its sanitized spelling
+                    # would name a value that does not apply either.
+                    _warn_if_bot_name_altered(key, parsed)
+                _warn_if_address_space_capped(key, parsed)
+                _warn_unapproved_share_names(key, parsed)
+                _warn_if_not_finite(key, parsed)
     elif action == "edit":
 
         p = config_path()
@@ -481,13 +698,121 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
             source="cli",
             resources=str(p),
         )
-        editor = os.environ.get("EDITOR", "vi")
-        os.execvp(editor, [editor, str(p)])
+        _edit_config_endorsed(os.environ.get("EDITOR", "vi"))
     elif action == "defaults":
         _defaults_cmd(args)
+    elif action == "pending":
+        from kiro_crew.cli_config_pending import pending_cmd
+
+        pending_cmd(args)
     else:
-        print("Usage: kirocrew config {get,set,edit,defaults}", file=sys.stderr)
+        print("Usage: kirocrew config {get,set,edit,defaults,pending}", file=sys.stderr)
         sys.exit(1)
+
+
+def _run_editor(editor: str, path: Path) -> int:
+    """Run *editor* on *path*, wait for it, and return its exit status.
+
+    Ctrl-C is the editor's to handle, but the terminal also sends it to this process
+    while the editor runs a shell command, so SIGINT is ignored here until it exits.
+    """
+    with subprocess.Popen([editor, str(path)]) as proc:
+        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            return proc.wait()
+        finally:
+            signal.signal(signal.SIGINT, previous)
+
+
+def _edit_config_endorsed(editor: str) -> None:
+    """Edit a copy of ``config.json`` in *editor* and publish it as Kiro Crew's own write.
+
+    The copy is staged inside the sealed ``config-provenance`` directory, which no
+    sandboxed process can write, so what is published is what the editor saved.
+    Publishing goes through ``update_config_locked``, which endorses the bytes it
+    writes, so the edit takes effect at once instead of waiting as an outside change.
+    """
+    loosening_provenance.refuse_save_if_pending(loosening_provenance.LEAF_CONFIG)
+    try:
+        # As the loader reads it, so bytes swapped onto the file are never what is edited.
+        original_text = read_endorsed_config_text(config_path())
+    except UnicodeDecodeError as e:
+        print(
+            f"❌ {config_path()} is not UTF-8 text, so it cannot be edited here: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    original = original_text.encode("utf-8")
+    # A corrupt original (the repair path) counts as empty: every edited value is new.
+    try:
+        original_raw: object = json.loads(strip_utf8_bom(original_text))
+    except json.JSONDecodeError:
+        original_raw = {}
+    original_doc: dict = original_raw if isinstance(original_raw, dict) else {}
+    parent = config_dir() / loosening_provenance.RECORD_DIR_LEAF
+    parent.mkdir(mode=0o700, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix="edit-", dir=parent))
+    staged = staging / "config.json"
+    keep = False
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        fd = os.open(staged, flags, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(original)
+        status = _run_editor(editor, staged)
+        edited = staged.read_bytes()
+        keep = edited != original
+        kept = f"; the edited copy is kept at {staged}" if keep else ""
+        if status != 0:
+            print(
+                f"❌ The editor exited with status {status}; nothing was written{kept}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not keep:
+            # A GUI launcher (EDITOR=code) returns at once, before anything is saved.
+            print(
+                "No changes to config.json, so nothing was written. If you did save a "
+                "change, the editor returned before you saved it: set EDITOR to an "
+                "editor that waits until the file is closed."
+            )
+            return
+        try:
+            data = json.loads(strip_utf8_bom(edited.decode("utf-8")))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            print(f"❌ Invalid JSON: {e}{kept}", file=sys.stderr)
+            sys.exit(1)
+        if not isinstance(data, dict):
+            print(
+                f"❌ Not a config object: the edit holds a JSON "
+                f"{type(data).__name__}, expected an object{kept}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        def _mutate(_cur: dict) -> dict:
+            try:
+                current: str | None = read_endorsed_config_text(config_path())
+            except (FileNotFoundError, UnicodeDecodeError):
+                current = None
+            if current != original_text:
+                raise ConfigWriteRefused(
+                    "config.json changed while the editor was open, so this edit was not saved"
+                )
+            # Under the lock and before the write, so the next load keeps the choice.
+            _ack_edited_values("", original_doc, data)
+            return data
+
+        try:
+            update_config_locked(config_path(), mutate=_mutate, on_corrupt="reset")
+        except (ConfigReadError, ConfigWriteRefused) as e:
+            print(f"❌ {e}{kept}", file=sys.stderr)
+            sys.exit(1)
+        keep = False
+        print(f"✅ Saved {config_path()}")
+    finally:
+        if not keep:
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 def _defaults_cmd(args: argparse.Namespace) -> None:
@@ -577,7 +902,8 @@ def _defaults_cmd(args: argparse.Namespace) -> None:
         for centry, stored in coerced:
             print(
                 f"⚠️  {centry.dotted_key} ({stored!r}) cannot be kept — "
-                f"the loader replaces it. Use --adopt to drop it."
+                f"the loader replaces it. Use --adopt to drop it.",
+                file=sys.stderr if wanted else sys.stdout,
             )
         coerced = []
         if not drifted:
@@ -640,6 +966,9 @@ def _defaults_cmd(args: argparse.Namespace) -> None:
         except ConfigReadError as e:
             print(f"❌ Cannot edit a corrupt config.json: {e}", file=sys.stderr)
             sys.exit(1)
+        except ConfigWriteRefused as e:
+            print(f"❌ {e}", file=sys.stderr)
+            sys.exit(1)
         except OSError as e:
             # A read-only or full data home, or a refused link: report it and stop,
             # rather than letting the CLI die on a traceback.
@@ -697,6 +1026,9 @@ def _defaults_cmd(args: argparse.Namespace) -> None:
         except ConfigReadError as e:
             print(f"❌ Cannot read a corrupt config.json: {e}", file=sys.stderr)
             sys.exit(1)
+        except ConfigWriteRefused as e:
+            print(f"❌ {e}", file=sys.stderr)
+            sys.exit(1)
         except OSError as e:
             print(f"❌ Could not record acknowledgments: {e}", file=sys.stderr)
             sys.exit(1)
@@ -753,22 +1085,101 @@ def _overlay_keys(dotted_keys: list[str]) -> set[str]:
     carrying nothing: a wrong claim is worse than a missing note either way, and
     every other surface already tolerates a broken overlay.
     """
-    p = config_local_path()
-    if not p.is_file():
-        return set()
-    try:
-        raw = json.loads(read_config_text(p))
-    except (OSError, ValueError):
-        # ValueError covers malformed JSON and invalid UTF-8 alike; either way the
-        # overlay is treated as carrying nothing.
-        return set()
-    if not isinstance(raw, dict):
-        return set()
+    raw = _read_overlay()
     found = set()
     for dotted in dotted_keys:
         if _dict_get(raw, dotted) is not _MISSING:
             found.add(dotted)
     return found
+
+
+def _read_overlay() -> dict:
+    """Return ``config.local.json`` as a dict, or ``{}`` when absent or unreadable."""
+    # Read as the loader reads it, so a pending hand edit the sandbox has not
+    # endorsed (or a deleted file with an endorsed copy) answers like the load.
+    try:
+        raw = json.loads(read_endorsed_config_text(config_local_path()))
+    except (OSError, ValueError):
+        # ValueError covers malformed JSON and invalid UTF-8 alike; either way the
+        # overlay is treated as carrying nothing.
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _overlay_shadowing_keys(leaf_paths: list[tuple[str, ...]]) -> set[tuple[str, ...]]:
+    """Return the overlay key paths that decide any of *leaf_paths* at load.
+
+    The loader deep-merges ``config.local.json`` over ``config.json``: objects
+    merge, any other overlay value replaces the base value whole. So a written
+    leaf is decided by the overlay when the overlay holds a value at that leaf,
+    or a non-object value at one of its ancestors (reported as that ancestor).
+    Paths are segment tuples, so a mapping key holding a literal dot (a model
+    id such as ``custom.v1``) stays one segment. Reads only; an unreadable
+    overlay carries nothing, as in ``_overlay_keys``.
+    """
+    raw = _read_overlay()
+    found = set()
+    for parts in leaf_paths:
+        cur: object = raw
+        for i, part in enumerate(parts):
+            if not isinstance(cur, dict) or part not in cur:
+                break
+            cur = cur[part]
+            if i == len(parts) - 1 or not isinstance(cur, dict):
+                found.add(parts[: i + 1])
+                break
+    return found
+
+
+def _written_leaf_paths(key: str, value: object) -> list[tuple[str, ...]]:
+    """Return the leaf key paths a ``config set <key> <value>`` writes.
+
+    A scalar or list writes *key* itself; an object writes each of its leaves,
+    so an overlay key the object does not mention is not reported as shadowed.
+    """
+    out: list[tuple[str, ...]] = []
+
+    def walk(path: tuple[str, ...], v: object) -> None:
+        if not isinstance(v, dict) or not v:
+            out.append(path)
+            return
+        for child, child_value in v.items():
+            walk(path + (str(child),), child_value)
+
+    walk(tuple(key.split(".")), value)
+    return out
+
+
+def _addressable_key(path: tuple[str, ...]) -> str:
+    """Spell *path* as a dotted key ``config get``/``config set`` can address.
+
+    A segment holding a literal dot cannot be spelled in a dotted key, so the
+    key stops at the parent that holds it.
+    """
+    kept: list[str] = []
+    for part in path:
+        if "." in part:
+            break
+        kept.append(part)
+    return ".".join(kept)
+
+
+def _print_overlay_shadowed_keys(keys: list[str]) -> None:
+    """Say that ``config.local.json`` still decides keys a base write just stored.
+
+    The overlay deep-merges over ``config.json`` at load, so the value written
+    there does not apply while the overlay sets the key. Advice on stderr, not a
+    refusal: the write succeeded and takes effect once the overlay drops the key.
+    The overlay's value is not printed; ``config get`` shows what loads.
+    """
+    for key in keys:
+        print(
+            f"⚠️  {key} is also set in config.local.json, which overrides config.json, "
+            "so the value just saved does not apply until that key is removed there. "
+            f"`kirocrew config get {key}` shows the value that loads; "
+            f"`kirocrew config set --local {key} <value>` changes it.",
+            file=sys.stderr,
+        )
 
 
 def _dict_get(d: dict, key: str) -> object:
@@ -1059,6 +1470,32 @@ def _declared_type_error(entry: ConfigEntry, value: object) -> str | None:
         return f"expected {entry.type}, got boolean"
     if not isinstance(value, expected):
         return f"expected {entry.type}, got {type(value).__name__}"
+    return None
+
+
+def _extraction_model_error(key: str, value: object) -> str | None:
+    """Why Settings would refuse this write of ``knowledge.extraction_model``, or None.
+
+    The installer copies that id into the knowledge agent's spec as written, so
+    ``config set`` holds it to the Settings PATCH spec's length bound and pattern,
+    whether it is set by its dotted key or inside a ``knowledge`` object
+    (kirodotdev/KiroCrew#30336). The other model pins keep taking any id: one no
+    catalog claims, such as a regional Bedrock profile, reaches the wire unchanged.
+    """
+    if key == "knowledge" and isinstance(value, dict):
+        value = value.get("extraction_model")
+    elif key != "knowledge.extraction_model":
+        return None
+    if not isinstance(value, str):
+        return None
+    # Deferred: it loads the whole dashboard handlers package, which only this key pays for.
+    from kiro_crew.dashboard.handlers.core import _EDITABLE_CONFIG
+
+    spec = _EDITABLE_CONFIG["knowledge.extraction_model"]
+    if len(value) > spec["max_len"]:
+        return f"must be at most {spec['max_len']} characters"
+    if not re.fullmatch(spec["pattern"], value):
+        return f"{value!r} is not a model id Settings accepts (a bare id, or provider/model)"
     return None
 
 

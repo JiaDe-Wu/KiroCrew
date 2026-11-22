@@ -3,7 +3,7 @@
 :func:`validate_import_zip` reads the archive's inventory and its one manifest under the
 member, size and name limits; the staged cron store is vetted again and published
 (:func:`_sanitize_imported_crons`); and host-local state is stripped from the staged
-memory stores (:func:`_strip_host_local_store_state`).
+archive (:func:`_strip_host_local_store_state`).
 """
 
 from __future__ import annotations
@@ -17,17 +17,20 @@ from pathlib import Path, PurePosixPath
 from kiro_crew import pinned_fs, platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.mcp_cron import _log_cron_denial, _vet_shell_command
-from kiro_crew.memory_stores import MEMORY_STORES_DIR_NAME, is_host_local_store_state
 from kiro_crew.portability_archive import (
     _MAX_IMPORT_MEMBERS,
-    _MAX_IMPORT_UNCOMPRESSED,
     _MAX_SETTINGS_DOCUMENT_BYTES,
     MEMORY_EXPORT_MANIFEST_VERSION,
     _is_link_entry,
     _unsafe_member_name,
+    import_size_problem,
     manifest_is_memory_only,
 )
-from kiro_crew.snapshot import EXPORT_MANIFEST_VERSION
+from kiro_crew.snapshot import (
+    EXPORT_MANIFEST_VERSION,
+    _is_host_local,
+    _may_hold_host_local,
+)
 from kiro_crew.zip_vet import ZipInventoryRejected, vet_zip_inventory
 
 
@@ -86,7 +89,8 @@ def validate_import_zip(zip_path: Path) -> tuple[bool, str, dict]:
                 if _unsafe_member_name(name):
                     return False, f"Rejected path traversal: {name}", {}
 
-            # Zip-bomb guard: bound entry count and total uncompressed size.
+            # Zip-bomb guard: bound entry count, each member's size, and the total
+            # against the ceiling, the compression ratio and the free disk space.
             infos = zf.infolist()
             if len(infos) > _MAX_IMPORT_MEMBERS:
                 return (
@@ -94,16 +98,9 @@ def validate_import_zip(zip_path: Path) -> tuple[bool, str, dict]:
                     f"Rejected: archive has too many entries ({len(infos)} > {_MAX_IMPORT_MEMBERS})",
                     {},
                 )
-            total_uncompressed = sum(i.file_size for i in infos)
-            if total_uncompressed > _MAX_IMPORT_UNCOMPRESSED:
-                return (
-                    False,
-                    (
-                        f"Rejected: uncompressed size {total_uncompressed} exceeds cap "
-                        f"{_MAX_IMPORT_UNCOMPRESSED} (possible zip bomb)"
-                    ),
-                    {},
-                )
+            size_problem = import_size_problem(infos, os.path.getsize(zip_path))
+            if size_problem is not None:
+                return False, size_problem, {}
 
             # Link members can redirect a later write outside the extraction root
             # even when every name passes the traversal check above.
@@ -188,10 +185,10 @@ def _sanitize_imported_crons(
     Three rules, each closing a different way an archive can act on the host:
 
     1. A job that is not an object, or whose ``schedule`` is not one, is DROPPED.
-       ``CronService._load`` skips such a record with a warning and it is then
-       silently dropped from the store on the next write — dead weight with an
-       invisible deadline. Dropping it at import, with the drop REPORTED to the
-       user, is the honest version of the same outcome.
+       ``CronService._load`` skips such a record with a warning on every load and
+       the store keeps it, never running — dead weight only the log mentions.
+       Dropping it at import, with the drop REPORTED to the user, keeps an
+       archive from planting one.
 
     2. A ``command`` is vetted with ``mcp_cron._vet_shell_command``, so it is
        judged exactly as the same command would be at ``cron_add`` (deny-list,
@@ -235,6 +232,16 @@ def _sanitize_imported_crons(
 
 
 def _read_staged_cron_store(crons_path: Path, dir_fd: int | None) -> str | None:
+    """:func:`_read_staged_store_bytes` decoded as UTF-8; ``None`` when it is not UTF-8."""
+    data = _read_staged_store_bytes(crons_path, dir_fd)
+    try:
+        # UTF-8, never the locale codepage: see _sanitize_imported_crons.
+        return None if data is None else data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _read_staged_store_bytes(crons_path: Path, dir_fd: int | None) -> bytes | None:
     """Open the staged store once, judge the descriptor, and read through it.
 
     Returns ``None`` when the name holds something that is not one regular file
@@ -268,9 +275,8 @@ def _read_staged_cron_store(crons_path: Path, dir_fd: int | None) -> str | None:
         try:
             while chunk := os.read(fd, 1024 * 1024):
                 chunks.append(chunk)
-            # UTF-8, never the locale codepage: see _sanitize_imported_crons.
-            return b"".join(chunks).decode("utf-8")
-        except (OSError, UnicodeDecodeError):
+            return b"".join(chunks)
+        except OSError:
             return None
     finally:
         os.close(fd)
@@ -325,9 +331,9 @@ def _sanitize_cron_text(
         # Rule 1: a shape unfit for the store must not survive the import. This
         # predicate is deliberately STRICTER than the loader's (it also demands
         # str-typed id/name/message, which `_job_from_record` would accept
-        # untyped): the loader skips a bad record with a warning and the next
-        # write drops it for good, so importing anything questionable only
-        # manufactures dead weight with an invisible deadline. Dropping it here,
+        # untyped): the loader skips a bad record with a warning on every load
+        # and the store keeps it unrun, so importing anything questionable
+        # manufactures dead weight that only the log mentions. Dropping it here,
         # reported in the import summary, tells the user it happened.
         if not drop_malformed and not isinstance(job, dict):
             kept.append(job)
@@ -365,6 +371,7 @@ def _sanitize_cron_text(
         # Rule 3: anything that EXECUTES arrives paused, awaiting a human.
         if (command or script) and not job.get("user_paused", False):
             job["user_paused"] = True
+            job["user_pause_requested"] = True
             job["enabled"] = False
             changed = True
             paused.append(_name_of(job))
@@ -403,17 +410,16 @@ def _disable_imported_script_hooks(hooks_path: Path) -> list[str]:
                 os.path.realpath(hooks_path.parent), what="imported hook store", refusal=OSError
             )
         try:
-            text = _read_staged_cron_store(hooks_path, dir_fd)
+            raw = _read_staged_store_bytes(hooks_path, dir_fd)
         except (FileNotFoundError, IsADirectoryError):
             return []
-        if text is None:
+        if raw is None:
             return []
-        # Parse exactly as the hook store does (one leading UTF-8 mark dropped):
-        # a file the store loads must never be one this sanitizer reads as inert.
-        from kiro_crew.user_json import loads_user_json
-
+        # Parse exactly as the hook store does (the bytes, so UTF-8 with or without
+        # a mark, UTF-16 and UTF-32): a file the store loads must never be one this
+        # sanitizer reads as inert.
         try:
-            data = loads_user_json(text)
+            data = json.loads(raw)
         except (ValueError, RecursionError):
             return []
         if not isinstance(data, dict) or not isinstance(data.get("hooks"), list):
@@ -443,14 +449,18 @@ def _disable_imported_script_hooks(hooks_path: Path) -> list[str]:
 
 
 def _strip_host_local_store_state(snap: Path) -> None:
-    """Remove from the extracted archive what no export ever writes under ``memory_stores/``.
+    """Remove from the extracted archive every path no bundle carries (`_is_host_local`).
 
-    The export's own filter (`_keep_store_for_export`) keeps these out on the way out; this
-    is the same predicate applied on the way in, so an import is not the one direction in
-    which a hand-built archive can plant them. Pruned at the first matching component, so a
-    whole ``.execution-logs/`` or ``<store>/backups/`` goes as one removal.
+    That is ``memory_stores/``'s host-local half, ``crew-teams/.lock`` and the legacy
+    activity files in ``members/<slug>/``. The export and staging filters keep these out
+    on the way out; this is the same predicate applied on the way in, ON DISK, so neither
+    an import nor a restore is a direction in which a hand-built archive can plant them,
+    whatever spelling of an entry name the filesystem resolved to one of them. Pruned at
+    the first matching component, so a whole ``.execution-logs/`` or ``<store>/backups/``
+    goes as one removal, and descended only where a match is possible
+    (`_may_hold_host_local`), so a large working tree is not walked.
 
-    An absent or non-directory ``memory_stores`` is a no-op, answered by the pin chain
+    A tree that is absent or not a real directory is a no-op, answered by the pin chain
     below rather than by a by-name ``is_dir()`` probe ahead of it -- that probe would be
     the screen-then-act shape this traversal exists to remove.
     """
@@ -499,7 +509,7 @@ def _strip_host_local_store_state(snap: Path) -> None:
     def _strip(pinned: platform_compat.PinnedDirectory, rel: tuple[str, ...]) -> None:
         for name in sorted(pinned.names()):
             here = (*rel, name)
-            matched = is_host_local_store_state((MEMORY_STORES_DIR_NAME, *here))
+            matched = _is_host_local(here)
             if pinned.is_link(name) or not pinned.is_dir(name):
                 if matched:
                     pinned.unlink(name)
@@ -507,6 +517,8 @@ def _strip_host_local_store_state(snap: Path) -> None:
             if matched:
                 # Removed whole, so its contents are never judged individually.
                 _remove_dir(pinned, name)
+                continue
+            if not _may_hold_host_local(here):
                 continue
             sub = pinned.child_if_real_dir(name)
             if sub is None:
@@ -524,8 +536,4 @@ def _strip_host_local_store_state(snap: Path) -> None:
             # and following it is the harm.
             return
         with snap_pin:
-            stores_pin = snap_pin.child_if_real_dir(MEMORY_STORES_DIR_NAME)
-            if stores_pin is None:
-                return
-            with stores_pin:
-                _strip(stores_pin, ())
+            _strip(snap_pin, ())

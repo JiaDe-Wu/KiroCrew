@@ -266,7 +266,9 @@ def test_a_bundled_skill_must_pair_with_its_folder_and_its_skill_md():
 
 
 def test_a_carried_file_with_a_credential_is_refused():
-    token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
+    from kiro_crew.testing.synthetic_credentials import github_classic
+
+    token = github_classic(seed=411)  # the GitHub row checks the CRC32 checksum
     data = _zip({**_carrying(), "crons/run.py": f"TOKEN = '{token}'\n"})
     assert _refused(data) == "invalid_text"
 
@@ -657,13 +659,15 @@ def test_only_the_owner_can_import(world, monkeypatch, tmp_path, auth):
         (_zip(_bundle(agent_DOT_json={"allowedTools": ["*"]})), ZIP, "grant_in_bundle"),
         (_zip(_bundle()), {"Content-Type": "text/plain"}, "invalid_content_type"),
         (_zip(_bundle()), {"Content-Type": "application/octet-stream"}, "invalid_content_type"),
-        (b"x" * (crewmate_bundle.FILE_MAX_BYTES + 1), ZIP, "too_large"),
+        # Built in the test: a parametrize literal is held by every worker all run.
+        (lambda: b"x" * (crewmate_bundle.FILE_MAX_BYTES + 1), ZIP, "too_large"),
     ],
     ids=["grant", "text-plain", "octet-stream", "over-8-mib"],
 )
 def test_a_refused_file_raises_no_card_and_keeps_nothing(
     world, monkeypatch, tmp_path, data, headers, code
 ):
+    data = data() if callable(data) else data
     store, writes = CardStore(tmp_path / "c.json"), _Writes()
 
     async def go(c, app):
@@ -1037,6 +1041,77 @@ def test_skills_land_under_the_workspace_and_a_linked_skills_folder_is_refused(t
     assert exc.value.code == "workspace_link"
     with pytest.raises(files_route._Refused):
         files_route._skills_root(cfg, SimpleNamespace(workspace="nope"))
+
+
+def _on_windows_paths(monkeypatch, real: dict[str, str], fn, *args):
+    """``fn(*args)`` under Windows path rules: its value, its refusal, or its error.
+
+    ``realpath`` answers *real*'s spelling of a path, and ``commonpath`` over those
+    spellings is ``ntpath``'s, which raises ``ValueError`` for two drives, as on
+    Windows. Both patch the one shared ``os.path``, so they forward every other call
+    and end before this returns.
+    """
+    import ntpath
+
+    # Bound before the patch: on Windows ``os.path`` IS ``ntpath``, so a lookup at
+    # call time would find the patched function and recurse.
+    resolve, common, nt_common = os.path.realpath, os.path.commonpath, ntpath.commonpath
+
+    def windows_commonpath(paths):
+        paths = list(paths)
+        owned = all(p in real.values() for p in paths)
+        return (nt_common if owned else common)(paths)
+
+    with monkeypatch.context() as m:
+        m.setattr(files_route.os.path, "commonpath", windows_commonpath)
+        m.setattr(
+            files_route.os.path,
+            "realpath",
+            lambda p, *a, **kw: real.get(os.fspath(p)) or resolve(p, *a, **kw),
+        )
+        try:
+            return fn(*args)
+        except files_route._Refused as exc:
+            return exc.status, exc.code
+        except ValueError as exc:
+            return repr(exc)
+
+
+@pytest.mark.parametrize(
+    "outside", ["C:\\elsewhere\\skills", "D:\\elsewhere\\skills"], ids=["same-drive", "other-drive"]
+)
+def test_a_skills_folder_resolving_outside_the_workspace_is_refused_on_any_drive(
+    tmp_path, monkeypatch, outside
+):
+    """A skills folder on another drive is outside the workspace: a 409, never a raise."""
+    from kiro_crew.config.loader import WorkspaceConfig
+
+    ws = tmp_path / "member-ws"
+    ws.mkdir()
+    cfg = SimpleNamespace(workspaces={"mine": WorkspaceConfig(dir=str(ws))})
+    agent = SimpleNamespace(workspace="mine")
+    root = ws / ".kiro" / "skills"
+    real = {str(ws): "C:\\ws", str(root): "C:\\ws\\.kiro\\skills"}
+    assert _on_windows_paths(monkeypatch, real, files_route._skills_root, cfg, agent) == root
+    real[str(root)] = outside
+    outcome = _on_windows_paths(monkeypatch, real, files_route._skills_root, cfg, agent)
+    assert outcome == (409, "workspace_link")
+
+
+@pytest.mark.parametrize(
+    "outside", ["C:\\elsewhere\\mate", "D:\\elsewhere\\mate"], ids=["same-drive", "other-drive"]
+)
+def test_a_script_folder_resolving_outside_crons_is_refused_on_any_drive(monkeypatch, outside):
+    """The same for ``crons/imported/<slug>``, refused as ``scripts_dir_link``."""
+    from kiro_crew.config.paths import config_dir
+
+    crons = config_dir() / "crons"
+    target = crons / files_route.IMPORTED_SCRIPTS_DIR / "mate"
+    real = {str(crons): "C:\\home\\crons", str(target): "C:\\home\\crons\\imported\\mate"}
+    assert _on_windows_paths(monkeypatch, real, files_route._scripts_dir, "mate") == target
+    real[str(target)] = outside
+    outcome = _on_windows_paths(monkeypatch, real, files_route._scripts_dir, "mate")
+    assert outcome == (409, "scripts_dir_link")
 
 
 def test_the_picture_commits_through_the_editor_avatar_path(monkeypatch):
@@ -1445,3 +1520,75 @@ def test_an_upload_waits_for_the_start_up_sweep_before_it_stages(world, monkeypa
 
     sha = _go(world, store, writes, monkeypatch, tmp_path, go)
     assert crewmate_stage.load(sha)
+
+
+def _pin_bot_share(monkeypatch, denied: bool) -> None:
+    """Install (or lift) a boot-frozen ceiling that pins ``capabilities.bot_share`` off."""
+    from kiro_crew.platform import context as pc
+    from kiro_crew.platform.governance import parse_policy
+
+    doc = {
+        "version": 1,
+        "boot": {"fail_closed": True},
+        "capabilities": {"bot_share": {"enabled": False}},
+    }
+    ceiling = parse_policy(doc) if denied else None
+
+    class _Ctx:
+        governance = ceiling
+
+    monkeypatch.setattr(pc, "current_context", lambda: _Ctx())
+
+
+def test_a_card_raised_before_a_policy_landed_cannot_be_pressed_under_it(
+    world, monkeypatch, tmp_path
+):
+    """The ceiling is read at boot and a card lives a day: the press asks the gate again."""
+    store, writes = CardStore(tmp_path / "c.json"), _Writes()
+    _pin_bot_share(monkeypatch, denied=False)
+
+    async def go(c, app):
+        card_id = await _raise(c)
+        _pin_bot_share(monkeypatch, denied=True)
+        refused = await _press(c, store, card_id)
+        still_pending = store.get(card_id)["status"], dict(writes.crews)
+        _pin_bot_share(monkeypatch, denied=False)
+        allowed = await _press(c, store, card_id)
+        return card_id, refused, still_pending, allowed
+
+    card_id, refused, still_pending, allowed = _go(world, store, writes, monkeypatch, tmp_path, go)
+
+    assert refused == [403]
+    # Refused before the step was admitted: nothing was created and the card is unused.
+    assert still_pending == ("pending", {})
+    assert all(s < 300 for s in allowed), allowed
+    assert store.get(card_id)["status"] == "applied"
+
+
+def test_a_denied_fleet_can_still_undo_an_import_that_was_already_applied(
+    world, monkeypatch, tmp_path
+):
+    store, writes = CardStore(tmp_path / "c.json"), _Writes()
+    _pin_bot_share(monkeypatch, denied=False)
+
+    async def go(c, app):
+        card_id = await _raise(c)
+        assert all(s < 300 for s in await _press(c, store, card_id))
+        _pin_bot_share(monkeypatch, denied=True)
+        return await _press(c, store, card_id, op="undo")
+
+    undone = _go(world, store, writes, monkeypatch, tmp_path, go)
+
+    # Leaving is never what the policy withdraws.
+    assert undone and all(s < 300 for s in undone), undone
+
+
+def test_an_app_cannot_raise_an_import_card_on_a_denied_fleet(monkeypatch):
+    from kiro_crew.apps.crewmate_sdk import CrewmateProposalError, CrewmateSDK
+
+    _pin_bot_share(monkeypatch, denied=True)
+
+    with pytest.raises(CrewmateProposalError) as refused:
+        asyncio.run(CrewmateSDK("some-app", None).propose({}))
+
+    assert refused.value.code == "governance_denied"

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import re
 from datetime import datetime
 
 import pytest
@@ -95,7 +96,7 @@ EXPECTED_SITES = {
     # sample SEPARATELY (keyed on the effective session_key so a linked-channel
     # turn is attributed to its channel surface, and surviving the
     # usage_has_billing gate), and the abnormal-end seam emits NOTHING —
-    # abnormal-turn sampling is out of this change's scope, and letting its
+    # abnormal-turn sampling is out of this test's scope, and letting its
     # persist emit (default True) would mis-file a linked-channel turn under the
     # slot's `dashboard` key.
     "dashboard/handlers/hooks.py": 1,
@@ -177,6 +178,7 @@ def test_chat_runner_no_longer_builds_the_dead_stats_object():
 
     It also fed ``inc_duration_ms(usage.duration_ms)`` — the same structurally
     zero field — so it was doubly dead. Guard against it being reintroduced.
+    The live ``Stats().inc_message_admitted()`` in ``turn_entry`` is not that block.
     """
     runner = SRC / "dashboard" / "chat_runner.py"
     src = "\n".join(
@@ -185,4 +187,5 @@ def test_chat_runner_no_longer_builds_the_dead_stats_object():
         if turn_file.name != "__init__.py"
     )
     assert "stats = Stats()" not in src
-    assert "from kiro_crew.stats import Stats" not in src
+    # The one ``Stats()`` left is that live counter.
+    assert re.findall(r"\bStats\(\)[.\w]*", src) == ["Stats().inc_message_admitted"]

@@ -3,11 +3,12 @@ import { useNavigate } from 'react-router-dom'
 import { useAppDispatch, useAppStore } from '../store'
 import { switchSlot, deleteSlot, openActivityToTab, resumeFromHistory, setAgentSwitchNotice } from '../store/chatSlice'
 import { closeConfirmPrompt } from '../lib/closeConfirmPrompt'
+import { cachedViewerIds } from './sharedCrew/cachedViewer'
 import { askAppConfirm } from '../lib/appConfirm'
 import { forgetClosedSessionRef, hasRecentlyClosedSession, isClosedSessionOpenIn, rememberClosedSession, restoreClosedSession, takeRecentlyClosedSession, trackClosedSessionClose, waitForClosedSession } from '../lib/recentlyClosedSessions'
 import type { ClosedSessionRef } from '../lib/recentlyClosedSessions'
 import { loadChatConfig } from '../pages/chat/ChatSettings'
-import { focusComposerElement, focusComposerForResumedSession, queryComposerOrExpand, queryPendingApprovalAction, releaseComposerForKeyboardSwitch } from '../pages/chat/composerFocus'
+import { focusComposerElement, focusComposerForResumedSession, queryComposerOrExpand, queryPendingApprovalAction, rejectPendingApproval, releaseComposerForKeyboardSwitch } from '../pages/chat/composerFocus'
 import { reportSeamCollision } from '../apps/seamCollision'
 import {
   loadPanelToggleOverrides,
@@ -44,10 +45,12 @@ import { isEditableTarget } from '../utils/editableTarget'
 import { closeShownCrewWindow, crewWindowShown } from '../pages/chat/crew-window/crewWindowStore'
 import { stepTurn } from '../pages/chat/turnStep'
 import { noteEscapeStoppedSpeech } from '../utils/speechStopKey'
+import { requestDictationMuteToggle } from '../lib/dictationMute'
+import { openGlobalChatSearch } from '../components/globalChatSearch/globalChatSearchStore'
 
 /** Shortcuts scoped to the session on screen (see the crew-window guard). */
 const CREW_WINDOW_SCOPED: ReadonlySet<string> = new Set([
-  'close-chat', 'focus-input', 'focus-approval',
+  'close-chat', 'focus-input', 'focus-approval', 'reject-approval',
   'cycle-agent', 'cycle-prev-agent', 'cycle-reasoning', 'cycle-prev-reasoning',
   'cycle-approval', 'cycle-prev-approval', 'cycle-model', 'cycle-prev-model',
   'pop-out-session',
@@ -64,7 +67,7 @@ export const SHORTCUTS_ENABLED_EVENT = 'mc-keyboard-shortcuts-changed'
 export const MAC_CTRL_DIGITS_KEY = 'mc-mac-ctrl-digits'
 
 /** True on macOS where Option+number produces characters (UK: ⌥3→#, ⌥2→€). */
-function isMacPlatform(): boolean {
+export function isMacPlatform(): boolean {
   return /Mac|iPhone|iPad/.test(navigator?.platform ?? '') || /Macintosh/.test(navigator?.userAgent ?? '')
 }
 // Frozen at module load for the chord-shape decisions (modifier choice, gate
@@ -277,12 +280,15 @@ export const SHORTCUT_LABEL_KEY: Record<string, string> = {
   'nav-notifications': 'hooks.useKeyboardShortcuts.notifications_panel',
   'nav-projects': 'hooks.useKeyboardShortcuts.projects_panel',
   'nav-schedule': 'hooks.useKeyboardShortcuts.schedule_panel',
-  // Reused: the same commands as the top-bar arrows, so the reference list and
-  // the buttons cannot drift apart.
-  'history-back': 'app.nav_back',
-  'history-forward': 'app.nav_forward',
+  // Same commands as the top-bar arrows, but list-only keys: the handler leaves
+  // ⌘/Ctrl+←/→ to a focused text field (line start/end or word-jump), so the
+  // rows name that rule the way the Alt+arrow rows do. The buttons keep the
+  // plain `app.nav_back` / `app.nav_forward`, because a click works anywhere.
+  'history-back': 'hooks.useKeyboardShortcuts.back_outside_text_fields',
+  'history-forward': 'hooks.useKeyboardShortcuts.forward_outside_text_fields',
   'focus-input': 'hooks.useKeyboardShortcuts.focus_text_input',
   'focus-approval': 'hooks.useKeyboardShortcuts.focus_pending_approval',
+  'reject-approval': 'hooks.useKeyboardShortcuts.reject_pending_approval',
   // Reused: the same command as the chat sidebar's own New chat / Close session
   // controls, so the reference list and the buttons cannot drift apart.
   'new-chat': 'pages.chatSidebar.new_chat',
@@ -299,15 +305,23 @@ export const SHORTCUT_LABEL_KEY: Record<string, string> = {
   'cycle-model': 'hooks.useKeyboardShortcuts.cycle_model',
   'cycle-prev-model': 'hooks.useKeyboardShortcuts.previous_model',
   'toggle-focus-mode': 'hooks.useKeyboardShortcuts.toggle_focus_mode',
+  'toggle-dictation-mute': 'hooks.useKeyboardShortcuts.toggle_dictation_mute',
   // Reused: the chat header button this chord fires.
   'pop-out-session': 'pages.chatPage.pop_out_session_to_its_own_window',
+  // Reused: the dialog's own title.
+  'search-all-chats': 'components.globalChatSearch.title',
   // Reused: the ChatInput control this chord fires.
   'optimize-prompt': 'components.chatInput.optimize_prompt',
   'edit-last-message': 'hooks.useKeyboardShortcuts.edit_last_message',
+  // Reused: the "+" menu tile this chord opens.
+  'upload-file': 'components.chatInput.upload_file',
   'list-indent': 'hooks.useKeyboardShortcuts.indent_list_line',
   'list-outdent': 'hooks.useKeyboardShortcuts.outdent_list_line',
+  'stash-prompt': 'components.promptStash.shortcut_label',
   'agent-monitor': 'hooks.useKeyboardShortcuts.open_agent_monitor',
   'stop-speaking': 'hooks.useKeyboardShortcuts.stop_speaking',
+  // Reused: the composer's Stop button, which this key presses.
+  'stop-turn': 'components.chatInput.stop_generation',
   'notification-prev': 'hooks.useKeyboardShortcuts.previous_notification',
   'notification-next': 'hooks.useKeyboardShortcuts.next_notification',
   'instance-1': 'hooks.useKeyboardShortcuts.switch_to_local',
@@ -661,7 +675,7 @@ export function formatShortcut(def: ShortcutDef): string {
   if (def.ctrl) parts.push(mac ? '\u2303' : 'Ctrl')
   if (def.alt) parts.push(mac ? '\u2325' : 'Alt')
   if (def.shift) parts.push(mac ? '\u21e7' : 'Shift')
-  const keyLabel = def.key === 'ArrowLeft' ? '\u2190' : def.key === 'ArrowRight' ? '\u2192' : def.key === 'ArrowUp' ? '\u2191' : def.key === 'ArrowDown' ? '\u2193' : def.key === '`' ? '`' : def.key === 'Enter' ? (mac ? '\u23ce' : 'Enter') : def.key === ',' ? ',' : def.key === 'Escape' ? '\u238b' : def.key === 'Tab' ? (mac ? '\u21e5' : 'Tab') : def.key.toUpperCase()
+  const keyLabel = def.key === 'ArrowLeft' ? '\u2190' : def.key === 'ArrowRight' ? '\u2192' : def.key === 'ArrowUp' ? '\u2191' : def.key === 'ArrowDown' ? '\u2193' : def.key === '`' ? '`' : def.key === 'Enter' ? (mac ? '\u23ce' : 'Enter') : def.key === ',' ? ',' : def.key === 'Escape' ? 'Esc' : def.key === 'Tab' ? (mac ? '\u21e5' : 'Tab') : def.key.toUpperCase()
   parts.push(keyLabel)
   return parts.join(mac ? '' : ' + ')
 }
@@ -912,10 +926,13 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
     // Settings — ⌘, on macOS, Alt+, on Windows/Linux, Option/Alt+, a macOS
     // alias (see the registry entry for why). Must stay BEFORE the Alt gate
     // below: off macOS the primary chord now CARRIES Alt, so moving this branch
-    // under that gate would take Alt+, away from Settings. Fires even when
-    // shortcuts are globally disabled, so the user can always reach the toggle
-    // that re-enables them.
-    if (hit === 'open-settings') {
+    // under that gate would take Alt+, away from Settings. The primary chord
+    // fires even when shortcuts are globally disabled, so the user can always
+    // reach the toggle that re-enables them; the macOS Option+, alias then obeys
+    // the toggle, so the character it types reaches the field.
+    const settingsPrimary = bindings['open-settings']?.primary
+    if (hit === 'open-settings'
+        && (enabled || (settingsPrimary && chordMatchesEvent(e, settingsPrimary, shortcutPlatform())))) {
       e.preventDefault()
       navigate('/settings')
       return
@@ -1030,18 +1047,31 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
         'cycle-model': () => onCycleModel?.(),
         'cycle-prev-model': () => onCyclePrevModel?.(),
         'toggle-focus-mode': () => onToggleFocusMode?.(),
+        // The composer that owns the live recording answers; with none, the
+        // chord is claimed and does nothing. A held chord's auto-repeat would
+        // flip the mute back and forth.
+        'toggle-dictation-mute': () => { if (!e.repeat) requestDictationMuteToggle() },
         // ⌘O / Ctrl+O: the chat header's pop-out button, for the active
         // session. A held chord's auto-repeat is not another press.
         'pop-out-session': () => { if (!e.repeat) onPopOutSession?.() },
+        // The shell owns this chord on every page: a page's own window-level
+        // ⌘F listener (File Explorer ships from its own repository and does not
+        // check Shift) must not answer it as well.
+        'search-all-chats': () => { e.stopPropagation(); if (!e.repeat) openGlobalChatSearch() },
         // Focus the pending tool-approval row. Firing while typing is safe HERE
         // ONLY BECAUSE IT MOVES FOCUS AND NOTHING ELSE — the decision still costs
         // a second, deliberate press on a control the user can now see is
-        // focused. A chord that ANSWERED the prompt would be a one-keystroke path
+        // focused. A chord that APPROVED the prompt would be a one-keystroke path
         // to running a tool call nobody read, which is why this one stops at
         // focus; see queryPendingApprovalAction. Claimed even with no approval
         // pending: the chord collides with no browser binding, so swallowing it
         // avoids a stray newline in the draft; nothing is focused in that case.
         'focus-approval': () => queryPendingApprovalAction()?.focus(),
+        // Reject the pending tool call once; see rejectPendingApproval. Claimed
+        // with nothing pending so ⌥⇧R never types ‰ into the draft. Inert under
+        // a remote crew, whose local pane is hidden but still mounted, and on an
+        // auto-repeat, which must not refuse the next prompt as it arrives.
+        'reject-approval': () => { if (!e.repeat && appStore.getState().instances.activeId === null) rejectPendingApproval() },
         // Focus text input — works even from other inputs. Unguarded on purpose:
         // a pressed keyboard shortcut proves a keyboard exists —
         // `focusComposer`'s touch-device skip would wrongly no-op it. Still
@@ -1072,6 +1102,7 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
           const ask = closeConfirmPrompt(appStore.getState(), activeSlot, {
             settingOn: loadChatConfig().confirmCloseSession,
             checkBusy: modChord,
+            viewerIds: cachedViewerIds(),
           })
           // The slot captured here is the one the chord closed, even if the
           // user switches sessions while the dialog is open.

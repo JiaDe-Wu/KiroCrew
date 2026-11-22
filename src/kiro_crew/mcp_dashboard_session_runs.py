@@ -169,6 +169,7 @@ def _render_session_summary(resp: dict[str, Any]) -> str:
     it and says where the route left something out.
     """
     state_line = "still working" if resp.get("running") else "idle"
+    state_line += _activity_suffix(resp)
     head = f"\U0001f9ed `{resp.get('target', '')}` — {resp.get('title', '')} ({state_line})"
     if not resp.get("enabled"):
         return (
@@ -293,6 +294,8 @@ def _create_session(args: dict[str, Any], ctx: ToolContext, *, keep_walk: bool =
         payload["model"] = args["model"]
     if args.get("reasoning_effort"):
         payload["reasoning_effort"] = args["reasoning_effort"]
+    if args.get("backend"):
+        payload["backend"] = args["backend"]
     if args.get("agent_kind"):
         payload["agent_kind"] = args["agent_kind"]
     if args.get("autocompact_pct") is not None:
@@ -351,6 +354,13 @@ def _create_session(args: dict[str, Any], ctx: ToolContext, *, keep_walk: bool =
 
 
 def _run_session_create(args: dict[str, Any], ctx: ToolContext) -> str:
+    from kiro_crew.session_harness_preview import mcp_refusal
+
+    preview_off = mcp_refusal(args)
+    if preview_off is not None:
+        return preview_off
+    if args.get("requires") is not None and "crew" not in args and not args.get("work_item"):
+        return "Error: requires is taken only with crew or work_item."
     if args.get("work_item") and "crew" not in args:
         from kiro_crew.remote_dispatch import remote_dispatch_enabled
 
@@ -361,6 +371,8 @@ def _run_session_create(args: dict[str, Any], ctx: ToolContext) -> str:
 
         return run_crew_create(args, ctx)
     if "crew" in args:
+        if args.get("backend"):
+            return "Error: backend is taken only for a session on this gateway, not with crew."
         from kiro_crew.mcp_session_crew import run_crew_create
 
         return run_crew_create(args, ctx)
@@ -373,6 +385,10 @@ def _run_session_create(args: dict[str, Any], ctx: ToolContext) -> str:
     on_model = f" on model `{resp['model']}`" if resp.get("model") else ""
     if resp.get("reasoning_effort"):
         on_model += f" at reasoning effort `{resp['reasoning_effort']}`"
+    if resp.get("backend"):
+        on_model += f" on harness `{resp['backend']}`"
+        if resp.get("failover_from"):
+            on_model += f" (agent.acp_failover moved it from `{resp['failover_from']}`)"
     # Name what the caller did not choose, so a conductor reading its own reply
     # learns the child runs on its profile's pick rather than the default.
     inherited = resp.get("inherited") or []
@@ -385,14 +401,31 @@ def _run_session_create(args: dict[str, Any], ctx: ToolContext) -> str:
         )
     if resp.get("autocompact_pct") is not None:
         on_model += f", auto-compacting at {resp['autocompact_pct']:g}%"
+    opened = f"\U0001f195 Opened `{resp.get('target')}` ({resp.get('title')}){filed}{on_model}.{made_note} "
+    guidance = str(resp.get("guidance") or "")
+    if guidance:
+        # A code channel's conductor: it cannot read the worker's transcript, so
+        # it is told what it CAN do (the state read and the worker's link).
+        link = str(resp.get("dashboard_link") or "")
+        link_line = f" Dashboard: {link}" if link else ""
+        # A first message that did not land is still named (the conductor's only
+        # word that its worker got nothing); the rest of that line points at a
+        # transcript read this caller is not given.
+        failed = resp.get("delivery_error")
+        undelivered = (
+            _first_message_line({"message": ""}, resp) + " "
+            if args.get("message") is not None and isinstance(failed, dict)
+            else ""
+        )
+        return redact(f"{opened}{undelivered}{guidance}{link_line}" + reply_line(resp))
     # A Crew Mode chat's worker is in the sidebar but filed in no folder.
     where = (
-        "the user's sidebar, unfiled (this chat is in Ultra Mode)"
+        "the user's sidebar, unfiled (this chat is in conductor mode)"
         if crew_mode
         else "the user's sidebar"
     )
     return redact(
-        f"\U0001f195 Opened `{resp.get('target')}` ({resp.get('title')}){filed}{on_model}.{made_note} "
+        opened
         + _first_message_line(
             {"message": args["message"]} if args.get("message") is not None else {}, resp, where
         )
@@ -446,6 +479,14 @@ def _create_refusal_remedy(refused: DashboardError, payload: dict[str, Any]) -> 
     vouches. The binder that does vouch runs only for a chat with no messages, which
     is why a NEW chat with this session's agent is a remedy that works.
     """
+    # The create route's refusals of a ``backend`` that cannot start here
+    # (``messaging_api/spawn._requested_backend``), named by the code the tool
+    # description promises, so a conductor can branch on it.
+    if refused.code in ("unknown_backend", "backend_not_installed", "backend_restart_required"):
+        return (
+            f" (code `{refused.code}`). Pick a backend from that list, or omit `backend` "
+            "to run on the default harness."
+        )
     if refused.code != "memory_delegation_denied":
         return ""
     if payload.get("agent_kind") == "template":
@@ -690,6 +731,36 @@ def _run_session_set_color(args: dict[str, Any], ctx: ToolContext) -> str:
     return redact(f"Set the color of `{target}` to palette swatch {resp['color_index']}.")
 
 
+def _run_session_set_note(args: dict[str, Any], ctx: ToolContext) -> str:
+    try:
+        resp = ctx.client.post(
+            "/api/session-control/set-note",
+            {"target": args["target"], "note": args["note"]},
+            session_key=ctx.caller_key,
+        )
+    except DashboardError as refused:
+        return f"Error: could not leave that note: {refused.error}"
+    target = args["target"]
+    if resp.get("visibleDeferred"):
+        reply = (
+            f"`{target}` is running a turn, so the note is held and written into its "
+            "transcript when that turn ends."
+        )
+    else:
+        reply = f"Left the note in `{target}`'s transcript."
+    if resp.get("contextSkipped"):
+        reply += (
+            " Its next turn will not read it: the session already holds as many notes as "
+            "it takes, or the note looks like a credential."
+        )
+    else:
+        reply += " Its next turn reads it once"
+        if resp.get("deliveryConditional"):
+            reply += ", unless the session is first bound to another conversation"
+        reply += "."
+    return redact(reply)
+
+
 def _run_session_close(args: dict[str, Any], ctx: ToolContext) -> str:
     if "crew" in args:
         from kiro_crew.mcp_session_crew import run_crew_close
@@ -815,14 +886,30 @@ def _run_session_send(args: dict[str, Any], ctx: ToolContext) -> str:
             "is running, so it reads it mid-work. Watch what it does with it "
             "with session_read_message." + caps
         )
+    if resp.get("pending_steer"):
+        return (
+            f"\U0001f4e8 pending-steer for `{target}` (steer {str(resp.get('steer_id', ''))[:16]}) "  # emoji-ok: tool text, the glyph of its sibling replies
+            "— it could not take your message "
+            "this instant, so the gateway holds it and injects it at the target's next "
+            "tool-call boundary in the same turn. session_status then shows "
+            "delivered@<time> for that steer id; if the turn ends first it is queued and "
+            "the next turn starts at once. Do not re-send it." + caps
+        )
+    if resp.get("steer_state"):
+        # Not pending: the same steer is still on its way into the running turn.
+        return (
+            f"\U0001f4e8 Already on its way to `{target}` — the same steer is still going "  # emoji-ok: tool text, the glyph of its sibling replies
+            "into its running turn. Nothing was sent again." + caps
+        )
     if resp.get("started"):
         return (
             f"\U0001f4e8 Delivered to `{target}` — it started a turn on your message. "
             "Watch the result with session_read_message." + caps
         )
-    # A steer that could not be injected lands here, on the queue: say so, or
-    # the caller reads "queued" as "the target was busy" and never learns its
-    # steer did not cut anything.
+    # A plain send that waits for the turn to end lands here, and so does a steer
+    # the gateway queued without holding it (no pending_steer): say so, or the
+    # caller reads "queued" as "the target was busy" and never learns its steer
+    # did not cut anything.
     queued_note = (
         " Your steer could not go into the running turn, so it was queued instead." if steer else ""
     )
@@ -905,12 +992,29 @@ def _run_session_broadcast(args: dict[str, Any], ctx: ToolContext) -> str:
             lines.append(f"  \u2705 `{target}` — cut into its running turn")
         elif row.get("started"):
             lines.append(f"  \u2705 `{target}` — started a turn on it")
+        elif row.get("pending_steer"):
+            lines.append(
+                f"  ✅ `{target}` — pending-steer {str(row.get('steer_id', ''))[:16]}: injected at its next tool-call "  # emoji-ok: tool text, the glyph of its sibling rows
+                "boundary, or queued with the next turn started at once if the turn ends first"
+            )
+        elif row.get("steer_id") and row.get("steer_state"):
+            # Not pending: the same steer is still on its way into the running turn.
+            lines.append(
+                f"  \u2705 `{target}` — same steer {str(row['steer_id'])[:16]} already on its "  # emoji-ok: tool text, the glyph of its sibling rows
+                "way into its running turn; nothing was sent again"
+            )
         else:
-            # A steer that could not be injected lands here, for the reason
-            # session_send spells out: reporting a plain queue would leave the
-            # caller believing that target was interrupted.
-            fell_back = " (steer fell back to the queue)" if mode == "steer" else ""
-            lines.append(f"  \u2705 `{target}` — queued until its turn ends{fell_back}")
+            # A steer the gateway queued without holding it lands here, for the
+            # reason session_send spells out: reporting a plain queue would leave
+            # the caller believing that target was interrupted.
+            fell_back = (
+                " (steer fell back to the queue)"
+                if mode == "steer" and not row.get("steer_state")
+                else ""
+            )
+            lines.append(
+                f"  \u2705 `{target}` — queued until its turn ends{fell_back}"  # emoji-ok: tool text, the glyph of its sibling rows
+            )
     if delivered < requested:
         lines.append(
             "Some targets were not reached — the rows above say which and why. "
@@ -1026,10 +1130,11 @@ def _run_session_status(args: dict[str, Any], ctx: ToolContext) -> str:
             )
             continue
         mark = {"working": "\U0001f503", "queued": "\u23f8\ufe0f"}.get(status, "\U0001f4a4")
+        extra = _status_activity_suffix(row)
         if row.get("pending_approval"):
             status_lines.append(
                 f"  \u270b `{target}` ({title}) — {status}, "
-                f"{_pending_approval_phrase(row)}{queued}"
+                f"{_pending_approval_phrase(row)}{queued}{extra}"
             )
             continue
         # A turn admitted to a released worker reads `working` before its
@@ -1045,29 +1150,35 @@ def _run_session_status(args: dict[str, Any], ctx: ToolContext) -> str:
             if status == "idle" and row.get("looping")
             else ""
         )
-        status_lines.append(f"  {mark} `{target}` ({title}) — {status}{queued}{looping}{released}")
+        status_lines.append(
+            f"  {mark} `{target}` ({title}) — {status}{queued}{looping}{released}{extra}"
+        )
     status_lines.extend(quality_notes)
     return redact("\n".join(status_lines))
 
 
 def _run_session_handoff(args: dict[str, Any], ctx: ToolContext) -> str:
+    body: dict[str, Any] = {"target": args["target"], "to": args["to"]}
+    if args.get("bind") is True:
+        body["bind"] = True
     try:
-        resp = ctx.client.post(
-            "/api/session-control/handoff",
-            {"target": args["target"], "to": args["to"]},
-            session_key=ctx.caller_key,
-        )
+        resp = ctx.client.post("/api/session-control/handoff", body, session_key=ctx.caller_key)
     except DashboardError as refused:
         return f"Error: could not hand that session over: {refused.error}"
     target = resp.get("target", args["target"])
     manager = resp.get("manager", args["to"])
-    return (
+    text = (
         f"\U0001f91d Handed `{target}` to `{manager}`. That session manages it now: it "
         "can send to, read, stop and close it. If you are a fenced session you lose "
         "that reach, unless agent.session_manager_chain is on and you still manage "
         "that session. It cannot hand the session back to you. Who created it is "
         "unchanged."
     )
+    if resp.get("bind") is True:
+        text += f" It may also bind `{target}` to its work-ledger items now; you may not."
+        if resp.get("release_note"):
+            text += f" {resp['release_note']}"
+    return redact(text)
 
 
 def _run_session_adopt(args: dict[str, Any], ctx: ToolContext) -> str:
@@ -1109,6 +1220,59 @@ def _run_session_release(args: dict[str, Any], ctx: ToolContext) -> str:
     )
 
 
+def _activity_suffix(row: dict[str, Any]) -> str:
+    """The closed activity kinds a live session row reports."""
+    labels = {
+        "turn": "turn",
+        "admission": "turn admission",
+        "subagents": "sub-agents",
+        "subagents_queued": "sub-agents queued",
+        "workflow": "workflow",
+        "synthesis": "synthesis",
+        "preparing": "preparation",
+        "compaction": "compaction",
+        "automation": "automation",
+        "unknown": "unknown work",
+    }
+    raw = row.get("activity")
+    if not isinstance(raw, list):
+        return ""
+    shown = [labels[kind] for kind in raw if kind in labels]
+    return f", active: {', '.join(shown)}" if shown else ""
+
+
+def _status_activity_suffix(row: dict[str, Any]) -> str:
+    """``, active: workflow, last activity 40s ago — <link>`` from a live row.
+
+    Activity is a closed server-authored list. The other fields are state, never
+    transcript text: the server stamps the newest row's age, and attaches a
+    credential-free dashboard link only for a code channel's conductor. Absent
+    fields add nothing, so ordinary rows read as before.
+    """
+    parts = _activity_suffix(row)
+    since = row.get("since_activity_s")
+    if isinstance(since, int) and not isinstance(since, bool) and since >= 0:
+        if since < 120:
+            age = f"{since}s"
+        elif since < 7200:
+            age = f"{since // 60}m"
+        else:
+            age = f"{since // 3600}h"
+        parts += f", last activity {age} ago"
+    link = row.get("dashboard_link")
+    if isinstance(link, str) and link:
+        parts += f" — {link}"
+    # Peer steers held for a tool boundary, and how recent ones settled: an id the
+    # send reply named, and a state, never text.
+    receipts = [r for r in row.get("steer_receipts") or [] if isinstance(r, dict)][:8]
+    if receipts:
+        shown = ", ".join(
+            f"{str(r.get('steer_id', ''))[:16]} {str(r.get('state', ''))[:40]}" for r in receipts
+        )
+        parts += f"; steers: {shown}"
+    return parts
+
+
 def _pending_approval_phrase(resp: dict[str, Any]) -> str:
     """The state words for a session parked on a tool approval."""
     tool = str(resp.get("pending_approval_tool") or "")
@@ -1131,6 +1295,7 @@ def _run_session_read_message(args: dict[str, Any], ctx: ToolContext) -> str:
     state_line = "still working" if resp.get("running") else "idle"
     if resp.get("pending_approval"):
         state_line = _pending_approval_phrase(resp)
+    state_line += _activity_suffix(resp)
     queued = resp.get("queue_depth", 0)
     if queued:
         state_line += f", {queued} message(s) queued"
@@ -1257,6 +1422,12 @@ def _run_work_dispatch(args: dict[str, Any], ctx: ToolContext) -> str:
     Each step is the route the four-call path uses, called as the caller. The seed
     goes only to the key step 2 returned, and only after ``bind`` succeeded.
     """
+    from kiro_crew.session_harness_preview import mcp_refusal
+
+    # Before step 1, so no item is created only to be closed again.
+    preview_off = mcp_refusal(args)
+    if preview_off is not None:
+        return preview_off
     not_sent = "seed: not sent"
     look = (
         "seed: not sent. Read your board (work_ledger_read) and sidebar (session_status) "
@@ -1290,7 +1461,7 @@ def _run_work_dispatch(args: dict[str, Any], ctx: ToolContext) -> str:
             "title": args.get("session_title") or args["title"],
             **{
                 k: args[k]
-                for k in ("agent", "agent_kind", "folder", "model", "reasoning_effort")
+                for k in ("agent", "agent_kind", "folder", "model", "reasoning_effort", "backend")
                 if args.get(k)
             },
         },
@@ -1344,4 +1515,90 @@ def _run_work_dispatch(args: dict[str, Any], ctx: ToolContext) -> str:
         + reply_line(bound)
         + _worker_capabilities_line(opened.resp or {})
         + _worker_capabilities_line(sent)
+    )
+
+
+def _render_session_queue(resp: dict[str, Any]) -> str:
+    """Render a ``/api/session-control/queue`` body as compact text.
+
+    The route has already redacted and cut every excerpt; this only formats the
+    listing and leads with what the action did.
+    """
+    state_line = "still working" if resp.get("running") else "idle"
+    count = int(resp.get("count") or 0)
+    # The title is editable text too, so it is collapsed like the entry rows below.
+    target_text = " ".join(str(resp.get("target") or "").split())
+    title_text = " ".join(str(resp.get("title") or "").split())
+    head = f"\U0001f4e5 `{target_text}` — {title_text} ({state_line}), {count} queued"
+    lines: list[str] = []
+    if resp.get("moved"):
+        lines.append(f"Moved queued entry {resp['moved']} to position {resp.get('position')}.")
+    lines.append(head)
+    entries = [e for e in (resp.get("entries") or []) if isinstance(e, dict)]
+    if not entries:
+        lines.append("The queue is empty.")
+    # A local, not a module name: the facade must bind every module name an owner defines.
+    from_labels = {"yours": "yours ", "person": "person", "other": "other "}
+    for e in entries:
+        label = from_labels.get(str(e.get("from")), "other ")
+        # Every whitespace run, CR, CRLF and U+2028 included, becomes one space: an
+        # entry's id and text are untrusted, and a line break in either would render
+        # as an extra listing row with a forged position, id and owner label.
+        excerpt = " ".join(str(e.get("excerpt") or "").split())
+        entry_id = " ".join(str(e.get("id") or "").split())
+        lines.append(f"{e.get('position')}  {entry_id}  {label}  \"{excerpt}\"")
+    if resp.get("omitted"):
+        lines.append(f"({resp['omitted']} more queued entries not shown.)")
+    return "\n".join(lines)
+
+
+def _run_session_queue(args: dict[str, Any], ctx: ToolContext) -> str:
+    action = args.get("action") or "list"
+    body: dict[str, Any] = {"target": args["target"], "action": action}
+    if args.get("entry") is not None:
+        body["entry"] = args["entry"]
+    if args.get("position") is not None:
+        body["position"] = args["position"]
+    try:
+        resp = ctx.client.post("/api/session-control/queue", body, session_key=ctx.caller_key)
+    except DashboardError as refused:
+        return f"Error: could not {action} that session's queue: {refused.error}"
+    return _render_session_queue(resp)
+
+
+def _run_session_run_queued(args: dict[str, Any], ctx: ToolContext) -> str:
+    try:
+        resp = ctx.client.post(
+            "/api/session-control/run-queued",
+            {"target": args["target"], "queue_id": args["queue_id"]},
+            session_key=ctx.caller_key,
+        )
+    except DashboardError as refused:
+        return f"Error: could not run that queued message: {refused.error}"
+    target = " ".join(str(resp.get("target") or args["target"]).split())
+    queue_id = " ".join(str(resp.get("queue_id") or args["queue_id"]).split())
+    outcome = resp.get("outcome")
+    if outcome == "started":
+        return f"\u25b6\ufe0f `{target}` started your queued message `{queue_id}` now. Nothing was stopped."
+    if outcome == "stopping":
+        return (
+            f"\U0001f6d1 Stopped the running turn on `{target}`; its work is discarded. "
+            f"Your queued message `{queue_id}` runs next, ahead of the rest of the queue, "
+            "which is kept. Its transcript shows the stop card."
+        )
+    if outcome == "idle":
+        return (
+            f"\u2139\ufe0f `{target}` had no active turn to stop. Your queued message "
+            f"`{queue_id}` is at the front and runs when the target's turn ends."
+        )
+    if outcome == "compacting":
+        # ``stop`` rides along only when the entry was promoted before the decline.
+        place = "is at the front of" if resp.get("stop") else "keeps its place in"
+        return (
+            f"\u2139\ufe0f `{target}` is compacting its context, so nothing was stopped. "
+            f"`{queue_id}` {place} the queue; try again once the compaction finishes."
+        )
+    return (
+        f"\u2139\ufe0f `{target}`: {resp.get('info') or 'stop already in progress'} — "
+        f"nothing changed, and `{queue_id}` keeps its place in the queue."
     )

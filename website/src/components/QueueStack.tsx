@@ -11,7 +11,7 @@ import { stripAppEnvelope } from '../pages/chat/groupDisplayItems'
 import { hasSubagentCompletionPrefix } from '../pages/chat/subagentCompletion'
 import { prependQuote, quoteBlock, quoteExcerpt, readMessageQuote, stripQuoteBlock } from '../chat-core/composer/messageQuote'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
-import { splitKnowledgeEnvelope } from '../pages/chat/useKnowledgeFetch'
+import { knowledgeEnvelopeEnd } from '../utils/knowledgeEnvelope'
 import { expandAll, findTokenRanges, foldPastesInOrder, pruneBlocks, saveStoredPaste, type PasteBlock } from '../utils/pasteTokens'
 import { usePasteTokens } from '../chat-core/composer/pasteEditor'
 /** System-injected sub-agent completion deliveries waiting for the busy slot.
@@ -24,18 +24,26 @@ export function isSystemDelivery(m: ChatMessage): boolean {
 }
 
 /** A queued entry that must NOT render as an interactive (edit/cancel) user
- *  card. Two families qualify, both machine orchestration rather than user
+ *  card. Three families qualify, all machine orchestration rather than user
  *  speech:
- *    - sub-agent completion deliveries (isSystemDelivery), and
+ *    - sub-agent completion deliveries (isSystemDelivery),
  *    - synthetic turn-recovery continuations (tool refusal / stalled turn /
  *      stalled tool / interrupted / empty response), which the gateway
  *      re-queues automatically and which surface as a compact RecoveryCard in
- *      the transcript once dequeued.
- *  Editing or cancelling either would corrupt an automatic effect, so they are
+ *      the transcript once dequeued, and
+ *    - the gateway's own prompts, a collapsed note once dequeued: the
+ *      follow-up after a workflow result (`meta.kind` `workflow_followup`)
+ *      and a heartbeat task's prompt (`heartbeat_prompt`).
+ *  Editing or cancelling any of them would corrupt an automatic effect, so they are
  *  filtered out of the QueueStack (sub-agent deliveries are still counted for
  *  the progress line via isSystemDelivery). */
 export function isNonInteractiveQueued(m: ChatMessage): boolean {
-  return isSystemDelivery(m) || parseRecoveryMessage(m.content || '') !== null
+  return (
+    isSystemDelivery(m) ||
+    parseRecoveryMessage(m.content || '') !== null ||
+    m.meta?.kind === 'workflow_followup' ||
+    m.meta?.kind === 'heartbeat_prompt'
+  )
 }
 
 /** An MCP-App ui/message entry waiting in the queue. It stays VISIBLE in the
@@ -48,6 +56,18 @@ export function isAppMessageQueued(m: ChatMessage): boolean {
   return m.meta?.kind === 'mcp_app_message'
 }
 
+/** Queue-entry kinds whose text the server wrote: an MCP-App message and a
+ *  resource wake. The same set `queue_edit_by_id` refuses to edit. */
+const SERVER_WRITTEN_QUEUED_KINDS: ReadonlySet<string> = new Set(['mcp_app_message', 'resource_wake'])
+
+/** A queued entry the server wrote, not the person. Its card offers no edit,
+ *  and a cancel never puts its text in the composer: the next send would
+ *  record the server's words, untrusted excerpts included, as the person's. */
+export function isServerWrittenQueued(m: ChatMessage | undefined): boolean {
+  const kind = m?.meta?.kind
+  return typeof kind === 'string' && SERVER_WRITTEN_QUEUED_KINDS.has(kind)
+}
+
 /** Display text for a queued entry: an app-message entry drops its machine
  *  envelope so the queue card wears the same skin the transcript row will —
  *  two skins for one message read as two different messages. */
@@ -57,8 +77,10 @@ export function isAppMessageQueued(m: ChatMessage): boolean {
  *  (when a knowledge block was picked) -- model-facing material the user never
  *  typed, so neither belongs on the card or in the editor. `quote` is set only
  *  when the content really starts with that quote's block, and `envelope` is
- *  the knowledge envelope as sent (empty when there is none), kept verbatim so
- *  an edit can put it back and the agent still receives the knowledge.
+ *  the knowledge envelope as sent, with the blank lines after it (empty when
+ *  there is none), kept verbatim so an edit can put it back and the agent
+ *  still receives the knowledge. The envelope is found by the mark the send
+ *  recorded (`meta.knowledgeEnvelope`).
  *
  *  A collapsed `[ Paste #N ]` token is the third kind of model-only text, but
  *  it expands IN PLACE with no marker around it, so the text alone cannot give
@@ -77,10 +99,11 @@ function splitQueuedContent(m: ChatMessage): {
   const carried = readMessageQuote(m.meta as Record<string, unknown> | undefined)
   const quote = carried && m.content.startsWith(quoteBlock(carried)) ? carried : null
   const afterQuote = quote ? stripQuoteBlock(m.content, quote) : m.content
-  const split = splitKnowledgeEnvelope(afterQuote)
-  const expanded = split ? split.rest : afterQuote
+  let end = knowledgeEnvelopeEnd(afterQuote, m.meta?.knowledgeEnvelope)
+  while (end && afterQuote[end] === '\n') end++
+  const expanded = afterQuote.slice(end)
   const folded = foldQueuedPastes(expanded, queuedPastes(m))
-  return { quote, envelope: split?.head ?? '', own: folded?.own ?? expanded, pastes: folded?.pastes ?? [] }
+  return { quote, envelope: afterQuote.slice(0, end), own: folded?.own ?? expanded, pastes: folded?.pastes ?? [] }
 }
 
 /** How many remains of a `[ Paste #N ]` token `text` holds outside every
@@ -161,8 +184,8 @@ function queuedOwnText(m: ChatMessage): string {
 /** True when the card hides a knowledge envelope it will still send. The card
  *  then shows only the typed words, so it needs its own mark that knowledge
  *  is attached; without one, the card reads as a plain message. False when the
- *  split refused (two close-marker lines), because then the card shows the
- *  whole text, envelope included. */
+ *  entry carries no mark that matches its text, because then the card shows
+ *  the whole text. */
 function queuedHasKnowledge(m: ChatMessage): boolean {
   return splitQueuedContent(m).envelope !== ''
 }
@@ -218,7 +241,8 @@ function reglueQuote(m: ChatMessage, edited: string, blocks: PasteBlock[] = spli
 function recordEditedPastes(m: ChatMessage, edited: string, wire: string, blocks: PasteBlock[]): PasteBlock[] {
   const { quote } = splitQueuedContent(m)
   const live = findTokenRanges(edited, blocks).sort((a, b) => a.start - b.start).map(r => r.block)
-  if (live.length) saveStoredPaste(wire.trim(), quote ? prependQuote(edited, quote) : edited, live)
+  const sendId = typeof m.meta?.sendId === 'string' ? m.meta.sendId : undefined
+  if (live.length) saveStoredPaste(wire.trim(), quote ? prependQuote(edited, quote) : edited, live, undefined, sendId)
   return live
 }
 
@@ -270,7 +294,7 @@ export function SubagentDeliveryProgress({ count }: { count: number }) {
         <Bot size={13} className="text-accent/70 shrink-0" />
         <Loader2 size={12} className="animate-spin text-accent/70 shrink-0" />
         <span>
-          {i18nT('components.queueStack.sub_agent_result', { count: count })} {i18nT('components.queueStack.ready_processing_after_the_current_turn')}
+          {i18nT('components.queueStack.sub_agent_results_ready', { count: count })}
         </span>
       </Glass>
     </div>
@@ -279,11 +303,16 @@ export function SubagentDeliveryProgress({ count }: { count: number }) {
 
 const MAX_PEEK = 2
 const CARD_H = 40
+/** The held line's row before it is measured: one 11px line at `leading-4`. */
+const HELD_ROW_H = 16
 const PEEK = 6
 const EXPANDED_GAP = 4
 const SCALE_STEP = 0.04
 const HIDDEN_EXTRA_SCALE = 0.02
 const OVERLAP = 11 // overlap to fuse with input area below
+// A third of the server's 90 s hold (`EDIT_HOLD_SECONDS`): a background tab's
+// timers can slip to once a minute, which still lands inside the hold.
+const EDIT_HOLD_RENEW_MS = 30_000
 
 const SPRING = { type: 'spring' as const, stiffness: 400, damping: 30 }
 
@@ -453,8 +482,9 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onEditOpen, 
    *  tokens the edit kept, in token order (empty when it kept none), for the
    *  row to carry on. Absent when the entry had none to begin with. */
   onEdit?: (queueId: string, content: string, pastes?: PasteBlock[]) => void
-  /** The editor opened (`true`) or closed without a save (`false`), so the host
-   *  can hold the entry meanwhile. A save goes through `onEdit` alone: a release
+  /** The editor opened or is still open (`true`, repeated every 30 s to renew
+   *  the hold) or closed without a save (`false`), so the host can hold the
+   *  entry meanwhile. A save goes through `onEdit` alone: a release
    *  sent beside it could reach the server first and drain the old words. */
   onEditOpen?: (queueId: string, open: boolean) => void
   onEditDraft?: (queueId: string, content: string | undefined) => void
@@ -517,6 +547,15 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onEditOpen, 
   useEffect(() => () => {
     if (openEditRef.current) onEditOpenRef.current?.(openEditRef.current, false)
   }, [])
+  // The hold lapses on its own deadline, so an editor left open renews it; a
+  // closed or killed tab stops renewing and the queue moves on soon after.
+  useEffect(() => {
+    if (!editingId) return
+    const timer = setInterval(() => {
+      if (openEditRef.current === editingId) onEditOpenRef.current?.(editingId, true)
+    }, EDIT_HOLD_RENEW_MS)
+    return () => clearInterval(timer)
+  }, [editingId])
   const openEdit = (queueId: string) => {
     if (openEditRef.current && openEditRef.current !== queueId) onEditOpen?.(openEditRef.current, false)
     openEditRef.current = queueId
@@ -538,9 +577,44 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onEditOpen, 
     if (open) onEditOpen?.(open, false)
   }
 
+  // A held card (the server's `meta.held`: it waits for the person) says so on
+  // a row of its own under the message. No row while an action on the card is
+  // in flight (an accepted Send now stays pending until the card leaves), while
+  // its editor is open, or where the stack does not offer Send now, edit and
+  // cancel, the actions the line leaves to the card's buttons.
+  const heldRowShown = (m: ChatMessage, i: number) => {
+    const id = m.meta?.queueId as string | undefined
+    return m.meta?.held === true && !!id && !pendingIds?.has(id) && editingId !== id
+      && !!onInterrupt && !!onCancel && !!onEdit && (expanded || i === 0)
+  }
+  // The row wraps, so its height is measured, and the card grows by it.
+  const [heldRowH, setHeldRowH] = useState<Readonly<Record<string, number>>>({})
+  const heldObserver = useRef<ResizeObserver | null>(null)
+  const heldRowEls = useRef(new Map<string, HTMLElement>())
+  const measureHeldRow = (id: string) => (el: HTMLElement | null) => {
+    if (typeof ResizeObserver === 'undefined') return
+    const prev = heldRowEls.current.get(id)
+    if (prev && prev !== el) { heldObserver.current?.unobserve(prev); heldRowEls.current.delete(id) }
+    if (!el || prev === el) return
+    heldRowEls.current.set(id, el)
+    heldObserver.current ??= new ResizeObserver(entries => {
+      for (const entry of entries) {
+        const id = (entry.target as HTMLElement).dataset.queueId
+        const h = Math.ceil((entry.target as HTMLElement).offsetHeight)
+        if (id) setHeldRowH(prev => (prev[id] === h ? prev : { ...prev, [id]: h }))
+      }
+    })
+    heldObserver.current.observe(el)
+  }
+  useEffect(() => () => heldObserver.current?.disconnect(), [])
+  const cardH = messages.map((m, i) => {
+    if (!heldRowShown(m, i)) return CARD_H
+    const id = m.meta?.queueId as string
+    return CARD_H + (heldRowH[id] ?? HELD_ROW_H)
+  })
   const peekCount = Math.min(MAX_PEEK, Math.max(0, messages.length - 1))
-  const collapsedHeight = messages.length > 0 ? CARD_H + peekCount * PEEK : 0
-  const expandedHeight = messages.length > 0 ? messages.length * CARD_H + (messages.length - 1) * EXPANDED_GAP : 0
+  const collapsedHeight = messages.length > 0 ? cardH[0] + peekCount * PEEK : 0
+  const expandedHeight = messages.length > 0 ? cardH.reduce((a, b) => a + b, 0) + (messages.length - 1) * EXPANDED_GAP : 0
 
   const targetHeight = expanded ? expandedHeight : collapsedHeight
   const targetMargin = messages.length > 0 && !expanded && fuseBelow ? -OVERLAP : 0
@@ -612,18 +686,22 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onEditOpen, 
 
             if (expanded) {
               const pos = messages.length - 1 - i
-              y = pos * (CARD_H + EXPANDED_GAP)
+              // Index 0 sits at the bottom; each card stands on the ones before it.
+              y = expandedHeight - cardH.slice(0, i + 1).reduce((a, b) => a + b, 0) - i * EXPANDED_GAP
               scale = 1
               opacity = 1
               zIndex = pos + 1
             } else if (i <= MAX_PEEK) {
               const depth = i
-              y = (collapsedHeight - CARD_H) - depth * PEEK
+              // Every card in the collapsed stack lines its top up with the
+              // front card's, one PEEK higher per depth, so a taller held front
+              // card still leaves the peeks showing above it.
+              y = (collapsedHeight - cardH[0]) - depth * PEEK
               scale = 1 - (depth + 1) * SCALE_STEP
               opacity = 1
               zIndex = (MAX_PEEK + 1) - depth
             } else {
-              y = (collapsedHeight - CARD_H) - MAX_PEEK * PEEK
+              y = (collapsedHeight - cardH[0]) - MAX_PEEK * PEEK
               scale = 1 - (MAX_PEEK + 1) * SCALE_STEP - HIDDEN_EXTRA_SCALE
               opacity = 0
               zIndex = 0
@@ -633,15 +711,22 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onEditOpen, 
             const queueId = m.meta?.queueId as string | undefined
             const isEditing = !!queueId && editingId === queueId
             const isPending = !!queueId && !!pendingIds?.has(queueId)
+            const held = heldRowShown(m, i)
             // Per-card actions show on the front single card or when expanded.
             const showActions = (expanded || messages.length === 1) && !!queueId
-            // App-message entries are read-only-but-visible: the backend
-            // refuses queue_edit_by_id for system-injection kinds (the user's
-            // replacement words would drain app-authored), so the card must
-            // not offer the pencil. Cancel/interrupt/reorder stay: they change
-            // WHEN or WHETHER the entry runs, never who authored its text.
+            // Server-written entries are read-only-but-visible: the backend
+            // refuses queue_edit_by_id for them (the user's replacement words
+            // would drain server-authored), so the card must not offer the
+            // pencil. Cancel/interrupt/reorder stay: they change WHEN or
+            // WHETHER the entry runs, never who authored its text.
             const isAppEntry = isAppMessageQueued(m)
+            const isServerWritten = isServerWrittenQueued(m)
+            // Its user row is already in the conversation (the server's
+            // `meta.written`): the queue refuses an edit or cancel of it, so the
+            // card offers only Send now.
+            const isWritten = m.meta?.written === true
             const displayText = queuedDisplayText(m)
+            const notDurable = m.meta?.durable === false
             // The card hides the knowledge envelope, so this chip is what says
             // the send still carries it. Same icon as the sent bubble's
             // knowledge chip, so the two read as one thing.
@@ -682,7 +767,7 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onEditOpen, 
                 exit={{ y: y + 40, zIndex: 50, transition: SPRING }}
                 transition={SPRING}
                 className="absolute top-0 left-0 right-0"
-                style={{ transformOrigin: 'bottom center', height: CARD_H, zIndex }}
+                style={{ transformOrigin: 'bottom center', height: cardH[i], zIndex }}
               >
               {/* `glass-warn`, not a theme-specific color: the warn tint step is
                   what every pending-decision pane in the dock wears, and the
@@ -707,10 +792,13 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onEditOpen, 
                 className="@container/queuecard h-full glass-warn px-3 py-2 text-[13px] glass-warn-fg"
                 title={readOnlyHint}
               >
-                <span className="flex items-center gap-1.5 h-full">
+                <span className="flex flex-col h-full">
+                <span className="flex items-center gap-1.5 h-6 shrink-0">
                   <span className="shrink-0 text-[10px] font-mono opacity-50 w-4 text-center">{i + 1}</span>
+                  {/* A held card waits for the person (nothing sends it on its
+                      own), so its hourglass stands still. */}
                   {isFrontCollapsed && (
-                    <span className="shrink-0 inline-flex animate-[hourglass-flip_3s_ease-in-out_infinite]">
+                    <span data-testid="queue-card-hourglass" className={`shrink-0 inline-flex${m.meta?.held === true ? '' : ' animate-[hourglass-flip_3s_ease-in-out_infinite]'}`}>
                       <Hourglass size={13} />
                     </span>
                   )}
@@ -756,8 +844,16 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onEditOpen, 
                       )}
                       {/* `min-w-16` only when a chip shares the row: the chip
                           gives way (truncates) before the typed words do. */}
-                      <span className={`truncate flex-1${knowledgeChip ? ' min-w-16' : ''}`}>{displayText}</span>
+                      <span className={`truncate flex-1${knowledgeChip || notDurable ? ' min-w-16' : ''}`}>{displayText}</span>
                       {knowledgeChip}
+                      {/* The server's verdict that the durable copy of the queue
+                          cannot hold this entry: accepted, but a restart before
+                          it runs loses it. Quiet on purpose, not an error. */}
+                      {notDurable && (
+                        <span data-testid="queue-card-not-durable" className="min-w-0 truncate text-[11px] italic opacity-80" title={i18nT('components.queueStack.wont_survive_a_restart')}>
+                          {i18nT('components.queueStack.wont_survive_a_restart')}
+                        </span>
+                      )}
 
                       {/* Reorder arrows only make sense with 2+ cards, and only
                           in the expanded stack where the run order is visible.
@@ -786,7 +882,7 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onEditOpen, 
                           </button>
                         </>
                       )}
-                      {onEdit && showActions && !isAppEntry && (
+                      {onEdit && showActions && !isServerWritten && !isWritten && (
                         <button
                           className="shrink-0 p-0.5 rounded hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                           title={i18nT('components.queueStack.edit_queued_message')}
@@ -808,10 +904,10 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onEditOpen, 
                           <Zap size={13} fill="currentColor" />
                         </button>
                       )}
-                      {onCancel && showActions && (
+                      {onCancel && showActions && !isWritten && (
                         <button
                           className="shrink-0 p-0.5 rounded hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                          title={i18nT(isAppEntry ? 'components.queueStack.cancel_queued_message' : 'components.queueStack.cancel_and_move_back_to_input')}
+                          title={i18nT(isServerWritten ? 'components.queueStack.cancel_queued_message' : 'components.queueStack.cancel_and_move_back_to_input')}
                           aria-label={i18nT('components.queueStack.cancel_queued_message')}
                           disabled={isPending}
                           onClick={(e) => { e.stopPropagation(); onCancel(queueId!) }}
@@ -830,6 +926,12 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onEditOpen, 
                       )}
                     </>
                   )}
+                </span>
+                {held && (
+                  <span ref={measureHeldRow(queueId!)} data-queue-id={queueId} data-testid="queue-card-held" className="block pl-[22px] text-[11px] leading-4 italic opacity-80 break-words">
+                    {i18nT('components.queueStack.restored_held')}
+                  </span>
+                )}
                 </span>
               </Glass>
               </motion.div>

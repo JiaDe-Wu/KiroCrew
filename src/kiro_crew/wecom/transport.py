@@ -47,9 +47,11 @@ import ntpath
 import posixpath
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import replace
 from typing import Any
 
-from kiro_crew.messaging.outbound_files import OutboundFile
+from kiro_crew.messaging.outbound_files import ExtractLimits, OutboundFile, upload_filename
+from kiro_crew.messaging.split import truncate_utf8
 from kiro_crew.messaging.tables import TABLE_POLICY_OFF
 from kiro_crew.messaging.transport import (
     ConfiguredChannelTarget,
@@ -68,6 +70,22 @@ from kiro_crew.wecom.client import (
 from kiro_crew.wecom.media_upload import MAX_BYTES_BY_TYPE
 
 logger = logging.getLogger(__name__)
+
+
+def _cut_caption(caption: str) -> str:
+    """Fit a file caption into one WeCom text push, logging when it was cut.
+
+    The client would cut an over-cap push silently at ``WECOM_MAX_REPLY_BYTES``.
+    Cutting here instead lands on the last whole UTF-8 character, adds a trailing
+    ``…`` so the reader can see the text was cut, and logs it.
+    """
+    size = len(caption.encode("utf-8"))
+    if size <= WECOM_MAX_REPLY_BYTES:
+        return caption
+    ellipsis = "…"
+    cut = truncate_utf8(caption, WECOM_MAX_REPLY_BYTES - len(ellipsis.encode("utf-8")))
+    logger.info("wecom send_document: caption cut from %d to %d bytes", size, WECOM_MAX_REPLY_BYTES)
+    return cut + ellipsis
 
 
 # Upper bound on the number of LEARNED (non-roster) warm peers kept in
@@ -442,6 +460,7 @@ class WeComTransport(MessagingTransport):
             if not self._may_push(conversation_id):
                 logger.warning("wecom send_document: conversation deauthorized before caption")
             else:
+                caption = _cut_caption(caption)
                 try:
                     if not await self._client.send_proactive(conversation_id, caption):
                         logger.warning("wecom send_document: caption push not acknowledged")
@@ -457,6 +476,24 @@ class WeComTransport(MessagingTransport):
         # even though the file already reached the user.
         return media_id or "sent"
 
+    async def outbound_image_limits(
+        self, conversation_id: str, thread_id: str | None = None
+    ) -> ExtractLimits | None:
+        """The renderer's own budgets; its pictures go to a userid, as these do."""
+        from kiro_crew.wecom.renderer import _UPLOAD_LIMITS
+
+        return _UPLOAD_LIMITS
+
+    async def send_outbound_image(
+        self, conversation_id: str, file: OutboundFile, *, thread_id: str | None = None
+    ) -> bool:
+        """Send one extracted image through :meth:`send_document`, as the renderer does."""
+        # The renderer's own rename: a sanitized name whose extension follows the
+        # sniffed type, never the raw basename of an LLM-authored path.
+        return bool(
+            await self.send_document(conversation_id, replace(file, path=upload_filename(file, 0)))
+        )
+
     async def resolve_conversation(self, user_id: str) -> str:
         # No addressable DM channel id; the userid is the logical conversation.
         return user_id
@@ -467,12 +504,15 @@ class WeComTransport(MessagingTransport):
     ) -> bool:
         """Mirror :meth:`authorize` on the userid the conversation id carries.
 
-        Defence in depth rather than the live gate: WeCom declares
-        ``supports_proactive_send=False``, so the shared send ladder refuses this
-        transport before asking. Implemented anyway, and fail-closed, so the
-        answer is already correct if that capability is ever flipped -- and
-        because ``send_message`` also accepts a one-shot ``response_url`` as its
-        conversation id, which is not a roster identity and is therefore refused.
+        The shared send ladder's recipient check for WeCom: WeCom declares
+        ``supports_proactive_send=True``, so the ladder does not refuse this
+        transport earlier, and its recipient leg (``_authorize_recipient``) asks
+        here and SEL-audits a refusal. ``send_message`` and ``send_document``
+        re-check the same roster through :meth:`_may_push` at the send boundary.
+
+        Every WeCom conversation id is the userid. An empty id is refused;
+        ``allow_all`` admits any non-empty id, just as :meth:`authorize` admits
+        any non-empty userid inbound.
         """
         if not conversation_id:
             return False
@@ -515,12 +555,18 @@ class WeComTransport(MessagingTransport):
             for user_id in sorted(identities)
         ]
         # Under the allow-everyone policy there is no configured list to draw on,
-        # so the warm peers ARE the list: they are the only addressable ones.
+        # so the warm peers ARE the list: they are the only addressable ones. They
+        # are marked learned, because messaging the bot once makes nobody the
+        # owner: an owner-DM path must never infer one from them.
         if self._allow_all:
             for chat_id in sorted(self._warm_chats):
                 if any(x.target_id == f"user:{chat_id}" for x in targets):
                     continue
-                targets.append(ConfiguredChannelTarget(f"user:{chat_id}", f"WeCom DM · {chat_id}"))
+                targets.append(
+                    ConfiguredChannelTarget(
+                        f"user:{chat_id}", f"WeCom DM · {chat_id}", learned=True
+                    )
+                )
         if self._warm_dropped:
             # Say the overflow out loud in EVERY snapshot while it holds: the
             # warm-peer bound has shed learned peers, so this list is a truncated

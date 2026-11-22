@@ -9,6 +9,8 @@ import { renderWithProviders } from '../../test/helpers'
 vi.mock('../../api/client', () => ({
   api: {
     members: vi.fn(),
+    // The owner check behind Import from file (`useViewerIsNotOwner`): the owner.
+    viewerOwnerOk: vi.fn(() => Promise.resolve(true)),
     teams: { list: vi.fn(() => Promise.resolve({ teams: [] })) },
     memberThread: vi.fn((slug: string) =>
       Promise.resolve({ slot_key: 'member-' + slug, slug, member: slug, created: true }),
@@ -63,7 +65,7 @@ async function openAlpha() {
 async function pressAndAsk(button: HTMLElement) {
   fireEvent.click(button)
   const dialog = await screen.findByRole('dialog')
-  expect(within(dialog).getByText('Give this Bot a fresh start?')).toBeTruthy()
+  expect(within(dialog).getByText('Give this bot a fresh start?')).toBeTruthy()
   expect(within(dialog).getByText(/messages stay here/i)).toBeTruthy()
   return dialog
 }

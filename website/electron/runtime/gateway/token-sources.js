@@ -182,7 +182,7 @@ function createTokenSources({
     // ANSWERED. The pre-spawn probe established the port was free then, and our
     // child binds only after its interpreter has imported -- seconds on a cold
     // bundled tree -- so anything may bind inside that window. An `ssh -L`
-    // reconnect answers `/api/status` exactly as the gateway would, `waitForBackend`
+    // reconnect answers `/api/live` exactly as the gateway would, `waitForBackend`
     // accepts it, and the secret would go to the far end of the tunnel.
     //
     // The kernel's own pid-to-port mapping settles it, and that is the whole
@@ -239,6 +239,22 @@ function createTokenSources({
    * probe has no parent-pid lookup here, so a launcher there still falls
    * through to the token prompt.
    */
+  /**
+   * Does the kernel name this process's own live gateway child (or a direct child of
+   * it holding this home's gateway.lock) as the listener on the launch port? The
+   * proof `mintLocalToken` demands before it sends a secret, as a question. Anything
+   * unproven (no child, a configured remote crew, an unreadable snapshot, Windows
+   * where none can be taken) is false.
+   */
+  async function ownsLocalListener() {
+    const child = getGatewayProcess();
+    if (!child || child.exitCode !== null) return false;
+    if (getRemoteHostConfig(store, PORT)?.host) return false;
+    const holders = await snapshotGatewayPortPids(PORT);
+    const owned = holders && await ownedListener(holders, child.pid);
+    return Boolean(owned) && getGatewayProcess() === child && child.exitCode === null;
+  }
+
   async function ownedListener(holders, ownPid) {
     if (holders.includes(ownPid)) return true;
     if (isWindows) return false;
@@ -250,7 +266,7 @@ function createTokenSources({
     return false;
   }
 
-  return { fetchRemoteToken, mintLocalToken };
+  return { fetchRemoteToken, mintLocalToken, ownsLocalListener };
 }
 
 module.exports = { createTokenSources };

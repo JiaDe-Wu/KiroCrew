@@ -1,8 +1,12 @@
 import { useQuery } from '@tanstack/react-query'
 import { api, type TunnelStatus as TunnelStatusData } from '../api/client'
 import { StatCard } from './ui'
+import ErrorNotice from './ErrorNotice'
 
 import { i18nT } from '../i18n/t'
+
+/** The states a default-only personal Crew waits in while it cannot host yet. */
+const QUIET_STATES: ReadonlySet<TunnelStatusData['state']> = new Set(['starting', 'reconnecting', 'stopped'])
 /** Human-readable label, color, and tooltip for a tunnel status.
  *  Pure function — unit tested independently of react-query.
  *
@@ -14,11 +18,16 @@ export function tunnelDisplay(
   s: TunnelStatusData | null,
 ): { value: string; colorClass: string; tooltip?: string } | null {
   if (!s) return null
+  // A personal Crew the relay hosts only by default and that cannot host YET (it
+  // retries on its own): nothing to show. A final relay failure ('error') stays loud.
+  if (s.reason === 'personal_default' && QUIET_STATES.has(s.state)) return null
   switch (s.state) {
     case 'connected': {
       const mins = Math.max(0, Math.round((s.uptime || 0) / 60))
       const up = mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m` : `${mins}m`
       const tip = s.url ? `${s.url}${s.uptime ? ` · ${i18nT('components.tunnelStatus.up', { time: up })}` : ''}` : i18nT('components.tunnelStatus.tunnel_connected')
+      // The status API can report an error while still connected; the tile renders it through ErrorNotice.
+      if (s.error) return { value: i18nT('components.tunnelStatus.connected_with_error'), colorClass: 'text-warn', tooltip: tip }
       return { value: i18nT('components.tunnelStatus.connected'), colorClass: 'text-accent', tooltip: tip }
     }
     case 'starting':
@@ -58,5 +67,8 @@ export function TunnelStatus({ delay }: { delay?: number }) {
   const display = tunnelDisplay(data)
   if (!display) return null
   const { value, colorClass, tooltip } = display
-  return <StatCard label={i18nT('components.tunnelStatus.tunnel')} value={value} colorClass={colorClass} title={tooltip} delay={delay} />
+  const card = <StatCard label={i18nT('components.tunnelStatus.tunnel')} value={value} colorClass={colorClass} title={tooltip} delay={delay} />
+  if (!data?.error || !['connected', 'reconnecting', 'error'].includes(data.state)) return card
+  // A read-only status tile holds no draft, so the agent hand-off is on.
+  return <div>{card}<ErrorNotice variant="inline" askAgent message={data.error} className="mt-1.5" testId="tunnel-status-error" /></div>
 }

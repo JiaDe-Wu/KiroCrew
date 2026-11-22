@@ -15,12 +15,16 @@ import chat_tags_helpers
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_state, _make_tags_app
+from redaction_structured_cases import github_classic
 
+from kiro_crew.dashboard import chat_tags as chat_tags_module
 from kiro_crew.dashboard.chat_tags import _normalize_column, _valid_color
 from kiro_crew.dashboard.state import _ChatSlot
 
 # The shared autouse fixture, bound here by name so pytest registers it for this module.
 _hermetic_signing_secret = chat_tags_helpers._hermetic_signing_secret
+# A GitHub token with a valid checksum: redacted wherever it appears in a name.
+_TOKEN = github_classic(seed=51)
 
 
 # ── Pure helpers ──
@@ -826,7 +830,7 @@ class TestTagVocabulary:
 
     @pytest.mark.asyncio
     async def test_update_tag_redacts_credentials_in_name(self, tmp_path, monkeypatch):
-        """PATCH a tag name containing an AWS key — the credential is redacted."""
+        """PATCH a tag name containing a GitHub token — the credential is redacted."""
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
         app = _make_tags_app(state)
@@ -834,11 +838,11 @@ class TestTagVocabulary:
             tag = await (await client.post("/api/chat/tags", json={"name": "Safe"})).json()
             resp = await client.patch(
                 f"/api/chat/tags/{tag['id']}",
-                json={"name": "key-AKIAIOSFODNN7EXAMPLE"},
+                json={"name": f"key-{_TOKEN}"},
             )
             assert resp.status == 200
             data = await resp.json()
-            assert "AKIAIOSFODNN7EXAMPLE" not in data["name"]
+            assert _TOKEN not in data["name"]
 
     @pytest.mark.asyncio
     async def test_update_tag_redacts_credential_straddling_truncation(self, tmp_path, monkeypatch):
@@ -852,11 +856,11 @@ class TestTagVocabulary:
             tag = await (await client.post("/api/chat/tags", json={"name": "Redact"})).json()
             resp = await client.patch(
                 f"/api/chat/tags/{tag['id']}",
-                json={"name": "x" * 50 + "AKIAIOSFODNN7EXAMPLE"},
+                json={"name": "x" * 50 + _TOKEN},
             )
             assert resp.status == 200
             data = await resp.json()
-            assert "AKIA" not in data["name"]
+            assert _TOKEN[:8] not in data["name"]
 
     @pytest.mark.asyncio
     async def test_create_tag_redacts_credential_straddling_truncation(self, tmp_path, monkeypatch):
@@ -866,11 +870,11 @@ class TestTagVocabulary:
         async with TestClient(TestServer(app)) as client:
             resp = await client.post(
                 "/api/chat/tags",
-                json={"name": "x" * 50 + "AKIAIOSFODNN7EXAMPLE"},
+                json={"name": "x" * 50 + _TOKEN},
             )
             assert resp.status == 201
             data = await resp.json()
-            assert "AKIA" not in data["name"]
+            assert _TOKEN[:8] not in data["name"]
 
     @pytest.mark.asyncio
     async def test_delete_tag_persists_vocab_before_slots(self, tmp_path, monkeypatch):
@@ -1008,6 +1012,66 @@ class TestTagVocabulary:
             assert tag["id"] not in slot.tags
             updated_col = next(c for c in state._tag_boards if c["id"] == col["id"])
             assert tag["id"] not in updated_col["tag_ids"]  # stripped in memory
+
+    @pytest.mark.asyncio
+    async def test_delete_tag_strips_a_slot_popped_during_the_vocabulary_write(
+        self, tmp_path, monkeypatch
+    ):
+        """A close that pops a tagged slot DURING the vocab write must not keep the id.
+
+        The strip pass reads ``state._slots`` after the vocabulary write has awaited, so
+        a slot popped inside that await window is in no view it can see. When the close's
+        own ``save_slot_off_loop`` then FAILS, ``chat_handlers`` puts the SAME object back
+        still carrying the deleted tag id, and the periodic flush full-saves it from
+        memory -- so the id reaches disk. No later pass repairs it, because the object is
+        in no snapshot while it is out.
+
+        The pop is injected from inside ``_write_tags_snapshot``, which is exactly the
+        call the handler awaits, so the window is the code's own rather than this test's
+        model of it.
+
+        POSITIVE CONTROL: ``live`` stays in ``_slots`` throughout and must also be
+        stripped, so a fix that simply stopped stripping cannot pass.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        app = _make_tags_app(state)
+        original_write = chat_tags_module._write_tags_snapshot
+
+        async with TestClient(TestServer(app)) as client:
+            tag = await (await client.post("/api/chat/tags", json={"name": "Doomed"})).json()
+
+            popped = _ChatSlot("s-popped")
+            popped.tags = [tag["id"]]
+            state._slots["s-popped"] = popped
+            live = _ChatSlot("s-live")
+            live.tags = [tag["id"]]
+            state._slots["s-live"] = live
+
+            def _pop_during_write(st, snapshot):
+                # Models chat_handlers' close: _slots.pop before its own save await.
+                st._slots.pop("s-popped", None)
+                return original_write(st, snapshot)
+
+            with (
+                patch("kiro_crew.dashboard.chat_tags.save_slot_off_loop"),
+                patch("kiro_crew.dashboard.chat_tags._write_tags_snapshot", _pop_during_write),
+            ):
+                resp = await client.delete(f"/api/chat/tags/{tag['id']}")
+
+            assert resp.status == 200
+            # NEGATIVE CONTROL on the fixture: the pop really did happen, so a green
+            # result cannot come from the slot having stayed visible all along.
+            assert "s-popped" not in state._slots, "the injected close never popped the slot"
+            assert tag["id"] not in popped.tags, (
+                "a slot popped during the vocabulary write kept the deleted tag id; the "
+                "close's failed save restores this same object, so the id becomes "
+                "durable and no later pass can reach it"
+            )
+            assert tag["id"] not in live.tags, (
+                "the still-present slot was not stripped either -- the strip stopped "
+                "working rather than being widened"
+            )
 
 
 class TestTagCreateAfterDeleteAppends:

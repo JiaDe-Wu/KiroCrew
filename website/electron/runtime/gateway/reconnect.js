@@ -1,6 +1,7 @@
 "use strict";
 
 const { decideGatewayAction } = require("../../instance-guard");
+const { readBakedEdition } = require("../../edition");
 const {
   classifyAdoptedGateway,
   waitForServiceRebind,
@@ -12,6 +13,8 @@ const {
 const { RESPAWN_SUPERSEDED } = require("./respawn-owner");
 
 const ADOPTED_RECOVERY_WAIT_MS = 30_000;
+const ADOPTED_PORT_WAIT_MS = 30_000;
+const ADOPTED_PORT_POLL_MS = 2_500;
 
 /**
  * The two liveness recoveries that never kill the gateway on the port: waiting
@@ -32,6 +35,8 @@ const ADOPTED_RECOVERY_WAIT_MS = 30_000;
  * @param {() => Promise<boolean|string>} deps.respawnGateway  the supervisor's
  *        respawn owner (respawn-owner.js); RESPAWN_SUPERSEDED means an update
  *        install took over, so the recovery stops without connecting.
+ * @param {() => number} [deps.getInstallEpoch]  bumped on every install
+ *        dispatch; the adopted port wait stops when it changes.
  */
 function createReconnect({
   app,
@@ -61,6 +66,7 @@ function createReconnect({
   unverifiedIncumbent,
   waitForIncumbentExit,
   probeLockHolderPid,
+  getInstallEpoch = () => 0,
 }) {
   async function reconnectExternalGateway(window) {
     const webContents = window.webContents;
@@ -91,7 +97,7 @@ function createReconnect({
     const owner = await probeGatewayPortOwner(PORT);
     const health = await fetchHealthInfo();
     const decision = decideGatewayAction(app.getVersion(), health, {
-      localOwner: owner,
+      localOwner: owner, ownEdition: readBakedEdition(),
     });
     const readiness = await fetchGatewayReadiness();
     if (window.isDestroyed() || quitting()) return;
@@ -108,7 +114,36 @@ function createReconnect({
     return showUnrecoverableGatewayError(window, PORT, "held");
   }
 
+  // "unknown" readiness (no answer from /api/ready, or an unexpected status) is
+  // not proof of serving; the port wait asks again on its next poll.
+  async function adoptedHolderServing() {
+    try { await checkBackend(HEALTH_URL); }
+    catch { return false; }
+    const readiness = await fetchGatewayReadiness();
+    return readiness !== "shutting-down" && readiness !== "unknown";
+  }
+
+  // A supervised gateway keeps the port through a stall, so a holder that
+  // serves again ends the wait as well as a port that frees. The deadline is
+  // checked before each port wait, so one serving probe can run past it.
+  async function waitForAdoptedPort(window, epoch) {
+    const cancelled = () => !window || window.isDestroyed() || quitting() || getInstallEpoch() !== epoch;
+    const deadline = Date.now() + ADOPTED_PORT_WAIT_MS;
+    const polls = Math.ceil(ADOPTED_PORT_WAIT_MS / ADOPTED_PORT_POLL_MS);
+    for (let poll = 0; poll <= polls; poll += 1) {
+      if (cancelled()) return "cancelled";
+      if (await adoptedHolderServing()) return cancelled() ? "cancelled" : "serving";
+      const left = deadline - Date.now();
+      if (poll === polls || left <= 0) break;
+      if (await waitForPortFree(Math.min(ADOPTED_PORT_POLL_MS, left))) {
+        return cancelled() ? "cancelled" : "cleared";
+      }
+    }
+    return cancelled() ? "cancelled" : "held";
+  }
+
   async function reconnectOrRespawnAdoptedGateway(window) {
+    const epoch = getInstallEpoch();
     const webContents = window.webContents;
     try { webContents.loadFile(path.join(dirname, "loading.html"), { query: splashQuery(window, { reconnect: true }) }); }
     catch { /* window may be tearing down */ }
@@ -129,7 +164,7 @@ function createReconnect({
       await new Promise((resolve) => setTimeout(resolve, 2500));
     }
     if (!window || window.isDestroyed() || quitting()) return;
-    glog(`liveness: adopted local gateway did not recover within ${ADOPTED_RECOVERY_WAIT_MS}ms — waiting for :${PORT} to clear, then spawning our own backend`);
+    glog(`liveness: adopted local gateway did not recover within ${ADOPTED_RECOVERY_WAIT_MS}ms — waiting up to ${ADOPTED_PORT_WAIT_MS}ms for :${PORT} to clear or for the gateway to answer again`);
     sendStatus("Waiting for the previous gateway to exit…");
     // The incumbent may be draining: a socket lookup can name no PID while the
     // gateway sheds its socket, and once it has released the socket but still
@@ -194,15 +229,21 @@ function createReconnect({
         return reconnectToNewHolder(window, "gateway.lock holder started serving");
       }
     }
-    if (!(await waitForPortFree())) {
+    const portWait = await waitForAdoptedPort(window, epoch);
+    if (portWait === "cancelled") return;
+    if (portWait === "serving") {
+      return reconnectToNewHolder(window, "adopted gateway answering again on");
+    }
+    if (portWait !== "cleared") {
       glog(`liveness: :${PORT} still held by a process we did not spawn — surfacing port-held instead of waiting forever`);
       return showUnrecoverableGatewayError(window, PORT, "held");
     }
     if (!window || window.isDestroyed() || quitting()) return;
 
     if (getGatewayOwnership() === "reused-service") {
-      // A real manager may rebind after the socket release. Orphans share the
-      // same classification, so this is a bounded grace, never an exemption.
+      // A real manager may rebind after the socket release. Off macOS orphans
+      // share the same classification, so this is a bounded grace, never an
+      // exemption.
       glog("liveness: adopted gateway was service-managed — waiting a bounded grace for its manager to respawn it before spawning our own");
       sendStatus("Waiting for the gateway to restart…");
       const verdict = await waitForServiceRebind({

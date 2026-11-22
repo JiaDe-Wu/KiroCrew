@@ -1,15 +1,18 @@
 import { useState, useCallback, useMemo, useEffect, useRef, type MutableRefObject, type Dispatch, type SetStateAction } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import { store, type AppDispatch } from '../../../store'
-import { isHiddenInvisibleAssistantRow, isRetractedSteerRow } from '../../../utils/invisibleText'
+import { isRetractedSteerRow } from '../../../utils/invisibleText'
+import { isHiddenReplyAt } from '../../../app-sdk/turnPolicyBlock'
 import { appendSlotMessage, selectSendConfirmed, resolveOptimisticSteer } from '../../../store/chatSlice'
 import { sendTurn } from '../../../chat-core/transport/sendTurn'
 import { applySteerReceipt } from '../../../chat-core/transport/steerReceipt'
 import { useMessageQuote } from '../../../chat-core/composer/useMessageQuote'
 import { type MessageQuote, stripQuoteBlock } from '../../../chat-core/composer/messageQuote'
+import { markDictated } from '../../../chat-core/composer/dictationProvenance'
 import { api } from '../../../api/client'
 import { resolveAskAfterSend } from '../../../lib/resolveAskAfterSend'
 import { isSystemNoticeRow } from '../CompactionCard'
+import { injectOpensTurn } from '../RecoveryCard'
 import { mergeRecoveredDraft, setDraft } from '../../../utils/chatDrafts'
 import { revealComposer } from '../composerFocus'
 import type { ChatMessage } from '../../../types'
@@ -40,6 +43,14 @@ export const REFUSED_PRESS_TITLE_KEYS = {
 
 export type RefusedPressAction = keyof typeof REFUSED_PRESS_TITLE_KEYS
 
+/** The turn-opening inject kinds whose row is the gateway's own fixed text (a
+ *  workflow follow-up, a heartbeat prompt, the sub-agent synthesis kick-off), so
+ *  Regenerate re-runs it. Regenerate stops at every `inject` row that opened a turn
+ *  (`injectOpensTurn`), and the server refuses the other openers (a cron
+ *  notification, an app message, an automation notice). Mirrors
+ *  `_RERUN_INJECT_KINDS` and `_turn_opening_inject_kind` in chat_regenerate.py. */
+const RERUN_INJECT_KINDS: ReadonlySet<unknown> = new Set(['workflow', 'heartbeat', 'synthesis'])
+
 /** The refused-press notice for an intercepted slash command that failed. The
  *  title names the command that was refused; the message is the gateway's
  *  reason, or a fallback saying the draft is still in the composer. */
@@ -67,6 +78,11 @@ export interface SteerVars {
   askId?: string | null
   files?: string[]
   baseAtPress?: number
+  /** `text` without the dictation note a composer steer added; a hand-back
+   *  restores this instead of the sent text. */
+  typedText?: string
+  /** The composer provenance the steer took; a hand-back puts it back. */
+  dictated?: boolean
 }
 
 interface SteerDeliveryOptions {
@@ -132,7 +148,7 @@ export function useSteerDelivery({
         ...(sendId ? { meta: { sendId, ...(files?.length ? { files } : {}), ...(quote ? { quote } : {}) } } : {}),
         race: { baseRevision: await baseRevisionForPress(slot, baseAtPress), ...(sendId ? { idempotencyKey: sendIdempotencyKey(sendId) } : {}) },
       }),
-    onSuccess: (receipt, { text, sendId, slot, quote, askId }) => {
+    onSuccess: (receipt, { text, sendId, slot, quote, askId, typedText, dictated }) => {
       // Receipt policy for a steer, owned once in chat-core (issue #9457):
       // applySteerReceipt decides WHICH ruling applies; the adapter below is
       // ChatPage's HOW. The composer was cleared at submit and the optimistic
@@ -158,7 +174,13 @@ export function useSteerDelivery({
         // On screen: the quote goes back on the stage when it is free, else
         // its block stays in the text. Off screen (no stage per slot): the
         // block stays in the parked text. Nothing is lost either way.
-        const typed = onScreenNow && quote ? messageQuote.recoverInto(stripQuoteBlock(text, quote), quote, composerMountedRef.current) : text
+        // The text as it stood before this send added the dictation note, and
+        // the provenance it took: both supplied by the sender, never inferred
+        // from the words, so a line the user typed themselves is never removed.
+        // The re-send then adds the note once.
+        const bare = typedText ?? text
+        if (dictated) markDictated(slot)
+        const typed = onScreenNow && quote ? messageQuote.recoverInto(stripQuoteBlock(bare, quote), quote, composerMountedRef.current) : bare
         const back = mergeRecoveredDraft(kept, typed)
         setDraft(drafts.current, slot, back)
         saveDrafts()
@@ -292,7 +314,7 @@ export function useRegenerate({
       // System-notice rows (compaction / session reload) are passed over too:
       // they draw a system card, not a reply, so hosting Regenerate/variant
       // switching on them would target the wrong row.
-      if (messages[i].role === 'assistant' && !isHiddenInvisibleAssistantRow(messages[i]) && !isSystemNoticeRow(messages[i])) return i
+      if (messages[i].role === 'assistant' && !isHiddenReplyAt(messages[i], messages, i) && !isSystemNoticeRow(messages[i])) return i
     }
     return -1
   }, [messages])
@@ -343,8 +365,8 @@ export function useRegenerate({
     const messages = messagesRef.current
     // Mirror the server's scan exactly (chat_regenerate.py): only a slot whose
     // last turn holds an assistant reply BY ROLE can be regenerated. System
-    // notices (compaction / session reload) are skipped and a real user turn is
-    // never crossed, on both sides. Nothing is removed here: the previous reply
+    // notices (compaction / session reload) are skipped and neither a real user
+    // turn nor a turn-opening inject row is crossed, on both sides. Nothing is removed here: the previous reply
     // stays on screen until the server replaces it at the end of a turn that
     // produced a new one, so a turn that ends empty keeps it.
     let aiIdx = -1
@@ -355,7 +377,7 @@ export function useRegenerate({
       // Never cross a real user turn (mirror the server): a reply found past
       // a newer user row (e.g. a /compact row awaiting only its notice) would
       // be regenerated by deleting that newer turn, irreversibly.
-      if (messages[i].role === 'user') break
+      if (messages[i].role === 'user' || injectOpensTurn(messages[i])) break
       if (messages[i].role !== 'assistant') continue
       if (isSystemNoticeRow(messages[i])) continue
       aiIdx = i
@@ -365,17 +387,22 @@ export function useRegenerate({
     let uIdx = -1
     for (let i = aiIdx - 1; i >= 0; i--) {
       if (isRetractedSteerRow(messages[i])) continue
-      if (messages[i].role === 'user') { uIdx = i; break }
+      if (messages[i].role === 'user' || injectOpensTurn(messages[i])) { uIdx = i; break }
     }
     if (uIdx < 0) return
-    // The same rows the server arms as the target: everything after the
-    // regenerated user row.
-    const mids = new Set<string>()
-    for (const row of messages.slice(uIdx + 1)) {
-      const mid = row.meta?.mid
-      if (typeof mid === 'string' && mid) mids.add(mid)
+    // The server refuses a reply to an automated message and removes nothing, so
+    // no row is marked; the press still reaches it for the refused-press notice.
+    const request = messages[uIdx]
+    if (!injectOpensTurn(request) || RERUN_INJECT_KINDS.has(request.meta?.injectKind)) {
+      // The same rows the server arms as the target: everything after the
+      // regenerated request row.
+      const mids = new Set<string>()
+      for (const row of messages.slice(uIdx + 1)) {
+        const mid = row.meta?.mid
+        if (typeof mid === 'string' && mid) mids.add(mid)
+      }
+      setReplacingMids(mids)
     }
-    setReplacingMids(mids)
     setRegenerating(true)
     api.regenerateSlot(activeSlot).catch((e: unknown) => {
       showRefusedPress('regenerate', e)

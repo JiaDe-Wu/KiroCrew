@@ -94,9 +94,11 @@ def _without_local_only_grants(grants: list[str]) -> list[str]:
             if tool in LOCAL_ONLY_CORE_TOOLS:
                 continue
             if "*" in tool or "?" in tool:
-                from kiro_crew.acp.kas_permissions import _mcp_pattern
+                from kiro_crew.acp.kas_permissions import _UNSHARED_GLOB_SYNTAX
 
-                if _mcp_pattern(grant) is not None:
+                # Expanded to literal names, so `?` reads as kiro-cli reads it;
+                # a backslash or class/brace syntax `fnmatch` reads differently.
+                if "\\" not in tool and not set(tool) & (_UNSHARED_GLOB_SYNTAX - {"?"}):
                     out.extend(
                         f"@{CORE_MCP_SERVER}/{t}"
                         for t in core_tools
@@ -240,6 +242,12 @@ async def _write_remote_token(self: AcpRuntime) -> None:
     args = list(server["args"])
     args[args.index("--token-file") + 1] = str(path)
     workspace["server"] = {**server, "args": args}
+    # A connected computer's exposed local MCP servers ride their own relays.
+    for extra in workspace.get("extra_servers") or ():
+        extra_path = await asyncio.to_thread(extra["write_token"], scratch)
+        extra_args = list(extra["server"]["args"])
+        extra_args[extra_args.index("--token-file") + 1] = str(extra_path)
+        extra["server"] = {**extra["server"], "args": extra_args}
 
 
 def _remote_session_servers(self: AcpRuntime, servers: list[Any]) -> list[Any]:
@@ -255,21 +263,42 @@ def _remote_session_servers(self: AcpRuntime, servers: list[Any]) -> list[Any]:
         for s in servers
         if s.get("name") != entry["name"] and s.get("name") not in LOCAL_ONLY_SERVERS
     ]
-    return kept + [entry]
+    # Only a connected computer's workspace carries extra servers (its exposed
+    # local MCP servers); every other remote workspace returns as before.
+    extras = [e["server"] for e in self._remote_workspace.get("extra_servers") or ()]
+    if not extras:
+        return kept + [entry]
+    names = {e["name"] for e in extras}
+    return [s for s in kept if s.get("name") not in names] + [entry, *extras]
 
 
-def _remote_workspace_agents(self: AcpRuntime, agents: Any, servers: list[Any]) -> Any:
+def _remote_workspace_agents(
+    self: AcpRuntime,
+    agents: Any,
+    servers: list[Any],
+    *,
+    active_agent: str | None = None,
+    notices_out: list[str] | None = None,
+) -> Any:
     """Agent definitions with built-in tools unmounted for a remote workspace.
 
     MCP grants survive; ``"*"`` becomes the servers sent. Every built-in acts
     on this machine, so each is replaced by its workspace tools
     (:func:`_workspace_grants`); an empty allowlist stays empty.
+
+    The session's own entry (id *active_agent*; every entry when ``None``) is
+    refused when its shell or file rules cannot bind here. Any other entry is a
+    sub-agent registered beside it (:mod:`kiro_crew.acp.kas_subagent_targets`):
+    one with such rules is left out and named in *notices_out*, so the session
+    starts and only the hand-off to it fails.
     """
     if self._remote_workspace is None or not agents:
         return agents
     name = self._remote_workspace["server"]["name"]
     workdir = self._remote_workspace["workdir"]
-    notice = (
+    # A connected computer brings its own wording: its git uses that computer's
+    # own logins, and no gateway git proxy runs for it.
+    notice = self._remote_workspace.get("notice") or (
         f"\n\nThis session's files and shell live in a remote workspace at {workdir}. "
         f"Use the @{name} tools for every file and command; local file and shell "
         "tools are not available. Git over HTTPS or SSH to GitHub, GitLab, Bitbucket "
@@ -284,12 +313,16 @@ def _remote_workspace_agents(self: AcpRuntime, agents: Any, servers: list[Any]) 
         "rewrites."
     )
     out = []
+    left_out: list[str] = []
     for agent in agents:
         # KAS judges workspace tools as `mcp`, so the agent's own shell and
         # file restrictions would stop matching: refuse instead of dropping them.
         # The spec's deny-all-but allowlists (shell `denyByDefault`, write
         # `fallbackAction: "deny"`) bind built-ins only, so they are refused too.
         if _restricts_replaced_builtins(agent.get("permissions")) or _carries_spec_allowlist(agent):
+            if active_agent is not None and agent.get("id") != active_agent:
+                left_out.append(str(agent.get("id")))
+                continue
             from kiro_crew.session_environment import REMOTE_AGENT_RESTRICTED
 
             raise AcpRuntimeError(REMOTE_AGENT_RESTRICTED)
@@ -341,4 +374,12 @@ def _remote_workspace_agents(self: AcpRuntime, agents: Any, servers: list[Any]) 
             agent["excludedTools"] = list(dict.fromkeys([*entries, *replacements]))
         agent["prompt"] = str(agent.get("prompt") or "") + notice
         out.append(agent)
+    if left_out:
+        from kiro_crew.session_environment import REMOTE_SUBAGENTS_RESTRICTED
+
+        logger.info("remote workspace: sub-agents %s left out of the batch", left_out)
+        if notices_out is not None:
+            notices_out.append(
+                REMOTE_SUBAGENTS_RESTRICTED.format(agent=active_agent, targets=", ".join(left_out))
+            )
     return out

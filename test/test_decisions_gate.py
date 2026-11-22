@@ -435,7 +435,10 @@ class TestGovernanceWithdrawsTheSeam:
         calls: list[str] = []
 
         def _probe(
-            surface_key: str = capability.DASHBOARD_SURFACE_KEY, *, local: bool = False
+            surface_key: str = capability.DASHBOARD_SURFACE_KEY,
+            *,
+            local: bool = False,
+            provider: str | None = None,
         ) -> bool:
             calls.append(surface_key)
             return denied
@@ -1554,7 +1557,7 @@ class TestResponseMetadataOnRow:
 
 class TestDecisionLists:
     """``capabilities.decisions`` ``models`` / ``points`` / ``endpoints`` lists, at
-    ``decide`` (RFC crew-enterprise-edition, appendix: decision models, decision
+    ``decide`` (RFC crew-lts-edition, appendix: decision models, decision
     kinds, decision endpoints). Real policy, real evaluator; only SEL is faked."""
 
     @pytest.fixture(autouse=True)

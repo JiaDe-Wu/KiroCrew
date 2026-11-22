@@ -32,6 +32,10 @@ silently reorder every existing result. Instead:
    ``str.count`` tests.
 2. The unchanged scoring code then runs on those candidates only, taking their
    folded text from this store instead of from the JSONL.
+3. For a needle whose candidate set is exact
+   (:meth:`SessionSearchIndex.answers_presence_exactly`), the same lookup also
+   says how many vouched-for sessions hold it, which the ranking's idf needs
+   without reading the sessions the lookup ruled out.
 
 A session the index does not vouch for is scanned exactly as before, so the
 index can be empty, partial, stale, or absent without changing one result.
@@ -104,7 +108,6 @@ import logging
 import os
 import re
 import threading
-import time
 import unicodedata
 import zlib
 from pathlib import Path
@@ -112,7 +115,7 @@ from typing import TYPE_CHECKING, Iterable, Iterator, NamedTuple, Sequence
 
 from kiro_crew._sqlite_compat import fts5_available, is_cjk_char, sqlite3
 from kiro_crew.owner_only_files import mkdirs_owner_only, prepare_owner_only_sqlite
-from kiro_crew.sqlite_wal import enable_wal
+from kiro_crew.sqlite_wal import enable_wal, wal_truncated
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from kiro_crew.history_search import SearchNeedle
@@ -231,9 +234,6 @@ _CONNECT_TIMEOUT_SECS = 30
 #: refused deletion. What they must never do is turn a persistent BUSY into a
 #: reported success.
 _LOGGER = logging.getLogger(__name__)
-
-_WAL_TRUNCATE_ATTEMPTS = 3
-_WAL_TRUNCATE_RETRY_SECS = 0.05
 
 _SQLITE_INT_MIN = -(1 << 63)
 _SQLITE_INT_MAX = (1 << 63) - 1
@@ -656,21 +656,8 @@ class SessionSearchIndex:
             return False
 
     def _truncate_wal(self, conn: sqlite3.Connection) -> bool:
-        """Truncate the WAL, reporting whether it actually happened.
-
-        ``PRAGMA wal_checkpoint(TRUNCATE)`` does NOT raise when it cannot proceed:
-        it returns ``(busy, log_pages, checkpointed_pages)`` with ``busy=1``, so a
-        caller that ignores the row reports an erasure it did not perform. A reader
-        outliving ``busy_timeout`` is what makes it busy, so a few short retries
-        clear the ordinary case without weakening the verdict.
-        """
-        for attempt in range(_WAL_TRUNCATE_ATTEMPTS):
-            row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-            if row is None or int(row[0]) == 0:
-                return True
-            if attempt + 1 < _WAL_TRUNCATE_ATTEMPTS:
-                time.sleep(_WAL_TRUNCATE_RETRY_SECS)
-        return False
+        """Truncate the WAL, reporting whether it actually happened (:func:`wal_truncated`)."""
+        return wal_truncated(conn)
 
     def store_exists(self) -> bool:
         """Whether an index file is on disk, regardless of :attr:`available`.
@@ -740,6 +727,21 @@ class SessionSearchIndex:
                 continue
             out.append((pos, "session_fts", _or_group(spellings)))
         return out
+
+    @staticmethod
+    def answers_presence_exactly(needle: "SearchNeedle") -> bool:
+        """Whether this needle's candidate set is EXACTLY the sessions holding it.
+
+        :meth:`_lookups` only promises a superset, which is all the gate needs.
+        Counting how many sessions contain a needle needs the exact set, and two
+        lookups give more: a two-character CJK word matches its characters
+        anywhere in the document, and a digit-bounded number matches inside a
+        longer number. Every other lookup is a substring test on the same folded
+        text ``count_needle`` reads.
+        """
+        if needle.digit_bounded or not SessionSearchIndex._lookups([needle]):
+            return False
+        return not (len(needle.text) == 2 and all(map(is_cjk_char, needle.text)))
 
     @staticmethod
     def _candidates_from(
@@ -881,6 +883,7 @@ class SessionSearchIndex:
             conn.execute("VACUUM")
             self._truncate_wal(conn)
         except Exception:
+            # A failed pass runs again at the next maintenance interval.
             pass
 
     def close(self) -> None:

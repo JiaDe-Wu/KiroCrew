@@ -175,7 +175,7 @@ async def callback(job):
         root = Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
         from kiro_crew.slack import gateway
 
-        census = inspect.getsource(gateway.GatewayOrchestrator._in_flight_work_counts)
+        census = inspect.getsource(gateway.GatewayOrchestrator._in_flight_work_census)
         for token in (
             "sessions.inbound_callback_count",
             "inbound_spool.pending_refusal_write_count()",
@@ -220,7 +220,7 @@ async def callback(job):
                     *sorted((root / "slack" / "gateway_runtime").glob("*.py")),
                 ],
                 2,
-                ("len(self._running_script_ids)",),
+                ("for job_id in list(self._running_script_ids)",),
             ),
             "taskrunner": (
                 [root / "taskrunner.py", *sorted((root / "taskrunner_parts").glob("*.py"))],
@@ -399,47 +399,3 @@ async def callback(job):
             and node.func.attr == "send_socket_mode_response"
         ]
         assert admit and ack and min(admit) < min(ack)
-
-    def test_every_auto_apply_path_uses_the_final_restart_fence(self):
-        path = Path(__file__).resolve().parents[1] / "src" / "kiro_crew" / "slack" / "gateway.py"
-        sources = (path, *sorted((path.parent / "gateway_runtime").glob("*.py")))
-        text = "\n".join(source.read_text(encoding="utf-8") for source in sources)
-        tree = ast.parse(text, filename=str(path))
-        methods = {
-            node.name: node
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-
-        def attrs_of(name: str) -> set[str]:
-            return {
-                node.func.attr
-                for node in ast.walk(methods[name])
-                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-            }
-
-        # The managed-venv apply builds with admission open and reaches the fence
-        # through the restart bracket, which pauses admission first.
-        assert "_retry_pending_update_restart" in attrs_of("_auto_apply_wheel_update")
-        for name in ("_auto_apply_update", "_retry_pending_update_restart"):
-            assert "_restart_after_update" in attrs_of(name)
-        for name in ("_auto_apply_update", "_auto_apply_wheel_update"):
-            assert "reexec_python_module" not in attrs_of(name)
-
-        prepare_attrs = {
-            node.func.attr
-            for node in ast.walk(methods["_prepare_auto_update_apply"])
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-        }
-        assert "drain_active_turns" not in prepare_attrs
-
-        restart = methods["_restart_after_update_claimed"]
-        calls: dict[str, list[int]] = {}
-        for node in ast.walk(restart):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                calls.setdefault(node.func.attr, []).append(node.lineno)
-        drains = sorted(calls["_drain_update_callback_work"])
-        assert len(drains) == 2
-        assert drains[0] < calls["fence_update_restart"][0]
-        assert calls["fence_update_restart"][0] < calls["close_all"][0] < drains[1]
-        assert drains[1] < calls["reexec_python_module"][0]

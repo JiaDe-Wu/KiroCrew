@@ -4,20 +4,23 @@ import type { ComposerHandle } from '../../../chat-core/composer/Composer'
 import type { ComposerDraftStore } from '../../../chat-core/composer/draftStore'
 import type { MessageQuote } from '../../../chat-core/composer/messageQuote'
 import { buildOutgoingTurn, isEmptyTurn } from '../../../chat-core/composer/outgoingTurn'
-import { mintSendId } from '../../../chat-core/transport/sendTurn'
+import { takeDictated, wantsDictationNote } from '../../../chat-core/composer/dictationProvenance'
+import { mintSendId, type SendReceipt } from '../../../chat-core/transport/sendTurn'
 import type { UseMessageQuote } from '../../../chat-core/composer/useMessageQuote'
 import { isNonInteractiveQueued, isSystemDelivery } from '../../../components/QueueStack'
 import { useQueuedMessageActions } from '../../../hooks/useQueuedMessageActions'
 import { useSteerRetract } from '../../../hooks/useSteerRetract'
 import { drainPendingChunks } from '../../../lib/pendingChunkDrain'
 import { store, type AppDispatch } from '../../../store'
-import { appendMessage, appendSlotMessage, capturePendingAskId, clearPendingPermissions, requestStop, selectComposerBusy, type pendingQuestionFor } from '../../../store/chatSlice'
+import { appendMessage, appendSlotMessage, capturePendingAskId, requestStop, selectComposerBusy, selectSendConfirmed, type pendingQuestionFor } from '../../../store/chatSlice'
 import type { ChatMessage, ChatSlot } from '../../../types'
 import { mergeIntoDraft, mergeRecoveredDraft, setDraft } from '../../../utils/chatDrafts'
 import { setFileDraft } from '../../../utils/chatFileDrafts'
 import { restoreToComposer } from '../../../utils/composerRestore'
 import { expandAll as expandPasteTokens } from '../../../utils/pasteTokens'
 import { handleStopPress, isEscalationState } from '../../../utils/stopDebounce'
+import { stopRefusalCopy } from '../../../chat-core/stop/useStopPress'
+import { i18nT } from '../../../i18n/t'
 import { answerRejectedMessage } from '../../../utils/questionAnswers'
 import { interceptSlashCommand, isInterceptedSlashCommand } from '../ChatInput'
 import { baseRevisionFor } from '../../../api/sendRace'
@@ -25,6 +28,7 @@ import { noteComposerSent } from '../shared-crew/typingSignal'
 import type { SteerVars } from './turnActions'
 import type { ComposerDraftStores } from './composerDrafts'
 import type { ComposerStaging } from './composerStaging'
+
 
 interface BusyTurnControlsOptions {
   activeSlot: string | null
@@ -35,9 +39,14 @@ interface BusyTurnControlsOptions {
   messages: ChatMessage[]
   transcriptAuthoritative: boolean
   /** The page's send, for the busy-but-not-running case and a `/fork` prompt. */
-  send: (optionText?: string, targetSlot?: string, steerNow?: boolean, isolated?: boolean) => Promise<boolean>
+  send: (optionText?: string, targetSlot?: string, steerNow?: boolean, isolated?: boolean, sendNow?: boolean, onUndelivered?: (kind: 'refused' | 'indeterminate', reason?: string) => void, reportConfirmed?: (confirmed: boolean) => void) => Promise<boolean>
   /** The receipt-aware steer POST (turnActions.ts's `applySteerReceipt` adapter). */
-  steerMutation: { mutate: (vars: SteerVars) => void }
+  steerMutation: {
+    mutate: (vars: SteerVars) => void
+    /** Same POST. Settles for every call, where `mutate`'s per-call callbacks
+     *  fire only for the latest one, so the composer steer reads its verdict here. */
+    mutateAsync: (vars: SteerVars) => Promise<SendReceipt>
+  }
   /** The whole-message quote stage (`useMessageQuote`): a steer consumes it
    *  like a send does, and a cancelled queued send hands its quote back here. */
   messageQuote: UseMessageQuote
@@ -60,6 +69,9 @@ interface BusyTurnControlsOptions {
   /** Reports a refused slash command on the composer's notice, while its
    *  origin chat is still on screen (the restored text is then right below). */
   onSlashRefused?: (res: { stage?: 'open' | 'turn' | 'agent' | 'fork'; error?: string }) => void
+  /** Reports a Stop the server refused (a cron run this caller may not cancel)
+   *  or could not reach, on the page's action-error notice. */
+  showActionError?: (message: string, title?: string) => void
 }
 
 /**
@@ -92,6 +104,7 @@ export function useBusyTurnControls({
   softStopAtMapRef,
   dispatch,
   onSlashRefused,
+  showActionError,
 }: BusyTurnControlsOptions) {
   const { drafts, fileDrafts, pasteDrafts, sessionRefDrafts, saveDrafts } = stores
   const { pendingFilesRef, pasteBlocksRef, setPasteBlocks, setPendingFiles, pendingSessionsRef, setPendingSessions, pickedFileTokens, mergeSlotTokens } = staging
@@ -139,8 +152,13 @@ export function useBusyTurnControls({
   // the text inline via the 'steer_push' WS event. Composer, pending files,
   // paste blocks, and the per-slot drafts are all cleared HERE (not in
   // ChatInput) so text and attachments clear atomically.
-  const steer = useCallback((opts?: { auto?: boolean; text?: string }) => {
-    if (!activeSlot) return
+  //
+  // Resolves true only when the server provably holds the composer's text (a
+  // `dispatched` or `queued` receipt, or a correlated echo), the verdict
+  // `composerSend` gives a send. The composer's prompt stash deletes a
+  // restored draft's stored copy on it, so every other path resolves false.
+  const steer = useCallback(async (opts?: { auto?: boolean; text?: string }): Promise<boolean> => {
+    if (!activeSlot) return false
     // A follow-up chip's own text, steered as-is: like an option send, it
     // leaves the composer draft, attachments and staged quote alone.
     const optionText = opts?.text
@@ -152,13 +170,17 @@ export function useBusyTurnControls({
     // server-side hold that keeps a user message behind running sub-agents.
     // Delegating here, BEFORE the composer is read and cleared below, leaves
     // send() owning the draft, attachment and optimistic-bubble bookkeeping.
-    if (!slotRunning) { void send(optionText, undefined, true); return }
+    if (!slotRunning) {
+      let confirmed = false
+      const delivered = await send(optionText, undefined, true, false, false, undefined, (ok) => { confirmed = ok })
+      return delivered && confirmed
+    }
     if (optionText) {
       // Offline, a chip send is a no-op, as send() makes it: the chip stays.
-      if (!connected) return
+      if (!connected) return false
       composerRef.current?.voice()?.disarmForSend()
       steerText(optionText, activeSlot, opts?.auto === true)
-      return
+      return false
     }
     const askAtSteer = capturePendingAskId(store.getState().chat.pendingQuestions, activeSlot)
     const raw = inputRef.current.trim()
@@ -171,7 +193,7 @@ export function useBusyTurnControls({
     // A staged quote alone is a payload; a slash command is not a send, so the
     // quote stays staged through it.
     const steerQuote = isInterceptedSlashCommand(raw) ? null : messageQuote.consume('').quote
-    if (isEmptyTurn({ text: raw, files, quote: steerQuote })) return
+    if (isEmptyTurn({ text: raw, files, quote: steerQuote })) return false
     // Same rule as send(): a steer while STREAMING dictation is live ends the
     // dictation before the composer is cleared below. AFTER the empty-payload
     // check, like send(): an Enter on an empty composer before the first
@@ -229,15 +251,21 @@ export function useBusyTurnControls({
       // The composer's draft is consumed, so its typing lease ends now.
       noteComposerSent(originSlot)
       setInput(''); setPasteBlocks([])
-      return
+      return false
     }
     // The text-only steer turn (`buildOutgoingTurn`): files inlined, folder
     // tokens kept in their `@rel/` form (a marker with no `meta.dirs` to
     // replay against would truncate a spaced path), staged session references
     // appended as links, the live paste tokens expanded, the quote opening
     // the text.
-    const turn = buildOutgoingTurn({ text: raw, files, pastes: pasteBlocksRef.current, sessionRefs, quote: steerQuote }, 'steer')
-    const llmTxt = turn.wire
+    // The note ends the steered text too. The note-free text and the
+    // provenance ride the mutation, so a steer that is handed back restores
+    // exactly what was typed and puts the provenance back (turnActions' `handBack`).
+    const wasDictated = takeDictated(activeSlot)
+    const steerInput = { text: raw, files, pastes: pasteBlocksRef.current, sessionRefs, quote: steerQuote }
+    const turn = buildOutgoingTurn(steerInput, 'steer')
+    const typedTxt = turn.wire
+    const llmTxt = wantsDictationNote(wasDictated) ? buildOutgoingTurn({ ...steerInput, dictationNote: true }, 'steer').wire : typedTxt
     // `meta.files` is the ordered non-image list the `[attached_file N]`
     // markers index into: the transcript chip resolves marker N to
     // files[N-1]. Without it the renderer falls back to a whitespace-bounded
@@ -267,7 +295,13 @@ export function useBusyTurnControls({
     // is the answer every refusal keeps, so it is the honest guess while the POST
     // is in flight, and a queue answer replaces this row through the same
     // `queue_push` reconcile a manual queue uses.
-    steerMutation.mutate({ text: llmTxt, sendId: steerSendId, slot: activeSlot, auto: opts?.auto === true, quote: steerQuote, askId: askAtSteer, files: steerFiles, baseAtPress: baseRevisionFor(activeSlot) })
+    const steerSlot = activeSlot
+    const verdict = steerMutation.mutateAsync({ text: llmTxt, sendId: steerSendId, slot: steerSlot, auto: opts?.auto === true, quote: steerQuote, askId: askAtSteer, files: steerFiles, baseAtPress: baseRevisionFor(steerSlot), typedText: typedTxt, dictated: wasDictated })
+      .then(
+        receipt => receipt.status === 'dispatched' || receipt.status === 'queued'
+          || selectSendConfirmed(store.getState(), steerSlot, steerSendId),
+        () => false,
+      )
     // Staged session references were appended to `llmTxt` as links, so they
     // are consumed with the rest of the composer. Nothing is lost on a
     // refused, failed or unconfirmed steer: steerMutation hands the whole
@@ -279,6 +313,7 @@ export function useBusyTurnControls({
     setInput(''); setPendingFiles([]); delete pickedFileTokens.current[activeSlot]; setPasteBlocks([]); setPendingSessions([])
     delete drafts.current[activeSlot]; delete fileDrafts.current[activeSlot]; delete pasteDrafts.current[activeSlot]; delete sessionRefDrafts.current[activeSlot]
     saveDrafts()
+    return verdict
   }, [activeSlot, slotRunning, connected, forkUnavailable, send, steerText, steerMutation, messageQuote, saveDrafts, dispatch, setInput, onSlashRefused,
     // Refs and state setters: stable, so none of these re-creates the callback.
     activeSlotRef, composerRef, composerSlotRef, composerMountedRef, inputRef, drafts, fileDrafts, pasteDrafts, sessionRefDrafts,
@@ -381,15 +416,30 @@ export function useBusyTurnControls({
       get current() { return map.get(slot) ?? 0 },
       set current(v: number) { map.set(slot, v) },
     }
-    const action = handleStopPress(
+    // A failed press is reported as ChatPane reports it (useStopPress), and only
+    // while the slot it was pressed on is still the one on screen. A refusal also
+    // disarms the force window: the next press is a fresh soft stop.
+    const press = (force: boolean) => {
+      void dispatch(requestStop({ slotId: slot, force, rejectPending: true })).then((res) => {
+        const failure = requestStop.fulfilled.match(res) ? res.payload : null
+        if (!failure || activeSlotRef.current !== slot) return
+        if (/fetch|network|load failed/i.test(failure.error)) {
+          showActionError?.(i18nT('components.chatPane.stop_failed_network'))
+          return
+        }
+        map.set(slot, 0)
+        const copy = stopRefusalCopy(failure)
+        showActionError?.(copy.detail || copy.message, copy.detail ? copy.message : undefined)
+      })
+    }
+    // An 'ignore' (a rapid double-tap in the arming window) sends nothing.
+    handleStopPress(
       isEscalation,
       Date.now(),
       slotRef,
-      () => dispatch(requestStop({ slotId: slot, force: false })),
-      () => dispatch(requestStop({ slotId: slot, force: true })),
+      () => press(false),
+      () => press(true),
     )
-    // 'ignore' = accidental rapid double-tap during the arming window
-    if (action !== 'ignore') dispatch(clearPendingPermissions())
   }
   /** A question card's answer that could not be delivered (a 404): kept for an explicit retry. */
   const keepQuestionAnswer = (text: string, questions?: { question: string }[]) => {

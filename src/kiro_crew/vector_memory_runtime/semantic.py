@@ -20,11 +20,13 @@ from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew import context_omissions
+from kiro_crew import context_omissions, injection_receipts
 from kiro_crew import memory_record_metadata as record_meta
+from kiro_crew import memory_relevance_rule as _relevance_rule
 from kiro_crew import memory_schema, memory_v2
+from kiro_crew.config.memory_sections import relevance_rule_mode_from
 from kiro_crew.embeddings import PRIORITY_BULK, PRIORITY_INTERACTIVE
-from kiro_crew.lesson_validation import order_by_request_relevance
+from kiro_crew.lesson_validation import LESSON_APPLIES_VALUES, order_by_request_relevance
 from kiro_crew.user_json import strict_json_equal
 from kiro_crew.validation import ALLOWED_LESSON_CATEGORIES
 from kiro_crew.vector_memory_runtime import lessons as _lessons
@@ -92,7 +94,7 @@ def row_bytes(row: dict[str, object]) -> int:
     """What one scoring row is charged against the set's byte budget.
 
     Strings and blobs are the user-data payload; the fixed margin accounts for
-    the four dict entries and Python object headers.
+    the five dict entries and Python object headers.
     """
     total = 256
     for value in row.values():
@@ -362,12 +364,12 @@ def validate_semantic(
     # rule capacity below what the bare string form always allowed, and a
     # caller with a JSONL fallback would report the lesson saved while the
     # vector store had refused it. The exemption applies ONLY when every
-    # unbounded field is measured at its RAW stored size: exact
-    # {rule, category, negative} shape, enum-bounded (or absent) category,
-    # and a None-or-string negative. The basis concatenates the UNSTRIPPED
-    # rule and negative — the same bytes that persist — so whitespace
-    # padding cannot ride past the cap; anything else (oversized category,
-    # extra key, non-string negative) is measured as its full envelope.
+    # unbounded field is measured at its RAW stored size: the known lesson
+    # key set, enum-bounded (or absent) category and tier, and a
+    # None-or-string negative. The basis concatenates the UNSTRIPPED rule
+    # and negative — the same bytes that persist — so whitespace padding
+    # cannot ride past the cap; anything else (oversized category, unknown
+    # tier, extra key, non-string negative) is measured as its full envelope.
     # Every stored byte is therefore either raw-measured or bounded by a
     # constant (the enum member and the key envelope).
     size_basis = vj
@@ -380,9 +382,12 @@ def validate_semantic(
         raw_negative = value.get("negative")
         raw_scope = value.get("repo_scope")
         raw_writer = value.get("written_by")
+        raw_applies = value.get("applies")
         if (
-            set(value.keys()) <= {"rule", "category", "negative", "repo_scope", "written_by"}
+            set(value.keys())
+            <= {"rule", "category", "negative", "repo_scope", "written_by", "applies"}
             and (cat is None or (isinstance(cat, str) and cat in ALLOWED_LESSON_CATEGORIES))
+            and (raw_applies is None or raw_applies in LESSON_APPLIES_VALUES)
             and (raw_negative is None or isinstance(raw_negative, str))
             and (raw_scope is None or isinstance(raw_scope, str))
             and (raw_writer is None or isinstance(raw_writer, dict))
@@ -956,16 +961,11 @@ def semantic_candidates_v1(
         with store._db_lock:
             store._check_recall_query(recall_query)
             all_rows = [
-                dict(row)
-                for row in store._fetch_all_locked(
-                    "SELECT key, value_json, updated_at, embedding, source FROM semantic_memory "
-                    "WHERE is_deleted = 0 AND key NOT LIKE 'lesson.%'",
-                    scan="semantic",
-                )
+                dict(row) for row in store._fetch_all_locked(_SCORING_SELECT, scan="semantic")
             ]
 
     # Stored write-time vectors only — one embed per request (the query),
-    # same as the lessons path. Re-embedding every row here was an
+    # same as the lessons path. Re-embedding every row here would be an
     # unbounded O(table) loop of blocking embeds per context build. Rows
     # the write path or backfill has not embedded yet contribute 0.0 on
     # the vector term of the same weighted scale (see _hybrid_score).
@@ -987,13 +987,10 @@ def semantic_candidates_v1(
     else:
         row_tokens = _text_scoring._row_stem_tokens_for_scan(2 * len(all_rows))
 
-    blocked = store._ineligible_ids()
     indexed = _scoring_term_index(store, scoring, identities) if scoring is not None else None
     hits = indexed[0].query(query_words) if indexed is not None else None
     for i, raw in enumerate(all_rows):
         key = raw["key"]
-        if blocked and record_meta.record_id_for("fact", key) in blocked:
-            continue
         identity = identities.get(key)
         label = key if identity is None else store._fact_label({"key": key, "identity": identity})
         key_text = label.replace("_", " ").replace(".", " ")
@@ -1034,6 +1031,20 @@ def semantic_candidates_v1(
                 "cosine": vec_score if query_has_vector else None,
             }
             scored_rows.append((score, r))
+
+    # Only scored rows are tested, so look eligibility up by their record ids (the
+    # PRIMARY KEY) rather than scan memory_record_meta, which only grows.
+    if scored_rows:
+        scored_ids = [
+            record_meta.record_identity_or_none("fact", r["key"]) for _score, r in scored_rows
+        ]
+        blocked = store._ineligible_ids([rid for rid in scored_ids if rid is not None])
+        if blocked:
+            scored_rows = [
+                row
+                for row, rid in zip(scored_rows, scored_ids)
+                if rid is None or rid not in blocked
+            ]
 
     # The key is the last tie-break so the order depends on the rows, never on the
     # order they sit in: a resident set patched in place holds the same rows as
@@ -1253,44 +1264,12 @@ def _install_scoring_set(
     return built
 
 
-def get_semantic_context(
-    store: VectorMemoryStore, query_text: str = "", cap: int = 1500, *, facts_only: bool = False
-) -> str:
-    """Format semantic memory for prompt injection with hybrid retrieval.
-
-    When embeddings are available and a query is provided, uses hybrid
-    scoring (vector similarity + keyword overlap) for better recall.
-    Falls back to keyword-only scoring without embeddings.
-
-    ``facts_only`` drops the ``pref.*`` rows: the startup path serves those
-    complete through :meth:`get_preferences_context` as protected context,
-    so the budgeted activity block carries facts only, never a second copy.
-    """
-    max_rows = max(cap // 15, 20)
-
-    # Two row shapes reach the loop below -- dicts from the candidate
-    # selectors, sqlite3.Row from the no-query path -- and it reads both as
-    # mappings.
-    rows: list
-    # Query-aware filtering: hybrid vector + keyword scoring
-    if store.algorithm_version == "v2":
-        rows = store._semantic_candidates_v2(query_text)[:max_rows]
-    elif query_text:
-        rows = store._semantic_candidates_v1(query_text)[:max_rows]
-    else:
-        # No query: recent entries. Same serialization requirement as the
-        # query path above.
-        rows = store._fetch_all_locked(
-            "SELECT key, value_json FROM semantic_memory WHERE is_deleted = 0 "
-            "AND key NOT LIKE 'lesson.%' ORDER BY updated_at DESC, key LIMIT ?",
-            (max_rows,),
-        )
-    if facts_only:
-        rows = [r for r in rows if not str(r["key"]).startswith("pref.")]
-
-    if not rows:
-        return ""
+def _fact_lines(store: VectorMemoryStore, rows: list, cap: int) -> tuple[list[str], list[str]]:
+    """The fact lines that fit *cap*, best first, and the keys they render."""
     lines: list[str] = []
+    keys: list[str] = []
+    if not rows:
+        return lines, keys
     total = 0
     for r in store._eligible_rows(rows, "fact"):
         try:
@@ -1306,7 +1285,101 @@ def get_semantic_context(
             # Skip a line that does not fit; a shorter, lower-ranked one may.
             continue
         lines.append(line)
+        keys.append(str(r["key"]))
         total += len(line) + 1
+    return lines, keys
+
+
+def get_semantic_context(
+    store: VectorMemoryStore,
+    query_text: str = "",
+    cap: int = 1500,
+    *,
+    facts_only: bool = False,
+    relevance_rule: str = "off",
+) -> str:
+    """Format semantic memory for prompt injection with hybrid retrieval.
+
+    When embeddings are available and a query is provided, uses hybrid
+    scoring (vector similarity + keyword overlap) for better recall.
+    Falls back to keyword-only scoring without embeddings.
+
+    ``facts_only`` drops the ``pref.*`` rows: the startup path serves those
+    complete through :meth:`get_preferences_context` as protected context,
+    so the budgeted activity block carries facts only, never a second copy.
+
+    *relevance_rule* is ``memory.relevance_rule``
+    (:mod:`kiro_crew.memory_relevance_rule`). Under ``enforce`` a fact, on
+    either store, also needs the private store's evidence gate
+    (``relevance_evidence``) measured on the request's significant terms only;
+    ``shadow`` keeps today's block and records in the injection receipt the
+    fact keys that gate would add or drop. ``pref.*`` rows are never gated.
+    """
+    max_rows = max(cap // 15, 20)
+    mode = relevance_rule_mode_from(relevance_rule)
+    gated = mode != _relevance_rule.MODE_OFF and bool(query_text)
+
+    # Two row shapes reach the loop below -- dicts from the candidate
+    # selectors, sqlite3.Row from the no-query path -- and it reads both as
+    # mappings.
+    rows: list
+    enforced: list = []
+    if query_text:
+        # Query-aware filtering: hybrid vector + keyword scoring
+        candidates = (
+            store._semantic_candidates_v2(query_text)
+            if store.algorithm_version == "v2"
+            else store._semantic_candidates_v1(query_text)
+        )
+        rows = candidates[:max_rows]
+        if gated:
+            terms = _relevance_rule.fact_terms(query_text)
+            enforced = [
+                row
+                for row in candidates
+                if str(row["key"]).startswith("pref.")
+                or _relevance_rule.fact_admitted(
+                    terms,
+                    _relevance_rule.fact_text(store._fact_label(row), row["value_json"]),
+                    (row.get("retrieval") or {}).get("cosine"),
+                )
+            ][:max_rows]
+            if mode == _relevance_rule.MODE_ENFORCE:
+                rows = enforced
+    elif store.algorithm_version == "v2":
+        rows = store._semantic_candidates_v2(query_text)[:max_rows]
+    else:
+        # No query: recent entries. Same serialization requirement as the
+        # query path above.
+        rows = store._fetch_all_locked(
+            "SELECT key, value_json FROM semantic_memory WHERE is_deleted = 0 "
+            "AND key NOT LIKE 'lesson.%' ORDER BY updated_at DESC, key LIMIT ?",
+            (max_rows,),
+        )
+    if facts_only:
+        rows = [r for r in rows if not str(r["key"]).startswith("pref.")]
+        enforced = [r for r in enforced if not str(r["key"]).startswith("pref.")]
+
+    lines, shown = _fact_lines(store, rows, cap)
+    if gated:
+        if mode == _relevance_rule.MODE_SHADOW:
+            kept = _fact_lines(store, enforced, cap)[1]
+            injection_receipts.record_stage(
+                injection_receipts.RELEVANCE_RULE,
+                mode=mode,
+                policy=_relevance_rule.POLICY_VERSION,
+                would_add=[k for k in kept if k not in shown],
+                would_drop=[k for k in shown if k not in kept],
+                part=_relevance_rule.PART_FACTS,
+                kept=[k for k in shown if k in kept],
+            )
+        else:
+            injection_receipts.record_stage(
+                injection_receipts.RELEVANCE_RULE,
+                mode=mode,
+                policy=_relevance_rule.POLICY_VERSION,
+                part=_relevance_rule.PART_FACTS,
+            )
     if not lines:
         return ""
     if facts_only:
@@ -1466,11 +1539,10 @@ def publish_committed_write(
     # (called outside the lock — _retire_stale_episodic does a blocking embed
     # first, then takes _db_lock itself for its db writes).
     #
-    # Best-effort: the semantic row is already committed at this point, so a
-    # failure here must not propagate. Callers batch many keys per call
-    # (history consolidation writes N semantic + M episodic items in one
-    # thread), and an exception raised after a successful commit discarded
-    # every remaining item in the batch.
+    # Best-effort: the semantic row is already committed, so a failure here
+    # must not propagate. Callers batch many keys per call (history
+    # consolidation writes N semantic + M episodic items in one thread), and a
+    # raise after the commit would discard every remaining item in the batch.
     #
     # A rewrite that changes nothing supersedes nothing, on EITHER algorithm:
     # the episodes it would retire restate the still-current value. Value-level

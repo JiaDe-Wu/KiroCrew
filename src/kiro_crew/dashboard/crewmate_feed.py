@@ -18,7 +18,8 @@ Each snapshot is appended only when it differs from the last one this process
 recorded for that thread, so the append that a check itself causes does not repeat
 it. A snapshot counts as recorded once its append commits (the writer's
 ``on_settled``); one the writer rejects is appended again on the next check. A restart forgets the last digest and records one fresh snapshot per thread on
-the next change, which a fold that keeps the newest one whole absorbs.
+the next change (a thread idle since, at start-up: :func:`_read_restored_threads`),
+which a fold that keeps the newest one whole absorbs.
 
 Runs on the serving loop; the growth signal arrives on the emitter's writer thread
 and is handed over with ``call_soon_threadsafe``. The list reads the change-card
@@ -34,6 +35,7 @@ import itertools
 import json
 import logging
 import threading
+import time
 import weakref
 from datetime import datetime, timezone
 from typing import Any
@@ -42,6 +44,10 @@ logger = logging.getLogger(__name__)
 
 #: How long a burst of log growth is coalesced before the list is read again.
 _SETTLE_SECONDS = 0.4
+
+#: How long the feed waits before reading a thread's list again when a card is past
+#: its expiry but still open, or the append that dropped the last one has not committed.
+_EXPIRY_RETRY_SECONDS = 60.0
 
 _state_ref: "weakref.ReferenceType[Any] | None" = None
 _registered = False
@@ -64,6 +70,9 @@ _held_goals: dict[str, dict[str, Any]] = {}
 #: Per thread slot key, the session it last logged into, so a growth that lands
 #: after the turn's teardown cleared the live client still finds its thread.
 _sessions: dict[str, str] = {}
+#: Per thread slot key, the timer that reads its waiting list again when its soonest
+#: open change card expires (:func:`_arm_card_expiry`).
+_expiry_timers: "dict[str, asyncio.TimerHandle]" = {}
 
 
 def _digest(data: Any) -> str:
@@ -236,7 +245,60 @@ def record_waiting(state: Any, slot: Any, *, cards: bool = True) -> bool:
     from kiro_crew.dashboard import member_waiting
 
     items, total = member_waiting.waiting_list(state, slot.key, cards=cards)
-    return _record(slot.key, "waiting", _sid(slot), {"items": items, "total": total})
+    data = {"items": items, "total": total}
+    sid = _sid(slot)
+    appended = _record(slot.key, "waiting", sid, data)
+    if cards:
+        _arm_card_expiry(state, slot.key, data if sid else None)
+    return appended
+
+
+def _arm_card_expiry(state: Any, slot_key: str, recorded: "dict[str, Any] | None") -> None:
+    """Read *slot_key*'s waiting list again once its soonest open change card expires.
+
+    A card expires by the clock alone, which writes nothing to the thread's log, so
+    neither the growth signal nor :func:`question_retired` would ever take it off the
+    list. One timer per thread, replaced on every record; none without a serving loop.
+    A card already past its expiry (a step still in flight holds it open), or a list
+    whose last card just left and whose snapshot *recorded* has not committed, is
+    read again after :data:`_EXPIRY_RETRY_SECONDS`: a rejected append grows no log,
+    so nothing else would retry it. *recorded* is None for a thread with no session,
+    which records afresh on its first growth. A timer does not outlive the gateway:
+    :func:`_read_restored_threads` reads each idle thread's list at start-up, which
+    arms it again.
+    """
+    from kiro_crew.dashboard import change_cards
+
+    loop = getattr(state, "serving_loop", None)
+    if loop is None:
+        return
+    try:
+        cards = change_cards.card_store_for(state).pending(slot_key)
+    except Exception:
+        logger.debug("Bot feed: card expiry not armed for %s", slot_key, exc_info=True)
+        return
+    ends = [
+        float(card["expires_at"])
+        for card in cards
+        if card.get("status") in (change_cards.STATUS_PENDING, change_cards.STATUS_FAILED)
+        and isinstance(card.get("expires_at"), (int, float))
+    ]
+    old = _expiry_timers.pop(slot_key, None)
+    if old is not None:
+        old.cancel()
+    now = time.time()
+    key = (slot_key, "waiting")
+    with _lock:
+        unsettled = recorded is not None and (
+            key in _inflight or _last.get(key) != _digest(recorded)
+        )
+    if ends and min(ends) > now:
+        delay = min(ends) - now + _SETTLE_SECONDS
+    elif ends or (old is not None and unsettled):
+        delay = _EXPIRY_RETRY_SECONDS
+    else:
+        return
+    _expiry_timers[slot_key] = loop.call_later(delay, _retired, slot_key)
 
 
 async def _warm_cards(state: Any) -> bool:
@@ -325,6 +387,8 @@ def _retired(slot_key: str) -> None:
         return
     slot = (getattr(state, "_slots", None) or {}).get(slot_key)
     if slot is None or getattr(slot, "mode", "") != members_mod.DM_SLOT_MODE:
+        # A closed thread has no list to read again; its expiry timer goes with it.
+        _expiry_timers.pop(slot_key, None)
         return
     sid = _sid(slot)
     if not sid:
@@ -476,16 +540,20 @@ def _goal_written(member: str, rec: dict[str, Any]) -> None:
         return
     for slot in slots:
         try:
-            # An idle thread after a restart has no session to log into yet (a
-            # milestones press between turns): the snapshot stays held, newest
-            # wins, until the thread's next growth names one.
+            # A thread whose session is not known yet (no turn logged, or a
+            # restart still restoring the tabs) has none to log into: the snapshot
+            # stays held, newest wins, until the thread's next growth names one.
             record_goal(slot, rec)
         except Exception:
             logger.debug("Bot feed: goal for %s not recorded", slot.key, exc_info=True)
 
 
 def start(state: Any) -> None:
-    """Record into *state*'s crewmate logs from now on. Once per process; no-op with the log off."""
+    """Record into *state*'s crewmate logs from now on. Once per process; no-op with the log off.
+
+    With a serving loop, also reads each restored idle thread's list once
+    (:func:`_read_restored_threads`).
+    """
     global _state_ref, _registered
     from kiro_crew.constants import crew_log_enabled
 
@@ -500,3 +568,33 @@ def start(state: Any) -> None:
             emit.add_growth_listener(_on_log_growth)
             member_goals.add_change_listener(_on_goal_written)
             _registered = True
+    loop = getattr(state, "serving_loop", None)
+    if loop is not None:
+        task = loop.create_task(_read_restored_threads(state))
+        _keep.add(task)
+        task.add_done_callback(_keep.discard)
+
+
+async def _read_restored_threads(state: Any) -> None:
+    """Read the list of every Bot thread idle since the gateway started, once.
+
+    An idle thread grows no log, so nothing else would read it, and its live client is
+    gone, so it first learns the session it last logged into: its newest crew-log
+    unit, read off the loop once the restore has put the tabs back. The read, the one
+    a retired question starts, drops a card that expired while the gateway was down
+    and arms the timer for the next one (:func:`record_waiting`).
+    """
+    from kiro_crew.crew_log.projection_readers import newest_unit_in_succession
+
+    if state.slot_list_rebuilding:
+        await state.startup_tabs_rebuilt.wait()
+    for slot in _crewmate_slots(state):
+        try:
+            if _sid(slot):
+                continue  # its growth records the list and arms the timer
+            unit = await asyncio.to_thread(newest_unit_in_succession, slot.key)
+            if unit and not _sid(slot):
+                _sessions[slot.key] = unit
+                _retired(slot.key)
+        except Exception:
+            logger.debug("Bot feed: %s not read after the restart", slot.key, exc_info=True)

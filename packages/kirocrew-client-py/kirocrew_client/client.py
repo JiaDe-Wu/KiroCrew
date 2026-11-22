@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Awaitable
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 import aiohttp
 
@@ -137,7 +137,15 @@ _SLOT_SCOPED_APPROVAL_MODES = frozenset({"normal", "trust_reads", "trust"})
 
 
 def _read_app_secret(app_name: str) -> str:
-    """Read the per-app secret from disk. Returns empty string if unavailable."""
+    """The per-app secret, or an empty string if unavailable.
+
+    A backend the Gateway starts gets its secret in ``KIROCREW_PROXY_SECRET``, beside
+    its name in ``KIROCREW_APP_NAME``; current Gateways keep no copy the app can read.
+    The file in the app's folder is read only for a Gateway older than that.
+    """
+    env_secret = os.environ.get("KIROCREW_PROXY_SECRET", "").strip()
+    if env_secret and os.environ.get("KIROCREW_APP_NAME") == app_name:
+        return env_secret
     home = os.environ.get("KIROCREW_HOME", str(Path.home() / ".kiro" / "crew"))
     secret_path = Path(home) / "apps" / app_name / ".app_secret"
     try:
@@ -188,6 +196,7 @@ class KiroCrewClient:
         base_url: str = "",
         token: str = "",
         app_name: str = "",
+        app_secret: str = "",
         timeout: int = _DEFAULT_TIMEOUT,
         max_retries: int = _DEFAULT_MAX_RETRIES,
         retry_base_delay: float = _DEFAULT_RETRY_BASE_DELAY,
@@ -209,11 +218,14 @@ class KiroCrewClient:
         self._default_slot: str | None = None
         self._last_flush_dropped = 0
 
-        # Auto-token: if app_name is set and no explicit auth, read secret
+        # Auto-token: with app_name set, use the given app secret, or look it up
+        # when no explicit auth is given
         self._app_secret = ""
-        has_explicit_auth = bool(token or on_auth_expired)
-        if app_name and not has_explicit_auth:
-            self._app_secret = _read_app_secret(app_name)
+        if app_name:
+            if app_secret:
+                self._app_secret = app_secret
+            elif not (token or on_auth_expired):
+                self._app_secret = _read_app_secret(app_name)
 
         if self._app_secret and not on_auth_expired:
             self._on_auth_expired = self._auto_refresh_token
@@ -221,11 +233,11 @@ class KiroCrewClient:
             self._on_auth_expired = on_auth_expired
 
     async def _auto_refresh_token(self) -> str:
-        """Exchange the on-disk app secret for a fresh token."""
+        """Exchange the app secret for a fresh token."""
         return await _exchange_app_token(self.base_url, self.app_name, self._app_secret)
 
     async def authenticate(self) -> bool:
-        """Bootstrap app auth by exchanging the on-disk secret for a token.
+        """Bootstrap app auth by exchanging the app secret for a token.
 
         Call once after construction if no explicit token was provided.
         No-op if the client already has a token or no app secret is available.
@@ -633,6 +645,8 @@ class KiroCrewClient:
         slot_id: str = "",
         *,
         pattern: str = "",
+        request_mid: str = "",
+        instance: str = "",
     ) -> None:
         """Resolve a pending tool approval.
 
@@ -657,15 +671,41 @@ class KiroCrewClient:
         one session the app may control is refused; pass *slot_id* to name it.
         Any refusal other than the missing grant is the 404 an unknown id also
         gets, raised as ``ErrorCode.NOT_FOUND``.
+
+        A request id recurs, so a decide that names only the id resolves
+        whichever request holds it when the call lands, possibly not the one
+        the caller saw. Pass the request's target to decide only that request:
+
+        - *request_mid* (needs *slot_id*), for a chat runner's request: the
+          ``meta.mid`` of its permission row in the slot history
+          (:meth:`get_slot_history`). Sent on the slot route as
+          ``origin: "native"`` with ``request_mid``.
+        - *instance*, for a request from :meth:`list_approvals`: the record's
+          ``instance``, with its ``slot`` as *slot_id* (empty for a slotless
+          record). Sent as ``POST /api/approvals/{id}/{action}?origin=coordinator``
+          with ``slot`` and ``instance``; the actions are those of the route
+          without a slot.
+
+        Passing both, or *request_mid* without *slot_id*, raises
+        ``ErrorCode.VALIDATION_ERROR`` before any request. Without either the
+        call sends the bare id, the form a later Gateway refuses.
+        A target that no longer names a pending request is the same 404.
         """
         if not request_id:
             raise KiroCrewError(ErrorCode.VALIDATION_ERROR, "request_id is required")
+        if request_mid and instance:
+            raise KiroCrewError(
+                ErrorCode.VALIDATION_ERROR,
+                "pass request_mid or instance, not both",
+            )
+        if request_mid and not slot_id:
+            raise KiroCrewError(ErrorCode.VALIDATION_ERROR, "request_mid needs slot_id")
         if action in ("trust_command", "trust_base") and not pattern:
             raise KiroCrewError(
                 ErrorCode.VALIDATION_ERROR,
                 f"pattern is required for {action}",
             )
-        if slot_id:
+        if slot_id and not instance:
             # The slot route denies any action it does not recognise, so the
             # global spellings must be translated rather than passed through.
             slot_action = {"approve": "approved", "reject": "rejected"}.get(action, action)
@@ -675,6 +715,9 @@ class KiroCrewClient:
                     f"action must be one of {sorted(_SLOT_APPROVAL_ACTIONS)} with a slot_id",
                 )
             body = {"action": slot_action, "request_id": request_id}
+            if request_mid:
+                body["origin"] = "native"
+                body["request_mid"] = request_mid
             if pattern:
                 body["pattern"] = pattern
             await self._post(
@@ -686,10 +729,16 @@ class KiroCrewClient:
         if http_action not in _GLOBAL_APPROVAL_ACTIONS:
             raise KiroCrewError(
                 ErrorCode.VALIDATION_ERROR,
-                f"action must be one of {sorted(_GLOBAL_APPROVAL_ACTIONS)} without a slot_id",
+                f"action must be one of {sorted(_GLOBAL_APPROVAL_ACTIONS)}"
+                + (" with an instance" if instance else " without a slot_id"),
             )
+        qs = ""
+        if instance:
+            # The route reads the target from the query string.
+            target = {"origin": "coordinator", "slot": slot_id, "instance": instance}
+            qs = "?" + urlencode(target)
         await self._post(
-            f"/api/approvals/{quote(request_id, safe='')}/{quote(http_action, safe='')}"
+            f"/api/approvals/{quote(request_id, safe='')}/{quote(http_action, safe='')}{qs}"
         )
 
     async def set_approval_mode(self, mode: str, slot_id: str = "") -> None:

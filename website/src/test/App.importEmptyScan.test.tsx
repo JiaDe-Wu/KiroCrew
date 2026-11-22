@@ -24,16 +24,16 @@ const themeState = {
   mode: 'dark' as const,
   onboarded: true,
   importOnboarded: true,
-  privacyAcked: true,
   crewmatesOnboarded: true,
   crewmatesFlowSeen: true,
   themeBootReady: true,
+  themeBootRead: true,
   themes: [],
   // Read by the Customize chapter `/onboarding` opens once the import step closes.
   allThemes: [],
   markOnboarded: vi.fn(),
   markImportOnboarded: vi.fn(),
-  markPrivacyAcked: vi.fn(),
+
   markCrewmatesOnboarded: vi.fn(),
   setColorTheme: vi.fn(),
   setMode: vi.fn(),
@@ -70,10 +70,11 @@ const CHAIN_WAIT = { timeout: 5000 }
 beforeEach(() => {
   themeState.onboarded = true
   themeState.importOnboarded = true
-  themeState.privacyAcked = true
   themeState.markImportOnboarded.mockClear()
   vi.spyOn(api, 'onboardingImportScan').mockResolvedValue(NOTHING_TO_IMPORT)
   vi.spyOn(api, 'onboardingImportState').mockResolvedValue({ ok: true })
+  // First run opens only for the owner (`useViewerIsNotOwner`).
+  vi.spyOn(api, 'viewerOwnerOk').mockResolvedValue(true)
 })
 
 afterEach(() => {

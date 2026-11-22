@@ -42,6 +42,7 @@ const apiMocks = vi.hoisted(() => ({
 vi.mock('../api/client', () => ({ api: apiMocks }))
 
 import { useQueuedMessageActions, queuedSendStash, type QueuedMessageActions } from '../hooks/useQueuedMessageActions'
+import { DICTATION_NOTE, _resetDictationProvenance, isDictated } from '../chat-core/composer/dictationProvenance'
 
 const queued = (queueId: string, content: string): ChatMessage =>
   ({ role: 'queued', content, cls: 'msg msg-queued', ts: '', meta: { queueId } }) as ChatMessage
@@ -100,6 +101,7 @@ beforeEach(() => {
   // Module-level store: entries would otherwise leak across tests (and across
   // reused queue ids like 'q1'), making the suite order-dependent.
   queuedSendStash.clear()
+  _resetDictationProvenance()
   for (const fn of Object.values(apiMocks)) fn.mockResolvedValue({ ok: true })
 })
 
@@ -130,6 +132,34 @@ describe('useQueuedMessageActions — cancel', () => {
     expect(restoreDraft).toHaveBeenCalledWith('summarize this', [spaced], undefined)
     // Consumed: a record restores exactly once.
     expect(queuedSendStash.has('q1')).toBe(false)
+  })
+
+  it('without a stash, a card ending in the note text is restored verbatim and marks nothing', async () => {
+    // A reload or another tab leaves no record of provenance, and the same
+    // words could be ones the user typed, so nothing is inferred from them.
+    const restoreDraft = vi.fn()
+    const rows = [queued('q1', `book the room\n\n${DICTATION_NOTE}`)]
+    const { get } = renderActions({ rows, restoreDraft })
+    await act(async () => { get().onCancel('q1') })
+    expect(restoreDraft).toHaveBeenCalledWith(`book the room\n\n${DICTATION_NOTE}`, [], undefined)
+    expect(isDictated('chat-1')).toBe(false)
+  })
+
+  it('a stash hit for a dictated send restores the typed text and the provenance it recorded', async () => {
+    const sent = `book the room\n\n${DICTATION_NOTE}`
+    const restoreDraft = vi.fn()
+    queuedSendStash.set('q1', { raw: 'book the room', files: [], sent, dictated: true })
+    const { get } = renderActions({ rows: [queued('q1', sent)], restoreDraft })
+    await act(async () => { get().onCancel('q1') })
+    expect(restoreDraft).toHaveBeenCalledWith('book the room', [], undefined)
+    expect(isDictated('chat-1')).toBe(true)
+  })
+
+  it('a typed card restores no provenance', async () => {
+    const restoreDraft = vi.fn()
+    const { get } = renderActions({ restoreDraft })
+    await act(async () => { get().onCancel('q1') })
+    expect(isDictated('chat-1')).toBe(false)
   })
 
   it('without a stash, the row\'s own meta.quote is restored as the quote and its block comes off the text', async () => {
@@ -304,6 +334,41 @@ describe('useQueuedMessageActions — cancel', () => {
     await act(async () => { get().onCancel('q1') })
     expect(restoreDraft).not.toHaveBeenCalled()
     expect(apiMocks.cancelQueuedMessage).toHaveBeenCalledWith('chat-1', 'q1')
+  })
+})
+
+describe('useQueuedMessageActions — cancel of a server-written entry', () => {
+  const serverWritten = (queueId: string, kind: string, content: string): ChatMessage =>
+    ({ role: 'queued', content, cls: 'msg msg-queued', ts: '', meta: { queueId, kind } }) as ChatMessage
+  const WAKE_TEXT = '[Webhook wake]\nresource changed: crux://reviews/CR-9\n[End of webhook wake]'
+
+  /** A host composer holding a half-typed draft; a restore merges into it. */
+  function composer() {
+    const box = { draft: 'half-typed reply' }
+    const restoreDraft = vi.fn((text: string) => { box.draft = `${text}\n${box.draft}` })
+    return { box, restoreDraft }
+  }
+
+  it.each([
+    ['resource_wake', WAKE_TEXT],
+    ['mcp_app_message', '[MCP app message from "demo"]\nclicked\n[End of MCP app message]'],
+  ])('a queued %s is cancelled on the server and leaves the composer draft exactly as it was', async (kind, text) => {
+    const { box, restoreDraft } = composer()
+    const rows = [serverWritten('q1', kind, text), queued('q2', 'then deploy')]
+    const { get, store } = renderActions({ rows, restoreDraft })
+    await act(async () => { get().onCancel('q1') })
+    expect(restoreDraft).not.toHaveBeenCalled()
+    expect(box.draft).toBe('half-typed reply')
+    expect(apiMocks.cancelQueuedMessage).toHaveBeenCalledWith('chat-1', 'q1')
+    expect(queueIdsIn(store)).toEqual(['q2'])
+  })
+
+  it('the person\'s own queued message still moves back into the composer on cancel', async () => {
+    const { box, restoreDraft } = composer()
+    const { get } = renderActions({ rows: [serverWritten('q1', 'resource_wake', WAKE_TEXT), queued('q2', 'then deploy')], restoreDraft })
+    await act(async () => { get().onCancel('q2') })
+    expect(restoreDraft).toHaveBeenCalledWith('then deploy', [], undefined)
+    expect(box.draft).toBe('then deploy\nhalf-typed reply')
   })
 })
 

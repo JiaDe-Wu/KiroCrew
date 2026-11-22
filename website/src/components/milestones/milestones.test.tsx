@@ -58,9 +58,10 @@ vi.mock('../../hooks/useTheme', async (importOriginal) => ({
 
 import { api } from '../../api/client'
 import { ApiError } from '../../api/apiError'
+import { refreshOnce, __resetRefreshOnceForTests } from '../../api/refreshOnce'
 import { store } from '../../store'
 import { setActiveSlot, setPendingInput } from '../../store/chatSlice'
-import { PREVIEW_CREW_MODE, PREVIEW_EXPLORE, setPreviewFlag } from '../../utils/previewFlags'
+import { PREVIEW_EXPLORE, setPreviewFlag } from '../../utils/previewFlags'
 import enManual from '../../i18n/locales/en.manual.json'
 import WelcomeView from '../WelcomeView'
 import { NavigationLeaveGuardProvider, usePublishNavigationStake, useRegisterNavigationLeaveGuard } from '../NavigationLeaveGuard'
@@ -71,6 +72,7 @@ import MilestoneNoticeToast, { __resetMilestoneNotices } from './MilestoneNotice
 import { __resetMilestonesRouteMissing, __resetPendingArrival, ARRIVAL_WAIT_MS, closeMilestonesPanel, earnedBadges, gettingStarted, openMilestonesPanel, tryToday, useExplorePreviewSwitch } from './useMilestones'
 import { __resetExploreVideoPick, pickExploreVideo } from './ExploreIntroVideo'
 import type { FeatureVideo } from '../../api/client/featureDiscovery'
+import { BANNER_AUTO_HIDE_MS } from '../../hooks/notificationBanner'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
 
@@ -186,7 +188,6 @@ beforeEach(() => {
   })
 })
 afterEach(() => {
-  setPreviewFlag(PREVIEW_CREW_MODE, false)
   setPreviewFlag(PREVIEW_EXPLORE, false)
   act(() => closeMilestonesPanel())
   cleanup()
@@ -195,7 +196,6 @@ afterEach(() => {
 
 describe('tryToday', () => {
   it('takes three untried features, the same all day, rotating with the local date', () => {
-    setPreviewFlag(PREVIEW_CREW_MODE, true)
     const data = payload({}, ALL_OPEN())
     const day = (d: number) => tryToday(data, new Date(2026, 9, d, 9)).map(i => i.id)
     expect(day(30)).toHaveLength(3)
@@ -210,7 +210,6 @@ describe('tryToday', () => {
   })
 
   it('keeps the rest of the day\'s picks when one of them is finished', () => {
-    setPreviewFlag(PREVIEW_CREW_MODE, true)
     const items = ALL_OPEN()
     items[0].state = 'done'
     items[1].state = 'done'
@@ -234,7 +233,7 @@ describe('tryToday', () => {
     expect(gettingStarted(payload({}, items))).toEqual([])
   })
 
-  it('drops done, skipped and unavailable rows, and the Crew Mode row while its preview is off', () => {
+  it('drops done, skipped and unavailable rows', () => {
     const items = ALL_OPEN()
     items[0].state = 'done'
     items[1].state = 'skipped'
@@ -246,7 +245,6 @@ describe('tryToday', () => {
   })
 
   it('never picks pr-watch or crew-mode, even when they are the only rows left', () => {
-    setPreviewFlag(PREVIEW_CREW_MODE, true)
     const items = ALL_OPEN().map(i => (['pr-watch', 'crew-mode'].includes(i.id) ? i : { ...i, state: 'done' as const }))
     for (let d = 1; d <= 7; d++) expect(tryToday(payload({}, items), new Date(2026, 10, d))).toEqual([])
   })
@@ -743,7 +741,6 @@ describe('Explore panel', () => {
   })
 
   it('lists the longer features once the quick ones are done, instead of saying all tried', async () => {
-    setPreviewFlag(PREVIEW_CREW_MODE, true)
     const items = ALL_OPEN().map(i => (['pr-watch', 'crew-mode'].includes(i.id) ? i : { ...i, state: 'done' as const }))
     vi.spyOn(api, 'milestones').mockResolvedValue(payload({}, items))
     renderWith(<MilestonesSheet />)
@@ -1071,12 +1068,37 @@ describe('a failed read', () => {
   })
 })
 
-describe('Crew Mode preview', () => {
-  it('leaves the Crew Mode row out of the ring while the preview is off', async () => {
+describe('a first read refused because the sign-in ran out', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    __resetRefreshOnceForTests()
+  })
+
+  it('reads once more after the renewal that refusal started has answered, and the dot shows', async () => {
+    let renewed: (status: number) => void = () => {}
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(resolve => { renewed = status => resolve(new Response('{}', { status })) })))
+    const read = vi.spyOn(api, 'milestones')
+      // What `checkSessionExpired` does on that 403: start the renewal, hand the refusal back.
+      .mockImplementationOnce(() => { void refreshOnce(); return Promise.reject(new ApiError(403, 'Token required', '', true)) })
+      .mockResolvedValue(payload())
+    renderWith(<MilestonesIndicator />)
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(1))
+    await act(async () => {})
+    // Held: a second read sent now would carry the same lapsed sign-in.
+    expect(read).toHaveBeenCalledTimes(1)
+
+    await act(async () => { renewed(200) })
+    expect(await screen.findByTestId('milestones-ring-dot')).toBeTruthy()
+    expect(read).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('conductor mode row', () => {
+  it('counts the conductor mode row in the ring with no preview turned on', async () => {
     vi.spyOn(api, 'milestones').mockResolvedValue(payload({ features: { done: 1, total: 7 } }, ALL_OPEN()))
     renderWith(<MilestonesIndicator />)
     await screen.findByTestId('milestones-indicator')
-    expect(screen.getByTestId('milestones-ring').getAttribute('data-ratio')).toBe((1 / 6).toFixed(3))
+    expect(screen.getByTestId('milestones-ring').getAttribute('data-ratio')).toBe((1 / 7).toFixed(3))
   })
 })
 
@@ -1149,6 +1171,45 @@ describe('quiet notice', () => {
     vi.spyOn(api, 'milestones').mockResolvedValue(payload({ notices: ['streak-best:7'] }))
     renderWith(<MilestoneNoticeToast />)
     expect((await screen.findByTestId('milestone-notice')).textContent).toBe('Reached: 7-day streak')
+  })
+
+  it('stays up while keyboard focus is on it, and hides on the timer once focus leaves', async () => {
+    vi.spyOn(api, 'milestones').mockResolvedValue(payload({ notices: ['widgets'] }))
+    renderWith(<MilestoneNoticeToast />)
+    const notice = await screen.findByTestId('milestone-notice')
+    // Focus first, so the timer armed on show is cleared before the fake clock
+    // takes over; every timer after this is the fake one.
+    act(() => { within(notice).getByRole('button').focus() })
+    vi.useFakeTimers()
+    try {
+      act(() => { vi.advanceTimersByTime(BANNER_AUTO_HIDE_MS * 2) })
+      expect(screen.getByTestId('milestone-notice')).toBeTruthy()
+      act(() => { within(notice).getByRole('button').blur() })
+      act(() => { vi.advanceTimersByTime(BANNER_AUTO_HIDE_MS) })
+      expect(screen.queryByTestId('milestone-notice')).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('drops the focus hold when a temporary chat hides the notice, so it still times out on return', async () => {
+    vi.spyOn(api, 'milestones').mockImplementation(async (key?: string) => (key === 'dashboard:tmp' ? { enabled: false } : payload({ notices: ['widgets'] })))
+    renderWith(<MilestoneNoticeToast />)
+    const notice = await screen.findByTestId('milestone-notice')
+    act(() => { within(notice).getByRole('button').focus() })
+    vi.useFakeTimers()
+    try {
+      // The temporary chat's read turns milestones off: the card leaves without a blur.
+      act(() => { store.dispatch(setActiveSlot('tmp')) })
+      // React Query hands results over on a zero-delay timer; tick only that.
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(screen.queryByTestId('milestone-notice')).toBeNull()
+      act(() => { store.dispatch(setActiveSlot(null)) })
+      act(() => { vi.advanceTimersByTime(BANNER_AUTO_HIDE_MS) })
+      expect(screen.queryByTestId('milestone-notice')).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 

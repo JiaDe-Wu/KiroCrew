@@ -276,6 +276,33 @@ def test_revive_may_not_refile_a_session_out_of_a_mate_home(tmp_path, monkeypatc
     assert key not in state._slots
 
 
+def test_a_refused_revive_filing_does_not_restore_a_folder_deleted_in_the_window(
+    tmp_path, monkeypatch
+):
+    """The rollback keeps the revived session's own folder only while it exists."""
+    state = _make_state(tmp_path)
+    _folder(state, "f0", "Home")
+    _folder(state, "f1", "Gamma")
+    caller = _slot(state, "chat-1")
+    peer = _slot(state, "chat-2")
+    peer.folder_id = "f0"
+    key = _archive(state, caller, peer)
+    refused: list[str] = []
+
+    async def _both_deleted(state_, folder_id, **_kw):
+        state_._folders[:] = []
+        refused.append(folder_id)
+        return False
+
+    monkeypatch.setattr(sc, "_unhide_folder", _both_deleted)
+
+    result = _revive(state, caller, key, folder_id="f1")
+
+    assert refused == ["f1"]
+    assert result["filed"] is False
+    assert state._slots[key].folder_id == ""
+
+
 def test_revive_without_a_folder_keeps_the_previous_placement(tmp_path):
     state = _make_state(tmp_path)
     _folder(state, "f1", "Gamma")
@@ -623,7 +650,7 @@ def test_a_cap_crossed_before_the_final_check_is_refused_with_409(tmp_path, monk
     own._created_by = caller.key
     key = _archive(state, caller, own)
     monkeypatch.setattr(sc, "MAX_LIVE_SLOTS", 2)
-    monkeypatch.setattr(sc, "MAX_SLOTS_PER_CREATOR", 1)
+    monkeypatch.setattr("kiro_crew.dashboard.state.max_slots_per_creator", lambda: 1)
     original = chat_handlers.resume_slot_from_history
 
     async def _wrapped_resume(state_, **kw):
@@ -655,7 +682,7 @@ def test_revived_sessions_the_caller_did_not_create_still_charge_its_cap(tmp_pat
     state = _make_state(tmp_path)
     caller = _slot(state, "chat-1")
     keys = [_archive(state, caller, _slot(state, f"chat-{n}")) for n in (2, 3)]
-    monkeypatch.setattr(sc, "MAX_SLOTS_PER_CREATOR", 1)
+    monkeypatch.setattr("kiro_crew.dashboard.state.max_slots_per_creator", lambda: 1)
 
     first = _revive(state, caller, keys[0])
     assert first["target"] == keys[0]
@@ -683,12 +710,16 @@ def test_a_slot_both_created_and_revived_by_the_caller_is_charged_once(tmp_path)
 
 def test_create_and_revive_share_one_per_caller_accounting():
     """A caller at the cap through revives must not be able to fill the same
-    ceiling again through creates: both verbs gate on the registry's
-    ``creator_slot_count``, which charges created AND revived slots."""
+    ceiling again through creates: both verbs gate on the one reading of the
+    cap, which asks the registry's ``creator_slot_count``, and that charges
+    created AND revived slots."""
     import inspect
 
+    from kiro_crew.dashboard.state import creator_slot_cap_refusal
+
     for fn in (sc.create_session, sc.revive_session):
-        assert "state.creator_slot_count(caller_key)" in inspect.getsource(fn)
+        assert "creator_slot_cap_refusal(state, caller_key)" in inspect.getsource(fn)
+    assert "state.creator_slot_count(creator_key)" in inspect.getsource(creator_slot_cap_refusal)
 
 
 def test_a_creator_cap_crossed_in_the_window_is_refused_before_publish(tmp_path, monkeypatch):
@@ -697,7 +728,7 @@ def test_a_creator_cap_crossed_in_the_window_is_refused_before_publish(tmp_path,
     own = _slot(state, "chat-2")
     own._created_by = caller.key
     key = _archive(state, caller, own)
-    monkeypatch.setattr(sc, "MAX_SLOTS_PER_CREATOR", 1)
+    monkeypatch.setattr("kiro_crew.dashboard.state.max_slots_per_creator", lambda: 1)
 
     def _fill(_built):
         _slot(state, "chat-8")._created_by = caller.key
@@ -1061,7 +1092,7 @@ def test_revive_spends_the_create_budget_and_per_creator_cap(tmp_path, monkeypat
     assert exc.value.code == "create_rate_limited"
     monkeypatch.setattr(sc, "allow_create", lambda kind, who: True)
 
-    monkeypatch.setattr(sc, "MAX_SLOTS_PER_CREATOR", 0)
+    monkeypatch.setattr("kiro_crew.dashboard.state.max_slots_per_creator", lambda: 0)
     with pytest.raises(sc.SessionControlError) as exc:
         _revive(state, caller, key)
     assert exc.value.code == "creator_slot_cap_reached"

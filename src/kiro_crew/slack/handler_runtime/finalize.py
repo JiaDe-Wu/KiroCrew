@@ -1,8 +1,8 @@
 """What a native Slack turn leaves in the thread once its answer is out.
 
 The timing footer and the OPTIONS / Link-to-Dashboard controls it carries, the review-mode
-draft post and its store, the copy of the answer a linked dashboard slot receives, and the
-thread auto-title task.
+draft post and its store, the copy of the answer a linked dashboard slot receives (a slot
+linked mid-turn included), and the thread auto-title task.
 
 Composed onto :mod:`kiro_crew.slack.handler`; see
 :mod:`kiro_crew.slack.handler_runtime`.
@@ -10,6 +10,7 @@ Composed onto :mod:`kiro_crew.slack.handler`; see
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from typing import TYPE_CHECKING
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
         _REVIEW_DRAFT_MAX,
         _REVIEW_DRAFT_TTL,
         _REVIEW_PLACEHOLDER_TS,
+        _SLACK_TS_META,
         HUMAN_TURN_META_KEY,
         ConversationLog,
         LLMProvider,
@@ -28,8 +30,10 @@ if TYPE_CHECKING:
         _AnswerStream,
         _dashboard_state,
         _review_drafts,
+        _ts_before,
         auto_title,
         logger,
+        slack_cfg,
     )
 
 
@@ -74,8 +78,15 @@ def build_timing_footer(
 ) -> tuple[list[dict], str]:
     """Build the timing/context footer blocks for a Slack response.
 
-    Returns ``(blocks, fallback_text)`` suitable for ``post_blocks``.
+    Returns ``(blocks, fallback_text)`` suitable for ``post_blocks``. With
+    ``slack.show_timing_footer`` off it returns no blocks and the OPTIONS
+    fallback text: the only thing such a footer can still carry is a control, so
+    a caller posts it only when its final block list is not empty.
     """
+    if not slack_cfg().slack.show_timing_footer:
+        from kiro_crew.slack.outbound import OPTIONS_FALLBACK_TEXT
+
+        return [], OPTIONS_FALLBACK_TEXT
     if elapsed < 60:
         duration = f"{int(elapsed)}s"
     else:
@@ -136,6 +147,72 @@ def _append_footer_actions(
     return footer_blocks
 
 
+async def seal_stream(
+    slack: SlackClientOps,
+    channel: str,
+    ts: str,
+    final_text: str | None,
+    footer_blocks: list[dict] | None,
+    thread_ts: str | None = None,
+) -> bool:
+    """Stop a Slack stream, with *footer_blocks* at the bottom of the answer message.
+
+    True only when the footer is on the answer message, so the caller posts none of
+    its own. On False (no footer asked for, or the footer seal refused, e.g.
+    ``message_not_in_streaming_state`` once the stream's 10 minutes are up) the
+    stream is sealed bare and the caller posts the footer as its own message: one
+    footer per turn, never zero or two. Never raises: the seal is decoration. A
+    footer with no text to read back (only a control, the timing line hidden) is
+    never folded in, since the read-back below could not confirm it.
+
+    A failed footer seal may still have landed (Slack applied it and the reply was
+    lost, or the SDK's retry of an applied seal was refused), and the error cannot
+    say which. So the message is read back from *thread_ts*: a footer found there
+    counts as delivered; a footer not found, or a read that fails, means post it.
+    """
+    if footer_blocks and _block_texts(footer_blocks):
+        try:
+            if await slack.stop_stream(channel, ts, final_text, blocks=footer_blocks):
+                return True
+        except Exception:
+            logger.warning("Slack stop_stream with the footer failed", exc_info=True)
+    try:
+        await slack.stop_stream(channel, ts, final_text)
+    except Exception:
+        logger.warning("Slack stop_stream failed at finalize", exc_info=True)
+    if footer_blocks and thread_ts:
+        return await _footer_landed(slack, channel, thread_ts, ts, footer_blocks)
+    return False
+
+
+def _block_texts(blocks: object) -> set[str]:
+    """The mrkdwn/plain text of every context element in *blocks*."""
+    texts: set[str] = set()
+    for block in blocks if isinstance(blocks, list) else []:
+        for el in (block.get("elements") or []) if isinstance(block, dict) else []:
+            if isinstance(el, dict) and isinstance(el.get("text"), str):
+                texts.add(el["text"])
+    return texts
+
+
+async def _footer_landed(
+    slack: SlackClientOps, channel: str, thread_ts: str, ts: str, footer_blocks: list[dict]
+) -> bool:
+    """Whether the message at *ts* already shows *footer_blocks*; False on any doubt."""
+    want = _block_texts(footer_blocks)
+    oldest = _ts_before(ts)
+    if not want or oldest is None:
+        return False
+    try:
+        replies = await slack.fetch_thread_replies(
+            channel, thread_ts, limit=2, warn_on_pagination=False, oldest=oldest
+        )
+    except Exception:
+        logger.warning("Slack read-back of the footer seal failed", exc_info=True)
+        return False
+    return any(m.get("ts") == ts and want <= _block_texts(m.get("blocks")) for m in replies)
+
+
 async def _maybe_auto_title_slack(
     slack: SlackClientOps,
     sessions: SessionManager,
@@ -194,6 +271,7 @@ async def _post_review_draft(
             try:
                 await slack.stop_stream(channel, answer.stream_ts)
             except Exception:
+                # The placeholder is deleted next either way.
                 pass
         try:
             await slack.delete_message(channel, answer.stream_ts)
@@ -206,6 +284,9 @@ async def _post_review_draft(
     # with no verdict at all.
     draft = clean_text or _NO_RESPONSE
     draft_key = f"{channel}|{reply_ts}|{uuid.uuid4().hex[:8]}"
+    if not thread_ts:
+        # Marks a channel-level card so a re-posted card lands there too.
+        draft_key += "|root"  # matches interactions_approvals._REVIEW_ROOT_SUFFIX
     blocks = review_draft_blocks(draft, draft_key)
     try:
         await slack.post_ephemeral(
@@ -224,13 +305,19 @@ async def _post_review_draft(
     return True
 
 
-def _mirror_to_dashboard(linked_session_key: str, text: str, accumulated: str) -> None:
+async def _mirror_to_dashboard(linked_session_key: str, text: str, accumulated: str) -> None:
     """Append this Slack turn to the dashboard slot its thread is linked to."""
     try:
         ds = _dashboard_state
         slot_name = linked_session_key.removeprefix("dashboard:")
         slot = getattr(ds, "_slots", {}).get(slot_name)
         if slot:
+            # Own hop: the credential detector is quadratic on uniform runs, and
+            # this runs from the delivery coroutine.
+            from kiro_crew.history import _redact_at_write_boundary
+
+            mirrored = await asyncio.to_thread(_redact_at_write_boundary, "user", text)
+            reply = await asyncio.to_thread(_redact_at_write_boundary, "assistant", accumulated)
             # The person typed this in Slack; mirroring it into the
             # linked slot keeps it a human turn (see
             # history.HUMAN_TURN_META_KEY).
@@ -240,18 +327,71 @@ def _mirror_to_dashboard(linked_session_key: str, text: str, accumulated: str) -
 
             slot.append(
                 "user",
-                text,
+                mirrored,
                 "msg msg-u",
                 meta=stamp_principal_author({HUMAN_TURN_META_KEY: True}, Principal.unknown()),
             )
-            slot.append("assistant", accumulated, "msg msg-a")
+            slot.append("assistant", reply, "msg msg-a")
             if slot._on_message:
-                slot._on_message(slot.key, {"role": "user", "content": text, "cls": "msg msg-u"})
+                slot._on_message(
+                    slot.key, {"role": "user", "content": mirrored, "cls": "msg msg-u"}
+                )
                 slot._on_message(
                     slot.key,
-                    {"role": "assistant", "content": accumulated, "cls": "msg msg-a"},
+                    {"role": "assistant", "content": reply, "cls": "msg msg-a"},
                 )
             # ``ds`` is set: the caller mirrors only while ``_dashboard_state`` is.
             ds.push_slots_update()  # type: ignore[attr-defined,union-attr]
     except Exception:
         logger.debug("Failed to mirror Slack message to dashboard", exc_info=True)
+
+
+def _backfill_late_link(
+    reply_ts: str,
+    msg_ts: str,
+    linked_session_key: str | None,
+    stream_ts: str | None,
+    accumulated: str,
+    rotated_ts: list[str],
+) -> None:
+    """Give a slot whose import read this turn's question or reply its final answer.
+
+    A Link click while the turn runs imports the thread as it stands then: the reply
+    streaming into ``stream_ts`` is a cut-off row, or absent if it had not started.
+    When the stream rotated after the import, that row came from an earlier stream
+    message (``rotated_ts``), so the newest imported one of them is the row. That
+    row takes the final text, even when the question was not imported (a message
+    with no text, such as a voice memo); else the answer is appended after the
+    imported question. A slot this turn mirrored into already has it.
+
+    shortcut: an import that read two stream messages of one turn keeps the older
+    one's cut-off row too; replacing it needs a way to drop a slot row.
+    """
+    try:
+        from kiro_crew.dashboard.state import chat_message_note, row_mid
+
+        ds = _dashboard_state
+        slot = ds.get_linked_slot(reply_ts)  # type: ignore[union-attr]
+        if slot is None or (linked_session_key or "").removeprefix("dashboard:") == slot.key:
+            return
+        # The loaded rows only: an import's slot is never a pending window.
+        imported = {(m.get("meta") or {}).get(_SLACK_TS_META): m for m in slot.loaded_messages()}
+        row = next(
+            (imported[t] for t in (stream_ts, *reversed(rotated_ts)) if t and t in imported),
+            None,
+        )
+        if row is not None:
+            ts, mid = row.get("ts", ""), row_mid(row)
+            slot.update_message(ts, content=accumulated, mid=mid)
+            shown = chat_message_note(slot.key, row, workspace=getattr(slot, "workspace", None))
+            ds.broadcast_ws(  # type: ignore[union-attr]
+                "chat_message_update",
+                {"slot": slot.key, "ts": ts, "mid": mid, "content": shown["content"]},
+            )
+        elif msg_ts in imported:
+            slot.append("assistant", accumulated, "msg msg-a")
+        else:
+            return
+        ds.push_slots_update()  # type: ignore[union-attr]
+    except Exception:
+        logger.debug("Failed to give a mid-turn-linked slot its answer", exc_info=True)

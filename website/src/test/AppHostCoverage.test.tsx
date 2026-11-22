@@ -51,6 +51,7 @@ vi.mock('../app-sdk', () => ({
 }))
 
 import AppHost from '../components/AppHost'
+import { __resetAppBundleFreshnessForTests } from '../components/appBundleFreshness'
 
 type AppRecord = AppHostProps['app']
 
@@ -109,6 +110,8 @@ const origReload = window.location.reload
 
 beforeEach(() => {
   vi.useFakeTimers({ shouldAdvanceTime: true })
+  // Each case starts from a document that has imported no app bundle yet.
+  __resetAppBundleFreshnessForTests()
   mockNavigate.mockClear()
   sdk.props = null
   sdk.throwNext = false
@@ -363,5 +366,93 @@ describe('AppHost — error boundary', () => {
     // boundary has nothing to re-render into.
     expect(screen.getByTestId('page-subtitle').textContent).toBe('App crashed')
     await act(async () => { await Promise.resolve() })
+  })
+})
+
+describe('AppHost — onFailure (a host surface with no room for the fallbacks)', () => {
+  /** The real dynamic import has to reject before React.lazy hands AppHost's `.catch` the error. */
+  const BUNDLE_REJECT_TIMEOUT_MS = 5_000
+
+  it('reports a bundle that fails to load and paints nothing in its place', async () => {
+    const onFailure = vi.fn()
+    const { container } = renderWithProviders(<AppHost app={appRecord()} entry="desktop/pet.mjs" onFailure={onFailure} />)
+    // Chain: React.lazy -> import('/apps/<name>/ui/desktop/pet.mjs') rejects -> AppHost's catch -> onFailure.
+    await waitFor(() => expect(onFailure).toHaveBeenCalledTimes(1), { timeout: BUNDLE_REJECT_TIMEOUT_MS })
+    expect(screen.queryByRole('heading', { level: 3 })).toBeNull()
+    expect(screen.queryByTestId('app-host-load-error')).toBeNull()
+    expect(container.querySelector('[data-testid="sdk-provider"]')?.textContent).toBe('')
+  })
+
+  it('reports an app that throws and renders nothing instead of the crash card', () => {
+    sdk.throwNext = true
+    const onFailure = vi.fn()
+    renderWithProviders(<AppHost app={appRecord()} onFailure={onFailure} />)
+    expect(onFailure).toHaveBeenCalledWith(expect.objectContaining({ message: 'the app blew up during render' }))
+    expect(screen.queryByTestId('page-subtitle')).toBeNull()
+    expect(screen.queryByRole('button', { name: /retry/i })).toBeNull()
+  })
+})
+
+describe('AppHost — declared frame refused by an older page policy', () => {
+  const ORIGIN = 'https://video.example.com'
+
+  /** A frame-src refusal of `origin` under a policy that lacks it. */
+  function refuseFrame(origin = ORIGIN) {
+    const e = Object.assign(new Event('securitypolicyviolation'), {
+      effectiveDirective: 'frame-src',
+      blockedURI: `${origin}/embed/1`,
+      originalPolicy: "default-src 'self'; frame-src 'self'",
+    })
+    document.dispatchEvent(e)
+  }
+
+  function renderFraming() {
+    renderHost(appRecord({
+      frameSourcesGrant: { approved: [ORIGIN], staged: [] },
+      manifest: { ui: { entry: 'index.js', frameSources: [ORIGIN] }, permissions: {} },
+    }))
+  }
+
+  it('asks the owner to refresh, and reloads only when they click', async () => {
+    renderFraming()
+    await settleBundle()
+
+    act(() => refuseFrame())
+    const notice = await screen.findByTestId('app-host-frame-blocked')
+    expect(notice.textContent).toContain(ORIGIN)
+    expect(reloadSpy).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: /reload page/i }))
+    expect(reloadSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('points to the details page, not a reload, for an origin still waiting for approval', async () => {
+    renderHost(appRecord({
+      frameSourcesGrant: { approved: [], staged: [ORIGIN] },
+      manifest: { ui: { entry: 'index.js', frameSources: [ORIGIN] }, permissions: {} },
+    }))
+    await settleBundle()
+
+    act(() => refuseFrame())
+    const notice = await screen.findByTestId('app-host-frame-blocked')
+    expect(notice.textContent).toContain('waiting for your approval')
+    expect(screen.queryByRole('button', { name: /reload page/i })).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /open app details/i }))
+    expect(mockNavigate).toHaveBeenCalledWith(`/apps/detail/${NAME}`)
+    expect(reloadSpy).not.toHaveBeenCalled()
+  })
+
+  it('dismisses, and says nothing about an origin the app did not declare', async () => {
+    renderFraming()
+    await settleBundle()
+
+    act(() => refuseFrame('https://other.example.com'))
+    expect(screen.queryByTestId('app-host-frame-blocked')).toBeNull()
+
+    act(() => refuseFrame())
+    await screen.findByTestId('app-host-frame-blocked')
+    fireEvent.click(screen.getByRole('button', { name: /dismiss/i }))
+    expect(screen.queryByTestId('app-host-frame-blocked')).toBeNull()
   })
 })

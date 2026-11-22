@@ -37,7 +37,10 @@ A directory whose manifest is found in this order:
    fourth vendor directory needs no code change; sorting makes a package that
    carries several resolve identically on every machine.
 
-Neither candidate is accepted through a symlink.
+Neither candidate is accepted through a symlink. The schema probe and every JSON
+file the converter reads (the manifest, an `mcpServers` file, a hooks file) parse
+through `user_json.loads_user_json`, so a file saved with one leading UTF-8
+byte-order mark reads as if it had none.
 
 Manifest fields read, all camelCase, every path written `./`-relative:
 
@@ -212,7 +215,7 @@ small files, or of files each just under the per-file cap, would be unbounded. T
 allowance is shared across the whole recursion, because a per-directory cap is not
 a cap on a tree, and it is spent only by a copy that landed.
 
-The same bound applies to the schema PROBE, which is reached by more inputs than
+The 4 MiB manifest bound below applies to the schema PROBE too, which is reached by more inputs than
 the manifest read is: it runs on a root `plugin.json` for every candidate,
 including a directory that turns out not to be a plugin.
 

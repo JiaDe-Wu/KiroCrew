@@ -1,4 +1,4 @@
-import { memo } from 'react'
+import { memo, type ReactNode } from 'react'
 import { Ban, Info, TriangleAlert, type LucideIcon } from 'lucide-react'
 
 import { i18nT } from '../../i18n/t'
@@ -16,14 +16,20 @@ export type NoticeTone = 'info' | 'warn' | 'blocked'
  * older gateways without needing a migration. Only these three glyphs are
  * recognized: an unknown leading glyph is CONTENT and stays in the text, so a
  * broader emoji class can never silently eat meaning.
+ *
+ * Current gateways write the lead as a word (`Note:`, `Warning:`, `Blocked:`);
+ * saved history keeps the glyph, so both spellings map to the same tone.
  */
-const LEAD_EMOJI_RE = /^\s*(\u2139|\u26A0|\u26D4)\uFE0F*\s*/u
+const LEAD_RE = /^\s*(?:(\u2139|\u26A0|\u26D4)\uFE0F*|(Note|Warning|Blocked):)\s*/u
+const WORD_TONE: Record<string, NoticeTone> = { Note: 'info', Warning: 'warn', Blocked: 'blocked' }
 
 export function parseNotice(content: string): { tone: NoticeTone; text: string } {
   const raw = content ?? ''
-  const m = LEAD_EMOJI_RE.exec(raw)
+  const m = LEAD_RE.exec(raw)
   if (!m) return { tone: 'info', text: raw }
-  const tone: NoticeTone = m[1] === '\u2139' ? 'info' : m[1] === '\u26A0' ? 'warn' : 'blocked'
+  const tone: NoticeTone = m[2]
+    ? WORD_TONE[m[2]]
+    : m[1] === '\u2139' ? 'info' : m[1] === '\u26A0' ? 'warn' : 'blocked'
   return { tone, text: raw.slice(m[0].length) }
 }
 
@@ -60,12 +66,20 @@ export default memo(function NoticeCard({
   content,
   tone: toneOverride,
   icon: iconOverride,
+  body,
+  action,
 }: {
   content: string
   tone?: NoticeTone
   /** A caller whose notice names a cause the tone alone does not show (a Stop
    *  the user pressed) may name the glyph; the tone and its colour are kept. */
   icon?: LucideIcon
+  /** Copy the caller already built in the reader's language, drawn in place of
+   *  `content`'s text; `content` still sets the tone from its leading glyph. */
+  body?: ReactNode
+  /** A small control that follows the copy on its last line, such as a
+   *  Dismiss link. It wraps with the text, so a narrow column keeps it. */
+  action?: ReactNode
 }) {
   // Language-generation subscription: this memo() boundary renders i18nT()
   // strings, so a language switch must invalidate it.
@@ -97,7 +111,8 @@ export default memo(function NoticeCard({
             so a single-line notice renders identically. */}
         <span className="min-w-0 break-words whitespace-pre-line" data-testid="notice-card-text">
           {severity && <span className="sr-only">{severity} </span>}
-          {text}
+          {body ?? text}
+          {action && <>{' '}{action}</>}
         </span>
       </div>
     </div>

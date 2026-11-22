@@ -26,38 +26,15 @@ import {
 import { parseErrorCode } from '../utils/errorReport'
 import { fmtList, fmtNumber } from '../i18n/format'
 import { useDocumentImeLatch } from '../hooks/useImeGuard'
+import { useReducedMotion } from '../hooks/useReducedMotion'
 import { useLocalCrewHidden } from './overlayRoot'
 import { Btn, SendBtn } from './ui'
 import ErrorNotice from './ErrorNotice'
 import AgentSpecNotRewrittenNotice, { agentSpecNotRewritten } from './AgentSpecNotRewrittenNotice'
-import OnboardingChapterShell, {
-  OnboardingShellContext,
-  type ShellAsideCopy,
-} from './OnboardingChapterShell'
+import OnboardingChapterShell, { OnboardingShellContext } from './OnboardingChapterShell'
 
 import { i18nT } from '../i18n/t'
 type Stage = 1 | 2 | 3 | 4
-
-/**
- * The accent left panel's copy for the first-run SETUP chapters.
- *
- * Shared with the Privacy chapter that follows this one, rather than duplicated:
- * the panel is mounted ONCE by `OnboardingShellHost`, so identical copy across
- * the hand-off means nothing on the left changes and the floating mascots have
- * no reason to re-render, let alone replay their entrance. Two look-alike copies
- * would drift the moment one is edited.
- *
- * A function (not a const) because `i18nT()` at module load would freeze the
- * boot language; the lookup has to run during render.
- */
-export function setupChapterAside(ariaLabel: string): ShellAsideCopy {
-  return {
-    ariaLabel,
-    panelHeadline: i18nT('components.agentImportFlow.bring_your_crew_with_you'),
-    panelBody: i18nT('components.agentImportFlow.bring_your_supported_setup_sessions_memories_wor'),
-    panelFootnote: i18nT('components.agentImportFlow.merge_only_setup_credentials_stay_where_they_are'),
-  }
-}
 
 /** The wizard's stages, in order. Only the COUNT is ever displayed (the "2 of 4"
  *  eyebrow) — each stage's on-screen heading and description are separate,
@@ -189,16 +166,19 @@ function completionErrorMessage(error: unknown): string {
 
 // Animated "Importing…" label — cycles the trailing dots between ".", ".." and
 // "..." while an import is in flight. The dots span reserves width so the
-// button doesn't jitter as they grow.
+// button doesn't jitter as they grow. Ticking text is motion too: under reduced
+// motion the label holds still, and the disabled button still says it is busy.
 function ImportingLabel() {
   const [dots, setDots] = useState('.')
+  const reduceMotion = useReducedMotion()
   useEffect(() => {
+    if (reduceMotion) return
     const id = setInterval(() => setDots(d => (d.length >= 3 ? '.' : `${d}.`)), 400)
     return () => clearInterval(id)
-  }, [])
+  }, [reduceMotion])
   return (
     <>
-      {i18nT('components.agentImportFlow.importing')}<span className="inline-block w-3 text-left">{dots}</span>
+      {i18nT('components.agentImportFlow.importing')}<span className="inline-block w-3 text-left">{reduceMotion ? '' : dots}</span>
     </>
   )
 }
@@ -208,6 +188,7 @@ export default function AgentImportFlow({
   keepOpenWhenEmpty = false,
   onComplete,
   onSkipAll,
+  onDismiss,
 }: {
   initialOpen: boolean
   // First run finishes this chapter by itself when the scan finds nothing to
@@ -219,6 +200,10 @@ export default function AgentImportFlow({
   // drops the user straight into the product. Falls back to onComplete when the
   // host does not provide a distinct skip-all path.
   onSkipAll?: () => void
+  // The flow closed itself without finishing: an "Ask the agent" hand-off took the
+  // user to chat. The host drops its open signal so the flow can open again, and
+  // does NOT mark the chapter done, because nothing was imported or skipped.
+  onDismiss?: () => void
 }) {
   const [open, setOpen] = useState(initialOpen)
   const [stage, setStage] = useState<Stage>(1)
@@ -504,6 +489,14 @@ export default function AgentImportFlow({
     if (failedExit === 'skipAll' && onSkipAll) onSkipAll()
     else onComplete()
   }
+
+  // Every "Ask the agent" in this flow opens chat, so every one closes the dialog
+  // (or the chat sits under its focus trap) and tells the host it is closed (or a
+  // later "Import setup" opens nothing, because the host's signal never changed).
+  const handOffToChat = () => {
+    setOpen(false)
+    onDismiss?.()
+  }
   const isBusy = completionMutation.isPending || applyMutation.isPending || skipAllMutation.isPending
   // Disabled while ANY request is in flight, like every sibling control: leaving
   // mid-import would unmount the flow before its results (and any conflict to
@@ -657,7 +650,7 @@ export default function AgentImportFlow({
               or the chat it opens would sit underneath it. */}
           <ErrorNotice
             askAgent
-            onHandoff={() => setOpen(false)}
+            onHandoff={handOffToChat}
             testId="agent-import-scan-error"
             className="mt-2 max-w-lg text-left"
             message={errorMessage(scanQuery.error, i18nT('components.agentImportFlow.the_gateway_returned_an_unexpected_error'))}
@@ -694,6 +687,7 @@ export default function AgentImportFlow({
               agent can diagnose. No selections exist in this full-panel state. */}
           <ErrorNotice
             askAgent
+            onHandoff={handOffToChat}
             testId="agent-import-unreadable-error"
             className="mt-2 max-w-lg text-left"
             message={i18nT('components.agentImportFlow.found_setup_but_could_not_read_it', {
@@ -723,6 +717,7 @@ export default function AgentImportFlow({
           {/* Full-panel state: nothing selected yet, so the hand-off loses nothing. */}
           <ErrorNotice
             askAgent
+            onHandoff={handOffToChat}
             testId="agent-import-completion-error"
             className="mt-4 max-w-lg text-left"
             message={completionMessage}
@@ -753,6 +748,7 @@ export default function AgentImportFlow({
           {/* Full-panel state: nothing selected yet, so the hand-off loses nothing. */}
           <ErrorNotice
             askAgent
+            onHandoff={handOffToChat}
             testId="agent-import-completion-error"
             className="mt-4 max-w-lg text-left"
             message={completionMessage}
@@ -939,11 +935,21 @@ export default function AgentImportFlow({
                       <p className="text-[13px] font-medium text-text">
                         {item.category ? `${item.source}: ${item.category}` : item.source}
                       </p>
-                      {/* Every row stays a note, as before: which skips are caught
-                          failures needs a flag the scan does not send yet (#29216). */}
-                      <p className="mt-1 text-[13px] text-muted" data-reason={item.reason}>
-                        {skipReasonText(item.reason)}
-                      </p>
+                      {/* A caught failure is an error; any other skip is a note.
+                          No hand-off: the source and category picks are unsaved wizard state. */}
+                      {item.failed ? (
+                        <div className="mt-1" data-reason={item.reason}>
+                          <ErrorNotice
+                            variant="inline"
+                            testId="agent-import-skip-read-error"
+                            message={skipReasonText(item.reason)}
+                          />
+                        </div>
+                      ) : (
+                        <p className="mt-1 text-[13px] text-muted" data-reason={item.reason}>
+                          {skipReasonText(item.reason)}
+                        </p>
+                      )}
                     </div>
                     {item.count !== undefined && <span className="font-mono text-[13px] text-muted">{item.count}</span>}
                   </div>
@@ -1005,9 +1011,11 @@ export default function AgentImportFlow({
             </p>
             {/* The pressed one spins while it runs: every button on this step
                 waits for it, so the spinner is the only sign it is working. */}
+            {/* The stock Btn is transparent, so on the warn tint it has no edge until hovered. */}
             <div className="mt-3 flex flex-wrap gap-2">
               <Btn
                 type="button"
+                className="border-border-strong bg-bg-elevated"
                 disabled={isBusy}
                 aria-busy={resolving === 'rename'}
                 onClick={() => { setStrategy('rename'); applyMutation.mutate('rename') }}
@@ -1017,6 +1025,7 @@ export default function AgentImportFlow({
               </Btn>
               <Btn
                 type="button"
+                className="border-border-strong bg-bg-elevated"
                 disabled={isBusy}
                 aria-busy={resolving === 'overwrite'}
                 onClick={() => { setStrategy('overwrite'); applyMutation.mutate('overwrite') }}
@@ -1031,6 +1040,7 @@ export default function AgentImportFlow({
             the hand-off loses nothing. */}
         <ErrorNotice
           askAgent
+          onHandoff={handOffToChat}
           testId="agent-import-completion-error"
           className="mt-5"
           message={completionMessage}
@@ -1043,7 +1053,10 @@ export default function AgentImportFlow({
   return (
     <OnboardingChapterShell
       dialogRef={dialogRef}
-      {...setupChapterAside(i18nT('components.agentImportFlow.import_agent_setup'))}
+      ariaLabel={i18nT('components.agentImportFlow.import_agent_setup')}
+      panelHeadline={i18nT('components.agentImportFlow.bring_your_crew_with_you')}
+      panelBody={i18nT('components.agentImportFlow.bring_your_supported_setup_sessions_memories_wor')}
+      panelFootnote={i18nT('components.agentImportFlow.merge_only_setup_credentials_stay_where_they_are')}
       eyebrow={
         <>
           {showStepFooter

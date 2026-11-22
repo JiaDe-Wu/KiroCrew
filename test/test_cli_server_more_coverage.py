@@ -13,6 +13,7 @@ service commands; shared fixtures live in ``cli_server_more_coverage_helpers.py`
 import os
 import subprocess
 import sys
+import time
 import types
 import urllib.error
 from pathlib import Path
@@ -24,6 +25,7 @@ from cli_server_more_coverage_helpers import (  # noqa: F401 -- the fixture is r
 )
 
 from kiro_crew import cli_server, kiro_cli, platform_compat
+from kiro_crew.doctor_checks import services
 from kiro_crew.frontend import FrontendBuildResult
 from kiro_crew.platform.update_layout import InstallLayout
 
@@ -71,6 +73,10 @@ class _GitStub:
             )
         if argv[:2] == ["git", "fetch"]:
             return subprocess.CompletedProcess(argv, self.rc.get("fetch", 0), "", "no remote")
+        if argv[:2] == ["git", "diff"] and "--name-status" in argv:
+            # The changed-path listing: BYTES (NUL-separated), and exit 0 whether
+            # or not the target changes paths, unlike the --quiet probe.
+            return subprocess.CompletedProcess(argv, self.rc.get("name_only", 0), b"", b"")
         if argv[:2] == ["git", "diff"]:
             return subprocess.CompletedProcess(argv, self.rc.get("diff", 1), "", "")
         if argv[:2] == ["git", "rev-list"]:
@@ -482,10 +488,34 @@ class TestUpdateGitPath:
             cli_server._update()
         assert exc.value.code == 0
         out = capsys.readouterr().out
-        assert "will be discarded" in out
+        assert "uncommitted changes in 1 file" in out
         assert " M src/a.py" in out
         assert "?? scratch.txt" not in out  # untracked files are preserved, not listed
-        assert "Aborted." in out
+        assert "Answer N to keep them" in out
+        # The stash steps act on the installed checkout, not the shell's folder.
+        assert f"go to the checkout:\n      {git_checkout}\n  and run there:\n" in out
+        assert "git stash\n" in out
+        assert "      kirocrew update\n" in out
+        assert "git stash pop" in out
+        assert "Your changes were kept" in out
+        assert not any(c[:2] == ["git", "reset"] for c in stub.calls)
+
+    def test_local_changes_prompt_counts_files_and_repeats_force(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        stub = _GitStub()
+        stub.status_out = "".join(f" M src/f{i}.py\n" for i in range(12))
+        monkeypatch.setattr(subprocess, "run", stub)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "")
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update(force=True)
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "uncommitted changes in 12 files" in out
+        assert " M src/f9.py" in out
+        assert " M src/f10.py" not in out
+        assert "… and 2 more" in out
+        assert "kirocrew update --force" in out
         assert not any(c[:2] == ["git", "reset"] for c in stub.calls)
 
     def test_local_changes_confirmed_proceeds_to_reset(
@@ -536,7 +566,26 @@ class TestUpdateGitPath:
         out = capsys.readouterr().out
         assert str(log_path) in out
         assert "vite: build failed" in out
+        assert "see the log above" in out
         assert "Kiro Crew updated!" not in out
+
+    def test_frontend_build_failure_without_a_log_points_at_no_log(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        """Where no log was opened (Windows) nothing was printed for "the log above" to name."""
+        from kiro_crew.platform import release_apply
+
+        monkeypatch.setattr(subprocess, "run", _GitStub())
+        monkeypatch.setattr(
+            cli_server, "build_frontend_sync", lambda p: FrontendBuildResult("failed")
+        )
+        monkeypatch.setattr(release_apply, "apply_release", lambda *a, **k: 0)
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update()
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "Do not restart the gateway until the dashboard builds" in out
+        assert "see the log above" not in out
 
     def test_frontend_build_sees_the_node_ensure_node_recorded(
         self, monkeypatch, git_checkout, tmp_path
@@ -601,6 +650,45 @@ class TestUpdateGitPath:
         assert built == [git_checkout]
         assert ["/usr/bin/kiro-cli", "update"] in stub.calls
         assert any("setup" in c for c in stub.calls)
+
+    @pytest.mark.parametrize(
+        ("main", "member", "runs"),
+        [
+            ("claude", "claude", False),
+            ("codex", "claude", False),
+            # "" is ACP_BACKEND_KIRO, the Kiro CLI backend's id.
+            ("claude", "", True),
+            ("", "claude", True),
+        ],
+    )
+    def test_kiro_cli_update_runs_only_when_a_selected_role_runs_kiro_cli(
+        self, monkeypatch, git_checkout, capsys, main, member, runs
+    ) -> None:
+        """With no selected backend on kiro-cli the step is skipped, the reason
+        printed, and kiro-cli is never launched (its 120 s wait is the gateway's
+        downtime).
+
+        RED-BEFORE: on main every row runs ``kiro-cli update``.
+        """
+        from kiro_crew.config import KiroCrewConfig
+
+        real_load = KiroCrewConfig.load
+
+        def _load(*args, **kw):
+            cfg = real_load(*args, **kw)
+            cfg.agent.acp_backend = main
+            cfg.agent.member_acp_backend = member
+            return cfg
+
+        monkeypatch.setattr(KiroCrewConfig, "load", staticmethod(_load))
+        stub = _GitStub()
+        monkeypatch.setattr(subprocess, "run", stub)
+        monkeypatch.setattr(kiro_cli, "resolve_kiro_cli", lambda **kw: "/usr/bin/kiro-cli")
+        cli_server._update()
+        out = capsys.readouterr().out
+        assert (["/usr/bin/kiro-cli", "update"] in stub.calls) is runs
+        assert ("no selected backend runs kiro-cli" in out) is not runs
+        assert "Kiro Crew updated!" in out
 
     def test_agent_config_refresh_failure_only_warns(
         self, monkeypatch, git_checkout, capsys
@@ -829,6 +917,40 @@ class TestUpdateSubprocessHardening:
         assert exc.value.code == 1
         assert "git fetch timed out" in capsys.readouterr().out
 
+    def test_fetch_timeout_uses_the_shared_deadline_and_reaps_tmp_packs(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        """The manual fetch runs under the update check's deadline and
+        reaps the stale ``tmp_pack_*`` earlier killed fetches left.
+
+        RED-BEFORE: on main the fetch passes ``timeout=60`` and leaves the pack.
+        """
+        from kiro_crew import git_tmp_packs
+
+        pack_dir = Path(git_checkout) / ".git" / "objects" / "pack"
+        pack_dir.mkdir(parents=True, exist_ok=True)
+        stale = pack_dir / "tmp_pack_abc123"
+        stale.write_bytes(b"partial")
+        old = time.time() - git_tmp_packs.TMP_PACK_MAX_AGE_S - 60
+        os.utime(stale, (old, old))
+        seen: dict = {}
+        inner = self._timeout_on(["git", "fetch"], _GitStub())
+
+        def _run(argv, **kw):
+            if list(argv[:2]) == ["git", "fetch"]:
+                seen.update(kw)
+            return inner(argv, **kw)
+
+        monkeypatch.setattr(subprocess, "run", _run)
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update()
+        assert exc.value.code == 1
+        assert seen["timeout"] == git_tmp_packs.UPDATE_FETCH_TIMEOUT_S
+        out = capsys.readouterr().out
+        assert "git fetch timed out after 300s" in out
+        assert "kirocrew update" in out
+        assert not stale.exists()
+
     def test_diff_timeout_proceeds_like_a_nonzero_exit(
         self, monkeypatch, git_checkout, capsys
     ) -> None:
@@ -836,7 +958,9 @@ class TestUpdateSubprocessHardening:
         proceed to the divergence guard — rather than tracing back or lying
         "up to date"."""
         stub = _GitStub()
-        monkeypatch.setattr(subprocess, "run", self._timeout_on(["git", "diff"], stub))
+        monkeypatch.setattr(
+            subprocess, "run", self._timeout_on(["git", "diff", "--no-textconv"], stub)
+        )
         cli_server._update()
         out = capsys.readouterr().out
         assert "git diff timed out" in out
@@ -853,6 +977,29 @@ class TestUpdateSubprocessHardening:
             cli_server._update()
         assert exc.value.code == 1
         assert "git status timed out" in capsys.readouterr().out
+        assert not any(c[:2] == ["git", "reset"] for c in stub.calls)
+
+    def test_status_failure_refuses_the_reset(self, monkeypatch, git_checkout, capsys) -> None:
+        """A non-zero status prints nothing, which must not read as a clean tree
+        and skip the discard prompt."""
+        stub = _GitStub()
+
+        def _run(argv, **kw):
+            if list(argv[:2]) == ["git", "status"]:
+                stub.calls.append(list(argv))
+                return subprocess.CompletedProcess(argv, 128, "", "fatal: not a git repository\n")
+            return stub(argv, **kw)
+
+        monkeypatch.setattr(subprocess, "run", _run)
+        monkeypatch.setattr(
+            "builtins.input", lambda *_a: pytest.fail("prompted on an unreadable status")
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update()
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "git status exited 128" in out
+        assert "fatal: not a git repository" in out
         assert not any(c[:2] == ["git", "reset"] for c in stub.calls)
 
     def test_kiro_cli_update_timeout_degrades_best_effort(
@@ -876,6 +1023,8 @@ class TestUpdateWheelDispatch:
 
     def test_layout_is_built_from_the_distribution(self, monkeypatch, capsys) -> None:
         monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
+        # The suite runs from a checkout, which `_update` would update by git.
+        monkeypatch.setattr(cli_server, "_source_checkout_root", lambda: None)
         # Both bindings: the capability derives WHO owns the update from the
         # stamp, and cli_server names the layout kind from its own import.
         monkeypatch.setattr("kiro_crew.platform.update_capability.distribution", lambda: "wheel")
@@ -890,6 +1039,7 @@ class TestUpdateWheelDispatch:
 
     def test_unknown_distribution_defaults_to_wheel(self, monkeypatch) -> None:
         monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
+        monkeypatch.setattr(cli_server, "_source_checkout_root", lambda: None)
         monkeypatch.setattr("kiro_crew.platform.update_capability.distribution", lambda: "")
         monkeypatch.setattr("kiro_crew.cli_server.distribution", lambda: "")
         seen: list[InstallLayout] = []
@@ -1343,6 +1493,42 @@ class TestUpdateWheelInstaller:
         assert message in out
         assert "re-running the installer" not in out
 
+    @pytest.mark.parametrize(
+        ("stamp", "gateway", "code", "said"),
+        [
+            (4242, 4242, 0, "It does not\n     restart itself"),
+            (5151, 4242, 1, "possibly the gateway's own"),
+            (4242, None, 1, "possibly the gateway's own"),
+        ],
+    )
+    def test_a_lock_the_running_gateway_holds_is_not_a_failure(
+        self, monkeypatch, capsys, stamp, gateway, code, said
+    ) -> None:
+        """The gateway's own update is no failure, so the CLI exits 0 and says a restart
+        is still needed (the gateway never restarts itself); another holder, or a
+        gateway it cannot name, keeps exit 1."""
+        from kiro_crew import gateway_lock
+        from kiro_crew.platform import wheel_engine
+
+        def _gateway(home):
+            if gateway is None:
+                raise gateway_lock.LockProbeError(home, OSError("unreadable"))
+            return gateway_lock.LockHolder(pid=gateway, alive=True, source="flock_owner")
+
+        def _busy(**kw):
+            raise wheel_engine.WheelUpdateBusy("another kirocrew update is already in progress")
+
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: True)
+        monkeypatch.setattr(wheel_engine, "apply_wheel_update", _busy)
+        monkeypatch.setattr(wheel_engine, "update_lock_holder_pid", lambda: stamp, raising=False)
+        monkeypatch.setattr(gateway_lock, "lock_holder", _gateway)
+        try:
+            cli_server._update_wheel(_LAYOUT)
+            exit_code = 0
+        except SystemExit as exc:
+            exit_code = exc.code
+        assert (exit_code, said in capsys.readouterr().out) == (code, True)
+
     def test_an_incompatible_release_names_the_installer_rerun(self, monkeypatch, capsys) -> None:
         """Only the installer moves an install onto a Python the release accepts."""
         from kiro_crew.platform import wheel_engine
@@ -1417,8 +1603,37 @@ class TestUpdateWheelInstaller:
             raise AssertionError("installer must not run when already current")
 
         monkeypatch.setattr(subprocess, "run", unreachable)
+        monkeypatch.setattr(services, "_running_gateway_version", lambda port: None)
         cli_server._update_wheel(_LAYOUT)
         assert "Already on the latest version" in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        ("running", "said", "not_said"),
+        [
+            ("0.0.1", "but the running gateway is still 0.0.1", "Already on the latest"),
+            (None, "Already on the latest version", "kirocrew restart"),
+            ("same", "Already on the latest version", "kirocrew restart"),
+        ],
+    )
+    def test_already_latest_names_a_restart_when_the_gateway_runs_an_older_version(
+        self, monkeypatch, wheel_feed, capsys, running, said, not_said
+    ) -> None:
+        """An update never restarts the gateway, so the installed version can be the
+        latest while the gateway still serves an older one: then the next step is a
+        restart, not "already on the latest"."""
+        from kiro_crew import __version__ as local_version
+
+        wheel_feed(
+            b'{"schema": "kirocrew-cli-artifact-manifest-v1", "channel": "stable", '
+            + f'"version": "{local_version}"'.encode()
+            + b"}"
+        )
+        reported = local_version if running == "same" else running
+        monkeypatch.setattr(services, "_running_gateway_version", lambda port: reported)
+        cli_server._update_wheel(_LAYOUT)
+        out = capsys.readouterr().out
+        assert said in out
+        assert not_said not in out
 
 
 class TestStatusCountLines:
@@ -1432,8 +1647,7 @@ class TestStatusCountLines:
         assert cli_server._format_count(data, "lessons") == "42"
 
     def test_null_count_prints_a_dash_not_none(self) -> None:
-        # Fails on the previous head, which printed ``Lessons: None`` for a
-        # payload whose count was still unknown.
+        # An unknown count prints a dash, never ``Lessons: None``.
         data = {"cron_jobs": None, "lessons": None}
         assert cli_server._format_count(data, "cron_jobs") == "—"
         assert cli_server._format_count(data, "lessons") == "—"
@@ -1442,8 +1656,8 @@ class TestStatusCountLines:
         assert cli_server._format_count({"uptime": "1h"}, "lessons") == "—"
 
     def test_status_reads_the_cron_jobs_key(self, monkeypatch, capsys) -> None:
-        # Fails on the previous head, which read a ``crons`` key the snapshot
-        # never emits and so always printed ``Cron jobs: 0``.
+        # The snapshot emits ``cron_jobs``, never ``crons``; reading the wrong key
+        # always prints ``Cron jobs: 0``.
         import io
         import json
         from contextlib import contextmanager
@@ -1500,11 +1714,69 @@ class TestStatusMemoryLine:
         assert "Memory:      412 MiB rss, session ceiling 1536 MiB" in out
 
 
+def test_status_prints_the_session_map_remedy_only_while_writes_are_refused(
+    monkeypatch, capsys
+) -> None:
+    import io
+    import json
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    payloads = [
+        {"session_map_writes_refused": True, "session_map_remedy": "restart it"},
+        {"session_map_writes_refused": False, "session_map_remedy": ""},
+    ]
+
+    @contextmanager
+    def _urlopen(url, timeout):
+        yield io.BytesIO(json.dumps(payloads.pop(0)).encode())
+
+    monkeypatch.setattr(cli_server, "loopback_urlopen", _urlopen)
+    monkeypatch.setattr(cli_server, "resolve_client_port", lambda p: 7777)
+    cli_server._status(SimpleNamespace(port=None))
+    assert "  Session map: restart it\n" in capsys.readouterr().out
+    cli_server._status(SimpleNamespace(port=None))
+    assert "Session map:" not in capsys.readouterr().out
+
+
 class TestApproveBusyVsDown:
     """The update-approve CLI path reports a slow gateway as busy, and a
     refused connection as not running. It carries a single-use nonce, so the
     busy line points at the dashboard, never a retry.
     """
+
+    def test_update_approve_says_an_armed_answer_applies_at_the_next_start(
+        self, monkeypatch, capsys
+    ) -> None:
+        import contextlib
+        import io
+
+        from kiro_crew.platform import update_capability, update_stepup
+
+        monkeypatch.setattr(
+            update_capability,
+            "derive_capability",
+            lambda: types.SimpleNamespace(managed_by="source"),
+        )
+        pending = types.SimpleNamespace(
+            version="1.2.3", channel="stable", expires_in=60, nonce="n" * 64
+        )
+        monkeypatch.setattr(update_stepup, "read_pending", lambda: pending)
+        monkeypatch.setattr(cli_server, "resolve_client_port", lambda _p: 7777)
+        monkeypatch.setattr(cli_server, "read_local_secret", lambda _p, **_kw: "")
+        monkeypatch.setattr(
+            cli_server,
+            "_owner_verified_secret_urlopen",
+            lambda *a, **k: contextlib.closing(
+                io.BytesIO(b'{"ok": true, "status": "armed", "version": "1.2.3"}')
+            ),
+        )
+
+        cli_server._update_approve()
+
+        out = capsys.readouterr().out
+        assert "is armed" in out and "next start" in out
+        assert "is applying" not in out
 
     def test_update_approve_timeout_reports_busy(self, monkeypatch, capsys) -> None:
         from kiro_crew.platform import update_capability, update_stepup
@@ -1531,6 +1803,6 @@ class TestApproveBusyVsDown:
         with pytest.raises(SystemExit) as exc:
             cli_server._update_approve()
         assert exc.value.code == 1
-        out = capsys.readouterr().out
-        assert "busy" in out
-        assert "is not running" not in out
+        err = capsys.readouterr().err
+        assert "busy" in err
+        assert "is not running" not in err

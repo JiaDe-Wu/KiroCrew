@@ -9,7 +9,7 @@ import { appRouteOf, routerParamForm } from '../utils/appPopoutRoute'
 import { withBase } from '../lib/basePath'
 import { chatDeepLinkSlot, claimChatLaunch } from '../utils/navIntent'
 import { consumeChatHandoff, installHardExit } from '../utils/errorReport'
-import { hasBuiltinComponent } from '../apps/builtinRegistry'
+import { CorePopoutPage, corePopoutPage, hasPopoutPage } from './corePopoutPages'
 import { appNavTarget } from '../appNav'
 import { useInstalledApps } from '../hooks/panelTabRegistry'
 import { useAppStore, type AppStore } from '../store'
@@ -81,7 +81,7 @@ function handOffToMain(store: AppStore, pathname: string, search: string): void 
  * and the main dashboard's routes are in app space (`/chat`). A path outside
  * the basename is returned unchanged.
  */
-function appSpacePath(pathname: string, basename: string): string {
+export function appSpacePath(pathname: string, basename: string): string {
   if (basename === '/') return pathname
   const base = basename.endsWith('/') ? basename.slice(0, -1) : basename
   if (!pathname.toLowerCase().startsWith(base.toLowerCase())) return pathname
@@ -123,7 +123,7 @@ function usePinnedNavigation(route: string, store: AppStore): ContextType<typeof
       const { pathname, search, hash } = typeof to === 'string' ? parsePath(to) : to
       if (pathname === undefined) return null
       const appPath = appSpacePath(pathname, navigation.basename)
-      return { appPath, search: search ?? '', hash: hash ?? '', exit: appRouteOf(appPath, hasBuiltinComponent) !== route }
+      return { appPath, search: search ?? '', hash: hash ?? '', exit: appRouteOf(appPath, hasPopoutPage) !== route }
     }
     const exits = (to: To): boolean => {
       const target = judge(to)
@@ -204,7 +204,7 @@ export default function AppPopoutFrame({ route }: {
   // as an app is one. Checked against the registry here rather than left to
   // `BuiltinAppRoute`, whose answer for an unknown path is a redirect to /chat —
   // an exit this window would forward to main, leaving an empty window here.
-  const valid = appRouteOf(route, hasBuiltinComponent) === route && !misrouted
+  const valid = appRouteOf(route, hasPopoutPage) === route && !misrouted
   const label = useMemo(() => {
     for (const app of apps) {
       const target = appNavTarget(app)
@@ -236,8 +236,9 @@ export default function AppPopoutFrame({ route }: {
   }, [store])
 
   // Reflect the app in the window/taskbar title so multiple pop-outs are
-  // distinguishable at the OS level.
-  const shownLabel = label || i18nT('pages.appPopoutFrame.app')
+  // distinguishable at the OS level. A core page has no app record to name it.
+  const corePage = corePopoutPage(route)
+  const shownLabel = (corePage ? i18nT(corePage.labelKey) : label) || i18nT('pages.appPopoutFrame.app')
   useEffect(() => {
     document.title = i18nT('pages.appPopoutFrame.window_title', { label: shownLabel })
   }, [shownLabel])
@@ -297,6 +298,8 @@ export default function AppPopoutFrame({ route }: {
             </div>
           ) : route.startsWith('/apps/') ? (
             <AppPage />
+          ) : corePage ? (
+            <CorePopoutPage entry={corePage} />
           ) : (
             <BuiltinAppRoute />
           )}
@@ -311,13 +314,19 @@ export default function AppPopoutFrame({ route }: {
  * steps this window back to the app.
  *
  * Reached only by a navigation from outside the frame's subtree, which the
- * pinned navigator never sees: the shell's soft navigator (`appShell.tsx`,
- * `installSoftNavigate`), through which a hook-free "Ask the agent" control
- * sends this window to /chat. The app subtree has already been replaced by
- * the time this renders, so it remounts after the step back; exits from the
- * app itself never come this way. Nor does a hard exit (`hardNavigate`, which
- * a hard `sendErrorToChat` also uses): it reaches `handOffToMain` directly
- * through `installHardExit`, with no navigation in this window.
+ * pinned navigator never sees, such as the desktop app's native menu entries
+ * (`subscribeNativeNavigate` in `appShell.tsx`). The app subtree has already
+ * been replaced by the time this renders, so it remounts after the step back;
+ * exits from the app itself never come this way. Nor does a hard exit
+ * (`hardNavigate`, which the shell also installs as this window's soft
+ * navigator, so every `sendErrorToChat` takes it): it reaches `handOffToMain`
+ * directly through `installHardExit`, with no navigation in this window.
+ *
+ * A POP is never handed off. It is this document's first location, a deep
+ * link that names something other than the pinned app (`/apps/foo/extra`, a
+ * differently cased route), or a step through this window's history onto an
+ * entry whose exit was handed off when it was pushed. Nobody asked to leave
+ * now, so the window only settles back on the app.
  *
  * Stepping back is a history `-1` after a PUSH (so the step restores the app's
  * sub-path as it was), and a `replace` to the app's route otherwise: after a
@@ -337,7 +346,7 @@ function AppPopoutHandoff({ route }: { route: string }) {
   useEffect(() => {
     if (handled.current === location.key) return
     handled.current = location.key
-    handOffToMain(store, location.pathname, location.search)
+    if (navigationType !== 'POP') handOffToMain(store, location.pathname, location.search)
     if (navigationType === 'PUSH') navigate(-1)
     else navigate(route, { replace: true })
   }, [location.key, location.pathname, location.search, navigationType, navigate, store, route])
@@ -345,14 +354,15 @@ function AppPopoutHandoff({ route }: { route: string }) {
 }
 
 /**
- * Installs this window's hard exit: a hard "Ask the agent" (the boundary card
- * of a crashed app, `AskAgentButton … hard`) and any other `hardNavigate`
- * hand their destination to the main window the way the frame's other exits
- * do, instead of loading it here and turning the pop-out into a second
- * dashboard. Rendered by App.tsx beside the frame's routes, above the route
- * boundary, so a crash of the frame itself does not take the sink with it.
- * `handOffToMain` drains the prompt `sendErrorToChat` staged in this window's
- * sessionStorage.
+ * Installs this window's hard exit: every "Ask the agent" (a hard one from
+ * the boundary card of a crashed app, `AskAgentButton … hard`, and a soft one,
+ * which the shell routes through `hardNavigate` in this window) and any other
+ * `hardNavigate` hand their destination to the main window the way the
+ * frame's other exits do, instead of loading it here and turning the pop-out
+ * into a second dashboard. Rendered by App.tsx beside the frame's routes,
+ * above the route boundary, so a crash of the frame itself does not take the
+ * sink with it. `handOffToMain` drains the prompt `sendErrorToChat` staged in
+ * this window's sessionStorage.
  */
 export function AppPopoutHardExit() {
   const store = useAppStore()

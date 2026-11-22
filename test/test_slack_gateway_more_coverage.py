@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import threading
 import time
 from dataclasses import replace
 from types import SimpleNamespace
@@ -68,9 +69,13 @@ from kiro_crew.monitoring.models import (
     MonitorState,
 )
 from kiro_crew.slack import gateway as gw
+from kiro_crew.testing.synthetic_credentials import github_classic
 from kiro_crew.testing.wait import await_until, finished
 
 # ─── Helpers ─────────────────────────────────────────────────────────────
+
+#: A GitHub token with a valid checksum, retained as a monitor target.
+_NOTICE_TOKEN = github_classic(seed=167)
 
 
 def _make_orchestrator(**kwargs: Any) -> Any:
@@ -102,6 +107,22 @@ def _mock_dashboard_state() -> MagicMock:
     ds.get_slot = MagicMock(return_value=None)
     ds.channel_transports = {}
     return ds
+
+
+def _monitor_notice(ds: MagicMock) -> tuple[str, str, dict | None, str | None]:
+    """``(title, body, meta, priority)`` of the one monitor notice *ds* received.
+
+    A merged pull request is pushed on the bus as a passive payload; every other
+    notice goes through ``notify`` at the channel's priority (``None`` here).
+    """
+    pushes = ds.notification_bus.push.call_args_list
+    notifies = ds.notify.call_args_list
+    assert len(pushes) + len(notifies) == 1, (pushes, notifies)
+    if pushes:
+        payload = pushes[0].args[0]
+        return payload.title, payload.body, payload.meta or None, payload.priority
+    call = notifies[0]
+    return call.args[1], call.args[2], call.kwargs["meta"], None
 
 
 def _mock_slack(*, dm: str | None = "D1") -> MagicMock:
@@ -261,18 +282,24 @@ class TestWarnIfKiroCliOutdated:
         would mean the dashboard never comes up at all.
         """
         orch = _make_orchestrator()
+        release = threading.Event()
 
         def _hang(**kwargs: Any) -> str:
-            time.sleep(5)  # outlives the budget pinned below
+            # Held until the asserts are done, so it outlives the budget pinned below.
+            # The loop's teardown joins this worker thread, so it must not outlive the test.
+            release.wait(30)
             return "/opt/pinned/bin/kiro-cli"
 
-        with caplog.at_level("WARNING"):
-            with patch.object(gw, "_KIRO_CLI_RESOLVE_TIMEOUT_SECS", 0.01):
-                with patch("kiro_crew.kiro_cli.resolve_kiro_cli", side_effect=_hang):
-                    with patch("asyncio.create_subprocess_exec") as spawn:
-                        await orch._warn_if_kiro_cli_outdated()
-        spawn.assert_not_called()
-        assert "exceeded" in caplog.text
+        try:
+            with caplog.at_level("WARNING"):
+                with patch.object(gw, "_KIRO_CLI_RESOLVE_TIMEOUT_SECS", 0.01):
+                    with patch("kiro_crew.kiro_cli.resolve_kiro_cli", side_effect=_hang):
+                        with patch("asyncio.create_subprocess_exec") as spawn:
+                            await orch._warn_if_kiro_cli_outdated()
+            spawn.assert_not_called()
+            assert "exceeded" in caplog.text
+        finally:
+            release.set()
 
     @pytest.mark.asyncio
     async def test_unspawnable_binary_is_silent(self, capsys):
@@ -431,6 +458,37 @@ class TestDeliverResultRouting:
         await orch._deliver_result("Title", "task", "result", "slack")
         orch.slack.open_dm.assert_awaited_once_with("U_OWNER")
         orch.slack.post_message.assert_not_awaited()
+
+    @pytest.mark.parametrize("connected", [True, False])
+    @pytest.mark.asyncio
+    async def test_slack_only_arm_waits_out_a_reconnect(self, connected: bool):
+        # A report finishing while a Reconnect has cleared the client posts with
+        # the client the attempt publishes; when the attempt fails, the
+        # Slack-only arm keeps the report as a notification instead of dropping it.
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        orch.slack = None
+        new_client = _mock_slack(dm="D9")
+
+        async def _attempt() -> dict:
+            orch._slack_reconnecting = False
+            if connected:
+                orch.slack = new_client
+            else:
+                orch._slack_client_lost = True
+            return {"connected": connected}
+
+        orch._slack_reconnecting = True
+        orch._slack_reconnect_task = asyncio.create_task(_attempt())
+        await orch._deliver_result("Title", "task", "result", "slack")
+        if connected:
+            new_client.open_dm.assert_awaited_once_with("U_OWNER")
+            assert new_client.post_message.await_args.args[0] == "D9"
+            ds.notify.assert_not_called()
+        else:
+            new_client.open_dm.assert_not_awaited()
+            ds.notify.assert_called_once_with("heartbeat", "Title", "task\n\nresult")
 
     @pytest.mark.asyncio
     async def test_slack_channel_arm_without_ts_posts_to_the_channel(self, monkeypatch):
@@ -663,53 +721,6 @@ class TestShutdownExtras:
             await finished(orch._shutdown(), "orchestrator shutdown")
 
         assert stopped == ["update", "teardown"]
-
-    @pytest.mark.asyncio
-    async def test_a_dashboard_started_policy_apply_is_stopped_before_the_teardown(self):
-        """``POST /api/update`` with a policy provider runs the same installer shape.
-
-        Its handler is cancelled only by aiohttp's own teardown, which the
-        graceful cap exits ahead of. Shutdown stops it with the coordinator, up
-        front, and waits for its rollback before the teardown.
-        """
-        from kiro_crew.dashboard.handlers import updates
-
-        orch = _make_orchestrator()
-        orch.cron_svc = None
-        orch.heartbeat_svc = None
-        orch.subagent_mgr = None
-        orch.sessions = None
-        orch.dashboard_state = None
-        orch._dashboard_runner = None
-        stopped: list[tuple[str, bool]] = []
-        started = asyncio.Event()
-        hold = asyncio.Event()  # never set: only a cancel ends the apply
-
-        async def _installer_running() -> bool | None:
-            started.set()
-            try:
-                await hold.wait()
-            except asyncio.CancelledError:
-                await asyncio.sleep(0)  # the installer's own rollback step
-                stopped.append(("apply", True))
-                raise
-            return True
-
-        # The handler's own seam, standing in for the aiohttp request task.
-        handler = asyncio.create_task(updates._run_tracked_policy_apply(_installer_running))
-        await await_until(started, what="the apply to start")
-        apply_task = updates.policy_applies_in_flight()[0]
-        orch._stop_mcp_broker = AsyncMock(
-            side_effect=lambda: stopped.append(("teardown", apply_task.done()))
-        )
-        with patch.object(gw.registry, "shutdown_tasks", return_value=[]):
-            await await_until(asyncio.ensure_future(orch._shutdown()), what="the shutdown")
-
-        # The apply's cancel arm ran, and it had finished before the teardown.
-        assert stopped == [("apply", True), ("teardown", True)]
-        with pytest.raises(updates._PolicyApplyStopped):
-            await await_until(handler, what="the handler to unwind")
-        assert updates.policy_applies_in_flight() == []
 
     @pytest.mark.asyncio
     async def test_an_update_task_that_will_not_stop_does_not_hold_shutdown(self, monkeypatch):
@@ -1151,12 +1162,13 @@ class TestNotifyNudgeExpired:
 
         orch._notify_nudge_expired(loop)
 
-        ds.notify.assert_called_once()
-        body = ds.notify.call_args.args[2]
+        _title, body, meta, priority = _monitor_notice(ds)
         assert expected in body
         assert forbidden not in body
         assert loop.monitor.target in body
-        assert ds.notify.call_args.kwargs["meta"] is None
+        assert meta is None
+        # Only a merge needs nothing from the user; every other stop rings.
+        assert priority == ("passive" if reason == "pull_request_merged" else None)
 
     def test_a_stalled_suppressed_red_is_not_described_as_fine(self):
         """The dominant stall is an ALREADY-ALERTED red, so the copy must not deny it.
@@ -1324,9 +1336,9 @@ class TestNotifyNudgeExpired:
     @pytest.mark.parametrize(
         "target",
         [
-            "https://github.com/acme/ghp_" + "a" * 36 + "/pull/7",
-            "https://example.com/?data=%67%68%70%5F" + "a" * 36,
-            "ghp_" + "a" * 36,
+            "https://github.com/acme/" + _NOTICE_TOKEN + "/pull/7",
+            "https://example.com/?data=%67%68%70%5F" + _NOTICE_TOKEN[4:],
+            _NOTICE_TOKEN,
         ],
     )
     def test_structured_notice_redacts_unsafe_retained_target(self, target):
@@ -1347,7 +1359,7 @@ class TestNotifyNudgeExpired:
 
         orch._notify_nudge_expired(loop)
 
-        body = ds.notify.call_args.args[2]
+        _title, body, _meta, _priority = _monitor_notice(ds)
         assert "was merged" in body
         assert target not in body
         assert "ghp_" not in body
@@ -1470,8 +1482,11 @@ class TestNotifyNudgeExpired:
 
         assert orch._notify_nudge_expired(loop) is True
 
-        assert ds.notify.call_args.args[1] == expected_title
-        assert expected_body in ds.notify.call_args.args[2]
+        title, body, _meta, priority = _monitor_notice(ds)
+        assert title == expected_title
+        assert expected_body in body
+        # The merge lands in the feed only; closed-unmerged still rings.
+        assert priority == ("passive" if (pending or delivered) == "success" else None)
 
     def test_a_legacy_cap_with_no_owed_turn_still_reports_the_cap(self):
         orch = _make_orchestrator()

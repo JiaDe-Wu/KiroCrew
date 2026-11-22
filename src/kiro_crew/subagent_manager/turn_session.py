@@ -2,11 +2,14 @@
 
 ``run_turn._run_inner_impl`` calls these in order: the tool-approval policy the run
 inherits (``resolve_parent_policy``), the session it runs on, shared or dedicated
-(``acquire_session``), the cleanup identity of that session (``capture_cleanup_identity``),
+(``acquire_session``, which holds a new session until its agent spec's MCP servers report,
+at most ``UNATTENDED_MCP_WAIT_SECS``), the cleanup identity of that session (``capture_cleanup_identity``),
 the child's memory, crew activity and folder steering (``prepare_child_context``), the
 records and the spawn event a restart and the panel read (``persist_spawn_records``), and
 the ``AgentSpawn`` and ``UserPromptSubmit`` hooks with their clock bookkeeping
-(``fire_prompt_hooks``). Each takes the run's ``RunEventCoordinator`` as ``self``.
+(``fire_prompt_hooks``). Each takes the run's ``RunEventCoordinator`` as ``self``, except
+``spec_builtin_tools_notice``, the line naming a named agent's ``model`` pin a claude
+session does not apply, which needs only the session.
 
 The turn body runs on ``kiro_crew.subagent``'s globals (``bind_component_globals``), and
 tests patch names there (``sel``, ``time``, ``_redact``, the session re-projection
@@ -29,6 +32,8 @@ import sys
 from collections.abc import Callable
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
+
+from kiro_crew.agent_sdk.mcp_problems import UNATTENDED_MCP_WAIT_SECS, wait_for_declared_mcp
 
 if TYPE_CHECKING:
     from ..subagent import SubagentInfo
@@ -56,6 +61,17 @@ def _founding_session(conversation_key: str) -> str:
     return ""
 
 
+def _run_on(manager: Any, key: str) -> SubagentInfo | None:
+    """The run on sub-agent *key*. Every run on the key is a candidate (a continuation
+    runs on the original's key): a live one first, then the newest."""
+    runs = [
+        run
+        for run in list(manager._agents.values())
+        if (run.conversation_key or f"subagent:{run.id}") == key
+    ]
+    return max(runs, key=lambda run: (not run.done, run.started)) if runs else None
+
+
 def _approval_lineage(
     self: RunEventCoordinator, parent_key: str, revocation: int
 ) -> tuple[tuple[str, int], ...] | None:
@@ -63,20 +79,13 @@ def _approval_lineage(
     rests on, root first: the parent's own, after the ones its run recorded when the
     parent is itself a sub-agent (a root's revocation never touches the ``"auto"`` that
     child's session was created with). ``None`` when the run on that sub-agent key holds
-    no ``"auto"`` itself, so the stored value is not its trust. Every run on the key is a
-    candidate (a continuation runs on the original's key): a live one first, then the
-    newest; with none left to read, the parent key alone."""
+    no ``"auto"`` itself, so the stored value is not its trust; with no run left to read,
+    the parent key alone."""
     own = (parent_key, revocation)
-    if not parent_key.startswith("subagent:"):
+    run = _run_on(self._manager, parent_key) if parent_key.startswith("subagent:") else None
+    if run is None:
         return (own,)
-    runs = [
-        run
-        for run in list(self._manager._agents.values())
-        if (run.conversation_key or f"subagent:{run.id}") == parent_key
-    ]
-    if not runs:
-        return (own,)
-    inherited = max(runs, key=lambda run: (not run.done, run.started))._approval_lineage
+    inherited = run._approval_lineage
     return None if inherited is None else (*inherited, own)
 
 
@@ -93,6 +102,24 @@ def parent_trust_revoked(
         return any(sessions.approval_revocation(key) not in (0, seen) for key, seen in lineage)
 
     return _revoked
+
+
+def approval_policy_of(manager: Any, key: str) -> str:
+    """The approval policy *key* passes to its spawns and their tool calls: the stored
+    one, else, for a live sub-agent on its parent's shared runtime (no session in the
+    store), ``"auto"`` while that run's lineage starts at a session that is not a
+    sub-agent and is not revoked since. A grant of a sub-agent's own is not passed on."""
+    policy = manager._sessions.get_approval_policy(key)
+    if policy or not key.startswith("subagent:"):
+        return policy
+    run = _run_on(manager, key)
+    if run is None or run.done or run._session_sharing is not True:
+        return ""
+    lineage = run._approval_lineage
+    if not lineage or lineage[0][0].startswith("subagent:"):
+        return ""
+    revoked = parent_trust_revoked(manager._sessions, lineage)
+    return "auto" if revoked is not None and not revoked() else ""
 
 
 async def resolve_parent_policy(self: RunEventCoordinator, info: SubagentInfo) -> tuple[str, str]:
@@ -112,7 +139,7 @@ async def resolve_parent_policy(self: RunEventCoordinator, info: SubagentInfo) -
     ask_key = info.parent_session_key
     # The stamp before the policy: the store writes them the other way round.
     revocation = sessions.approval_revocation(ask_key)
-    parent_policy = sessions.get_approval_policy(ask_key)
+    parent_policy = approval_policy_of(self._manager, ask_key)
     founder_lineage: tuple[tuple[str, int], ...] | None = ()
     if info.conversation_key:
         founder = await asyncio.to_thread(_founding_session, info.conversation_key)
@@ -136,7 +163,12 @@ async def resolve_parent_policy(self: RunEventCoordinator, info: SubagentInfo) -
         else:
             lineage = (*(founder_lineage or ()), *lineage)
     # Explicit approval_mode from spawn caller (e.g. Mochi bg agent)
-    if not parent_policy and info.approval_mode == "auto":
+    # A spawn's own or the config's ``auto`` is a session Trust: a policy that denies
+    # ``trust`` refuses both, and the child asks instead.
+    from kiro_crew.approval_mode_policy import session_mode_permitted
+
+    trust_ok = session_mode_permitted("trust")
+    if not parent_policy and info.approval_mode == "auto" and trust_ok:
         parent_policy = "auto"
         _sa.sel().log_api_access(
             caller=info.parent_session_key or f"subagent:{info.id}",
@@ -154,7 +186,7 @@ async def resolve_parent_policy(self: RunEventCoordinator, info: SubagentInfo) -
             source="subagent",
             resources=f"subagent_id={info.id}",
         )
-    if not parent_policy and self._manager._global_approval_mode == "auto":
+    if not parent_policy and self._manager._global_approval_mode == "auto" and trust_ok:
         # Apply global config as fallback only when parent is absent or
         # confirmed garbage-collected (absent from the session store).
         # If parent session still exists but returned no policy, deny by
@@ -220,6 +252,9 @@ async def acquire_session(
     _sa = _facade()
     if use_session_sharing:
         from kiro_crew.agent_sdk.drivers.acp_vocab import AcpRequestTimeout as _StartTimeout
+        from kiro_crew.agent_sdk.drivers.acp_vocab import (
+            AcpScopeAdmissionTimeout as _ScopeAdmissionTimeout,
+        )
 
         try:
             client = await self._manager._create_shared_session(info, session_key, agent)
@@ -234,6 +269,14 @@ async def acquire_session(
             is_new = True
             _resumed = False
             is_cc = False
+        except _ScopeAdmissionTimeout as exc:
+            # The companion runtime's spawn waited past its bound for the user
+            # systemd manager to admit its scope. That is congestion too: a
+            # dedicated process would ask the same manager for one more scope. The
+            # attempt ends the way ``_await_late_start`` ends an ``initialize``
+            # timeout that has no collector. No L3 failure is counted: the runtime
+            # never started, and an L4 escalation cannot make the manager faster.
+            raise RuntimeError(f"start_timeout: {exc}") from exc
         except Exception as exc:
             # The shared runtime itself is unavailable (dead, spawn failed):
             # not congestion. The failure is counted on the ladder's L3
@@ -333,6 +376,11 @@ async def acquire_session(
             self._manager._sessions, session_key, agent, await _claim(), _claim
         )
         is_cc = self._manager._is_cc_provider(client)
+    if is_new:
+        # A spawn prompts the moment its session opens, and nobody reconnects a
+        # slow server mid-run: hold the first prompt (bounded) for the agent
+        # spec's servers, as every other unattended run does.
+        await wait_for_declared_mcp(client, UNATTENDED_MCP_WAIT_SECS)
     return client, is_new, _resumed, is_cc, use_session_sharing
 
 
@@ -345,8 +393,17 @@ def capture_cleanup_identity(
     # acquisition. Every later step can fail and tombstone the run, so
     # delaying this until the state write leaves provider files unidentified.
     try:
+        from kiro_crew.agent_sdk.codex_transcripts import (
+            is_codex_provider_label,
+            recorded_codex_home,
+        )
+
         cleanup_session_id = str(client.session_id or "") if hasattr(client, "session_id") else ""
         cleanup_provider = self._manager._provider_label_of(client)
+        # The prune and spawn_release have no session, so a Codex run records its store now.
+        cleanup_codex_home = (
+            recorded_codex_home(client) if is_codex_provider_label(cleanup_provider) else ""
+        )
         # Continuations use this record to recover their project on every
         # backend, even when continuing a follow-up after gateway restart.
         provider_cwd = getattr(client, "cwd", "")
@@ -359,6 +416,7 @@ def capture_cleanup_identity(
         setattr(info, "_session_id", cleanup_session_id)
         setattr(info, "_session_provider", cleanup_provider)
         setattr(info, "_session_cwd", cleanup_cwd)
+        setattr(info, "_session_codex_home", cleanup_codex_home)
         self._publish_identity(
             info.id,
             session_id=cleanup_session_id,
@@ -366,6 +424,7 @@ def capture_cleanup_identity(
             cwd=cleanup_cwd,
             keep=info.keep,
             conversation_key=session_key if info.keep else "",
+            codex_home=cleanup_codex_home,
         )
     except Exception:
         _sa.logger.debug("Failed to capture live cleanup identity for %s", info.id, exc_info=True)
@@ -521,6 +580,7 @@ async def persist_spawn_records(
             cwd=str(getattr(info, "_session_cwd", "")),
             keep=info.keep,
             conversation_key=session_key if info.keep else "",
+            codex_home=str(getattr(info, "_session_codex_home", "")),
         )
     except Exception:
         _sa.logger.debug("Failed to persist cleanup identity for %s", info.id, exc_info=True)
@@ -627,11 +687,14 @@ async def fire_prompt_hooks(
     task: str,
     fresh_session: bool,
     spec: Any,
+    client: Any,
 ) -> str:
     """Fire the child's prompt-start hooks and return the ``[Hook context]`` prefix."""
     _sa = _facade()
     from kiro_crew.subagent_manager.prompt_hooks import prompt_hook_prefix
 
+    # The child's own ACP session id, for its spec hooks only.
+    _acp_sid = getattr(client, "session_id", "") if spec.hooks else ""
     # Before the first stream, as a dashboard turn fires them before its own.
     # Hook time is not the runtime's silence: the reaper's startup, first-prompt
     # and stall checks skip the run while they run, the startup clock does not
@@ -647,6 +710,7 @@ async def fire_prompt_hooks(
             fresh_session=fresh_session,
             spec_hooks=spec.hooks,
             spec_hooks_cwd=spec.cwd,
+            acp_session_id=_acp_sid if isinstance(_acp_sid, str) and _acp_sid else None,
         )
     finally:
         info._prompt_hooks_secs += _sa.time.monotonic() - _hooks_t0
@@ -654,3 +718,47 @@ async def fire_prompt_hooks(
         info._last_activity_mono = _sa.time.monotonic()
         info._prompt_hooks_running = False
     return _hook_prefix
+
+
+#: How long a sub-agent's first prompt waits for the spec read behind its notice.
+_SPEC_NOTICE_TIMEOUT_SECS = 10.0
+
+
+async def spec_builtin_tools_notice(
+    client: Any, info: SubagentInfo, session_key: str, *, fresh: bool
+) -> str:
+    """The block a spawn's new session's first prompt carries when its claude session
+    leaves the named agent's ``model`` pin unapplied
+    (``agent_sdk.spec_builtin_tools``).
+
+    Only on a *fresh* session, so a continuation or a respawn does not repeat it.
+    Logged for the operator too. ``""`` for any other run, so the caller prepends it
+    as it is; a spec that cannot be read in time adds nothing.
+    """
+    from kiro_crew.agent_sdk.capabilities import capabilities_of
+    from kiro_crew.agent_sdk.spec_builtin_tools import spec_builtin_tools_notice as _notice
+    from kiro_crew.agent_sdk.spec_hooks import spec_project_dir
+
+    if not fresh or not info.agent:
+        return ""
+    try:
+        text = await asyncio.wait_for(
+            asyncio.to_thread(
+                _notice,
+                info.agent,
+                spec_project_dir(client),
+                backend=capabilities_of(client).backend,
+                namespace=capabilities_of(client).model_id_namespace,
+                session_key=session_key,
+            ),
+            _SPEC_NOTICE_TIMEOUT_SECS,
+        )
+    except Exception:  # noqa: BLE001 - an informational line must never fail a run
+        _facade().logger.debug(
+            "agent spec tools for %r could not be read", info.agent, exc_info=True
+        )
+        return ""
+    if not text:
+        return ""
+    _facade().logger.warning("Subagent %s (agent %s): %s", info.id, info.agent, text)
+    return f"[Session notice] {text}\n\n"

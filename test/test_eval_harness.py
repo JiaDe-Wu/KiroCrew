@@ -791,8 +791,8 @@ class TestReporting:
         assert "# Eval Results" in report
         assert "test" in report
 
-    def test_the_report_is_never_ascii(self):
-        """Every result carries a ✅ or ❌, so the report cannot be saved as ASCII.
+    def test_the_report_keeps_non_ascii_turn_text(self):
+        """A turn's non-ASCII text reaches the report, so it cannot be saved as ASCII.
 
         This is the premise the artifact writer rests on: `_run_eval` hands this
         string straight to `write_eval_artifacts`, and the coverage tests around
@@ -804,7 +804,7 @@ class TestReporting:
                 name="test",
                 sessions=[SessionResult(name="s1", turns=[
                     TurnResult(
-                        user_message="q",
+                        user_message="café",
                         agent_response="r",
                         assertion_results=[
                             (Assertion(type=AssertionType.CONTAINS, value="r"), ok),
@@ -813,6 +813,7 @@ class TestReporting:
                 ])],
             )
             assert result.passed is ok
+            assert f"## {'PASS' if ok else 'FAIL'} test" in format_results([result])
             with pytest.raises(UnicodeEncodeError):
                 format_results([result]).encode("ascii")
 
@@ -889,6 +890,38 @@ class TestJudgeParsing:
         await judge.shutdown()
         assert verdict.score == 0
         assert "parse_error" in verdict.reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("reason", "expected"),
+        [("null", ""), ("7", "7"), ('["a", "b"]', "['a', 'b']")],
+    )
+    async def test_judge_reason_is_always_text(self, reason, expected):
+        """A passing score with a non-text reason keeps its score and gets text.
+
+        The eval CLI redacts the reason after it records the verdict, and the
+        redactors take text only, so a non-text reason raised there and turned
+        the passing verdict into a failed one.
+        """
+        from kiro_crew.eval.judge import LLMJudge
+        from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+
+        class OddProvider(MockProvider):
+            async def stream(self, message):
+                self.messages.append(message)
+                yield LLMEvent(
+                    kind=EVENT_TEXT_CHUNK, text='{"score": 5, "reason": ' + reason + "}"
+                )
+                yield LLMEvent(kind=EVENT_COMPLETE)
+
+        judge = LLMJudge(provider_factory=lambda key, **kw: OddProvider())
+        await judge.start()
+        verdict = await judge.judge_turn("desc", "criteria", "user msg", "assistant msg")
+        await judge.shutdown()
+        assert verdict.score == 5.0
+        assert verdict.reason == expected
+        redacted, _ = redact_credentials(redact_exfiltration_urls(verdict.reason)[0])
+        assert redacted == expected
 
 
 class TestJudgeAssertionType:

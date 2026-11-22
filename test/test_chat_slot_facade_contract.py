@@ -13,8 +13,12 @@ from types import SimpleNamespace
 
 from kiro_crew.dashboard import state as state_module
 from kiro_crew.dashboard.chat_utils import chunk_generation
+from kiro_crew.dashboard.slot_queue_repository import RESTORED_QUEUE_KEY, RESTORED_SEND_CHOSEN_KEY
 from kiro_crew.dashboard.state import _ChatSlot
 
+#: Contract: the wire keys of the ``to_dict`` projection, in order, that the REST and
+#: WebSocket snapshots send and the dashboard reads. Adding, dropping or moving a
+#: key changes what every client receives, so the record changes with it.
 _TO_DICT_KEYS = (
     "key",
     "title",
@@ -23,7 +27,7 @@ _TO_DICT_KEYS = (
     "crew_mode_agent",
     "effective_agent",
     "model",
-    # The owner's per-turn model-routing choice (the picker's "Auto (Jev)" entry).
+    # The owner's per-turn model-routing choice (the picker's "Auto (decision model)" entry).
     # Present on EVERY slot, so an absent key and "pinned by hand" are not the
     # same reading for a stale client.
     "jev_route",
@@ -38,12 +42,16 @@ _TO_DICT_KEYS = (
     # "runs locally" from "the field is missing on an older gateway".
     "executor",
     "instance_id",
+    # A cron run's transcript reopened read-only, also on every slot.
+    "cron_run_read_only",
     # The row's identity, resolved server-side. `<instance_id>:<peer_key>` for a
     # remote-bound session, the slot key otherwise. The peer's own slot key is NOT
     # projected; this is what the sidebar needs from it.
     "row_identity",
     "artifact",
     "messages",
+    # The greeting the welcome page draws while the chat has no row.
+    "welcome_message",
     "running",
     "admission_queued",
     "wake_starting",
@@ -52,20 +60,28 @@ _TO_DICT_KEYS = (
     # pair to match an idle row to its `chat_done` and history reply.
     "turn",
     "turn_gen",
+    # The running turn's own project, which a mid-reply pick does not move.
+    "turn_project",
+    "turn_project_fallback",
     "compacting",
     "preparing",
     "preparing_text",
     "preparing_lang",
     "stop_declined",
     "queue_depth",
+    "queue_held_depth",
     "stopping",
     "pending_approval",
     "pending_approval_info",
     "last_activity_ts",
     "last_agent_ts",
+    "unread_ts",
+    "unread_failed",
     "waiting_for_input",
     "needs_input",
     "interrupted",
+    "interrupted_stale",
+    "interrupted_by_sign_in",
     "stop_state",
     "wait_state",
     "created",
@@ -112,6 +128,9 @@ _TO_DICT_KEYS = (
     "created_by",
     "lineage_minted",
     "attribution",
+    "participants",
+    "participants_dropped",
+    "work_aggregate",
 )
 
 
@@ -328,3 +347,24 @@ def test_to_dict_key_order_and_single_source_scan(monkeypatch) -> None:
     assert payload["turn_gen"] == chunk_generation()
     assert payload["source_links"] == [link]
     assert payload["source_links_total"] == 1
+
+
+def test_queue_held_depth_counts_the_restored_cards_no_drain_starts() -> None:
+    """A restored card waits for the person, so the frame says how many of the
+    queued entries are held; a live entry and a chosen card are not."""
+    slot = _ChatSlot("held-depth")
+    slot._queue[:] = [
+        {"id": "r1", "content": "restored", RESTORED_QUEUE_KEY: True},
+        {"id": "r2", "content": "restored", RESTORED_QUEUE_KEY: True},
+    ]
+
+    payload = slot.to_dict()
+
+    assert (payload["queue_depth"], payload["queue_held_depth"]) == (2, 2)
+
+    slot._queue[1][RESTORED_SEND_CHOSEN_KEY] = True
+    slot._queue.append({"id": "l1", "content": "live"})
+
+    payload = slot.to_dict()
+
+    assert (payload["queue_depth"], payload["queue_held_depth"]) == (3, 1)

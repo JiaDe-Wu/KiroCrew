@@ -45,6 +45,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from kiro_crew import redaction_seams
 from kiro_crew.constants import (
     MARKER_CLOSERS,
     OPTIONS_RE_TRAILER,
@@ -55,9 +56,9 @@ from kiro_crew.constants import (
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.tables import render_tables, render_tables_with_metadata
 from kiro_crew.messaging.transport import TransportCapabilities
+from kiro_crew.option_marker_scan import crosses_line, option_labels
 from kiro_crew.security import (
     CREDENTIAL_REDACTION_TAGS,
-    EXFILTRATION_REDACTION_TAG_PREFIX,
     redact_credentials,
     redact_exfiltration_urls,
 )
@@ -95,7 +96,13 @@ class OutputEvent:
     # rules (the Slack `wait` stream rollover) must key on what the tool IS.
     # Empty when the transport sent no identity; renderers then fall back to the
     # title, which is what they matched on before the identity travelled.
+    # prompt_choice: the same identity of the tool asked about, set only from a
+    # pair :func:`trusted_mcp_identity` accepts, beside ``mcp_server``.
     tool_name: str = ""
+    # prompt_choice: the MCP server the call is routed to (``_meta.kiro.mcpServerName``),
+    # so an approver can see WHERE a tool runs: ``email_send`` alone does not say which
+    # mail server sends it. "" for a built-in, a shell call or an unproven identity.
+    mcp_server: str = ""
     tool_kind: str = ""  # tool_call (e.g. "read"/"execute" — drives phase emoji)
     tool_purpose: str = ""  # tool_call / prompt_choice (human-readable purpose)
     # tool_result: the call's TERMINAL outcome as the ACP layer reported it, one
@@ -168,6 +175,7 @@ def chunk_text(text: str, max_chars: int) -> list[str]:
     return [text[i : i + max_chars] for i in range(0, len(text), max_chars)]
 
 
+@redaction_seams.in_seam(redaction_seams.CHANNELS)
 def chunk_for_transport(
     text: str,
     capabilities: TransportCapabilities,
@@ -361,6 +369,23 @@ def session_provenance_tag(session_key: str) -> str:
     return hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:12]
 
 
+def trusted_mcp_identity(event: object) -> tuple[str, str]:
+    """``(server, tool)`` of the MCP tool a permission *event* asks about, or ``("", "")``.
+
+    Read from the ``_meta.kiro`` identity the ACP layer marked ``mcp_identity_trusted``,
+    never from the title the model wrote, and only when it names a server: a built-in
+    or a shell call has no server, and an unproven pair names nothing an approver can
+    rely on. Each field is type-checked, so an event shape that lacks them (a shim, a
+    stand-in) reads as unproven rather than as an attribute that merely exists.
+    """
+    if getattr(event, "mcp_identity_trusted", False) is not True:
+        return "", ""
+    server, tool = getattr(event, "mcp_server_name", ""), getattr(event, "tool_name", "")
+    if not isinstance(server, str) or not server.strip():
+        return "", ""
+    return server, tool if isinstance(tool, str) else ""
+
+
 def new_approval_nonce() -> str:
     """A per-prompt token that makes a STALE widget's press unusable.
 
@@ -412,12 +437,22 @@ def _default_redactor(text: str) -> str:
     dependencies -- the same module ``messaging.driver`` imports directly for its
     own stream redaction -- so this adds no import-time cost and nothing that
     could touch an event loop.
+
+    Text the credential plan leaves as written is returned after that one plan:
+    the URL pass replaces only values the same plan reads inside a URL, so on such
+    text it is a no-op and the pair returns the text unchanged. Every display
+    reading of a clean message is such text, so a message costs one plan per
+    reading rather than two. Any other text goes through the pair.
     """
-    out, _ = redact_exfiltration_urls(text or "")
+    text = text or ""
+    if redact_credentials(text)[0] == text:
+        return text
+    out, _ = redact_exfiltration_urls(text)
     out, _ = redact_credentials(out)
     return out
 
 
+@redaction_seams.in_seam(redaction_seams.CHANNELS)
 def display_safe(text: str) -> str:
     """Redact *text* against what the platform will SHOW, then defang mentions.
 
@@ -446,6 +481,13 @@ def display_safe(text: str) -> str:
     text = strip_control_comments(text or "")
     safe, _ = redact_for_display(text, _default_redactor)
     return safe.replace("@", "@\u200b").replace("<!", "<\u200b!")
+
+
+#: The host-written label that opens the echo of a message a person typed in
+#: the dashboard, on Slack (bold) and every other linked channel (plain). It
+#: says where the message came from, so a remote reader does not take it for
+#: the agent's own output next to the "Thinking…" placeholder.
+MIRROR_ECHO_LABEL = "Sent from Kiro Crew:"
 
 
 def credential_redaction_notice(count: int) -> str:
@@ -486,81 +528,45 @@ def credential_redaction_notice(count: int) -> str:
     )
 
 
-def redaction_notice(cred_count: int, url_count: int) -> str:
-    """The notice a channel sends after delivering text EITHER redactor rewrote.
+def redaction_notice(cred_count: int, url_count: int = 0) -> str:
+    """The notice a channel sends after delivering text the redactors rewrote.
 
-    Every channel delivery surface runs two body rewriters over the text it
-    ships -- ``security.redact_exfiltration_urls`` then
-    ``security.redact_credentials`` -- so the placeholder a reader sees can come
-    from either. ``cred_count`` is the number of ``CREDENTIAL_REDACTION_TAGS``
-    placeholders in the delivered text; ``url_count`` is the number of
-    ``EXFILTRATION_REDACTION_TAG_PREFIX`` placeholders (that tag interpolates the
-    redacted domain, so callers count it by prefix, never by equality). Like
-    :func:`credential_redaction_notice`, this carries NO secret bytes and no
-    redacted URL: only the counts are used, so the domain the tag names never
-    reaches the sentence.
+    Every channel delivery surface runs ``security.redact_exfiltration_urls`` then
+    ``security.redact_credentials`` over the text it ships. Both mask credential
+    VALUES only (inside a URL or not) and neither replaces a URL whole, so every
+    placeholder a reader sees is a credential tag. ``cred_count`` is the number of
+    ``CREDENTIAL_REDACTION_TAGS`` placeholders in the delivered text, and the
+    sentence is :func:`credential_redaction_notice`'s.
 
-    Worded BY KIND because the remedies differ: a credential needs the secret
-    re-entered where the command runs; a rewritten URL needs the original link
-    re-checked from a trusted source. Telling a reader whose URL was rewritten to
-    "supply the secret yourself" names a remedy that cannot help them, which is
-    the gap this closes. The credential-only sentence is delegated to
-    :func:`credential_redaction_notice` unchanged, so a surface that adopts this
-    builder ships byte-identical wording for the case it already covered.
+    ``url_count`` is the second count :func:`count_redaction_tags` returns, which
+    is always 0; it stays in the signature for the surfaces that pass both counts
+    through, and a non-zero one is a caller bug.
 
     Same delivery contract as the credential notice: plain text, no markup, no
     emoji, one string for every channel, sent as its own message BELOW the
-    answer. At least one count must be non-zero -- the caller gates on that, and
-    a zero/zero call is a caller bug rather than a silent empty message.
+    answer. The credential count must be non-zero -- the caller gates on that,
+    and a zero call is a caller bug rather than a silent empty message.
     """
-    if cred_count < 0 or url_count < 0 or not (cred_count or url_count):
-        raise ValueError("redaction_notice needs at least one placeholder to describe")
-    if not url_count:
-        return credential_redaction_notice(cred_count)
-    subjects: list[str] = []
-    if cred_count:
-        subjects.append("a credential" if cred_count == 1 else f"{cred_count} credentials")
-    subjects.append("a suspicious URL" if url_count == 1 else f"{url_count} suspicious URLs")
-    subject = " and ".join(subjects)
-    subject = subject[0].upper() + subject[1:]
-    verb = "was" if (cred_count + url_count) == 1 else "were"
-    if cred_count:
-        remedy = (
-            "supply the secret yourself on the machine where you run it, and "
-            "re-check any redacted URL against a trusted source."
-        )
-    else:
-        remedy = "re-check the original URL against a trusted source before using it."
-    return (
-        f"Security notice: {subject} in the message above {verb} replaced with a "
-        f"redaction placeholder. Any command or link shown will not work if you "
-        f"paste it as-is; {remedy}"
-    )
+    if cred_count < 1 or url_count:
+        raise ValueError("redaction_notice needs at least one credential placeholder to describe")
+    return credential_redaction_notice(cred_count)
 
 
 def count_redaction_tags(text: str) -> tuple[int, int]:
-    """Count both redaction placeholder kinds in delivered text.
+    """Count the redaction placeholders in delivered text.
 
-    Returns ``(cred_count, url_count)`` — the two arguments
-    :func:`redaction_notice` takes, in its order. Every delivery surface that
-    posts a notice needs the same two tallies over the text that actually
-    shipped, and each kind counts differently: a credential tag is a CLOSED set
-    of constant strings (``CREDENTIAL_REDACTION_TAGS``), matched exactly and
-    summed so an encoded-credential-only answer is not missed, while the URL
-    tag interpolates the redacted domain and so has no constant form — it is
-    counted by ``EXFILTRATION_REDACTION_TAG_PREFIX`` prefix, never by equality.
+    Returns ``(cred_count, url_count)`` -- the two arguments
+    :func:`redaction_notice` takes, in its order. A credential tag is a CLOSED
+    set of constant strings (``CREDENTIAL_REDACTION_TAGS``), matched exactly and
+    summed so an encoded-credential-only answer is not missed. ``url_count`` is
+    always 0: no redactor replaces a URL whole, and a credential inside a URL is
+    counted as a credential.
 
-    One shared counter exists so a surface cannot adopt half the tally: a
-    site that counts credentials but forgets the URL prefix (or vice versa)
-    posts a notice worded for the wrong remedy, which is the gap the two-kind
-    notice closes. Count from the DELIVERED text rather than a redactor's
-    warnings list: chunked surfaces redact on the way out, so re-redacting the
-    assembled answer reports nothing while the placeholders are plainly
-    visible in what shipped.
+    Count from the DELIVERED text rather than a redactor's warnings list:
+    chunked surfaces redact on the way out, so re-redacting the assembled answer
+    reports nothing while the placeholders are plainly visible in what shipped.
     """
-    cred_count = sum(text.count(tag) for tag in CREDENTIAL_REDACTION_TAGS)
-    url_count = text.count(EXFILTRATION_REDACTION_TAG_PREFIX)
-    return cred_count, url_count
+    return sum(text.count(tag) for tag in CREDENTIAL_REDACTION_TAGS), 0
 
 
 def repaired_after_a_sent_tail(
@@ -753,7 +759,7 @@ def split_options_trailer(text: str, *, hide_partial: bool = False) -> tuple[str
     text = relocate_glued_tail_marker(text)
     match = OPTIONS_RE_TRAILER.search(text)
     if match:
-        choices = [c.strip() for c in match.group("labels").split("|") if c.strip()]
+        choices = option_labels(match.group("labels"))
         return text[: match.start()].rstrip(), choices
     if hide_partial:
         idx = text.rfind("[OPTIONS")
@@ -784,15 +790,14 @@ def split_options_trailer(text: str, *, hide_partial: bool = False) -> tuple[str
             # nothing. It costs plenty: the trim point is wherever the quoted
             # token sits, everything after it to buffer end goes with it, and
             # when no ``]`` ever arrives the sealed frame re-trims too, so the
-            # transient-frame consolation above does not apply. Locating a
-            # marker by substring without asking whether it READS as one is
-            # the bug fixed at the directive seam; this is the same
-            # rule at the trailer seam. Only the tail-most occurrence can be
+            # transient-frame consolation above does not apply. The directive
+            # seam follows the same rule: a marker counts only if it READS as
+            # one, not by substring. Only the tail-most occurrence can be
             # mid-flight -- a stream appends, so text after an opener means
             # that opener was never in flight -- which is why one viability
             # check here beats walking earlier occurrences.
             tail = text[idx + len("[OPTIONS") :]
-            if not tail or tail.startswith(":"):
+            if not tail or (tail.startswith(":") and not crosses_line(tail)):
                 # A LINE-LEADING Markdown wrapper run abutting the fragment is
                 # part of the marker-to-be (``**[OPTIONS: A``): cutting at the
                 # ``[`` alone publishes a stray ``**`` on this frame. Widen the
@@ -864,6 +869,11 @@ class Renderer(ABC):
     #: ``on_tool_call`` is rendering (``OutputEvent.raw_title``), set by
     #: :meth:`dispatch` before the hook runs; ``""`` for a derived title.
     current_tool_raw_title: str = ""
+    #: ``(server, tool)`` of the MCP tool the prompt ``on_prompt_choice`` is rendering
+    #: asks about (``OutputEvent.mcp_server`` / ``tool_name``), set by :meth:`dispatch`
+    #: for that one call and cleared after it, so a later direct call cannot show
+    #: another tool's server. Never model-authored, unlike ``tool_title``.
+    prompt_mcp_identity: tuple[str, str] = ("", "")
     #: The driver's empty-turn verdict for the turn being finalized
     #: (``OutputEvent.notice`` on ``DONE``), set by :meth:`dispatch` before
     #: ``on_done`` runs. Non-empty means the turn closed with no assistant text
@@ -1095,13 +1105,17 @@ class Renderer(ABC):
         elif event.kind == TOOL_RESULT:
             await self.on_tool_result(event.tool_call_id, event.tool_status)
         elif event.kind == PROMPT_CHOICE:
-            await self.on_prompt_choice(
-                event.options,
-                event.request_id,
-                event.title,
-                event.tool_purpose,
-                event.tool_input,
-            )
+            self.prompt_mcp_identity = (event.mcp_server, event.tool_name)
+            try:
+                await self.on_prompt_choice(
+                    event.options,
+                    event.request_id,
+                    event.title,
+                    event.tool_purpose,
+                    event.tool_input,
+                )
+            finally:
+                self.prompt_mcp_identity = ("", "")
         elif event.kind == COMPACTION:
             await self.on_compaction(event.context_usage_pct)
         elif event.kind == DONE:

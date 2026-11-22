@@ -1,8 +1,8 @@
 """The app platform's boot work in ``start_dashboard``.
 
 Warming the PreToolUse gate's builtin app names and the materialized-agent snapshot,
-reconciling every enabled app's resources, and starting the app backends, in one
-wave, with the App SDK gateway hooks system.
+and starting the app backends (whose boot pass also reconciles each admitted enabled
+app's resources), in one wave, with the App SDK gateway hooks system.
 """
 
 from __future__ import annotations
@@ -32,40 +32,17 @@ if TYPE_CHECKING:
 
 
 async def _warm_builtin_app_names() -> None:
-    """Warm the PreToolUse gate's first-party (builtin) app-name set from the
-    shipped manifests, ONCE, on the executor (the discovery walk touches the
-    filesystem and must not run on the event loop). The gate's app-own-server
-    auto-approve then does a pure in-memory membership test with zero I/O; an
-    empty set (should this fail) simply fails closed (owns-server calls prompt).
-    """
-    try:
-        from kiro_crew.apps.execution import (
-            builtin_app_agents,
-            builtin_app_mcp_servers,
-            builtin_app_names,
-        )
-        from kiro_crew.hooks import (
-            set_builtin_app_agents,
-            set_builtin_app_mcp_servers,
-            set_builtin_app_names,
-        )
+    """Warm the PreToolUse gate's first-party (builtin) app sets on the executor.
 
-        names = await asyncio.get_running_loop().run_in_executor(
-            subprocess_executor(), builtin_app_names
-        )
-        set_builtin_app_names(names)
-        servers = await asyncio.get_running_loop().run_in_executor(
-            subprocess_executor(), builtin_app_mcp_servers
-        )
-        set_builtin_app_mcp_servers(servers)
-        # Agent → owning app, so a builtin whose UI is not an app iframe
-        # (empty Slot._app) can still auto-approve calls to its OWN server.
-        agents = await asyncio.get_running_loop().run_in_executor(
-            subprocess_executor(), builtin_app_agents
-        )
-        set_builtin_app_agents(agents)
-    except Exception:  # noqa: BLE001 — a warm failure only costs an extra prompt
-        logger.warning("Failed to warm builtin app-name set for the gate", exc_info=True)
+    The discovery walk touches the filesystem and must not run on the event loop.
+    The gate's app-own-server auto-approve then does a pure in-memory membership
+    test with zero I/O; an empty set (should this fail) fails closed (owns-server
+    calls prompt). ``publish_gate_app_trust`` does the work, and the gateway runs it
+    again after every app lifecycle or trust change, so this is only the first fill.
+    """
+    from kiro_crew.apps.builtin_adoption_gate import publish_gate_app_trust
+
+    await asyncio.get_running_loop().run_in_executor(subprocess_executor(), publish_gate_app_trust)
 
 
 async def _warm_materialized_agents() -> None:
@@ -80,23 +57,6 @@ async def _warm_materialized_agents() -> None:
         )
     except Exception:  # noqa: BLE001 — a warm failure only costs one fallback
         logger.debug("Failed to warm materialized agent names", exc_info=True)
-
-
-async def _reconcile_app_resources() -> None:
-    """Reconcile resources (agents / skills / crons / MCP) for every ENABLED app.
-    Registration otherwise happens only in the enable path, so an app that
-    gains agents or skills in a later version never registers them for a user
-    who already enabled it. Runs on the executor: it walks the apps tree and
-    writes into ~/.kiro/agents.
-    """
-    from kiro_crew.apps.bridges import reconcile_enabled_app_resources
-
-    try:
-        await asyncio.get_running_loop().run_in_executor(
-            subprocess_executor(), reconcile_enabled_app_resources
-        )
-    except Exception as exc:  # noqa: BLE001 — never block gateway startup
-        logger.warning("App resource reconcile failed: %s", exc)
 
 
 async def _start_app_backends(app: web.Application, state: DashboardState) -> None:
@@ -196,7 +156,10 @@ async def _start_app_backends(app: web.Application, state: DashboardState) -> No
                 "Error stopping background pollers on shutdown; proceeding to the "
                 "gateway hook shutdown sweep so app backends are torn down"
             )
-        await on_gateway_shutdown()
+        try:
+            await on_gateway_shutdown()
+        except Exception:  # noqa: BLE001 — one cleanup hook must not suppress later hooks
+            logger.exception("Gateway hook shutdown sweep failed")
 
     app.on_cleanup.append(_hooks_shutdown)
 
@@ -264,10 +227,19 @@ def _kick_interrupted_update_sweep(state: DashboardState) -> None:
     A tracked background task (``manager.sweep_interrupted_updates``): it lists the
     apps directory and may delete whole retired trees, so it never runs before the
     bind. Nothing waits on it; each app is swept under its lifecycle lock.
-    """
-    from kiro_crew.apps.manager import sweep_interrupted_updates
 
-    task = asyncio.create_task(sweep_interrupted_updates())
+    Then, with every tree back in place, the apps an older build installed get the
+    copy of their UI scripts the UI route serves (``protected_app_ui``), once per
+    data home; a script read before this finishes takes the same copy itself.
+    """
+    from kiro_crew.apps import protected_app_ui
+    from kiro_crew.apps.manager import apps_dir, sweep_interrupted_updates
+
+    async def _sweep_then_capture() -> None:
+        await sweep_interrupted_updates()
+        await asyncio.to_thread(protected_app_ui.capture_existing, apps_dir())
+
+    task = asyncio.create_task(_sweep_then_capture())
     state._background_tasks.add(task)
     task.add_done_callback(state._background_tasks.discard)
 

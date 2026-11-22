@@ -39,8 +39,9 @@ my-dashboard/
 
 Every app needs an `app.json`. See [Manifest Reference](manifest-reference.md) for all fields.
 
-The scaffold writes no `permissions` block. Add the one below: the sample page
-calls `api.get('/api/status')` and listens for `notification` events, and the
+The scaffold writes no `permissions` block (`--cron` writes only `"cron": true`).
+Add the one below: the page in the next section calls `api.get('/api/status')`
+and listens for `notification` events, and the
 SDK rejects a path or event the manifest does not declare.
 
 ```json
@@ -91,9 +92,9 @@ curl --fail -o ui/src/kirocrew-app-sdk.d.ts http://localhost:5476/vendor/kirocre
 ```
 
 Use your dashboard's address if it is not the default, and fetch the file again
-after you upgrade Kiro Crew. It names some libraries the host uses: keep
-`skipLibCheck: true` in your `tsconfig.json`, as the Vite template does, or
-install their types.
+after you upgrade Kiro Crew. It names some libraries the host uses: set
+`skipLibCheck: true` in the `tsconfig.json` you type-check with (the scaffold
+writes none), or install their types.
 
 ```tsx
 import { useAppApi, useAppEvents } from '@kirocrew/app-sdk'
@@ -187,7 +188,7 @@ and install from a local path. The enabled app then appears in the sidebar.
 During development:
 
 1. Edit `ui/src/App.tsx`.
-2. Run `cd ui && npm run build`.
+2. Run `npm run build` in `ui/`.
 3. Use the installed app's **Update** action in the authenticated App Store UI.
 4. Refresh the dashboard.
 
@@ -205,11 +206,12 @@ Available in `@kirocrew/app-sdk`:
 | `useAppApi()` | Permission-scoped JSON-response HTTP client (`request`, GET/POST/PUT/PATCH/DELETE); request options and errors: [API reference](api-reference.md#app-sdk-hooks-dashboard-ui) |
 | `useAppEvents(event, cb)` | Subscribe to real-time WebSocket events |
 | `useTheme()` | Reactive theme (mode, accent, colorTheme) |
-| `useAppInfo()` | App metadata (name, version, permissions, `active`, `update`) |
+| `useAppInfo()` | App metadata (name, version, permissions, `active`, `update`, `session`) |
 | `useNavigate()` | Navigate to Kiro Crew routes |
 | `useNotify()` | Show toast notifications |
 | `useNavBadge()` | Update sidebar badge count |
-| `useChatLauncher()` | Open a new chat or target `slotKey`; set `autoSend: false` for an unsent draft |
+| `useAppNotifications()` | This app's own bell notifications (`items`, `unread`, `status`) and `ack(ts)` / `ackAll()` to clear them; declare `/api/notifications/own` in `permissions.api`; needs `APP_SDK_LEVEL >= 4` |
+| `useChatLauncher()` | `openChat`: open a new chat or target `slotKey`; set `autoSend: false` for an unsent draft. `createChat`: create or reopen the person's chat your manifest's `permissions.chatLaunch` declares, without declaring `/api/chat/slots`, and resolve to its key; seam level 10, so feature-detect `createChat` ([API reference](api-reference.md#app-sdk-hooks-dashboard-ui)) |
 
 `useAppInfo().active` tells your app whether its host surface is the one the user is
 looking at. A routed `ui.pages` page is always the visible surface, so it reads `true`.
@@ -225,6 +227,19 @@ useEffect(() => {
   const id = setInterval(refresh, 5000)
   return () => clearInterval(id)
 }, [active])
+```
+
+`useAppInfo().session` names the chat a side-panel tab is mounted in. A tab is
+mounted per chat, so read `session.sessionKey` to show the data that belongs to
+that chat. It is the same key your `useAppApi()` requests already carry as
+`X-Session-Key`, and the same `sessionKey` a `contributes.sessionControls` control
+receives. A routed `ui.pages` page is not session-scoped, so there the field is
+absent.
+
+```tsx
+const { session } = useAppInfo()
+if (!session) return <p>Open this from a chat's side panel.</p>
+return <StreamFor sessionKey={session.sessionKey} />
 ```
 
 Treat `undefined` as `true`: the field is optional, so an app running on a host that
@@ -340,7 +355,8 @@ its message is used; the SDK does not select another session on failure.
 `memoryMode` (`'persistent'`, `'incognito'` or `'temporary'`) and
 `sessionFolder: false` shape a new session and are ignored with `slotKey`.
 Either one opens a new draft session, like `autoSend: false`, so the message is
-staged for the user to send.
+staged for the user to send. If the user leaves that draft session without having
+typed, clicked or changed anything in it, the host discards it.
 
 To tell an older host from one with these seams, read `APP_SDK_LEVEL` through a
 namespace import (`import * as sdk from '@kirocrew/app-sdk'`; an older host has
@@ -352,6 +368,9 @@ For Python app hooks with an existing cron grant, use
 `True` to resume it without replacing its ID. Use `set_enabled` off-loop.
 `update_job` and `update_job_async` reject `enabled` and `user_paused` arguments;
 use the toggle methods instead. Foreign and missing job IDs are refused.
+`await ctx.cron.run_job_async(job_id)` runs an owned job now, paused or not,
+without touching its schedule. It returns `False` when a run of that job is
+already in flight, and has no sync form.
 
 The `add_job*` methods accept `approval_mode`, `timeout_secs` and `timeout` at
 create time. Pass `approval_mode="auto"` for an unattended agent job: the

@@ -463,30 +463,139 @@ async def test_an_unreadable_store_makes_the_listing_partial() -> None:
     assert listing.partial is True and listing.runs == ()
 
 
+@pytest.mark.asyncio
 @pytest.mark.usefixtures("close_subagent_managers")
-def test_in_memory_pending_work_is_the_arms_whole_view() -> None:
-    """The arm's in-memory terms, on the real manager: a window entry, another
-    child whose task is still live (its report waits on teardown), a live
-    follow-up watcher -- and never the asking child's own task."""
+async def test_in_memory_pending_work_is_the_arms_whole_view(monkeypatch) -> None:
+    """Queue entries and actual outer tasks count, except the asking run's task."""
     from kiro_crew.subagent import SubagentInfo
 
-    loop = asyncio.new_event_loop()
+    cfg = KiroCrewConfig()
+    cfg.agent.task_queue_enabled = False
+    monkeypatch.setattr(KiroCrewConfig, "load", lambda: cfg)
+    mgr = SubagentManager(sessions=mock_sessions(), ctx_builder=mock_ctx())
+    parent = "dash:arm"
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def inner(info, _key):
+        info.done = True
+
+    async def cap_result(_info):
+        entered.set()
+        await await_until(release, what="the outer run's finalization release")
+
+    monkeypatch.setattr(mgr, "_run_inner", inner)
+    monkeypatch.setattr(
+        type(mgr._run_events), "_cap_unclaimed_result_impl", lambda _self, info: cap_result(info)
+    )
+    monkeypatch.setattr(mgr, "_teardown_run_session", AsyncMock())
+    monkeypatch.setattr(mgr, "_record_cost", lambda _info: None)
+    monkeypatch.setattr(mgr, "_drain_queue", lambda: None)
+    outer = None
     try:
-        mgr = SubagentManager(sessions=mock_sessions(), ctx_builder=mock_ctx())
-        parent = "dash:arm"
         assert mgr.has_in_memory_pending_work_for(parent) is False
+        assert mgr.has_current_execution_for(parent) is False
         mgr._queue.append({"parent_session_key": parent, "_preassigned_id": "w1"})
         assert mgr.has_in_memory_pending_work_for(parent) is True
+        assert mgr.has_current_execution_for(parent) is False
         mgr._queue.clear()
 
         me = SubagentInfo(id="me", task="t", parent_session_key=parent)
-        me.done = True
         mgr._agents[me.id] = me
-        mgr._tasks[me.id] = loop.create_future()
+        outer = asyncio.create_task(mgr._run(me))
+        mgr._tasks[me.id] = outer
+        completed_view = []
+
+        def observe_completion(task):
+            completed_view.append(
+                (task in mgr._run_task_owners, mgr.has_current_execution_for(parent))
+            )
+
+        # Registered before _run adds its callback, so the owner is still filed.
+        outer.add_done_callback(observe_completion)
+        await await_until(entered, what="the inner done-to-report gap")
         assert mgr.has_in_memory_pending_work_for(parent, exclude_id="me") is False
         assert mgr.has_in_memory_pending_work_for(parent) is True
+        assert mgr.has_current_execution_for(parent) is True
+        assert mgr.has_current_execution_for("dash:other") is False
+        # The actual task remains authoritative after both discovery indices vanish.
+        mgr._agents.pop(me.id)
+        mgr._tasks.pop(me.id)
+        assert mgr.has_current_execution_for(parent) is True
+        assert mgr.has_in_memory_pending_work_for(parent) is False
+        assert mgr.has_in_memory_pending_work_for(parent, exclude_id="me") is False
+        release.set()
+        await await_until(outer, what="the outer run to finish")
+        assert mgr.has_current_execution_for(parent) is False
+        assert completed_view == [(True, False)]
+        assert not mgr._run_task_owners
     finally:
-        loop.close()
+        mgr._shutting_down = True
+        release.set()
+        if outer is not None:
+            await await_until(
+                asyncio.gather(outer, return_exceptions=True), what="the outer run to drain"
+            )
+        await await_until(
+            asyncio.create_task(mgr.cancel_all()), what="the manager's reports to drain"
+        )
+        mgr.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("close_subagent_managers")
+async def test_outer_tasks_with_the_same_run_id_keep_independent_owners(monkeypatch) -> None:
+    from kiro_crew.subagent import SubagentInfo
+
+    cfg = KiroCrewConfig()
+    cfg.agent.task_queue_enabled = False
+    monkeypatch.setattr(KiroCrewConfig, "load", lambda: cfg)
+    mgr = SubagentManager(sessions=mock_sessions(), ctx_builder=mock_ctx())
+    entered = {name: asyncio.Event() for name in ("first", "next")}
+    release = {name: asyncio.Event() for name in entered}
+
+    async def inner(info, _key):
+        info.done = True
+
+    async def cap_result(info):
+        entered[info.task].set()
+        await await_until(release[info.task], what=f"the {info.task} outer task's release")
+
+    monkeypatch.setattr(mgr, "_run_inner", inner)
+    monkeypatch.setattr(
+        type(mgr._run_events), "_cap_unclaimed_result_impl", lambda _self, info: cap_result(info)
+    )
+    monkeypatch.setattr(mgr, "_claim_finalize", lambda _info: False)
+    monkeypatch.setattr(mgr, "_teardown_run_session", AsyncMock())
+    monkeypatch.setattr(mgr, "_drain_queue", lambda: None)
+    mgr._running_count = 2
+    tasks = {
+        name: asyncio.create_task(
+            mgr._run(SubagentInfo(id="same-id", task=name, parent_session_key=f"dash:{name}"))
+        )
+        for name in entered
+    }
+    try:
+        for event in entered.values():
+            await await_until(event, what="both outer tasks to register")
+        assert mgr.has_current_execution_for("dash:first")
+        assert mgr.has_current_execution_for("dash:next")
+        assert not mgr.has_in_memory_pending_work_for("dash:next", exclude_id="same-id")
+        release["first"].set()
+        await await_until(tasks["first"], what="the first outer task to finish")
+        assert not mgr.has_current_execution_for("dash:first")
+        assert mgr.has_current_execution_for("dash:next")
+        assert set(mgr._run_task_owners) == {tasks["next"]}
+    finally:
+        mgr._shutting_down = True
+        for event in release.values():
+            event.set()
+        await await_until(
+            asyncio.gather(*tasks.values(), return_exceptions=True),
+            what="both outer tasks to drain",
+        )
+        mgr.close()
+    assert not mgr._run_task_owners
+    assert not mgr.has_current_execution_for("dash:next")
 
 
 @pytest.mark.usefixtures("close_subagent_managers")
@@ -511,9 +620,13 @@ def test_an_unfinished_report_is_owed_after_its_run_task_ends() -> None:
         assert mgr.has_in_memory_pending_work_for(parent) is False
         assert mgr.has_unfinished_report_for(parent) is True
         assert mgr.has_unfinished_report_for("dash:other") is False
+        mgr._agents.pop(child.id)
+        assert mgr.has_current_execution_for(parent) is True
+        assert mgr.has_current_execution_for("dash:other") is False
 
         report.set_result(None)
         assert mgr.has_unfinished_report_for(parent) is False
+        assert mgr.has_current_execution_for(parent) is False
     finally:
         mgr._report_owners.clear()
         loop.close()
@@ -701,17 +814,21 @@ async def test_each_spawn_is_listed_once_live_then_queued_then_persisted() -> No
 @pytest.mark.asyncio
 async def test_collecting_a_member_whose_announce_already_queued_settles_it(tmp_path) -> None:
     """A slow sibling's delivery timed out waiting on the tool's turn and QUEUED
-    its announce; the tool then collected it inline. The queued announce is
-    removed (no duplicate completion turn), its delivery mark is written, and
-    its id stays out of the inline-collected set, where nothing would discard
-    it and the 'set empty, disarm' path would never fire again."""
+    its announce; the tool then collected it inline, and that turn landed. At the
+    landed release the queued announce is removed (no duplicate completion turn),
+    its delivery mark is owed, and its id stays out of the inline-collected set,
+    where nothing would discard it and the 'set empty, disarm' path would never
+    fire again."""
     import types
 
     from chat_test_helpers import _make_state
 
     from kiro_crew.constants import SUBAGENT_COMPLETION_META_KEY
     from kiro_crew.dashboard.chat_utils import SUBAGENT_COMPLETION_KIND
-    from kiro_crew.dashboard.handlers.messaging import api_spawn_mark_collected
+    from kiro_crew.dashboard.handlers.messaging import (
+        _settle_collected_on_slot,
+        api_spawn_mark_collected,
+    )
     from kiro_crew.subagent import SubagentDelivery
     from kiro_crew.subagent_completion_meta import single_completion_meta
 
@@ -739,22 +856,30 @@ async def test_collecting_a_member_whose_announce_already_queued_settles_it(tmp_
         )
     )
 
+    # The mark alone settles nothing on the tab, a dashboard tab's own included:
+    # the turn that received the reply can still be stopped.
+    assert [q for q in slot._queue if q.get("kind") == SUBAGENT_COMPLETION_KIND]
+    state.subagents.settle_queued_delivery.assert_not_awaited()
+
+    # That turn's landed release settles them on the tab (``_settle_inline``).
+    settled = _settle_collected_on_slot(slot, {"a1", "b1"}, state.subagents)
+
     assert not [q for q in slot._queue if q.get("kind") == SUBAGENT_COMPLETION_KIND]
     assert slot._subagents_inline_collected == {"b1"}
-    state.subagents.settle_queued_delivery.assert_awaited_once_with(owed)
+    assert settled == owed
 
 
 @pytest.mark.asyncio
-async def test_a_repeated_mark_leaves_an_already_reported_member_out_of_the_set(
+async def test_a_settle_leaves_an_already_reported_member_out_of_the_set(
     tmp_path,
 ) -> None:
-    """The tool re-sends a mark whose first attempt timed out. If that first
-    attempt already settled a queued announce, the member has reached the parent
-    and no later check discards its id, so the repeat must not add it to the
-    inline-collected set. A member still running is added as before."""
+    """A landed release settles a member that already reached the parent (an
+    earlier settle took its queued announce). No later check discards its id, so
+    the settle must not add it to the inline-collected set. A member still
+    running is added as before."""
     from chat_test_helpers import _make_state
 
-    from kiro_crew.dashboard.handlers.messaging import api_spawn_mark_collected
+    from kiro_crew.dashboard.handlers.messaging import _settle_collected_on_slot
 
     state = _make_state(tmp_path)
     slot = state.get_or_create_slot("chat-1")
@@ -762,19 +887,12 @@ async def test_a_repeated_mark_leaves_an_already_reported_member_out_of_the_set(
         "a1": MagicMock(_reported_to_parent=True, parent_session_key="dashboard:chat-1"),
         "b1": MagicMock(_reported_to_parent=False, parent_session_key="dashboard:chat-1"),
     }
-    state.subagents = MagicMock(
-        get=MagicMock(side_effect=infos.get), settle_queued_delivery=AsyncMock()
-    )
+    state.subagents = MagicMock(get=MagicMock(side_effect=infos.get))
 
-    await api_spawn_mark_collected(
-        _Req(
-            state,
-            body={"ids": ["a1", "b1"], "parent_session": "dashboard:chat-1", "written": True},
-        )
-    )
+    owed = _settle_collected_on_slot(slot, {"a1", "b1"}, state.subagents)
 
     assert slot._subagents_inline_collected == {"b1"}
-    state.subagents.settle_queued_delivery.assert_not_awaited()
+    assert owed == []
 
 
 def test_spawn_list_never_says_none_running_over_a_partial_queue() -> None:
@@ -808,6 +926,7 @@ def test_no_child_probe_spells_a_slots_session_key_by_hand() -> None:
         "queued_count_or_none_async",
         "has_pending_work_for",
         "has_pending_work_for_async",
+        "has_current_execution_for",
         "has_in_memory_pending_work_for",
         "has_unfinished_report_for",
     }
@@ -898,22 +1017,33 @@ async def test_an_unreadable_queue_answers_503_not_404() -> None:
 @pytest.mark.asyncio
 async def test_collected_ids_are_bounded_and_known(tmp_path) -> None:
     """Only ids the gateway knows, each of bounded length, and never more than
-    the cap in total: an id no completion will match is never evicted."""
+    the cap in total: an id no completion will match is never evicted. Each mark
+    is settled on the slot by its turn's landed release."""
     import types
 
     from chat_test_helpers import _make_state
 
     from kiro_crew.dashboard.handlers import messaging
+    from kiro_crew.parent_turns import ParentTurnLedger
 
     state = _make_state(tmp_path)
     slot = state.get_or_create_slot("chat-1")
     known = {f"k{i:04d}" for i in range(1500)}
-    child = types.SimpleNamespace(parent_session_key="dashboard:chat-1")
+    token = ("dashboard:chat-1", object(), 1)
+    child = types.SimpleNamespace(
+        parent_session_key="dashboard:chat-1",
+        _reported_to_parent=False,
+        _spawned_under=token,
+        _seen_done_under=token,
+    )
+    state.sessions = types.SimpleNamespace(
+        parent_turns=ParentTurnLedger(), turn_token=lambda _key, open_attempt=True: token
+    )
     state.subagents = MagicMock()
     state.subagents.get = MagicMock(side_effect=lambda aid: child if aid in known else None)
     for start in range(0, 1500, 200):
         ids = [f"k{i:04d}" for i in range(start, start + 200)] + ["x" * 500, "unknown1"]
-        body = {"ids": ids, "parent_session": "dashboard:chat-1", "written": True}
-        await messaging.api_spawn_mark_collected(_Req(state, body=body))
+        flagged = messaging._flag_collected_inline(state, ids, "dashboard:chat-1")
+        messaging._settle_collected_on_slot(slot, flagged, state.subagents)
     assert len(slot._subagents_inline_collected) == messaging._COLLECTED_IDS_CAP
     assert slot._subagents_inline_collected <= known

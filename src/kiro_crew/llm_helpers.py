@@ -64,6 +64,7 @@ __all__ = sorted(n for n in set(globals()) | set(_EXPORTS) if not n.startswith("
 if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
     from kiro_crew.llm_helpers_parts.backend_errors import (  # noqa: F401
         _CONNECTION_MARKERS,
+        _EXPIRED_TOKEN_CODES,
         _FRAME_DATA_TAIL_RE,
         _JITTER_RNG,
         _PROMPT_BUSY_DELAY,
@@ -85,12 +86,15 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         PromptBusyExhaustedError,
         _is_transient_acp_error,
         acp_error_after_tool_activity,
+        acp_error_is_capacity_or_throttle,
         acp_error_is_connection_failure,
         acp_error_is_pipe_death,
+        acp_error_is_server_error,
         acp_error_is_session_not_found,
         acp_error_is_throttle,
         acp_error_is_transient,
         acp_error_needs_fresh_credentials,
+        acp_error_needs_sign_in,
         connection_recovery_open,
         connection_retry_delay,
         credential_give_up_text,
@@ -101,14 +105,22 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         transient_retry_delay,
     )
     from kiro_crew.llm_helpers_parts.background_turns import (  # noqa: F401
+        BackgroundAdmissionRefused,
         _background_crew_log_owner,
+        _background_spawn_backend,
         _cleanup_memory_consolidation_session,
+        _lite_resets_failed,
+        _lite_rewrite_tasks,
+        _lite_rewrites,
+        _lite_spec_refusal,
         _lite_spec_unconfirmed,
         _raise_if_unfinished,
         _record_background_crew_log,
         _refuse_while_memory_critical,
+        _rewrite_lite_spec,
         _start_fresh_conversation,
         background_turn,
+        repair_lite_spec,
         run_bg_oneliner,
     )
     from kiro_crew.llm_helpers_parts.model_fallback import (  # noqa: F401
@@ -125,9 +137,11 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _fallback_wire_spelling,
         _latch_identity,
         _slot_switch_session_locks,
+        advance_fallback_after_activity,
         advance_fallback_candidate,
         annotate_model_fallback,
         append_fallback_story,
+        attach_fallback_story,
         configured_fallback_chain,
         engine_attributed_model,
         fallback_rewound_transient_budget,
@@ -150,10 +164,14 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     )
     from kiro_crew.llm_helpers_parts.tool_approval import (  # noqa: F401
         ToolApprovalPolicy,
+        _approval_expired,
+        _body_field_link_origin,
         _orphan_reject_done,
         _orphan_rejects,
         _resolve_permission,
         _steer_host_deny,
+        approval_expiry_watch,
+        note_approval_expired,
     )
     from kiro_crew.llm_helpers_parts.tool_input_denials import (  # noqa: F401
         _DIFF_TRUNCATION_MARK,
@@ -177,6 +195,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     )
     from kiro_crew.llm_helpers_parts.turn_stream import (  # noqa: F401
         _UNFINISHED_TURN_STOP_REASONS,
+        _join_continued,
         stream_and_collect,
         stream_and_collect_json,
         unfinished_turn_error,
@@ -216,6 +235,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         EVENT_TEXT_CHUNK,
         EVENT_TOOL_CALL,
         EVENT_TOOL_RESULT,
+        AcpAuthRequired,
         AcpError,
         AcpPromptBusy,
         LLMEvent,
@@ -227,9 +247,11 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.agent_sdk.drivers.acp_vocab import (  # noqa: F401
         STOP_REASON_STALE_RECOVER,
         STOP_REASON_TIMEOUT,
+        STOP_RECOVERY_MAX_RETRIES,
         AcpTimeoutError,
         engine_served_model,
         same_model,
+        timed_out_continuation,
         tracker_of,
         walk_outcome,
     )
@@ -237,15 +259,18 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         KiroCrewConfig,
     )
     from kiro_crew.constants import (  # noqa: F401
+        DENY_CAUSE_APPROVAL_TIMEOUT,
         DENY_CAUSE_INVALID_NAME,
         DENY_CAUSE_POLICY,
         DENY_CAUSE_SURFACE_POLICY,
+        DENY_CAUSE_UNREADABLE_IDENTITY,
     )
     from kiro_crew.credential_errors import (  # noqa: F401
         is_credential_propagation_delay,
     )
     from kiro_crew.deny_notice import (  # noqa: F401
         steer_refusal_notice,
+        unreadable_identity_clause,
     )
     from kiro_crew.executors import (  # noqa: F401
         run_in_tool_gate_pool,
@@ -283,6 +308,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     )
     from kiro_crew.security import (  # noqa: F401
         MAX_SCANNABLE_COMMAND_CHARS,
+        MAX_SCANNABLE_SOURCE_BODY_CHARS,
         is_denied,
         is_denied_synthesized_target,
         is_sensitive_bash_command,
@@ -292,9 +318,17 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         sensitive_path_refusal,
         sensitive_write_path_refusal,
     )
+    from kiro_crew.security.mcp_body_fields import (  # noqa: F401
+        body_field_keys,
+        is_kirocrew_server,
+        named_size_refusal,
+        warn_body_field_matches,
+    )
+    from kiro_crew.security.paths_resolver import bounded_judgment  # noqa: F401
     from kiro_crew.security.readonly_bash import (  # noqa: F401
         command_invokes_git,
         is_read_only_bash,
+        may_write_through_git_flag,
     )
     from kiro_crew.sel import sel as _sel  # noqa: F401
     from kiro_crew.start_priority import (  # noqa: F401
@@ -303,3 +337,4 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.tool_gate_busy import (  # noqa: F401
         hook_gate_busy,
     )
+    from kiro_crew.tracing import surfaces as trace_surfaces  # noqa: F401

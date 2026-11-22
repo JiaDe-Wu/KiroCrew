@@ -7,6 +7,11 @@
     "agent_capabilities": {
       "_meta": {
         "kiro": {
+          "autoCompactionThreshold": {
+            "default": 80,
+            "max": 80,
+            "min": 0
+          },
           "checkpoints": true,
           "executionTargets": [
             "local"
@@ -18,13 +23,31 @@
             "_kiro/memory/create",
             "_kiro/memory/update",
             "_kiro/memory/delete",
+            "_kiro/memory/import",
+            "_kiro/memory/export",
+            "_kiro/memory/getImportPrompt",
+            "_kiro/memory/getSyncStatus",
+            "_kiro/memory/sync",
             "_kiro/codeIntelligence",
+            "_kiro/environment/start_ssh_session",
+            "_kiro/environment/get_network_configuration",
             "_kiro/session/context",
             "_kiro/session/compact",
             "_kiro/session/export",
             "_kiro/session/history",
+            "_kiro/session/recordRelationship",
+            "_kiro/session/delete",
+            "_kiro/session/rename",
+            "_kiro/job/cancel",
+            "_kiro/job/output",
+            "_kiro/job/moveToBackground",
             "_kiro/config/template",
+            "_kiro/permissions/presets/list",
+            "_kiro/permissions/presets/stores",
+            "_kiro/permissions/presets/add",
+            "_kiro/permissions/presets/remove",
             "_kiro/configuration/getState",
+            "_kiro/configuration/set",
             "_kiro/workflow/new",
             "_kiro/workflow/invoke",
             "_kiro/workflow/load",
@@ -43,19 +66,19 @@
           "logging": {
             "channels": [
               {
-                "filePath": "~/.kiro/logs/20261024T003905266/kiro.log",
+                "filePath": "~/.kiro/logs/20261117T021542088-64730/kiro.log",
                 "name": "kiro"
               },
               {
-                "filePath": "~/.kiro/logs/20261024T003905266/mcp.log",
+                "filePath": "~/.kiro/logs/20261117T021542088-64730/mcp.log",
                 "name": "mcp"
               },
               {
-                "filePath": "~/.kiro/logs/20261024T003905266/powers.log",
+                "filePath": "~/.kiro/logs/20261117T021542088-64730/powers.log",
                 "name": "powers"
               }
             ],
-            "logDir": "~/.kiro/logs/20261024T003905266"
+            "logDir": "~/.kiro/logs/20261117T021542088-64730"
           },
           "modelFallbackReporting": true,
           "policyNotifications": true,
@@ -67,7 +90,8 @@
           "sessionSources": [
             "local"
           ],
-          "sourceProviders": false
+          "sourceProviders": false,
+          "strictSessionLoad": true
         }
       },
       "loadSession": true,
@@ -210,6 +234,23 @@
                     "origin": "bundled"
                   }
                 },
+                "source": "bundled",
+                "welcomeMessage": "You are using Default v2, an experimental agent mode."
+              }
+            },
+            "description": "Adaptive agent that plans, delegates, and verifies as the task demands",
+            "name": "Default v2",
+            "value": "default-v2"
+          },
+          {
+            "_meta": {
+              "kiro": {
+                "resource": {
+                  "resourceType": "agent",
+                  "source": {
+                    "origin": "bundled"
+                  }
+                },
                 "source": "bundled"
               }
             },
@@ -221,29 +262,7 @@
         "type": "select"
       },
       {
-        "category": "model",
-        "currentValue": "auto",
-        "id": "model",
-        "name": "Model",
-        "options": [
-          {
-            "_meta": {
-              "kiro": {
-                "hasEffort": false,
-                "rateMultiplier": 1,
-                "rateUnit": "Credit",
-                "thinkingToggleable": false
-              }
-            },
-            "description": "Models chosen by task for optimal usage and consistent quality",
-            "name": "Auto",
-            "value": "auto"
-          }
-        ],
-        "type": "select"
-      },
-      {
-        "currentValue": "on",
+        "currentValue": "off",
         "description": "Allow this session to reflect on new memory",
         "id": "memoryReflection",
         "name": "Memory reflection",
@@ -272,6 +291,23 @@
           {
             "description": "Agent asks for approval before file changes",
             "name": "Supervised",
+            "value": "off"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "currentValue": "off",
+        "description": "Let other sessions message this session, and let it message them",
+        "id": "sessionToolsMessaging",
+        "name": "Session messaging",
+        "options": [
+          {
+            "name": "On",
+            "value": "on"
+          },
+          {
+            "name": "Off",
             "value": "off"
           }
         ],
@@ -308,10 +344,17 @@
         "bug-fix",
         "plan",
         "autonomous",
+        "default-v2",
         "semantic_reviewer"
       ]
     },
     "session_id": "kas-bundle-session-1"
+  },
+  {
+    "action": "update",
+    "events": [],
+    "frame": "session/update",
+    "session_update": "config_option_update"
   },
   {
     "frame": "response",

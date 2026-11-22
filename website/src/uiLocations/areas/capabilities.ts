@@ -2,9 +2,10 @@
  * Registered UI locations under Customize (the Capabilities page). One area of
  * `UI_LOCATIONS`; see `../descriptors.ts` for the two-step contract.
  *
- * Customize > Connections opens on its Services sub-tab (local state, not the
- * URL), so the MCP server controls hang under the MCP Servers sub-tab: the path
- * names the click that reveals them.
+ * Customize > MCP Servers opens on its Servers view unless a link asks for
+ * Sharing, and Customize > Knowledge on its List view (local state, not the
+ * URL), so the MCP server controls hang under the Servers view and Add Source
+ * under the Sources view: the path names the click that reveals them.
  */
 import type { UiLocationArea } from '../types'
 
@@ -15,13 +16,53 @@ const ADD_MCP = {
 } as const
 
 export const LOCATIONS = {
-  'connections.mcp-servers-tab': {
+  'mcp.servers-view': {
     kind: 'tab',
     terms: {
       en: ['mcp', 'mcp list', 'tool servers', 'my mcp servers'],
       'zh-CN': ['MCP 列表', '工具服务器'],
     },
-    placements: [{ surface: 'capabilities', parent: 'tab.capabilities.mcp', entry: 'tab' }],
+    placements: [{ surface: 'capabilities', parent: 'tab.capabilities.mcp-servers', entry: 'tab' }],
+  },
+  // The Sharing view (the old MCP Management page): which servers run once,
+  // through the gateway, for every chat. The page opens on Servers; this tab is the click.
+  'mcp.sharing-view': {
+    kind: 'tab',
+    terms: {
+      en: [
+        'mcp management', 'share mcp servers', 'share an mcp server across chats', 'route an mcp server through the gateway',
+        'mcp gateway', 'turn on a custom mcp server for Kiro Crew', 'approve an mcp server launch', 'mcp launch approval',
+      ],
+      'zh-CN': ['MCP 管理', '共享 MCP 服务器', 'MCP 网关', '批准 MCP 启动', '批准 MCP 服务器'],
+    },
+    placements: [{ surface: 'capabilities', parent: 'tab.capabilities.mcp-servers', entry: 'tab' }],
+  },
+  // The page-wide switch in the sharing hero, above both views.
+  'mcp.share-switch': {
+    kind: 'toggle',
+    label: { from: 'attr', attr: 'aria-label' },
+    terms: {
+      en: ['share mcp servers', 'route mcp servers through the gateway', 'mcp gateway on', 'run mcp servers once for every chat'],
+      'zh-CN': ['共享 MCP 服务器', '开启 MCP 共享', 'MCP 网关'],
+    },
+    placements: [{ surface: 'capabilities', parent: 'tab.capabilities.mcp-servers', entry: 'header' }],
+  },
+  // The approval card's one button: it opens the review of every server whose
+  // launch waits for approval (listed in a config file by hand, or a command
+  // that changed). Each server is approved there with Share across chats.
+  'mcp.review-approve': {
+    kind: 'button',
+    terms: {
+      en: [
+        'approve an mcp server launch', 'approve a custom mcp server', 'mcp launch approval', 'approve mcp command',
+        'mcp server not approved', 'mcp server paused', 'approve mcp update',
+      ],
+      'zh-CN': ['批准 MCP 启动', '批准 MCP 服务器', 'MCP 服务器未批准', '批准 MCP 更新'],
+    },
+    placements: [{
+      surface: 'capabilities', parent: 'tab.capabilities.mcp-servers', entry: 'content',
+      requires: [{ kind: 'condition', id: 'mcp_launch_awaiting_approval' }],
+    }],
   },
   // Paste or write a server's own config (opens McpCustomServerModal). The
   // guide action `mcp.open_add` already points at this element.
@@ -34,7 +75,7 @@ export const LOCATIONS = {
       ],
       'zh-CN': [...ADD_MCP['zh-CN'], '自定义 MCP 服务器', '手动添加 MCP', 'MCP 配置', 'MCP 环境变量', '带环境变量的 MCP 服务器'],
     },
-    placements: [{ surface: 'capabilities', parent: 'connections.mcp-servers-tab', entry: 'toolbar' }],
+    placements: [{ surface: 'capabilities', parent: 'mcp.servers-view', entry: 'toolbar' }],
     guide: { action: 'mcp.open_add' },
   },
   // Install one from the catalog browser.
@@ -44,7 +85,7 @@ export const LOCATIONS = {
       en: [...ADD_MCP.en, 'install an mcp server', 'browse mcp servers', 'mcp store', 'mcp catalog', 'find mcp servers'],
       'zh-CN': [...ADD_MCP['zh-CN'], '安装 MCP', '安装 MCP 服务器', 'MCP 市场', '浏览 MCP 服务器'],
     },
-    placements: [{ surface: 'capabilities', parent: 'connections.mcp-servers-tab', entry: 'toolbar' }],
+    placements: [{ surface: 'capabilities', parent: 'mcp.servers-view', entry: 'toolbar' }],
   },
   // The icon-only refresh beside the server filter: it re-probes every server.
   'mcp.probe': {
@@ -54,7 +95,7 @@ export const LOCATIONS = {
       en: ['test my mcp servers', 'check mcp servers', 'refresh mcp servers', 'reconnect mcp servers', 'are my mcp servers working'],
       'zh-CN': ['检测 MCP 服务器', '测试 MCP 服务器', '刷新 MCP 服务器', '检查 MCP 连接'],
     },
-    placements: [{ surface: 'capabilities', parent: 'connections.mcp-servers-tab', entry: 'toolbar' }],
+    placements: [{ surface: 'capabilities', parent: 'mcp.servers-view', entry: 'toolbar' }],
   },
   // Customize > Skills header, drawn once the skill list has loaded. (The
   // loading skeleton draws a disabled copy of Create New Skill; it is not
@@ -76,6 +117,25 @@ export const LOCATIONS = {
       'zh-CN': ['安装技能', '浏览技能', '下载技能', '技能市场'],
     },
     placements: [{ surface: 'capabilities', parent: 'tab.capabilities.skills', entry: 'toolbar' }],
+  },
+  'knowledge.sources-tab': {
+    kind: 'tab',
+    terms: {
+      en: ['knowledge sources', 'my knowledge folders', 'indexed folders', 'watched folders'],
+      'zh-CN': ['知识来源', '知识库文件夹', '已索引的文件夹'],
+    },
+    placements: [{ surface: 'capabilities', parent: 'tab.capabilities.knowledge', entry: 'tab' }],
+  },
+  'knowledge.add-source': {
+    kind: 'button',
+    terms: {
+      en: [
+        'add a folder to the knowledge base', 'add files to knowledge', 'upload a document to knowledge',
+        'index a folder', 'watch a folder', 'add knowledge',
+      ],
+      'zh-CN': ['添加文件夹到知识库', '上传文档到知识库', '索引文件夹', '添加知识'],
+    },
+    placements: [{ surface: 'capabilities', parent: 'knowledge.sources-tab', entry: 'toolbar' }],
   },
   'skills.refresh': {
     kind: 'button',

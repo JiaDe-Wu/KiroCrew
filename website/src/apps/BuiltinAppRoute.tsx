@@ -28,6 +28,8 @@ import ErrorNotice from '../components/ErrorNotice'
 import InstalledAppSurface from '../components/InstalledAppSurface'
 import { Btn, ContentSkeleton } from '../components/ui'
 import { useInstalledAppsWhen } from '../hooks/panelTabRegistry'
+import { useAppInstalledElsewhere } from '../hooks/useAppInstalledElsewhere'
+import { useAppViewMetrics } from '../lib/appViewTelemetry'
 import { i18nT } from '../i18n/t'
 
 /**
@@ -142,10 +144,13 @@ const APP_RELEASED_CODE = 'app_released'
  * otherwise. A record or any other 404 is a cached `false`. A failed lookup is
  * no answer: it rethrows, so it takes the shared retry ladder and is asked again
  * on the next mount rather than cached. Until an answer is `true` the compiled
- * page stays, as it does today, and no failure is reported from here.
+ * page stays, as it does today. A lookup that still failed after its retries is
+ * returned as `error`, so the route can say the page may not be backed.
  */
-function useReleasedWithNoRecord(name: string | null): boolean {
-  const { data } = useQuery({
+function useReleasedWithNoRecord(
+  name: string | null,
+): { released: boolean; error: unknown; answered: boolean } {
+  const { data, error } = useQuery({
     queryKey: ['app-released', name],
     queryFn: () => (typeof api?.getApp === 'function' ? api.getApp(name as string) : Promise.resolve(null)).then(
       () => false,
@@ -156,7 +161,12 @@ function useReleasedWithNoRecord(name: string | null): boolean {
     ),
     enabled: name !== null,
   })
-  return name !== null && data === true
+  return {
+    released: name !== null && data === true,
+    error: name !== null ? error : null,
+    // Nothing was asked, or the lookup came back with an answer or a failure.
+    answered: name === null || data !== undefined || error != null,
+  }
 }
 
 export default function BuiltinAppRoute() {
@@ -194,7 +204,20 @@ export default function BuiltinAppRoute() {
   // any other answer, the compiled page renders as before.
   const recordless = !!entry && !adopted && installedApps !== undefined
     && !installedApps.some(app => app.name === entry.appId)
-  const released = useReleasedWithNoRecord(recordless && entry ? entry.appId : null)
+  const { released, error: releasedLookupError, answered: releasedAnswered } = useReleasedWithNoRecord(
+    recordless && entry ? entry.appId : null,
+  )
+  // The not-installed state below has the shell re-read its list when the app is
+  // installed again, and the record that list then names replaces this state.
+  useAppInstalledElsewhere(released && entry ? entry.appId : null)
+  // The compiled page counts its own view, but only once the list and the
+  // released lookup have answered: until then the route may still swap to an
+  // adopted copy (which InstalledAppSurface counts) or to a released app (no
+  // page), and counting early would count one view twice.
+  // shortcut: a list that never loads leaves the compiled page uncounted; count
+  // it on a load error too if that undercount ever shows in the data.
+  const compiledPageSettled = installedApps !== undefined && releasedAnswered
+  useAppViewMetrics(entry && compiledPageSettled && !adopted && !released ? entry.appId : null)
   if (adopted) {
     return (
       <ErrorBoundary key={`${path}#adopted`}>
@@ -211,7 +234,7 @@ export default function BuiltinAppRoute() {
   }
 
   // Both boundaries below are keyed by `path`, and that key is load-bearing.
-  // `App.tsx` serves all 23 builtin pages from ONE unkeyed
+  // `App.tsx` serves all 21 builtin pages from ONE unkeyed
   // `<Route path="/:builtinApp/*">`, so a builtin→builtin move is a param
   // change on a mounted component, not a fresh mount. Both branches return
   // `ErrorBoundary` as their root, so without a key React updates the SAME
@@ -270,6 +293,15 @@ export default function BuiltinAppRoute() {
 
   return (
     <ErrorBoundary key={path}>
+      {/* The page still renders, but whether its app is installed could not be
+          checked, so it may be talking to a backend that is not there. */}
+      {releasedLookupError != null && (
+        <ErrorNotice
+          message={releasedLookupError instanceof Error ? releasedLookupError.message : String(releasedLookupError)}
+          askAgent
+          className="m-4"
+        />
+      )}
       {/*
         Identity is published from this render body, NOT from an effect. React
         renders a parent before its children, so a provider here is guaranteed to

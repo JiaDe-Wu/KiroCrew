@@ -248,7 +248,9 @@ class _Dispatches:
         self.pending_after = [item[0] for item in orch._pending_queue.get(_THREAD, ())]
         self.files_after = {path.name: path.exists() for path in paths}
 
-    async def __call__(self, _orch: Any, key: str, ts: str, text: str, kwargs: dict) -> None:
+    async def __call__(
+        self, _orch: Any, key: str, ts: str, text: str, kwargs: dict, **_kw: Any
+    ) -> None:
         self.calls.append((key, ts, text, kwargs))
         # flake-ok: the held dispatch never finishes by design; asyncio.run cancels it at teardown, moved verbatim
         await self._never.wait()
@@ -359,6 +361,19 @@ class TestSlacksStopIsTheCallersToo:
         _, _, dispatches, _ = _stop_by_bob(slack_home, outcome="hard")
         assert not dispatches.calls and not dispatches.queued_after
         assert dispatches.files_after == {"alice.png": False, "bob.png": False}
+
+    @pytest.mark.parametrize("pending", [False, True])
+    def test_a_shared_users_escalated_stop_keeps_the_owners_entries(
+        self, slack_home: pathlib.Path, pending: bool
+    ) -> None:
+        """Bob is a shared user (slack.shared_access): his escalated stop drops only his
+        own entries, never Alice's (the owner's)."""
+        from unittest.mock import patch
+
+        with patch("kiro_crew.slack.events.is_shared_listed", lambda u: u == "U_BOB"):
+            _, _, dispatches, _ = _stop_by_bob(slack_home, outcome="hard", pending=pending)
+        assert [call[1] for call in dispatches.calls] == ["101.0"]
+        assert dispatches.files_after == {"alice.png": True, "bob.png": False}
 
     def test_both_enqueue_sites_and_the_stash_record_the_sender(
         self, slack_home: pathlib.Path
@@ -569,7 +584,9 @@ class TestThePreservedEntryDrainsOnlyOnceTheStopIsDone:
         dispatched: list[str] = []
         seen: dict[str, Any] = {}
 
-        async def _dispatch(_orch: Any, key: str, ts: str, text: str, kwargs: dict) -> None:
+        async def _dispatch(
+            _orch: Any, key: str, ts: str, text: str, kwargs: dict, **_kw: Any
+        ) -> None:
             dispatched.append(ts)
 
         async def run() -> None:
@@ -636,7 +653,9 @@ class TestThePreservedEntryDrainsOnlyOnceTheStopIsDone:
         dispatched: list[str] = []
         seen: dict[str, Any] = {}
 
-        async def _dispatch(_orch: Any, key: str, ts: str, text: str, kwargs: dict) -> None:
+        async def _dispatch(
+            _orch: Any, key: str, ts: str, text: str, kwargs: dict, **_kw: Any
+        ) -> None:
             dispatched.append(ts)
 
         async def run() -> None:
@@ -764,7 +783,7 @@ def _press(handler: str, mgr: Any) -> tuple[list[str], list[int]]:
     dispatched: list[str] = []
     seen_mid_stop: list[int] = []
 
-    async def _dispatch(_orch: Any, key: str, ts: str, text: str, kwargs: dict) -> None:
+    async def _dispatch(_orch: Any, key: str, ts: str, text: str, kwargs: dict, **_kw: Any) -> None:
         dispatched.append(ts)
 
     async def _turn_ends_during_cancel(**_kw: Any) -> str:

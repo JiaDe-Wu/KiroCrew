@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 from installer_test_helpers import run_bounded
+from spawn_test_helpers import unblocked_signals
 
 from kiro_crew.testing.wait import wait_until
 
@@ -366,16 +367,9 @@ def test_cli_relinks_the_interpreter_when_rebuilding_a_venv(tmp_path: Path) -> N
     """Re-running the installer over an existing managed venv must recreate the
     interpreter links, not inherit them -- WITHOUT destroying the install.
 
-    ``python -m venv`` on an existing venv rewrites pyvenv.cfg but LEAVES an
-    existing bin/python* symlink in place: switching an existing install to
-    --managed-python would produce a hybrid venv that claims the new
-    interpreter while its shebangs still resolve to the old system one, dying
-    the day that interpreter is removed. The fix removes ONLY the interpreter
-    links before the rebuild -- never ``venv --clear``, which would empty
-    site-packages and the entrypoint too, so a failed wheel download in the
-    step after would leave NO working install. This locks both halves: the
-    link is recreated against the new interpreter, and non-link venv content
-    survives.
+    ``python -m venv`` keeps an existing bin/python* symlink, leaving shebangs on
+    the old interpreter. Only the links are removed, never ``venv --clear``, so a
+    failed wheel download afterwards still leaves a working install.
     """
     a_dir = tmp_path / "old-interp"
     a_dir.mkdir()
@@ -766,14 +760,10 @@ def test_cli_never_executes_a_store_interpreter_directly(tmp_path: Path) -> None
 def test_cli_marker_driven_managed_run_falls_back_on_provision_failure(
     tmp_path: Path,
 ) -> None:
-    """A `managed` marker records a DEFAULTED choice, not an explicit request:
-    when the uv download fails on a marker-driven re-run (the shape every
-    `kirocrew update` takes after the first successful default install) and a
-    usable system interpreter exists, the run must degrade to it instead of
-    hard-failing -- otherwise the first successful install would turn every
-    later update into a hard network dependency on the uv download. Only a
-    flag/env request made THIS run fails hard (pinned by
-    test_cli_managed_python_flag_skips_system_interpreters)."""
+    """A `managed` marker records a DEFAULTED choice: when the uv download fails on
+    a marker-driven re-run (every `kirocrew update`), the run degrades to a usable
+    system interpreter. Only a flag/env request made THIS run fails hard
+    (test_cli_managed_python_flag_skips_system_interpreters)."""
     data_home = tmp_path / "data-home"
     data_home.mkdir()
     (data_home / "python-mode").write_text("managed\n")
@@ -1025,12 +1015,10 @@ def test_run_step_interrupt_terminates_the_child_and_fails_the_step(
 ) -> None:
     """Ctrl-C during a step must stop the command, not just the spinner.
 
-    The command runs asynchronously, and POSIX starts an async child of a
-    non-interactive shell with SIGINT ignored, so the shell's INT trap is the
-    only thing that can reach it. The step must end with the child's signal
-    status (so the caller's `if !` restore path runs, the same status a
-    foreground pip returns for the keypress), the child must be gone, and
-    the caller's own traps must be back in place afterwards.
+    POSIX starts an async child of a non-interactive shell with SIGINT ignored,
+    so only the shell's INT trap can reach it. The step must end with the child's
+    signal status (so the caller's `if !` restore runs), the child must be gone,
+    and the caller's traps must be restored.
     """
     helpers = tmp_path / "helpers.sh"
     helpers.write_text(_progress_helpers())
@@ -1048,15 +1036,16 @@ def test_run_step_interrupt_terminates_the_child_and_fails_the_step(
     )
     # Its own session, so a timed-out run can be reaped as a group in
     # `finally` instead of leaving the sleeps behind.
-    proc = subprocess.Popen(
-        ["sh", "-c", script],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        cwd=tmp_path,
-        start_new_session=True,
-    )
+    with unblocked_signals():
+        proc = subprocess.Popen(
+            ["sh", "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            cwd=tmp_path,
+            start_new_session=True,
+        )
     try:
         # The step owns INT only from its trap takeover to its restore, and the
         # takeover happens before the fork, so the child's pid file is the
@@ -1103,14 +1092,16 @@ def test_run_step_interrupt_terminates_the_child_and_fails_the_step(
 
 
 def _session_processes(sid: int) -> str:
-    """Every process in the step's session with its group and state, for a failure report.
+    """Every process in the step's session with its parent, group and state, for a failure report.
 
-    `ps -g` reads a session id as a process group on BSD ps and as a session
-    on procps, so the listing is filtered here by the session column instead.
+    Membership is asked of the kernel with ``os.getsid``, never read from a ps
+    column: `ps -g` reads a session id as a process group on BSD ps, and BSD
+    ps's `sess` column is the kernel's session pointer, not an id, so on macOS
+    a filter on it matched nothing and reported a step still running as gone.
     """
     try:
         listing = subprocess.run(
-            ["ps", "-A", "-o", "pid=,pgid=,sess=,stat=,command="],
+            ["ps", "-A", "-o", "pid=,ppid=,pgid=,stat=,command="],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -1118,8 +1109,38 @@ def _session_processes(sid: int) -> str:
         ).stdout
     except (OSError, subprocess.TimeoutExpired) as exc:
         return f"(ps unavailable: {exc})"
-    rows = [line for line in listing.splitlines() if line.split()[2:3] == [str(sid)]]
+    rows = [line for line in listing.splitlines() if _in_session(line, sid)]
     return "\n".join(rows) or "(no process left in the session)"
+
+
+def _in_session(ps_row: str, sid: int) -> bool:
+    """Whether the process a ps row names is in session ``sid`` (one that has exited is not)."""
+    try:
+        return os.getsid(int(ps_row.split(None, 1)[0])) == sid
+    except (IndexError, ValueError, OSError):
+        return False
+
+
+def test_the_session_listing_names_a_process_still_in_the_session() -> None:
+    """The interrupt test's failure report must see a step that is still running.
+
+    It is that test's only evidence of what kept the step alive, so a listing
+    that came back empty for a live session would send the triage the wrong way.
+    """
+    child = subprocess.Popen(
+        ["sleep", "30"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        listing = _session_processes(child.pid)
+    finally:
+        child.kill()
+        child.wait(timeout=10)
+    assert [row.split()[0] for row in listing.splitlines()] == [str(child.pid)], listing
+    assert _session_processes(child.pid) == "(no process left in the session)"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1473,7 +1494,8 @@ def test_cli_restores_the_venv_when_stopped_mid_rebuild(
             "exit 9",
         ]
     )
-    proc = subprocess.Popen(["sh", "-c", script], cwd=tmp_path, start_new_session=True)
+    with unblocked_signals():
+        proc = subprocess.Popen(["sh", "-c", script], cwd=tmp_path, start_new_session=True)
     try:
         wait_until(phase.exists, timeout=10, describe=lambda: "the stand-in never reached its gap")
         time.sleep(0.2)
@@ -1563,6 +1585,7 @@ def test_a_stop_during_a_failure_branch_restore_keeps_the_venv(
             _cli_sh_function("_venv_rollback_on_exit"),
             _cli_sh_function("_venv_restore_after_failure"),
             _cli_sh_function("_tolerate"),
+            _cli_sh_function("_report_disk_full"),
             _cli_sh_function("_report_pip_failure"),
             _cli_sh_function("_rs_interrupt"),
             _cli_sh_function("_run_step"),

@@ -69,9 +69,11 @@ max_runtime_secs?)` revises it in place without losing its cycle count, and
 `interval_secs` (default 300) is stored as the loop's `idle_secs`; the raw
 REST/dataclass field defaults to 60.
 
-`monitor_start` defaults to 24 delivered cycles and a 14,400-second wall-clock
-budget; use explicit positive finite bounds for unattended work. Raw REST defaults
-both bounds to 0 (unlimited). Reaching either bound is a runaway backstop, not a
+`monitor_start` caps a loop that re-injects every interval (`gate=false`, or
+nothing to observe) at 24 delivered cycles and sets no cycle cap on a gated loop;
+its wall-clock budget defaults to the `monitoring.max_runtime_secs` ceiling (7 days
+as shipped). Use explicit positive finite bounds for unattended work. Raw REST
+defaults both bounds to 0 (unlimited). Reaching either bound is a runaway backstop, not a
 successful finish: check the exit condition every cycle and call `autonudge_stop`
 deliberately.
 
@@ -104,7 +106,7 @@ curl -sf -X POST "http://127.0.0.1:5476/api/autonudge?token=$TOKEN" \
 ```
 
 Common 403 traps (all have the same error body `{"error":"Token required"}`):
-- Forgetting the `?token=…` query param. The `/api/autonudge` arm/list/edit/delete routes do **not** accept `X-Internal-Secret` auth; they require the dashboard owner (`_require_monitor_owner` in `dashboard/handlers/autonudge.py`). Which paths accept the machine secret is defined by `_STRICT_INTERNAL_API_PATHS` / `_MIXED_INTERNAL_API_PATHS` in `dashboard/server.py`.
+- Forgetting the `?token=…` query param. The `/api/autonudge` arm/list/edit/delete routes do **not** accept `X-Internal-Secret` auth; they require the dashboard owner (`_require_monitor_owner` in `dashboard/handlers/autonudge.py`). Which paths accept the machine secret is defined by `_STRICT_INTERNAL_API_PATHS` / `_MIXED_INTERNAL_API_PATHS` in `dashboard/server_internal_paths.py`.
 - Calling `/api/token/local` without `X-Local-Secret` — the endpoint is in `_BYPASS_EXACT` (no token needed) but still validates the machine secret via HMAC compare. Missing/wrong secret → `{"error":"invalid secret"}` 403.
 - Non-loopback source. Token issuance and most internal paths require `is_loopback(request.remote)` regardless of auth material.
 
@@ -177,7 +179,7 @@ When all true: agent posts the DoD checklist with ticks, calls `autonudge_stop(r
 
 | Failure | Mitigation (REQUIRED) |
 |---|---|
-| **Context-window overflow after ~100 cycles** (each nudge+reply adds ~170 B; session SIGTERMs at `ContentWindowOverflow`) | `max_cycles: 30` per arming. Re-arm manually for more. |
+| **Context-window overflow after ~100 cycles** (each nudge+reply adds ~170 B; session SIGTERMs at `ContentWindowOverflow`) | A loop that wakes every interval (`gate=false`, UI or REST timer): `max_cycles: 30` per arming; re-arm manually for more. A gated `monitor_start` loop takes no cap: a quiet tick adds no turn. |
 | **STOP file does not stop before delivery** when no service sentinel was configured | UI arming has no stop-file input, but the service gives the loop its own default stop file; put `{{STOP_FILE}}` in the nudge so the loop knows that path, and still check it in the nudge and call `autonudge_stop`. Raw REST callers may set `stop_sentinel_path` to a custom path. |
 | **Credential-file leak** via urllib `ValueError` echoing raw cookie-jar contents (e.g. `~/.config/<app>/credentials`) into transcripts | Use `http.cookiejar.MozillaCookieJar(path).load()` + urllib opener, OR `curl -b <cookie-jar>`. Scrub auth-path exceptions to `type(e).__name__` only. |
 
@@ -242,7 +244,7 @@ Before clicking 🎯 "Set a goal" → the Play icon button ("Start loop"):
 - [ ] Anchor doc (`LOOP.md`) exists with a Definition of Done section. (Run `scaffold.sh` in this skill dir to generate a hardened template in one command.)
 - [ ] STOP sentinel absent: `ls <STOP_PATH>` says "No such file".
 - [ ] Popover fields: Goal description (the nudge, from the template), Seconds between nudges `60`, and a finite Max cycles such as 30. The popover has no stop-file input; the service assigns a default stop file, which `{{STOP_FILE}}` in the nudge names. The nudge itself must still check its stop path and call `autonudge_stop`.
-- [ ] If arming with `monitor_start`, set positive finite `max_cycles` and `max_runtime_secs`; use `monitor_update` rather than a second arm when the instruction changes.
+- [ ] If arming a gated `monitor_start` loop, leave `max_cycles` and `max_runtime_secs` unset (no cycle cap; the runtime defaults to the 7-day `monitoring.max_runtime_secs` ceiling). With `gate=false`, keep a finite `max_cycles`. Use `monitor_update` rather than a second arm when the instruction changes.
 - [ ] If a human is arming via REST, keep the dashboard token in their private terminal and optionally set `stop_sentinel_path`; agents must not read local-secret or cookie files.
 - [ ] If the loop touches authenticated APIs, the user must establish or refresh access through the supported client; never copy credential contents into the nudge or transcript.
 
@@ -256,5 +258,5 @@ Before clicking 🎯 "Set a goal" → the Play icon button ("Start loop"):
 6. Test execution lives in a sandbox — never in the local workspace for ops that touch live systems.
 7. One cycle, one step. Compound cycles build features.
 8. Human approval required for Done. Loop only moves cards to Review.
-9. `max_cycles: 30` cap every arming — this recipe's own recommendation, not a code default (`monitor_start` defaults to 24, the raw surface to 0 = unlimited). Re-arm manually for more.
-10. Every nudge checks an explicit halt condition and calls `autonudge_stop`; UI and REST arming get a default `stop_sentinel_path`, and only raw REST arming can set a custom one.
+9. `max_cycles: 30` cap every arming that wakes every interval — this recipe's own recommendation, not a code default (`monitor_start` sets no cap on a gated loop and 24 otherwise; the raw surface defaults to 0 = unlimited). Re-arm manually for more.
+10. Every nudge checks an explicit halt condition against live state; when it holds, the loop first sends ONE final report, then calls `autonudge_stop` in a later step; UI and REST arming get a default `stop_sentinel_path`, and only raw REST arming can set a custom one.

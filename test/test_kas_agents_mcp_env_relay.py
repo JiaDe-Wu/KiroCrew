@@ -20,6 +20,7 @@ import logging
 
 import pytest
 from kas_agents_helpers import _spec
+from redaction_structured_cases import github_classic
 
 from kiro_crew.acp._dispatch import build_session_new_params
 from kiro_crew.acp.kas_agents import hoist_servers_for_session, to_client_custom_agent
@@ -34,14 +35,14 @@ _FLAGS = {
 }
 
 
-def _wire(env: dict, *, load: bool = False) -> str:
+def _wire(env: dict) -> str:
     """The ``session/new`` params for one agent declaring ``vendor`` with *env*, as sent."""
     agent = to_client_custom_agent(
         "a",
         _spec(mcpServers={"vendor": {"command": "vendor-mcp", "env": env}}),
         "p",
     )
-    agents, servers = hoist_servers_for_session([agent], "a", [], include_user_servers=load)
+    agents, servers = hoist_servers_for_session([agent], "a", [])
     return json.dumps(build_session_new_params("/w", mcp_servers=servers, kas_custom_agents=agents))
 
 
@@ -62,9 +63,8 @@ class TestBooleansReachTheServer:
     def test_each_boolean_relays_on_its_own(self, key):
         assert _relayed_env({key: _FLAGS[key]}) == {key: _FLAGS[key]}
 
-    @pytest.mark.parametrize("load", [False, True])
-    def test_the_flags_are_in_the_frame_on_new_and_on_load(self, load):
-        wire = _wire(_FLAGS, load=load)
+    def test_the_flags_are_in_the_frame(self):
+        wire = _wire(_FLAGS)
         for value in _FLAGS.values():
             assert json.dumps(value) in wire
 
@@ -95,8 +95,8 @@ _NOT_BOOLEAN = [
     ("ONE_FLAG", "1"),
     ("BASE_URL", "https://api.example.com/v1"),
     ("WORKSPACE_ROOT", "/home/user/projects/demo"),
-    # Short secrets under names that earlier rounds of review found no key list
-    # could cover: run-together, acronym-prefixed, or simply innocent.
+    # Short secrets under names no key list can cover: run-together,
+    # acronym-prefixed, or simply innocent.
     ("DBPASS", "hunter3"),
     ("SMTPPASS", "hunter3"),
     ("MYSQLPWD", "hunter3"),
@@ -129,14 +129,13 @@ _NOT_BOOLEAN = [
 
 
 class TestEverythingElseIsWithheld:
-    @pytest.mark.parametrize("load", [False, True])
     @pytest.mark.parametrize(
         ("key", "value"),
         _NOT_BOOLEAN,
         ids=[key for key, _ in _NOT_BOOLEAN],
     )
-    def test_a_non_boolean_value_is_not_in_the_frame(self, key, value, load):
-        wire = _wire({**_FLAGS, key: value}, load=load)
+    def test_a_non_boolean_value_is_not_in_the_frame(self, key, value):
+        wire = _wire({**_FLAGS, key: value})
         # The entry is gone whole, and a value long enough to be unique is
         # nowhere in the frame (a short one such as "on" occurs in other words).
         assert json.dumps(key) not in wire
@@ -162,7 +161,7 @@ class TestABooleanCanStillBeWithheld:
     def test_a_key_paired_credential_is_withheld(self):
         """The redactor sees the key: ``ghp_...=true`` is credential-shaped only as
         a pair, so the value under that key is withheld."""
-        assert _relayed_env({"ghp_" + "b2" * 18: "true"}) == {}
+        assert _relayed_env({github_classic(seed=73): "true"}) == {}
 
 
 class TestTheRuleIsLocalToTheKasProjection:
@@ -190,7 +189,7 @@ class TestTheWithholdIsLogged:
         assert "FEATURE_X_ENABLED" not in caplog.text
 
     def test_a_credential_shaped_key_name_is_counted_not_printed(self, caplog):
-        key = "ghp_" + "b2" * 18
+        key = github_classic(seed=73)
         with caplog.at_level(logging.INFO, logger="kiro_crew.acp.kas_agents"):
             assert _relayed_env({key: "x"}) == {}
         assert "1 unnamed" in caplog.text

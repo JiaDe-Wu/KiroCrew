@@ -93,6 +93,7 @@ agent loads only the one it needs.
 |---|---|
 | [app-kit-platform.md](app-kit-platform.md) | App contracts: MCP scoping, agent JSON composition, permissions, and dependencies. |
 | [plugin-import.md](plugin-import.md) | Converting a manifest-declared plugin package into an installable app: manifest discovery, per-kind mapping, root containment, and what is reported instead of converted. |
+| [agent-plugins.md](agent-plugins.md) | Discovering and validating installed Agent Plugins (agent-plugins.org 1.0.0) from the shared `~/.kiro/powers` tree: states, manifest, skills and `mcp.json` rules; the converter; the owner's read-only list, and what is held until the rulings. |
 | [harness-plugin-mapping.md](harness-plugin-mapping.md) | Where other harnesses' plugin contribution kinds land -- an existing extension point, a converter, or nowhere -- and the reason per kind. |
 | [mcp-apps.md](mcp-apps.md) | Apps that surface as MCP servers. |
 | [mcp-shareability.md](mcp-shareability.md) | Predicting which MCP servers can share one backend, from local evidence. |
@@ -118,7 +119,7 @@ agent loads only the one it needs.
 |---|---|
 | [papyrus.md](papyrus.md) | The Papyrus writing app. |
 | [aws-control.md](aws-control.md) | The AWS account portal and S3-backed cloud drive app: accounts, Drive/Library/Backup, consent and confirmation guards, sharing, the crew bundle builder, and the crew container runtime a remote crew runs as. |
-| [command-bar.md](command-bar.md) | The opt-in launcher that replaces quick-search: the overlay seam, the request-free root, ranking and scopes. |
+| [command-bar.md](command-bar.md) | The dashboard's quick-search launcher and its on/off setting: the request-free root, ranking, scopes, and the fold of the former Command Bar app. |
 | [pptx-maker.md](pptx-maker.md) | Deck generation. |
 | [meetings.md](meetings.md) | Meeting capture and summarization. |
 | [issue-radar.md](issue-radar.md) | Issue triage and grouping. |
@@ -132,10 +133,9 @@ agent loads only the one it needs.
 |---|---|
 | [cloud.md](cloud.md) | Cloud connect and remote gateway login. |
 | [connections.md](connections.md) | Third-party account connections: provider registry and tiers, the mint endpoints, grant custody at the kiro-cli boundary, warm-table prewarming, owner-only disconnect, and the L0/L1 launch gates. |
-| [connector-capability-manifest.md](connector-capability-manifest.md) | The connector campaign's manifest field schema (one row per required operation) and the `W00`–`W16` work-stream DAG that sequences its provider rounds. |
+| [connector-capability-manifest.md](connector-capability-manifest.md) | The connector campaign's manifest field schema (one row per required operation) and the `W00`–`W16` work-stream DAG that sequences its provider rounds, and who owns each `ConformanceRun`/`EvidenceReceipt` conformance responsibility (none is enforced on `main` yet). |
 | [connector-github.md](connector-github.md) | The GitHub connector (`W02`): per-operation instance data and the GitHub-specific wire parsing (pagination, rate-limit signals, status/body-to-error-class mapping, capability-signature resolution). |
 | [microsoft-graph-runtime.md](microsoft-graph-runtime.md) | The shared Microsoft Graph runtime base (`W05`): the resource locator (`/me` vs `/users/{id}`, the app-only `/me` refusal, the required Graph resource shapes), request/response payload shaping, and the `@odata.nextLink` pagination variants. Pure logic; defines no vendor-error taxonomy. |
 | [connector-zoom.md](connector-zoom.md) | The Zoom connector's `W11-A` contract-semantics slice: identity/UUID double-encoding, recurrence-occurrence time semantics, per-endpoint pagination, the AI Companion processing tri-state, and error classification plus credential redaction — pure logic, no network/auth/dispatch. |
-| [connector-conformance.md](connector-conformance.md) | The `W00-S4` conformance foundation: which component owns each `ConformanceRun`/`EvidenceReceipt` conformance responsibility, so none is dropped when the slice-unique validation remainder is empty. Records the `evidence_tier` contract-vs-spec item as pending. |
 | [instances.md](instances.md) | Managing multiple instances over SSH. Sections here are cited by number from `dashboard/handlers_instances.py`, `dashboard/session_transfer.py` and `dashboard/session_transfer_staging.py`, so do not renumber them. |
 | [dev-fleet.md](dev-fleet.md) | Worktree fleet management and pruning. |

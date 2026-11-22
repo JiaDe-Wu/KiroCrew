@@ -9,6 +9,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.metrics import tool_calls
+from kiro_crew.stats import Stats
 from kiro_crew.testing.wait import await_until
 
 
@@ -90,6 +92,17 @@ class TestStatusSnapshot:
         }
         assert required.issubset(snap.keys())
 
+    def test_message_and_tool_call_counts_come_from_stats(self, state: DashboardState) -> None:
+        """The two figures ``kirocrew status`` prints have writers: ``Stats``."""
+        before = state.status_snapshot()
+        Stats().inc_message_received()
+        Stats().inc_message_admitted()
+        tool_calls.note_tool_call_started("snap-1", kind="read", scope="status-snapshot")
+        tool_calls.record_tool_call_finished("snap-1", status="completed", scope="status-snapshot")
+        after = state.status_snapshot()
+        assert after["messages"] - before["messages"] == 2, "one per counter"
+        assert after["tool_calls"] - before.get("tool_calls", 0) == 1
+
     def test_includes_build_branch_and_commit(self, state: DashboardState) -> None:
         """branch/commit come from the build info resolved at construction."""
         state._build_info = ("beta-braveheart", "abc1234")
@@ -134,6 +147,20 @@ class TestStatusSnapshot:
         old-gateway from absent-because-stable within one payload version."""
         snap = state.status_snapshot()
         assert snap["release_channel"] in ("nightly", "insider", "stable")
+
+    @pytest.mark.parametrize(
+        ("stamp", "expected"),
+        [("docker", "docker exec kirocrew kirocrew token"), ("wheel", ""), ("dmg", ""), ("", "")],
+    )
+    def test_names_the_container_sign_in_command_only_on_a_container(
+        self, state: DashboardState, monkeypatch, stamp: str, expected: str
+    ) -> None:
+        """A container's dashboard sends the person on the host through
+        ``docker exec``; every other install keeps the catalog's ``kirocrew token``.
+        Read from the baked stamp, so the environment variable cannot set it."""
+        monkeypatch.setattr("kiro_crew.beacon._BAKED_DISTRIBUTION", stamp)
+        monkeypatch.setenv("KIROCREW_DISTRIBUTION", "docker")
+        assert state.status_snapshot().get("sign_in_command") == expected
 
     def test_cached_overrides_skip_expensive_calls(self, state: DashboardState) -> None:
         """Caller-supplied cron_jobs/lessons pass straight through and never
@@ -189,6 +216,7 @@ class TestAllStatusSnapshotCallersPassTheUpdateFields:
             "update_latest_version",
             "update_latest_version_display",
             "update_channel",
+            "update_upcoming",
             "update_channel_move_pending",
             "update_managed_by",
             "update_policy_file",
@@ -196,7 +224,14 @@ class TestAllStatusSnapshotCallersPassTheUpdateFields:
             "update_commits_behind",
             "update_can_arm",
             "update_auto_effect",
+            "update_auto_manual_only",
             "update_bundled_by_app",
+            "update_restart_ready",
+            "update_restart_ready_version",
+            "update_restart_ready_reason",
+            "update_armed_version",
+            "update_armed_at",
+            "pending_apply_error",
             "update_last_checked_at",
             "update_check_interval_secs",
             "update_required",
@@ -326,7 +361,7 @@ class TestAllStatusSnapshotCallersPassTheUpdateFields:
         sentinel = {key: f"S:{key}" for key in status_update_fields()}
         monkeypatch.setattr(
             "kiro_crew.dashboard.handlers.updates.status_update_fields",
-            lambda: dict(sentinel),
+            lambda *_next_start: dict(sentinel),
         )
 
         async def _run():
@@ -560,6 +595,27 @@ class TestAutoUpdateEffectOnTheStatusFrame:
         _fresh.record_auto_update_effect(AutoUpdateEffect("notify", None, "why"))
         assert status_fields_of(_fresh)["update_auto_effect"] == "notify"
 
+    @pytest.mark.parametrize(
+        ("effect", "route", "manual_only"),
+        [
+            # `updates.unattended_apply: false`: the one notify that keeps its route.
+            pytest.param("notify", "wheel", True, id="policy-keeps-the-route"),
+            pytest.param("notify", None, False, id="nothing-can-install"),
+            pytest.param("install", "wheel", False, id="installs"),
+            pytest.param("mandatory", "git", False, id="floor"),
+        ],
+    )
+    def test_manual_only_says_a_persons_update_still_installs(
+        self, _fresh, effect, route, manual_only
+    ) -> None:
+        from kiro_crew.platform.update_capability import AutoUpdateEffect
+
+        assert status_fields_of(_fresh)["update_auto_manual_only"] is False
+        _fresh.record_auto_update_effect(AutoUpdateEffect(effect, route, "why"))
+        fields = status_fields_of(_fresh)
+        assert fields["update_auto_effect"] == effect
+        assert fields["update_auto_manual_only"] is manual_only
+
     @pytest.mark.asyncio
     async def test_a_stale_effect_is_rederived_off_the_loop(self, _fresh, monkeypatch) -> None:
         """A branch switch or policy edit shows within one TTL, never blocking the frame."""
@@ -583,7 +639,9 @@ class TestAutoUpdateEffectOnTheStatusFrame:
 
         _fresh.record_auto_update_effect(AutoUpdateEffect("install", "git"))
         monkeypatch.setattr(_fresh, "_AUTO_EFFECT_TTL_SECS", 60.0)
-        monkeypatch.setattr(_fresh, "_auto_effect", (time.monotonic() - 120.0, "install"))
+        monkeypatch.setattr(
+            _fresh, "_auto_effect", (time.monotonic() - 120.0, AutoUpdateEffect("install", "git"))
+        )
         calls = {"n": 0}
 
         def _boom():

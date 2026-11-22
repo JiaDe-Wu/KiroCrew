@@ -52,6 +52,7 @@ from kiro_crew.dashboard.slot_ownership import (
     deny_app_slot_access,
     slot_not_found,
 )
+from kiro_crew.dashboard.slot_read_state import load_read_state_after_listen
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.dashboard.token_auth import (
     KNOWN_INTERNAL_CALLERS,
@@ -207,7 +208,7 @@ async def api_chat_slot_folder(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     if (not_object := body_not_object_error(body)) is not None:
         return not_object
     folder_id = str(body.get("folder_id") or "")
@@ -283,7 +284,9 @@ async def api_chat_slot_folder(request: web.Request) -> web.Response:
             # into the folder it already sits in changes nothing.
             claim_for_person=folder_id != previous and _audit_origin(request)[0] == "dashboard",
         ):
-            slot.folder_id = previous
+            # `previous` was captured before the await, and a delete of that folder
+            # can land inside it: put the slot back only into a folder that exists.
+            slot.folder_id = previous if any(f["id"] == previous for f in state._folders) else ""
             slot._folder_changed = previous_changed
             return web.json_response(
                 {"error": "folder not found", "code": "folder_not_found"}, status=400
@@ -297,7 +300,10 @@ async def api_chat_slot_folder(request: web.Request) -> web.Response:
             # have committed a newer placement that an unconditional restore
             # would erase (the same guard _restore_unfiled applies).
             if slot.folder_id == folder_id:
-                slot.folder_id = previous
+                # Only into a folder that still exists, as the refusal above.
+                slot.folder_id = (
+                    previous if any(f["id"] == previous for f in state._folders) else ""
+                )
                 slot._folder_changed = previous_changed
             # The UNPINNED periodic flush may have persisted the provisional
             # value while this save awaited: mark dirty so the
@@ -369,7 +375,7 @@ async def api_chat_slot_pin(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     if (not_object := body_not_object_error(body)) is not None:
         return not_object
     # Optional generation token, the same one api_chat_slot_folder reads: the
@@ -837,13 +843,18 @@ async def load_pinned_order_after_listen(state: DashboardState) -> None:
     Kept off the boot path (``no-new-work-on-gateway-boot-path``): until it
     lands, slot rows carry no ``pin_rank`` and pinned sessions show in the
     sidebar's own sort for a moment. The manual order, kept in the same store,
-    is read next, on its own terms (``chat_manual_order``).
+    is read next, on its own terms (``chat_manual_order``), then the read times
+    kept in the same directory (``slot_read_state``).
     """
     try:
         await ensure_pinned_order_loaded(state)
     except Exception:  # noqa: BLE001 -- a display preference must not crash startup
         logger.warning("could not load the pinned session order", exc_info=True)
     await load_manual_order_after_listen(state)
+    try:
+        await load_read_state_after_listen(state)
+    except Exception:  # noqa: BLE001 -- read times must not crash startup
+        logger.warning("could not load the session read times", exc_info=True)
 
 
 async def _write_pinned_order(
@@ -1156,7 +1167,7 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     if (not_object := body_not_object_error(body)) is not None:
         return not_object
     mode = _coerce_requested_mode(body.get("mode", ""))
@@ -1317,6 +1328,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _folder_icon_lock,
         _is_single_emoji,
         _is_valid_folder_color,
+        _prune_icon_tasks_from_other_loops,
         _spawn_chat_folder_icon_task,
         generate_emoji_for_name,
         icon_preview_avoid,
@@ -1338,6 +1350,8 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.dashboard.chat_folders_records import (  # noqa: F401
         _KNOWN_INTERNAL_CALLERS,
         CREATED_BY_SESSION,
+        FOLDER_MEMBER_KEYS_CHECKED_MARKER,
+        FOLDER_MEMBER_LABELS_MARKER,
         LAYOUT_ONLY_FIELDS,
         MAX_CHAT_FOLDERS,
         MAX_FOLDER_DEFAULT_PROMPT_CHARS,
@@ -1348,6 +1362,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         FolderOwnershipError,
         _caller_reaches_a_channel,
         _folder_history_counts,
+        _folders_moved_onto_a_crewmate,
         _folders_with_history_counts,
         _refuse_unattributable_caller,
         _slot_home_folder_id,
@@ -1360,6 +1375,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         create_folder_record,
         folder_ids_filed_into,
         live_slot_names_in_folders,
+        migrate_folder_member_labels,
     )
     from kiro_crew.dashboard.chat_folders_routes import (  # noqa: F401
         _ICON_PREVIEW_ATTEMPTS,
@@ -1372,4 +1388,5 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         api_chat_folder_reorder,
         api_chat_folder_update,
         api_chat_folders,
+        api_chat_folders_collapse_all,
     )

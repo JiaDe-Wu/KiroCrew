@@ -136,11 +136,21 @@ def _prune_session_pid_files_pass(narrow_with_leaders: bool, retract: bool) -> i
                 if retract and _retract_recycled_mapping(pid_file, pid):
                     stale_pid_files += 1
                 continue
-        pid_file.unlink(missing_ok=True)
+        try:
+            pid_file.unlink(missing_ok=True)
+        except OSError:
+            # One entry that cannot be removed (a directory at that name, a
+            # locked file) must not stop the pass: boot and shutdown call it
+            # unguarded, so a raise here would stop the gateway from starting.
+            logger.debug("Could not remove stale pid file: %s", pid_file.name, exc_info=True)
+            continue
         # Remove the HMAC sidecar (session_pid_<pid>.sig) alongside its
         # .txt — a dangling sidecar is harmless (verification requires
         # both) but would accumulate forever.
-        pid_file.with_suffix(".sig").unlink(missing_ok=True)
+        try:
+            pid_file.with_suffix(".sig").unlink(missing_ok=True)
+        except OSError:
+            logger.debug("Could not remove stale pid sidecar for %s", pid_file.name, exc_info=True)
         stale_pid_files += 1
     if stale_pid_files:
         logger.info("Cleaned up %d stale session PID files", stale_pid_files)
@@ -381,8 +391,8 @@ def _prune_stale_session_token_files(ttl_secs: float = _SESSION_TOKEN_TTL_SECS) 
 
     It runs from :func:`cleanup_orphaned_sessions` at startup and graceful shutdown,
     and from the session cleanup loop's periodic tick
-    (``SessionCleanup._sweep_session_token_mappings``), so a long-lived gateway
-    reclaims a mapping within one tick of it passing the TTL.
+    (``SessionCleanup._sweep_session_token_mappings``, at most hourly), so a
+    long-lived gateway reclaims a mapping within an hour of it passing the TTL.
 
     A mapping outliving its session is not a forgery risk: it names a session that
     does not exist, and any holder of its token is inside the trust boundary. So
@@ -399,11 +409,13 @@ def _prune_stale_session_token_files(ttl_secs: float = _SESSION_TOKEN_TTL_SECS) 
 
     Returns the number of mappings removed.
     """
-    from kiro_crew.session_token_sig import MAPPING_WRITE_LOCK
+    from kiro_crew.session_token_sig import MAPPING_WRITE_LOCK, SESSION_TOKEN_DIR
 
     removed = 0
     try:
+        # A mapping directly in the data-home root is never read; the pass clears it too.
         candidates = list(config_dir().glob("session_token_*.sig"))
+        candidates += config_dir().joinpath(SESSION_TOKEN_DIR).glob("session_token_*.sig")
     except OSError:
         return 0
     for path in candidates:

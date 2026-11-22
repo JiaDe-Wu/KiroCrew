@@ -148,6 +148,7 @@ MONITOR_PUBLIC_FIELDS = (
     "budgets",
     "cadence_secs",
     "wake_instructions",
+    "wake_on_terminal",
     "last_observation",
     "last_observation_status",
     "last_observation_reason_code",
@@ -788,6 +789,11 @@ class MonitorState:
     budgets: MonitorBudgets = field(default_factory=MonitorBudgets)
     cadence_secs: int = DEFAULT_MONITOR_CADENCE_SECS
     wake_instructions: str = ""
+    #: Opt-in: wake the owning session ONCE when the watch ends on a terminal
+    #: pull-request transition (merged or closed-unmerged), reusing the ordinary
+    #: actionable-wake path. Default False keeps every existing and stored watch
+    #: turn-free on merge/close, exactly as before this field existed.
+    wake_on_terminal: bool = False
     last_observation: dict[str, object] = field(default_factory=dict)
     last_observation_status: MonitorObservationStatus | None = None
     last_observation_reason_code: str = ""
@@ -919,6 +925,23 @@ class MonitorState:
     #: loads as no baseline at all, which delivers the next short reading.
     short_reading_digest: str = ""
     short_reading_held: int = 0
+    #: Pull-request watches only: the blockers the last DELIVERED turn carried, so a
+    #: later tick can tell a blocker that is NEW to the owner from one they were
+    #: already shown. ``delivered_failed_checks`` is the sorted check identities that
+    #: were failing in that reading; ``delivered_conflicting`` whether it conflicted
+    #: with its base. A blocker present now but absent from this basis reached the
+    #: subject AFTER the owner last looked, so the gate wakes on it even when a narrow
+    #: custom judge would stay quiet -- the typed fact the judge cannot be allowed to
+    #: silence. A blocker already in the basis (a red PR still under repair) stays
+    #: quiet, which is what the judge's own override bar is for.
+    #:
+    #: Written only where a delivery is confirmed, like ``short_reading_digest``: a
+    #: refused fire or a process that stops before the turn lands records no new basis,
+    #: so the next tick still measures against what the owner was actually shown. An
+    #: update that re-aims the loop clears both, so the first reading of a new subject
+    #: is a delivery, not a spurious wake.
+    delivered_failed_checks: list[str] = field(default_factory=list)
+    delivered_conflicting: bool = False
     #: Work-ledger watches only: the worker-report revision the probe read on its
     #: newest successful observation, and the one it had read when the last turn
     #: was DELIVERED. While the two are equal no worker has reported since the
@@ -936,17 +959,21 @@ class MonitorState:
     #: Found still set on the next tick, it means a poll was interrupted, so that
     #: tick fires instead of trusting a quiet verdict: one extra turn at worst.
     poll_in_flight: bool = False
-    #: Non-empty when the subject is terminal but the final turn owed to a CHANNEL
-    #: loop has not been delivered yet. The VALUE is the outcome to record once it
+    #: Non-empty when the subject is terminal but the final turn owed to the
+    #: watching session has not been delivered yet. The VALUE is the outcome to record once it
     #: has (``"success"`` for a merge, ``"blocked"`` for a close without merging),
     #: so the classification survives the wait without a second field and without
     #: writing ``outcome`` early.
     #:
-    #: A channel-bound loop learns its watch finished from a delivered turn, so
-    #: settlement waits for it even when the channel is busy. This marker stops
+    #: The watching session learns its watch finished from a delivered turn, so
+    #: settlement waits for it even when the session is busy. This marker stops
     #: retries from re-announcing, and since no outcome is recorded yet, a restart
     #: in the window finds a live loop rather than a finished one.
     terminal_pending: str = ""
+    #: The one-line result that owed turn opens with ("PR owner/repo#N merged at
+    #: <ts>, head <sha>."), written with ``terminal_pending`` and read only while
+    #: that is set.
+    terminal_note: str = ""
     #: Non-empty once that owed turn LANDED but its settlement has not: the delivery
     #: moves the outcome out of ``terminal_pending`` into this field, so a restart
     #: in the window settles without repeating the channel turn. A separate field,
@@ -1041,6 +1068,20 @@ class MonitorState:
         ):
             self.short_reading_held = 0
             self.short_reading_digest = ""
+        # The delivered-blocker basis is a set the gate subtracts a live reading from,
+        # so an unreadable value becomes the EMPTY basis, never a guess. Empty means
+        # "the owner has seen no blocker", which makes every live blocker read as new
+        # and wakes -- the safe direction, matching every other doubt in the gate. A
+        # list, like the check buckets on ``last_observation``, so it round-trips
+        # through JSON without the tuple/list asymmetry ``asdict`` would otherwise
+        # leave on the record; any non-string entry or non-list value drops to empty.
+        checks = self.delivered_failed_checks
+        if isinstance(checks, (list, tuple)) and all(isinstance(item, str) for item in checks):
+            self.delivered_failed_checks = list(checks)
+        else:
+            self.delivered_failed_checks = []
+        if not isinstance(self.delivered_conflicting, bool):
+            self.delivered_conflicting = False
         # The marker carries an outcome name, so an unreadable value cannot be
         # guessed. Keep it PENDING and record the cautious classification: a
         # delivery still happens, and a subject wrongly called blocked prompts a
@@ -1064,6 +1105,8 @@ class MonitorState:
         _validate_strict_json_object("last_observation", self.last_observation)
         if not isinstance(self.wake_instructions, str):
             raise ValueError("wake_instructions must be a string")
+        if not isinstance(self.wake_on_terminal, bool):
+            raise ValueError("wake_on_terminal must be a boolean")
         if any(
             not isinstance(value, str)
             for value in (

@@ -36,7 +36,9 @@ if TYPE_CHECKING:
         _annotate_model_downgrade,
         _annotate_model_fallback,
         _annotate_partial_block,
+        _app_job_names_bot,
         _apply_gate_verdict,
+        _cron_auth_expiry,
         _cron_failure_attribution,
         _cron_stream_with_posttoken_resume,
         _CronCapture,
@@ -48,12 +50,17 @@ if TYPE_CHECKING:
         acp_error_after_tool_activity,
         acp_error_is_session_not_found,
         acp_error_is_transient,
+        agent_sequence_dispatches,
+        auto_job_approver,
         configured_fallback_chain,
         consume_reinjection,
         context_meter_reading,
         dataclass,
         declared_mcp_not_ready_note,
+        declared_mcp_note_change,
+        effective_job_approval_mode,
         engine_attributed_model,
+        live,
         logger,
         note_turn_landed,
         persist_token_record_async,
@@ -65,6 +72,7 @@ if TYPE_CHECKING:
         read_effective_agent,
         read_turn_model,
         rearm_reinjection,
+        record_interaction_event,
         rollback_skill_bodies,
         run_in_embed_pool,
         settle_turn,
@@ -108,7 +116,12 @@ async def _cron_run_sequence(
 
     for agent in agents:
         _seq_kagent, _seq_cwd, _seq_crew = self._resolve_cron_agent(
-            cron_execution, agent, sequence_step=True
+            cron_execution,
+            agent,
+            sequence_step=True,
+            template_namespace=_app_job_names_bot(
+                job, agent, live.snapshot() or getattr(self, "_cfg", None)
+            ),
         )
         _seq_cwd = await asyncio.to_thread(cron_session_cwd, job, _seq_cwd)
         steps.append(
@@ -163,16 +176,34 @@ async def _cron_run_sequence(
                 "sequence",
             )
             return None
+        _live = self.sessions.get_provider(step.session_key) if self.sessions else None
+        if _live is not None and await self._cron_batch_kind_defers(
+            job, step.session_key, _live, reprojected=False
+        ):
+            return None
 
     result_text = "_No response._"
-    # Each step's missing-server note, kept apart from result_text because the
-    # next step's reply replaces it; the stored result carries all of them.
+    # Each step's spec notices, kept apart from result_text because the next
+    # step's reply replaces it; the stored result carries all of them.
     _seq_mcp_notes: list[str] = []
+    # Each step's (agent, missing-server note): the run keeps one combined
+    # note under the job's key, recorded only once the result is stored, so
+    # a step that raises or a superseded run delivers none.
+    _seq_step_notes: list[tuple[str, str]] = []
+    # Run-scoped for the same reason: a refused person-only directive.
+    _seq_directive_refusals: list[str] = []
     _seq_downgraded = False
     # Run-scoped: a sequence where one agent got a tool through has
     # done work, even if a later agent was blocked outright.
     _gate = _GateTally()
+    # Imported here: this module's functions run on the gateway's globals.
+    from kiro_crew.apps.own_agent_tools import app_run_of
+    from kiro_crew.tracing import turns as trace_turns
+
     for step in steps:
+        # Each agent is its own turn of the run's trace, not an attempt of the
+        # previous one; outside the re-load loop, so a re-run stays an attempt.
+        trace_turns.next_turn()
         # One re-load per step when a live backend lost this step's
         # session: the step is re-run on a fresh runtime that
         # session/loads the same id. A second loss ends the fire.
@@ -185,6 +216,8 @@ async def _cron_run_sequence(
             if self.cron_svc is not None:
                 self.cron_svc.register_active_session_key(job.id, agent_session_key)
             _acq = False
+            # Whether a re-projection left this step holding the replay gap.
+            _seq_reprojected = False
             # Post-compaction re-injection bookkeeping for the finally:
             # consumed the one-shot flag / turn landed. The stream
             # returns text only, so the completion's stop reason is
@@ -210,7 +243,13 @@ async def _cron_run_sequence(
                 _seq_execution = cron_execution.with_template(
                     step.dispatch_agent, step.crew or step.alias
                 )
-                client, is_new, _resumed, _downgraded = await self._acquire_with_model_fallback(
+                (
+                    client,
+                    is_new,
+                    _resumed,
+                    _downgraded,
+                    _seq_token,
+                ) = await self._acquire_with_model_fallback(
                     job,
                     cron_execution,
                     step.session_key,
@@ -222,6 +261,74 @@ async def _cron_run_sequence(
                 )
                 _seq_downgraded = _seq_downgraded or _downgraded
                 _acq = True
+                # As on the single-agent site: a stale KAS batch is reset and
+                # claimed again under the replay gap, closed after the release. The
+                # fence reads the token the acquire minted the instant its claim
+                # returned (before the rebind await), never the live session.
+                from kiro_crew.agent_sdk.spec_hooks import (
+                    reproject_unattended_claim,
+                    running_agent,
+                )
+
+                async def _seq_reclaim(
+                    _step: Any = step, _execution: Any = _seq_execution
+                ) -> tuple[tuple[Any, bool, bool], Any]:
+                    nonlocal _seq_downgraded
+                    got, fresh, resumed, downgraded, tok = await self._acquire_with_model_fallback(
+                        job,
+                        cron_execution,
+                        _step.session_key,
+                        _step.dispatch_agent,
+                        _step.cwd,
+                        _step.crew,
+                        execution=_execution,
+                        replace_execution=True,
+                    )
+                    _seq_downgraded = _seq_downgraded or downgraded
+                    return (got, fresh, resumed), tok.entry
+
+                # Past the sweep a step never defers, or the steps before it would
+                # replay: on a person's batch with sub-agent work on its key, it runs
+                # as projected.
+                from kiro_crew.agent_sdk.kas_project_hooks import scheduled_turn_reprojects
+
+                _seq_kind = scheduled_turn_reprojects(
+                    client
+                ) and not await self._cron_key_work_pending(agent_session_key)
+                _seq_reprojection = await reproject_unattended_claim(
+                    self.sessions,
+                    agent_session_key,
+                    running_agent(client, step.dispatch_agent or ""),
+                    (client, is_new, _resumed),
+                    _seq_reclaim,
+                    _seq_token,
+                    scheduled=_seq_kind,
+                )
+                client, is_new, _resumed = _seq_reprojection.claimed
+                _seq_reprojected = _seq_reprojection.reprojected
+                if _seq_reprojection.superseded:
+                    # A hard Stop replaced this step's session with a successor
+                    # another turn owns during the staleness probe: abandon the
+                    # fire. The finally releases and closes the gap.
+                    logger.info(
+                        "Cron '%s': step session replaced during re-projection; abandoning",
+                        job.name,
+                    )
+                    if step is steps[0]:
+                        # Nothing was sent on this fire, so it is retained like
+                        # every other undispatched exit, not recorded as a success.
+                        _defer_cron_before_dispatch(
+                            job, "the session was replaced by a Stop before this run started"
+                        )
+                    else:
+                        # Earlier steps already ran: a retry would replay them, so
+                        # the fire is not kept as never started, nor a success.
+                        job.last_status = "error"
+                        job.last_error = (
+                            f"the session of sequence step {step.alias!r} was replaced "
+                            "by a Stop; the steps before it ran, the rest did not"
+                        )
+                    return None
                 # Publish this turn's session identity so managed MCP
                 # tools resolve their parent session. The cron path was
                 # the ONE turn-running surface that skipped this (every
@@ -261,6 +368,22 @@ async def _cron_run_sequence(
                     minimal_context=job.minimal_context,
                     request_prefix_context=cap.prior_result or None,
                 )
+                # The step agent's own spec hooks on a backend that never runs
+                # them (KAS): AgentSpawn and UserPromptSubmit before the prompt,
+                # PreToolUse on each permission request, Stop once it lands.
+                from kiro_crew.cron_service.turn_hooks import CronTurnHooks
+                from kiro_crew.messaging.script_hooks import with_hook_context
+
+                _seq_hooks = await CronTurnHooks.prepare(
+                    client,
+                    step.dispatch_agent,
+                    agent_session_key,
+                    msg,
+                    fresh_session=is_new and not _resumed,
+                )
+                full_message = await with_hook_context(
+                    full_message, await _seq_hooks.prompt_context()
+                )
                 # Wall clock for the cron agent turn: acp never assigns
                 # TurnUsage.duration_ms, so the row falls back to this.
                 # Brackets only the model turn — session acquisition and
@@ -270,6 +393,7 @@ async def _cron_run_sequence(
                     client,
                     full_message,
                     job_name=job.name,
+                    directive_refusals=_seq_directive_refusals,
                     on_resume=lambda: settle_turn(self.sessions, agent_session_key),
                     # The gate resolves this session's governance profile, as it
                     # does for a chat turn, and refuses when it cannot evaluate.
@@ -278,18 +402,25 @@ async def _cron_run_sequence(
                     # name applies here; the template is for dispatch only.
                     session_key=agent_session_key,
                     agent=step.alias,
+                    app_run=app_run_of(job, client),
                     unattended=True,
                     approval_policy=(
                         ToolApprovalPolicy.AUTO_APPROVE
-                        if job.approval_mode == "auto"
+                        if effective_job_approval_mode(job.approval_mode) == "auto"
                         else ToolApprovalPolicy.HOOK_BASED
                     ),
                     hooks=self.ctx_builder.hooks,
                     # The card's requester line ends with the user-authored job
                     # name, so it cannot forge the id or agent before it.
                     on_tool_approval=(
-                        None
-                        if job.approval_mode == "auto"
+                        # ``auto`` is re-checked per request: a mid-turn deny asks instead.
+                        auto_job_approver(
+                            self._interactive_approval(
+                                "cron",
+                                requester=f"cron job {job.id}, agent {step.alias}: {job.name}",
+                            )
+                        )
+                        if effective_job_approval_mode(job.approval_mode) == "auto"
                         else self._interactive_approval(
                             "cron", requester=f"cron job {job.id}, agent {step.alias}: {job.name}"
                         )
@@ -298,6 +429,7 @@ async def _cron_run_sequence(
                     on_complete=_seq_note_complete,
                     on_compaction=_seq_note_compaction,
                     fallback_models=configured_fallback_chain(),
+                    spec_hooks=_seq_hooks,
                 )
                 # The prompt reached the model and the turn completed, so
                 # the finally must NOT restore the re-injection flag --
@@ -306,14 +438,20 @@ async def _cron_run_sequence(
                 if _seq_landed:
                     # This step's release confirms what it received inline.
                     note_turn_landed(self.sessions, agent_session_key)
+                    # Per-interaction telemetry, as every landed-turn engine
+                    # reports it: one event per step that landed.
+                    record_interaction_event(client, agent_session_key, "cron")
+                    await _seq_hooks.stop(result_text)
                 if not result_text:
                     result_text = _gate.empty_reply_placeholder()
                 result_text = _annotate_model_fallback(
                     result_text, client, stop_reason=_seq_stop["reason"]
                 )
-                _seq_missing = declared_mcp_not_ready_note(client)
-                if _seq_missing:
-                    _seq_mcp_notes.append(f"⚠ {agent}: {_seq_missing}.")
+                _seq_step_notes.append((agent, declared_mcp_not_ready_note(client)))
+                # The spec notices for this step's session, once per agent.
+                _seq_notices = _seq_hooks.notices()
+                if _seq_notices and _seq_notices not in _seq_mcp_notes:
+                    _seq_mcp_notes.append(_seq_notices)
                 logger.info("Cron '%s': agent '%s' completed", job.name, agent)
 
                 # ── Per-turn usage row: background spend. ──
@@ -398,6 +536,11 @@ async def _cron_run_sequence(
                     if callable(_finish_key):
                         _finish_key(job.id, agent_session_key)
                     self.sessions.release(agent_session_key)
+                    if _seq_reprojected:
+                        # After the release, as on the single-agent site.
+                        from kiro_crew.agent_sdk.spec_hooks import close_reprojection_gap
+
+                        close_reprojection_gap(self.sessions, agent_session_key)
                     # Mirror the single-agent finally below: defer the
                     # reset when this agent's sub-agents are still
                     # running, QUEUED behind the concurrency/stagger
@@ -485,12 +628,19 @@ async def _cron_run_sequence(
                     agent,
                 )
                 raise AcpError(f"{SESSION_NOT_FOUND_GIVE_UP_TEXT} {_seq_snf_err}")
+    _seq_note = "\n".join(f"Warning: {agent}: {note}." for agent, note in _seq_step_notes if note)
+    _seq_missing = declared_mcp_note_change(f"cron:{job.id}", _seq_note, record=False)
+    if _seq_missing:
+        _seq_mcp_notes.insert(0, _seq_missing)
     if _seq_mcp_notes:
         result_text = "\n".join(_seq_mcp_notes) + "\n\n" + result_text
+    if _seq_directive_refusals:
+        result_text = "\n\n".join([*_seq_directive_refusals, result_text])
     if _seq_downgraded:
         result_text = _annotate_model_downgrade(job, result_text)
     result_text = _annotate_partial_block(result_text, _gate)
     job.set_run_result(result_text)
+    declared_mcp_note_change(f"cron:{job.id}", _seq_note)
     # This path owns the same verdict as the single-agent one, so a
     # multi-agent job's failure counter moves in both directions —
     # which is what keeps auto-pause both reachable and clearable.
@@ -523,8 +673,27 @@ async def _cron_run_single(
     # Tell the reaper which key to target if this run hangs.
     if self.cron_svc is not None:
         self.cron_svc.register_active_session_key(job.id, session_key)
+    # A stateless job's per-run transcript is tagged for the residue prune here,
+    # once the fire passed its gate and admission and the key is active, so a
+    # refused fire leaves no file and the prune cannot remove this one mid-run.
+    # Only an agent run writes a transcript under this key; tagging a script or
+    # command job would create an empty transcript on every fire.
+    if (
+        not job.persistent_session
+        and not (job.script or job.command)
+        and not agent_sequence_dispatches(cap.cron_agents)
+    ):
+
+        def tag_run_transcript() -> None:
+            from kiro_crew.history import ConversationLog
+
+            ConversationLog().update_metadata(session_key, {"cron_run": "ephemeral"})
+
+        await asyncio.to_thread(tag_run_transcript)
 
     _acquired = False
+    # Whether a re-projection left this run holding the replay gap.
+    _reprojected = False
     _model_downgraded = False
     # Set when the gate verdict below already counted this run, so the
     # exception handler does not count it a second time.
@@ -561,7 +730,10 @@ async def _cron_run_single(
         # + workspace before dispatch; falls back to the raw value when
         # it is already a real mode or unset.
         _single_kagent, _single_cwd, _single_crew = self._resolve_cron_agent(
-            cron_execution, cron_agent or None, template_namespace=_default_substituted
+            cron_execution,
+            cron_agent or None,
+            template_namespace=_default_substituted
+            or _app_job_names_bot(job, cron_agent, live.snapshot() or getattr(self, "_cfg", None)),
         )
         # A job's own project directory outranks the agent's workspace;
         # a job without one keeps the cwd resolved above.
@@ -647,23 +819,97 @@ async def _cron_run_single(
         # After an agent change the session record a previous run left
         # under the stable key still names the template captured before,
         # and the plain bind in `_acquire_with_model_fallback` refuses
-        # it. Bring the job's own record to the current capture first,
+        # it. Bring the job's own record to the execution this fire binds,
         # template only; any other difference is left for that bind to
         # refuse. Done here, at the fire, so a record published late (a
         # run still in flight during the update) or one written while the
         # job was stateless is caught on the next fire, and a failed
         # write is retried by it.
-        if job.execution_context is not None:
-            from kiro_crew.cron_service.identity import rebind_cron_session_template
+        # A member's turn dispatches the agent its binding names, which a 1.0
+        # capture or a job-level agent can spell differently. The record under
+        # the key is what the spawn gate reads as this session's template, so
+        # it names the agent this fire runs; member, store and mode stay.
+        if (
+            cron_execution.selection_kind == "member"
+            and cron_execution.member_id
+            and _single_kagent
+            and _single_kagent != cron_execution.template_id
+        ):
+            from dataclasses import replace as _with_dispatched
 
-            await asyncio.to_thread(
-                rebind_cron_session_template, session_key, cron_execution, job.name
-            )
-        client, is_new, _resumed, _model_downgraded = await self._acquire_with_model_fallback(
+            cron_execution = _with_dispatched(cron_execution, template_id=_single_kagent)
+        from kiro_crew.cron_service.identity import rebind_cron_session_template
+
+        await asyncio.to_thread(rebind_cron_session_template, session_key, cron_execution, job.name)
+        (
+            client,
+            is_new,
+            _resumed,
+            _model_downgraded,
+            _single_token,
+        ) = await self._acquire_with_model_fallback(
             job, cron_execution, session_key, _dispatch_agent, _single_cwd, _single_crew
         )
         _acquired = True
         _run_provider = client
+        # A KAS batch that auto-approves what a PreToolUse hook now covers is reset
+        # and claimed again under the replay gap, which the ``finally`` closes after
+        # the release. The fence reads the token the acquire minted the instant its
+        # claim returned (before the rebind await), never the live session. A cron
+        # turn reads no Stop count before its prompt, so a Stop before its stream is
+        # not honoured, with or without this reset.
+        from kiro_crew.agent_sdk.spec_hooks import (
+            reproject_unattended_claim,
+            running_agent,
+        )
+
+        async def _reclaim() -> tuple[tuple[Any, bool, bool], Any]:
+            nonlocal _model_downgraded, _run_provider
+            got, fresh, resumed, downgraded, tok = await self._acquire_with_model_fallback(
+                job, cron_execution, session_key, _dispatch_agent, _single_cwd, _single_crew
+            )
+            _model_downgraded = _model_downgraded or downgraded
+            _run_provider = got
+            return (got, fresh, resumed), tok.entry
+
+        # A batch a person's turn projected with folder hooks is re-projected for
+        # this turn, never while work is pending on its key: a scheduled fire
+        # defers then, and a manual Run (never deferred) runs as projected, with
+        # no kind reset; ordinary hook staleness still re-projects either.
+        from kiro_crew.agent_sdk.kas_project_hooks import scheduled_turn_reprojects
+
+        _single_agent = running_agent(client, _dispatch_agent or "")
+        if await self._cron_batch_kind_defers(job, session_key, client, reprojected=False):
+            return None
+        _kind_reset = not (
+            scheduled_turn_reprojects(client) and await self._cron_key_work_pending(session_key)
+        )
+        _reprojection = await reproject_unattended_claim(
+            self.sessions,
+            session_key,
+            _single_agent,
+            (client, is_new, _resumed),
+            _reclaim,
+            _single_token,
+            scheduled=_kind_reset,
+        )
+        client, is_new, _resumed = _reprojection.claimed
+        _reprojected = _reprojection.reprojected
+        if _reprojection.superseded:
+            # A hard Stop replaced the session with a successor another turn
+            # owns during the staleness probe: abandon this run, do not stream
+            # on the popped session. The finally releases and closes the gap.
+            logger.info("Cron '%s': session replaced during re-projection; abandoning", job.name)
+            _defer_cron_before_dispatch(
+                job, "the session was replaced by a Stop before this run started"
+            )
+            return None
+        if await self._cron_batch_kind_defers(job, session_key, client, reprojected=True):
+            return None
+        # The job's tab reads this lease as running, and with surface_channel_sessions
+        # off no reconcile pass pushes the start.
+        if self.dashboard_state is not None:
+            self.dashboard_state.push_slots_update()
         # Same identity publish as the sequential site above — the
         # single-agent cron turn must publish its pidfile mapping or
         # spawn_run's parent resolution has no source to walk to.
@@ -705,16 +951,33 @@ async def _cron_run_single(
             request_prefix_context=cap.prior_result or None,
             skill_trigger_text=trigger_text,
         )
+        # The agent spec's own hooks on a backend that never runs them (KAS), as
+        # on the sequence site: AgentSpawn and UserPromptSubmit on the job's own
+        # prompt, PreToolUse on each permission request, Stop once the turn lands.
+        from kiro_crew.apps.own_agent_tools import app_run_of
+        from kiro_crew.cron_service.turn_hooks import CronTurnHooks
+        from kiro_crew.messaging.script_hooks import with_hook_context
+
+        _hook_turn = await CronTurnHooks.prepare(
+            client,
+            _dispatch_agent or "",
+            session_key,
+            trigger_text,
+            fresh_session=is_new and not _resumed,
+        )
+        full_message = await with_hook_context(full_message, await _hook_turn.prompt_context())
 
         # Wall clock for the cron agent turn — see the sequential site
         # above. acp reports no duration, so this is the row's fallback.
         _turn_t0 = time.monotonic()
         _gate = _GateTally()
+        _directive_refusals: list[str] = []
         _prompt_dispatched = True
         result_text, _carried_credits = await _cron_stream_with_posttoken_resume(
             client,
             full_message,
             job_name=job.name,
+            directive_refusals=_directive_refusals,
             on_resume=lambda: settle_turn(self.sessions, session_key),
             # The gate resolves this session's governance profile, as it does
             # for a chat turn, and refuses when it cannot evaluate. The agent is
@@ -723,17 +986,26 @@ async def _cron_run_single(
             # the template it dispatches.
             session_key=session_key,
             agent=cap.gate_agent or "",
+            app_run=app_run_of(job, client),
             unattended=True,
             approval_policy=(
                 ToolApprovalPolicy.AUTO_APPROVE
-                if job.approval_mode == "auto"
+                if effective_job_approval_mode(job.approval_mode) == "auto"
                 else ToolApprovalPolicy.HOOK_BASED
             ),
             hooks=self.ctx_builder.hooks,
             # The job name ends the requester line, as on the sequence site.
             on_tool_approval=(
-                None
-                if job.approval_mode == "auto"
+                # ``auto`` is re-checked per request: a mid-turn deny asks instead.
+                auto_job_approver(
+                    self._interactive_approval(
+                        "cron",
+                        requester=f"cron job {job.id}"
+                        + (f", agent {cap.gate_agent}" if cap.gate_agent else "")
+                        + f": {job.name}",
+                    )
+                )
+                if effective_job_approval_mode(job.approval_mode) == "auto"
                 else self._interactive_approval(
                     "cron",
                     requester=f"cron job {job.id}"
@@ -745,6 +1017,7 @@ async def _cron_run_single(
             on_complete=_note_complete,
             on_compaction=_note_compaction,
             fallback_models=configured_fallback_chain(),
+            spec_hooks=_hook_turn,
         )
 
         # The prompt reached the model and the turn completed, so the
@@ -755,6 +1028,9 @@ async def _cron_run_single(
             # This turn's release confirms what it received inline; a turn the
             # deadline, a stop or a reap ends first never gets here.
             note_turn_landed(self.sessions, session_key)
+            # Per-interaction telemetry, as every landed-turn engine reports it.
+            record_interaction_event(client, session_key, "cron")
+            await _hook_turn.stop(result_text)
 
         # Recorded, not inferred from the text: the dedup hash below
         # swaps the placeholder for its count-free twin only when the
@@ -768,14 +1044,27 @@ async def _cron_run_single(
         result_text = _annotate_model_fallback(
             result_text, client, stop_reason=_turn_stop["reason"]
         )
-        _missing = declared_mcp_not_ready_note(client)
-        if _missing:
-            result_text = f"⚠ {_missing}.\n\n{result_text}"
+        if _directive_refusals:
+            result_text = "\n\n".join([*_directive_refusals, result_text])
         # Before set_run_result and the dedup hash below, so the stored
         # result, the slot, the bell and every transport carry the
         # refusal, and a run that lost a call never hashes equal to
         # one that did not.
         result_text = _annotate_partial_block(result_text, _gate)
+        # The spec notices for this run's session, as a dashboard chat says them.
+        # The same notices lead every run, so the dedup key is taken without them.
+        # The MCP warning prints only when its set changes, so the key carries
+        # the run's full missing-server note instead: the same answer with the
+        # same missing set is still a duplicate, and a changed set is posted.
+        _mcp_note = declared_mcp_not_ready_note(client)
+        _dedup_source = f"{_mcp_note}\n\n{result_text}" if _mcp_note else result_text
+        # Keyed on the job, not the session: a stateless job's key changes every fire.
+        _missing = declared_mcp_note_change(f"cron:{job.id}", _mcp_note)
+        if _missing:
+            result_text = f"Warning: {_missing}.\n\n{result_text}"
+        _notices = _hook_turn.notices()
+        if _notices:
+            result_text = f"{_notices}\n\n{result_text}"
 
         job.set_run_result(result_text)
 
@@ -843,7 +1132,7 @@ async def _cron_run_single(
         # unnoticed. An empty reply is hashed over its count-free
         # placeholder: the approved-call count the user sees is per-run,
         # and a key that moves with it never suppresses.
-        rh = _result_hash(_dedup_text(result_text, _gate, empty_reply=_empty_reply))
+        rh = _result_hash(_dedup_text(_dedup_source, _gate, empty_reply=_empty_reply))
 
         _gate_counted = _apply_gate_verdict(job, _gate)
 
@@ -865,6 +1154,7 @@ async def _cron_run_single(
         # attempt fails it may have dispatched, so the transient ladder
         # must not run again. A failed reset leaves it unset.
         _acp_retry_attempted = False
+        _retry_exc_for_auth: Exception | None = None  # set when the retry ran and failed
         if (
             # Match the death by type: the pipe-broken raise sites in
             # acp/client.py word it "pipe broken", which no substring
@@ -916,8 +1206,13 @@ async def _cron_run_single(
                 _turn_compaction["completed"] = False
                 _acp_retry_attempted = True
                 return await retry(job)
-            except Exception:
-                pass  # retry failed — fall through to dedup + alert
+            except Exception as _retry_exc:
+                # Keep the retry's exception for the auth-expiry decision only
+                # (``_cron_auth_expiry`` below). The outer raise stays bare so the
+                # original process-death exception is reported and stored, and
+                # the transient-retry ladder can still read it.
+                if _acp_retry_attempted:
+                    _retry_exc_for_auth = _retry_exc
             finally:
                 job._acp_retried = False  # type: ignore[attr-defined]
         # ── Transient backend errors: retry the whole callback with ──
@@ -1003,9 +1298,20 @@ async def _cron_run_single(
         # and advances dedup state, duplicating the outer handler.
         if getattr(job, "_acp_retried", False):
             raise
+        # Classify from the retry's exception when the ACP retry ran and failed,
+        # since that is what ended the turn; else from the original one.
+        _exc_for_auth = _retry_exc_for_auth if _retry_exc_for_auth is not None else exc
+        # From typed data only (``acp_error_needs_sign_in``), never the error's text.
+        _auth_expiry = _cron_auth_expiry(job, _exc_for_auth)
         _job_owns_failure, _hand_over_streak = _cron_failure_attribution(job, _run_provider)
         await self._cron_single_failure(
-            job, exc, session_key, _gate_counted, _job_owns_failure, _hand_over_streak
+            job,
+            exc,
+            session_key,
+            _gate_counted,
+            _job_owns_failure,
+            _hand_over_streak,
+            _auth_expiry=_auth_expiry,
         )
         raise
     finally:
@@ -1029,6 +1335,11 @@ async def _cron_run_single(
             if callable(_finish_key):
                 _finish_key(job.id, session_key)
             self.sessions.release(session_key)
+            if _reprojected:
+                # After the release, as the shared channel pipeline closes its own.
+                from kiro_crew.agent_sdk.spec_hooks import close_reprojection_gap
+
+                close_reprojection_gap(self.sessions, session_key)
             # Defer session reset if subagents are still running,
             # queued behind the concurrency/stagger gate, or
             # mid-injection — _subagent_done will reset after the last one.
@@ -1065,3 +1376,12 @@ async def _cron_run_single(
                     # run's → the reaper does not need this key.
                     if self.cron_svc is not None:
                         self.cron_svc.clear_active_session_key(job.id, session_key)
+        elif _reprojected:
+            # A retry arm released early; the gap ends with this run too.
+            from kiro_crew.agent_sdk.spec_hooks import close_reprojection_gap
+
+            close_reprojection_gap(self.sessions, session_key)
+        # A reset that took the lease away (a cancel, a reap) absorbs the release
+        # above, and the release observer never sees an absorbed one.
+        if self.dashboard_state is not None:
+            self.dashboard_state.push_slots_update()

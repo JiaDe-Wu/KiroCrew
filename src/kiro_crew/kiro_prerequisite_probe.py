@@ -15,7 +15,8 @@ import asyncio
 import logging
 import os
 import shutil
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.config.loader import CRED_KIRO_API_KEY, read_env_file_credential
@@ -105,6 +106,12 @@ _TURN_AUTH_MAX_AGE_SECS = 30.0
 # What ``kiro-cli whoami`` prints when there is no sign-in (measured on kiro-cli
 # 2.31.0: "Not logged in", exit 1). The launcher's refusal says the same words.
 _WHOAMI_SIGNED_OUT_MARKER = "not logged in"
+# How often, at most, a set too-old latch asks which route KAS resolves to
+# (``_drop_too_old_off_relay``). The answer can read kiro-cli's SEL-audited
+# sign-in store, and the blocking gate polls every few seconds, so asking per
+# poll would write an audit event per poll. A minute is how long the card can
+# outlive a kiro-cli that was removed or signed out.
+_RESOLVED_ROUTE_RECHECK_SECS = 60.0
 
 
 _KIRO_AUTH_SANDBOX_MODE = "standard"
@@ -268,7 +275,7 @@ def _stamp_probe(self: KiroPrerequisiteService, identity: str) -> None:
 def _latch_login_only(
     self: KiroPrerequisiteService, whoami: ProcessResult, probe_identity: str
 ) -> PrerequisiteStatus:
-    """Latch the sign-in verdict alone, for the enterprise boot check.
+    """Latch the sign-in verdict alone, for the LTS boot check.
 
     Readiness stays False and the probe is NOT marked done, so the next read
     (the post-bind warm-up, the login watch) runs the full probe with the spec
@@ -297,6 +304,80 @@ def _latch_login_only(
     )
     self._probe_identity = probe_identity
     return self._status
+
+
+def _binary_stamp(binary: str | None) -> tuple[object, ...]:
+    """Which file *binary* is: its resolved path, inode, size and mtime.
+
+    Compared across probes to notice a kiro-cli replaced in place. An unreadable
+    binary stamps as its path alone.
+    """
+    if not binary:
+        return ()
+    path = os.path.realpath(binary)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return (path,)
+    return (path, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _relay_route_configured() -> bool:
+    """Whether config still sends KAS sessions through the kiro-cli relay.
+
+    True while ``agent.acp_backend`` is KAS and ``agent.kas_bundle`` is off: the
+    only route that passes ``--auth-method``. Blocking (reads config); an
+    unreadable config reads as the relay, the default.
+    """
+    from kiro_crew.agent_sdk.backends import ACP_BACKEND_KAS
+    from kiro_crew.config import KiroCrewConfig
+
+    try:
+        agent = KiroCrewConfig.load().agent
+    except Exception:  # noqa: BLE001 - the default route is the relay
+        return True
+    return agent.acp_backend == ACP_BACKEND_KAS and not agent.kas_bundle
+
+
+def _relay_route_resolved(environ: Mapping[str, str], home: Path) -> bool:
+    """Whether the next KAS spawn still takes the relay, config unchanged.
+
+    False once KAS moves to the bundled engine on its own (no kiro-cli, or
+    kiro-cli signed out). Blocking; the signed-out read is SEL-audited, which is
+    why callers bound how often they ask.
+    """
+    from kiro_crew.agent_sdk import kas_bundle
+
+    return not kas_bundle.kas_route(environ=environ, home=home).bundle
+
+
+async def _drop_too_old_off_relay(self: KiroPrerequisiteService) -> bool:
+    """Clear the too-old latch when KAS does not take the relay; True when cleared.
+
+    The latch records that the relay's ``--auth-method`` was rejected. After a
+    switch to the Kiro CLI harness or the bundled engine, with no restart, the
+    card it raises would hide a harness that runs; the next session on the relay
+    latches it again if the CLI is still too old. Config is read on every call;
+    the resolved route, which KAS changes on its own, at most once per
+    :data:`_RESOLVED_ROUTE_RECHECK_SECS`, because every status poll lands here.
+    """
+    if not self._cli_too_old:
+        return False
+    why = "the configured route does not use the relay"
+    if await asyncio.to_thread(_relay_route_configured):
+        now = self._clock()
+        checked = self._cli_too_old_route_checked_at
+        if checked is not None and now - checked < _RESOLVED_ROUTE_RECHECK_SECS:
+            return False
+        self._cli_too_old_route_checked_at = now
+        if await asyncio.to_thread(_relay_route_resolved, self._environ, self._home):
+            return False
+        why = "KAS moved to the bundled engine on its own"
+    self._cli_too_old = False
+    self._cli_too_old_stamp = None
+    self._last_probe_at = 0.0
+    logger.info("Kiro CLI-too-old latch cleared: %s", why)
+    return True
 
 
 async def _probe(
@@ -391,8 +472,8 @@ async def _probe(
             if sandbox_failure is not None and candidate_runnable:
                 from kiro_crew import edition
 
-                if edition.is_enterprise():
-                    # The enterprise sign-in check re-runs its two fixed probes
+                if edition.is_lts():
+                    # The LTS sign-in check re-runs its two fixed probes
                     # through ``wrap_argv``'s first-party carve-out, which lets
                     # them run unconfined ONLY on a ``no_backend`` host with no
                     # governance floor; a ``transient`` or ``foreign_sandbox``
@@ -422,7 +503,7 @@ async def _probe(
                 if carve_out_whoami is not None and carve_out_whoami.ok:
                     # Still a WARNING: agent sessions cannot start on this host.
                     logger.warning(
-                        "Kiro CLI at %s is signed in (confirmed by the enterprise sign-in "
+                        "Kiro CLI at %s is signed in (confirmed by the LTS sign-in "
                         "check); agent sessions still need a sandbox, which this host "
                         "cannot build (%s: %s)",
                         first_candidate,
@@ -445,7 +526,7 @@ async def _probe(
                     installed=True,
                     # Unknown, not false: whoami also runs through the probe
                     # path, so we cannot claim either way -- unless the
-                    # enterprise sign-in check above answered signed in.
+                    # LTS sign-in check above answered signed in.
                     authenticated=bool(carve_out_whoami and carve_out_whoami.ok),
                     ready=False,
                     repair_required=False,
@@ -519,8 +600,7 @@ async def _probe(
                     bundled_cli=bundled,
                     probe_timed_out=True,
                 )
-                self._last_probe_at = self._clock()
-                self._has_probed = True
+                self._stamp_probe(probe_identity)
                 return self._status
             # Neither typed condition explains the failure, so carry the
             # probe's own account of it: without this the bare default below
@@ -570,7 +650,20 @@ async def _probe(
             rejected, rejection_detail = await self._probe_kas_spec_loading()
         # KAS needs ACP support but not a kiro-cli login, so the probe must
         # check for a too-old relay binary even when signed out.
-        acp_supported = await self._probe_acp_support(self._viable_binary)
+        # A spawn-proven too-old verdict (``mark_cli_too_old``) stays until an
+        # update, a human Check again, or a different binary clears it:
+        # ``acp --help`` cannot see it.
+        await _drop_too_old_off_relay(self)
+        if self._cli_too_old:
+            stamp = await asyncio.to_thread(_binary_stamp, self._viable_binary)
+            if self._cli_too_old_stamp is None:
+                self._cli_too_old_stamp = stamp
+            elif stamp != self._cli_too_old_stamp:
+                # Replaced since the latch (``kiro-cli update`` in a terminal):
+                # the next session spawn re-latches it if it is still too old.
+                self._cli_too_old = False
+                self._cli_too_old_stamp = None
+        acp_supported = await self._probe_acp_support(self._viable_binary) and not self._cli_too_old
         login_cmd, sso_cmd, bundled = login_commands_for(self._viable_binary, self._environ)
         self._status = PrerequisiteStatus(
             platform=_platform_label(self._platform),
@@ -746,6 +839,8 @@ async def update_cli(self: KiroPrerequisiteService, caller: str = "") -> dict[st
     if not error:
         # Re-probe so a successful update flips ``acp_supported`` / ``ready``
         # and the card clears. Explicit-action half of the probe budget.
+        self._cli_too_old = False
+        self._cli_too_old_stamp = None
         try:
             await self._probe(force=True)
         except Exception:  # noqa: BLE001 — stale state beats a 500
@@ -768,14 +863,26 @@ async def _audited_probe(
     args: list[str],
     *,
     first_party_fixed_argv: bool = False,
+    signed_in: bool = False,
 ) -> ProcessResult:
-    """Run one credential-free status probe with paired SEL lifecycle events.
+    """Run one status probe with paired SEL lifecycle events.
 
-    *first_party_fixed_argv* is for the enterprise sign-in check's fixed
+    By default the probe is credential-free: the strict sandbox hides Kiro CLI's
+    own identity stores and the environment carries no credential.
+
+    *signed_in* is for a subcommand that needs the sign-in ``whoami`` already
+    confirmed, so it runs the way ``whoami`` does (:func:`_run_auth_command`
+    against the real home). ``agent validate`` answers "You are not logged in"
+    without reading the file when its identity store is hidden.
+
+    *first_party_fixed_argv* is for the LTS sign-in check's fixed
     ``--version`` only (``_probe``): it claims ``wrap_argv``'s first-party
-    carve-out and opts into reaping survivors.
+    carve-out and opts into reaping survivors. It never combines with
+    *signed_in*, which would drop the carve-out silently, so that pair raises.
     """
 
+    if signed_in and first_party_fixed_argv:
+        raise ValueError("a signed-in probe cannot claim the first-party carve-out")
     await self._audit(
         action=action,
         outcome="invoked",
@@ -783,16 +890,25 @@ async def _audited_probe(
         critical=True,
     )
     try:
-        result = await self._run(
-            executable,
-            args,
-            env=self._probe_environment,
-            timeout_secs=_PROBE_TIMEOUT_SECS,
-            sandbox_mode=_UNVERIFIED_SANDBOX_MODE,
-            extra_hidden_dirs=self._hidden_probe_dirs,
-            first_party_fixed_argv=first_party_fixed_argv,
-            reap_survivors=first_party_fixed_argv,
-        )
+        if signed_in:
+            result = await self._run_auth_command(
+                executable,
+                args,
+                base_env=await _identity_environment(self),
+                timeout_secs=_PROBE_TIMEOUT_SECS,
+                isolate_home=False,
+            )
+        else:
+            result = await self._run(
+                executable,
+                args,
+                env=self._probe_environment,
+                timeout_secs=_PROBE_TIMEOUT_SECS,
+                sandbox_mode=_UNVERIFIED_SANDBOX_MODE,
+                extra_hidden_dirs=self._hidden_probe_dirs,
+                first_party_fixed_argv=first_party_fixed_argv,
+                reap_survivors=first_party_fixed_argv,
+            )
     except asyncio.CancelledError:
         await self._set_terminal_audit(action, "failed", "gateway-status", "cancelled")
         raise
@@ -829,7 +945,7 @@ async def _run_auth_command(
 ) -> ProcessResult:
     """Run one Kiro auth command against a sandboxed, trusted executable.
 
-    *first_party_fixed_argv* is for the enterprise sign-in check's fixed
+    *first_party_fixed_argv* is for the LTS sign-in check's fixed
     ``whoami`` only (``_probe``), against the real home: it claims
     ``wrap_argv``'s first-party carve-out and opts into reaping survivors.
 
@@ -905,6 +1021,28 @@ async def _run_auth_command(
         await asyncio.to_thread(shutil.rmtree, str(workspace.root), ignore_errors=True)
 
 
+async def _identity_environment(self: KiroPrerequisiteService) -> dict[str, str]:
+    """The probe environment plus Kiro CLI's own credential and proxy keys.
+
+    For subcommands that need the sign-in: ``whoami`` and the per-spec
+    ``agent validate``. See :data:`_IDENTITY_PROBE_ENV_KEYS`.
+    """
+    base_env = _identity_probe_env(self._environ, self._probe_environment)
+    if not base_env.get(CRED_KIRO_API_KEY):
+        # Post-scrub Docker: the entrypoint moved the CLI's own credential
+        # from the process environ into the data home's .env (mode 600), so
+        # the environ allowlist above found nothing. Read it back from the
+        # file — otherwise an API-key container reads as "Not logged in"
+        # while ACP sessions (which get the same re-injection at spawn)
+        # authenticate fine. Off-loop: file read.
+        fallback_key = await asyncio.to_thread(
+            read_env_file_credential, CRED_KIRO_API_KEY, self._data_home / ".env"
+        )
+        if fallback_key:
+            base_env[CRED_KIRO_API_KEY] = fallback_key
+    return base_env
+
+
 async def _audited_identity_probe(
     self: KiroPrerequisiteService,
     executable: str,
@@ -931,19 +1069,7 @@ async def _audited_identity_probe(
         caller="gateway-status",
         critical=True,
     )
-    base_env = _identity_probe_env(self._environ, self._probe_environment)
-    if not base_env.get(CRED_KIRO_API_KEY):
-        # Post-scrub Docker: the entrypoint moved the CLI's own credential
-        # from the process environ into the data home's .env (mode 600), so
-        # the environ allowlist above found nothing. Read it back from the
-        # file — otherwise an API-key container reads as "Not logged in"
-        # while ACP sessions (which get the same re-injection at spawn)
-        # authenticate fine. Off-loop: file read.
-        fallback_key = await asyncio.to_thread(
-            read_env_file_credential, CRED_KIRO_API_KEY, self._data_home / ".env"
-        )
-        if fallback_key:
-            base_env[CRED_KIRO_API_KEY] = fallback_key
+    base_env = await _identity_environment(self)
     try:
         result = await self._run_auth_command(
             executable,

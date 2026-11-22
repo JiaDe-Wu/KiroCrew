@@ -8,7 +8,7 @@
  * The header shows the mate's identity; the X close button is rendered by
  * DialogContent itself.
  */
-import { Loader2, ChevronRight, Wrench, Plug, BookOpen, ScrollText, type LucideIcon } from 'lucide-react'
+import { Loader2, ChevronRight, Wrench, Plug, BookOpen, ScrollText, FileText, type LucideIcon } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -40,13 +40,30 @@ import MemoryBackupsCard from '../../pages/overview/MemoryBackupsCard'
 import MemoryRetiredCard from '../../pages/overview/MemoryRetiredCard'
 import MemoryCarveCard from '../../pages/overview/MemoryCarveCard'
 import { api } from '../../api/client'
-import { apiErrorCode } from '../../api/apiError'
+import { pathBasename } from '../../utils/pathBasename'
+import { ApiError, apiErrorCode } from '../../api/apiError'
+import { isDeadlineError } from '../../api/queryClient'
+import { parseErrorField, reportForError } from '../../utils/errorReport'
 import { type CrewEditorController } from './useCrewEditor'
 import CrewEditorNextRail from './CrewEditorNextRail'
 import { uiLocation } from '../../uiLocations/uiLocation'
 
 export type NextSection = 'general' | 'builtFrom' | 'approvals' | 'schedules' | 'webhooks' | 'memory' | 'danger'
 type MemoryTab = 'profile' | 'memories' | 'recovery'
+
+/** The sentence under the Abilities pane's load error. A read past either
+ *  deadline (the gateway's `reason: timed_out`, or the dashboard's own, the
+ *  untranslated `deadline exceeded`) names the likely causes; any other
+ *  `capabilities_unavailable` points at the gateway log. Neither shows the code. */
+function capabilitiesLoadErrorText(error: unknown): string {
+  const timedOut = isDeadlineError(error)
+    || (error instanceof ApiError && parseErrorField(error.body, 'reason') === 'timed_out')
+  if (timedOut) return i18nT('crewEditorNext.load_error_timed_out')
+  if (apiErrorCode(error) === 'capabilities_unavailable') {
+    return i18nT('crewEditorNext.load_error_details')
+  }
+  return error instanceof Error ? error.message : i18nT('crewEditorNext.load_error_details')
+}
 
 /** Split a skill id into owner/namespace + skill name, and de-slugify the name
  *  into a readable Title Case label (hyphens/underscores → spaces). An id with no
@@ -63,11 +80,18 @@ function parseSkillId(id: string): { owner: string | null; name: string; display
   return { owner, name, display: display || name }
 }
 
+/** A resource row's name: a skill URI by its skill, a `file://` one by its path. */
+function resourceLabel(id: string): string {
+  if (id.startsWith('skill://')) return skillLabel(id)
+  return id.startsWith('file://') ? id.slice('file://'.length) || id : id
+}
+
 /** The label a capability row shows in a band. */
 function bandRowLabel(row: CapabilityRow): string {
   if (row.section === 'skills') {
     return row.label || (row.id.includes('://') ? skillLabel(row.id) : parseSkillId(row.id).display)
   }
+  if (row.section === 'resources') return resourceLabel(row.id)
   if (row.section === 'tools') return row.label || toolMeta(row.id).label
   if (row.section === 'prompt') return i18nT('crewEditorNext.band_directions')
   return row.label || row.id
@@ -82,7 +106,7 @@ function bandRowSecondary(row: CapabilityRow): string {
     if (v && typeof v === 'object' && !Array.isArray(v)) {
       const t = v as Record<string, unknown>
       if (typeof t.url === 'string') { try { return new URL(t.url).host } catch { return t.url } }
-      if (typeof t.command === 'string') return t.command.split('/').pop() || t.command
+      if (typeof t.command === 'string') return pathBasename(t.command) || t.command
     }
   }
   return ''
@@ -91,7 +115,8 @@ function bandRowSecondary(row: CapabilityRow): string {
 /** The capability kinds a band shows, in order: heading, icon, and whether the
  *  group starts collapsed (Tools is the long one, so it does). Behaviour
  *  directions is the one prompt slot an add fills; it leads, as it shapes how
- *  the worker uses everything below it. */
+ *  the worker uses everything below it. Resources lists every other `resources`
+ *  entry the agent loads (a `file://` document or glob), so none is left off. */
 const BAND_KINDS: {
   section: CapabilityRow['section']
   heading: () => string
@@ -102,9 +127,10 @@ const BAND_KINDS: {
   { section: 'tools', heading: () => i18nT('crewEditorNext.tab_tools'), Icon: Wrench, collapsed: true },
   { section: 'mcpServers', heading: () => i18nT('crewEditorNext.stat_mcp_servers'), Icon: Plug, collapsed: false },
   { section: 'skills', heading: () => i18nT('crewEditorNext.tab_skills'), Icon: BookOpen, collapsed: false },
+  { section: 'resources', heading: () => i18nT('crewEditorNext.band_resources'), Icon: FileText, collapsed: false },
 ]
 
-/** One collapsible kind group (Tools / MCP servers / Skills) inside a band. */
+/** One collapsible kind group (Tools / MCP servers / Skills / Resources) inside a band. */
 function BandKindGroup({
   testId, section, heading, Icon, startCollapsed, items, onRemove, removeBusy,
 }: {
@@ -184,8 +210,8 @@ function BandKindGroup({
 
 /**
  * One band of the read-only capabilities view: a heading and, under it, the
- * crewmate's tools / MCP servers / skills as collapsible kind groups. Each group
- * shows a count so the whole band scans at a glance; rows are compact (name +
+ * crewmate's tools / MCP servers / skills / resources as collapsible kind groups.
+ * Each group shows a count so the whole band scans at a glance; rows are compact (name +
  * inline description). `onRemove` adds a per-row Remove control (the "Added"
  * band). Approvals and the rest are configured elsewhere.
  */
@@ -770,13 +796,28 @@ export default function CrewEditorNextDialog({
                       </div>
                     )}
                     {capsQuery.error && (
-                      // No hand-off: the editor is a modal holding the user's
-                      // unsaved edits in its other sections; the hand-off would
-                      // navigate away and discard them.
+                      // The hand-off goes through the editor's leave guard
+                      // (`leaveGate`): the modal holds the user's unsaved edits
+                      // in its other sections, and the guard asks before the
+                      // navigation to the chat would discard them.
                       <ErrorNotice
-                        message={capsQuery.error instanceof Error ? capsQuery.error.message : i18nT('crewEditorNext.load_error')}
-                        variant="inline"
-                        askAgent={false}
+                        title={i18nT('crewEditorNext.load_error')}
+                        message={capabilitiesLoadErrorText(capsQuery.error)}
+                        report={reportForError(capsQuery.error)}
+                        askAgent
+                        gate={ctl.leaveGate}
+                        actions={(
+                          // A refetch of a query with no data goes back to
+                          // pending, so the pane shows its loading line, not
+                          // this notice, until the read settles again.
+                          <button
+                            type="button"
+                            onClick={() => { void capsQuery.refetch() }}
+                            data-testid="next-builtfrom-retry"
+                          >
+                            {i18nT('crewEditorNext.load_retry')}
+                          </button>
+                        )}
                         testId="next-builtfrom-error"
                       />
                     )}
@@ -883,6 +924,7 @@ export default function CrewEditorNextDialog({
                       <CrewWakeSection
                         crew={editing}
                         memberId={memberId}
+                        memberStore={memoryStore}
                         agentTemplate={kiroAgent}
                         isDefaultCrew={isDefaultCrew}
                         hideKindBadge
@@ -905,7 +947,7 @@ export default function CrewEditorNextDialog({
                       <p className="text-[12px] text-muted">
                         {i18nT('crewEditorNext.webhooks_frame')}
                       </p>
-                      <CrewWebhookSection crew={editing} onNavigateAway={guardedNavigate} />
+                      <CrewWebhookSection crew={editingAgent} onNavigateAway={guardedNavigate} />
                     </fieldset>
                   </div>
                 </div>

@@ -94,7 +94,13 @@ _STEER_STATE_REQUEUED = "requeued"
 # (``STEER_STATE_RETRACTED``, same reason for the spelling): it never reached the
 # turn either.
 _STEER_STATE_RETRACTED = "retracted"
-_STEER_STATES_NOT_TAKEN = frozenset({_STEER_STATE_REQUEUED, _STEER_STATE_RETRACTED})
+# The ``meta.steerState`` of a requeued steer whose own turn has since written its
+# own row with the same text (``STEER_STATE_SUPERSEDED``, same reason for the
+# spelling): the text ran as that turn, not as a redirect of this one.
+_STEER_STATE_SUPERSEDED = "superseded"
+_STEER_STATES_NOT_TAKEN = frozenset(
+    {_STEER_STATE_REQUEUED, _STEER_STATE_RETRACTED, _STEER_STATE_SUPERSEDED}
+)
 
 # The ``meta.injectKind`` values of an ``inject`` row that continues the turn above
 # it rather than opening one: a recovery (a Resume press, an automatic retry) and a
@@ -130,6 +136,7 @@ def _interrupted_opener_kind(row: dict) -> str:
     return {
         "cron": "a scheduled job",
         "mcp_app": "an app message",
+        "resource": "a resource subscription wake",
         "synthesis": "a sub-agent synthesis",
     }.get(kind if isinstance(kind, str) else "", "an automated message")
 
@@ -206,9 +213,9 @@ def build_interrupted_turn_preamble(
     opened the interrupted turn, collecting the assistant text it had streamed.
     A mid-turn steer (:func:`_is_steer_row`) is walked past rather than taken as
     the opener, and is carried in the partial output, in the order it was sent,
-    under ``[Steered mid-turn]`` -- unless its ``steerState`` is ``requeued``,
-    which means the turn never took it and it runs as its own turn, or
-    ``retracted``, which means the person took it back before the turn read it.
+    under ``[Steered mid-turn]`` -- unless its ``steerState`` is ``requeued`` or
+    ``superseded``, which means the turn never took it and it runs as its own turn,
+    or ``retracted``, which means the person took it back before the turn read it.
     Returns "" when no opener is found. The caller mints the result AFTER the
     prompt's egress scrub (its markers are in ``_STRUCTURAL_MARKER_RES``); the
     payload is scrubbed here instead.
@@ -407,7 +414,10 @@ def _quota_tail(messages: list[dict], *, conv_max: int, inject_max: int) -> list
     kept: list[dict] = []
     conv = inj = 0
     for m in reversed(messages):
-        role = m["role"]
+        # `.get`, not `[...]`: the transcript is a file anyone can hand-edit, and
+        # one row with no `role` or `content` would otherwise raise out of every
+        # context build for the chat. A row with no role is not a turn either way.
+        role = m.get("role")
         if _is_steer_row(m) and m["meta"].get("steerState") == _STEER_STATE_RETRACTED:
             # Taken back before the turn read it: it was never part of the
             # conversation, and its text was cleared when it was taken back.
@@ -424,7 +434,7 @@ def _quota_tail(messages: list[dict], *, conv_max: int, inject_max: int) -> list
             conv += 1
         else:
             continue
-        kept.append({"role": role, "content": strip_image_refs(m["content"])})
+        kept.append({"role": role, "content": strip_image_refs(m.get("content", ""))})
     kept.reverse()
     return kept
 
@@ -478,6 +488,74 @@ def replay_text(
 
     lines.reverse()
     return "\n\n".join(lines)
+
+
+#: Tool results a context-cap trim's seed names, newest kept; one line each.
+TOOL_POINTER_MAX_ROWS = 100
+#: A pointer's tool label and argument summary are cut to these many chars.
+_POINTER_TOOL_CHARS = 40
+_POINTER_ARGS_CHARS = 80
+
+
+def _pointer_args(raw: object) -> str:
+    """A tool call's stored input as one short line: its command, path or query first."""
+    text = raw if isinstance(raw, str) else ""
+    try:
+        parsed = json.loads(text) if text else None
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict):
+        inner = parsed.get("arguments")
+        fields = inner if isinstance(inner, dict) else parsed
+        for name in ("command", "path", "query", "url", "pattern"):
+            value = fields.get(name)
+            if isinstance(value, str) and value:
+                text = value
+                break
+        else:
+            text = json.dumps(fields, ensure_ascii=False, sort_keys=True)
+    return " ".join(text.split()).replace("|", "/")[:_POINTER_ARGS_CHARS]
+
+
+def tool_pointer_text(rows: list[dict], session_key: str) -> str:
+    """One line per stored tool result in *rows*, newest last, or ``""``.
+
+    ``tool_call_id | tool | args | size``: the id ``get_chat_session(tool_call_id=...)``
+    reads back. A trimmed session's seed carries it, so a tool result that left the
+    model's context can still be named and fetched. Returned unredacted; the caller
+    redacts.
+    """
+    # Function scope: this owner imports no kiro_crew module at module scope.
+    from kiro_crew.tool_row_prefix import strip_tool_row_lead
+
+    # An approved call stores two rows under one id; the newest one stands for both.
+    by_id: dict[str, str] = {}
+    for row in rows:
+        meta = row.get("meta") if isinstance(row, dict) else None
+        if row.get("role") != "tool" or not isinstance(meta, dict):
+            continue
+        call_id = meta.get("tool_call_id")
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        label = strip_tool_row_lead(str(row.get("content") or "")).strip()
+        label = " ".join(label.split()).replace("|", "/")[:_POINTER_TOOL_CHARS] or "tool"
+        output = meta.get("output")
+        size = len(output) if isinstance(output, str) else 0
+        by_id.pop(call_id, None)
+        by_id[call_id] = (
+            f"{call_id} | {label} | {_pointer_args(meta.get('input'))} | {size:,} chars"
+        )
+    lines = list(by_id.values())
+    if not lines:
+        return ""
+    dropped = len(lines) - TOOL_POINTER_MAX_ROWS
+    header = (
+        f"[Tool results not in context, newest last; session_key: {session_key}. "
+        "Format: tool_call_id | tool | args | output size.]"
+    )
+    if dropped > 0:
+        header += f"\n({dropped} older results not listed.)"
+    return header + "\n" + "\n".join(lines[-TOOL_POINTER_MAX_ROWS:])
 
 
 def thread_history_text(recent: list[dict], caps: _budgets._ResolvedCaps) -> str:
@@ -553,7 +631,9 @@ def stop_event_notes(messages: list[dict]) -> str:
     return "\n".join(notes) + "\n\n"
 
 
-def cancelled_turn_preamble(recent: list[dict], *, user_cap: int, assist_cap: int) -> str:
+def cancelled_turn_preamble(
+    recent: list[dict], *, user_cap: int, assist_cap: int, newest_request: bool = False
+) -> str:
     """The ``[PREVIOUS TURN WAS CANCELLED …]`` restore for *recent* rows, or ``""``.
 
     Scans backwards for a ``stop_event`` marker, then takes the user message
@@ -561,6 +641,11 @@ def cancelled_turn_preamble(recent: list[dict], *, user_cap: int, assist_cap: in
     steers in between. A steer the person took back (``steerState: retracted``)
     keeps its row with its text cleared and is stepped past, so *recent* must
     carry each row's ``meta``.
+
+    *newest_request*: the caller persists the new message only after this runs,
+    so a request after the marker is the stopped one and the marker is an older
+    surface's Stop (a channel Stop writes none). The dashboard, whose drained
+    queue row can already sit after its own marker, leaves it off.
     """
     if not recent:
         return ""
@@ -586,6 +671,10 @@ def cancelled_turn_preamble(recent: list[dict], *, user_cap: int, assist_cap: in
                 break
         except (ValueError, TypeError):
             continue
+    if newest_request and any(
+        row.get("role") == "user" and not _is_steer_row(row) for row in recent[stop_idx + 1 :]
+    ):
+        stop_idx = -1
     # Find the most recent user message. If a stop_event was found, the user
     # message must precede it; otherwise just take the latest user entry.
     search_end = stop_idx if stop_idx >= 0 else len(recent)

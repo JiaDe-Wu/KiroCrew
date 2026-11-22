@@ -22,13 +22,11 @@ rather than only described in comments:
 """
 import asyncio
 import json
-import shutil
-import tempfile
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
@@ -882,11 +880,14 @@ class TestAutoMergeMutation(unittest.TestCase):
 
 
 class TestPrStateCacheCoherence(unittest.TestCase):
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+    @pytest.fixture(autouse=True)
+    def _tmp_root(self, tmp_path):
+        """Hand each test pytest's per-test directory as the store root.
 
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        The store ``mkdir``s its root on read, so a late reader can re-create a
+        self-removed directory after cleanup; pytest owns ``tmp_path``.
+        """
+        self.tmp = tmp_path
 
     def test_close_drops_the_row_from_the_open_list(self):
         store.write_pulls_cache(
@@ -1020,6 +1021,8 @@ class TestReviewRoutePinning(unittest.TestCase):
         """
         client = mock.Mock()
         client.get_pr_detail.return_value = {"head_sha": live_sha}
+        # A GitHub stand-in: the route asks the client which review verbs it records.
+        client.PR_REVIEW_EVENTS = ("APPROVE", "REQUEST_CHANGES", "COMMENT")
         with mock.patch.object(routes, "_connected", return_value=True), \
                 mock.patch.object(routes, "_repo_can_write", return_value=True), \
                 mock.patch.object(provider, "client_for", return_value=client):
@@ -1114,6 +1117,7 @@ class TestReviewRoutePinning(unittest.TestCase):
         lazily-computed field."""
         client = mock.Mock()
         client.get_pr_detail.return_value = {"head_sha": "abc1234"}
+        client.PR_REVIEW_EVENTS = ("APPROVE", "REQUEST_CHANGES", "COMMENT")
         with mock.patch.object(routes, "_connected", return_value=True), \
                 mock.patch.object(routes, "_repo_can_write", return_value=True), \
                 mock.patch.object(provider, "client_for", return_value=client), \

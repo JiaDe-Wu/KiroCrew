@@ -141,10 +141,9 @@ async def test_blanket_off_reports_apps_it_could_not_stop(home: Path, tmp_path: 
 def test_uninstall_reports_a_trust_grant_it_could_not_drop(home: Path, tmp_path: Path):
     # REGRESSION: uninstall drops the app's grant because a grant is keyed on NAME
     # alone — a leftover would admit a DIFFERENT app installed under that name with
-    # no consent prompt. When the drop FAILED the old code logged and returned
-    # ok=True, so the app vanished while its code-execution trust stayed on file and
-    # reusable. The uninstall still succeeds (the files are gone either way) but it
-    # must say so.
+    # no consent prompt. Logging a FAILED drop and returning ok=True would make the
+    # app vanish while its code-execution trust stays on file and reusable. The
+    # uninstall still succeeds (the files are gone either way) but it must say so.
     from kiro_crew.apps import manager as appmanager
 
     _install(tmp_path, _APP, enabled=False)
@@ -325,7 +324,7 @@ def test_uninstall_drops_the_base_grant_even_when_an_overlay_replaces_the_list(
 
 
 def test_uninstall_withdraws_a_grant_that_landed_during_the_delete(home: Path, tmp_path: Path):
-    # The cross-process race GPT named: `kirocrew app uninstall` drops the (absent)
+    # The cross-process race: `kirocrew app uninstall` drops the (absent)
     # grant, and only THEN deletes the files. In that gap the dashboard's grant
     # handler sees the app on disk, writes the grant, and its own post-write
     # existence re-check ALSO still sees the app — so every guard on both sides
@@ -1039,3 +1038,45 @@ class TestDisablingAnAppStandsItsWorkersDownInTheRequest:
 
 async def _noop(ran: list[str]) -> None:
     ran.append("revoked")
+
+
+@pytest.mark.asyncio
+async def test_a_pending_config_json_is_refused_before_any_teardown(
+    home: Path, tmp_path: Path, mock_sel, monkeypatch: pytest.MonkeyPatch
+):
+    """With config.json changed outside Kiro Crew, revoke and blanket-off refuse up front.
+
+    Their save would be refused anyway, so stopping the app first would leave it
+    switched off with its grant still standing.
+    """
+    from kiro_crew.config import loosening_provenance as lp
+    from kiro_crew.dashboard.handlers import security
+
+    monkeypatch.setattr(lp, "enforcement_active", lambda: True)
+    _install(tmp_path, _APP, enabled=True)
+    teardown = MagicMock()
+    sweep = MagicMock()
+    async with _client() as client:
+        assert (await client.post(f"/api/security/trusted-apps/{_APP}")).status == 200
+        put = await client.put("/api/security/trusted-apps/allow-all", json={"value": True})
+        assert put.status == 200
+        config = home / "config.json"
+        config.write_text(config.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        assert lp.leaf_pending(lp.LEAF_CONFIG)
+        with (
+            patch.object(security, "teardown_app_runtime", teardown),
+            patch.object(security, "_stop_apps_running_on_blanket_trust", sweep),
+        ):
+            revoke = await client.delete(f"/api/security/trusted-apps/{_APP}")
+            off = await client.put("/api/security/trusted-apps/allow-all", json={"value": False})
+        for resp in (revoke, off):
+            assert resp.status == 409, await resp.text()
+            assert await resp.json() == {
+                "error": lp.PENDING_SAVE_REFUSED,
+                "code": "file_pending_review",
+            }
+    teardown.assert_not_called()
+    sweep.assert_not_called()
+    record = _read_installed(_APP)
+    assert record is not None and record.enabled is True
+    assert lp.leaf_pending(lp.LEAF_CONFIG)

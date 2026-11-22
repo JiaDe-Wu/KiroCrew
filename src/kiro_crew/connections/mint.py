@@ -3,7 +3,9 @@
 A mint is one dedicated kiro-cli process running a single-server agent spec. Its
 session is created with no prompt and makes no model call: MCP initialization is
 eager, so the server's OAuth challenge is buffered during init and readable as
-soon as the session is ready.
+soon as the session is ready. While chats run on KAS, a sign-in the KAS engine can
+hold runs on that engine instead (:mod:`kiro_crew.connections.mint_kas`), so its
+tokens land in the grant vault KAS chats read rather than in kiro-cli's cache.
 
 The process is HELD once the URL is in hand, not disposed. The PKCE verifier is a
 value in that process's memory and the loopback listener that answers the
@@ -11,8 +13,8 @@ provider's redirect is one of that session's MCP children, so a mint torn down
 after the drain leaves a redirect port that accepts a connect and then resets
 every real exchange -- consent the provider renders and no paste can redeem. The
 hold ends on a terminal condition only: a grant appears on disk, the TTL
-expires, a newer mint supersedes this one, or the server initializes without
-challenging.
+expires, a newer mint supersedes this one, the server initializes without
+challenging, or it reports the sign-in failed after the URL went out.
 
 Because the process is held while nothing claims it as a session, its PID is
 registered with the orphan-sweep protection set for exactly that span. Without
@@ -66,6 +68,7 @@ from kiro_crew.config.loader import data_home
 from kiro_crew.connections.tool_test import _classify as _classify_tool_inventory
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.mcp_grant import grant_fingerprint, grant_observed
+from kiro_crew.mcp_oauth_discovery import approve_discovered_oauth_endpoint
 from kiro_crew.mcp_utils import mcp_server_alias
 from kiro_crew.runtime_ownership import (
     RuntimeTeardownCommitted,
@@ -78,6 +81,7 @@ from kiro_crew.security import (
 )
 from kiro_crew.sel import sel
 from kiro_crew.session_pid import register_protected_pid, unregister_protected_pid
+from kiro_crew.startup_deadline import startup_deadline
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +96,9 @@ _GRANT_REVALIDATION_INTERVAL_SECONDS = 60.0
 # still-initializing mint. Cheap: an attribute read, no I/O.
 _MINT_PID_CLAIM_POLL_SECONDS = 0.05
 _CLIENT_SHUTDOWN_TIMEOUT_SECONDS = 10.0
+# A ceiling on reading the frames already queued from a held process, not a wait for
+# new ones: a watcher tick reads what arrived since the last.
+_MINT_FRAME_READ_SECONDS = 0.05
 
 # Ephemeral single-server specs a mint writes under the kiro agents directory.
 # Deliberately absent from the owned-spec allowlist: that is an exact-name set
@@ -600,6 +607,27 @@ async def _grant_change_proven(
     return await _validate_existing_grant(slug, mcp_url, pinned)
 
 
+async def _sign_in_refused(client: Any, slug: str) -> bool:
+    """Whether the held process reports ``slug``'s server failed since its URL went out.
+
+    kiro-cli answers the loopback callback BEFORE it exchanges the code. A refused
+    exchange then reaches us only as a ``server_init_failure`` frame, and the
+    listener closes, so no grant can ever land. Nothing else reads a held mint's
+    frames, and the private ``_drain_notifications`` is the only drain the client
+    has. Never raises: a read failure is no verdict, and the watcher still owes the
+    row its TTL expiry.
+    """
+    try:
+        await client._drain_notifications(
+            duration=_MINT_FRAME_READ_SECONDS, idle_exit=_MINT_FRAME_READ_SECONDS
+        )
+        failed = (client.mcp_session_report().payload() or {}).get("failed") or ()
+    except Exception:  # noqa: BLE001 — a read failure is no verdict
+        logger.debug("OAuth mint frame read failed [%s]", slug, exc_info=True)
+        return False
+    return mcp_server_alias(slug) in failed
+
+
 async def _mint_watcher(
     slug: str,
     mcp_url: str,
@@ -630,15 +658,26 @@ async def _mint_watcher(
     revalidation: list[float] = []
     try:
         deadline = time.monotonic() + _MINT_TTL_SECONDS
+        refused = False
         while time.monotonic() < deadline:
             await asyncio.sleep(_MINT_GRANT_POLL_SECONDS)
-            if not await grant_observed(mcp_url):
-                continue
-            if require_proof and not await (
-                _grant_change_proven(slug, mcp_url, baseline, revalidation)
-                if pinned is None
-                else _grant_change_proven(slug, mcp_url, baseline, revalidation, pinned)
-            ):
+            entry = _mints.get(slug)
+            # A warm row owns no client: ``warm.fail_refused_sign_ins`` reads its session.
+            client = entry.get("client") if entry and entry.get("token") == token else None
+            refused = client is not None and await _sign_in_refused(client, slug)
+            # A grant still wins over a refusal: the server can fail its own start after
+            # a good exchange.
+            granted = await grant_observed(mcp_url) and (
+                not require_proof
+                or await (
+                    _grant_change_proven(slug, mcp_url, baseline, revalidation)
+                    if pinned is None
+                    else _grant_change_proven(slug, mcp_url, baseline, revalidation, pinned)
+                )
+            )
+            if refused and not granted:
+                break
+            if not granted:
                 continue
             doomed: MintState | None = None
             async with _mints_lock:
@@ -661,11 +700,16 @@ async def _mint_watcher(
                 and entry.get("token") == token
                 and entry.get("state") == "waiting"
             ):
-                entry["state"] = "expired"
+                entry["state"] = "failed" if refused else "expired"
+                if refused:
+                    entry["reason"] = "mint_sign_in_rejected"
                 doomed = entry
         if doomed is not None:
             await _dispose_mint(doomed)
-        logger.info("OAuth mint for %r expired after %.0fs", slug, _MINT_TTL_SECONDS)
+        if refused:
+            logger.info("OAuth mint for %r failed: the server refused the sign-in", slug)
+        else:
+            logger.info("OAuth mint for %r expired after %.0fs", slug, _MINT_TTL_SECONDS)
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001 — watcher must never take the gateway down
@@ -911,7 +955,9 @@ async def _validate_existing_grant(
         try:
             # ONE deadline over readiness AND both commands, so the whole
             # validation costs at most what a cold mint spawn is already allowed.
-            results = await asyncio.wait_for(_ready_and_read(), timeout=_MINT_READY_TIMEOUT_SECONDS)
+            # Not wait_for: a start this deadline cuts is a startup timeout.
+            async with startup_deadline(_MINT_READY_TIMEOUT_SECONDS):
+                results = await _ready_and_read()
         finally:
             claim.cancel()
             _claim_mint_pid(client, holdings)
@@ -923,6 +969,59 @@ async def _validate_existing_grant(
 
     verdict = _classify_tool_inventory(results, slug, mcp_server_alias(slug))
     return verdict["verdict"] in _GRANT_PROVEN_VERDICTS
+
+
+class _MintProcessGone(Exception):
+    """The mint's process exited before its server reported."""
+
+    mint_reason = "mint_process_gone"
+
+
+class _MintServerFailed(Exception):
+    """The mint's server reported a failure, or a sign-in without a usable URL."""
+
+    mint_reason = "mint_server_failed"
+
+
+def _challenge_for(client: Any, slug: str) -> str:
+    """Pop the session's queued sign-in requests and return ``slug``'s URL, or ""."""
+    for req in client.pop_pending_oauth_requests():
+        if req.get("serverName") == slug and req.get("oauthUrl"):
+            return str(req["oauthUrl"])
+    return ""
+
+
+async def _ready_and_challenged(client: Any, slug: str) -> str:
+    """Start the mint session and return ``slug``'s approval URL, or "" for no challenge.
+
+    ``ensure_ready`` drains MCP init frames for about a second, and a remote OAuth
+    server that runs discovery and client registration first (Atlassian) asks for
+    sign-in later than that. Silence is not an open endpoint, so the session is
+    drained until the spec's server reports (ready, failed or a sign-in request)
+    or the readiness deadline passes. Only a server that reports ready is an open
+    endpoint; a failure ends as ``mint_server_failed``, a process that exits first
+    as ``mint_process_gone`` and silence as ``mint_timeouterror``. A server
+    missing from the spec never reports, and keeps the no-challenge answer at once.
+    """
+    deadline = time.monotonic() + _MINT_READY_TIMEOUT_SECONDS
+    await client.ensure_ready()
+    if url := _challenge_for(client, slug):
+        return url
+    if await asyncio.to_thread(_agent_spec_entry_missing, slug):
+        return ""
+    await client.wait_for_declared_mcp(max(0.0, deadline - time.monotonic()))
+    if url := _challenge_for(client, slug):
+        return url
+    alias = mcp_server_alias(slug)
+    report = client.mcp_session_report()
+    if report.unreported((alias,)):
+        if not client.is_process_alive():  # pid-owner-ok: the mint owns this process
+            raise _MintProcessGone()
+        raise TimeoutError
+    if alias in (report.payload() or {}).get("ready", ()):
+        return ""
+    # Failed, or asked for sign-in with no URL Crew could take: no open endpoint.
+    raise _MintServerFailed()
 
 
 async def start_oauth_mint(
@@ -955,6 +1054,17 @@ async def start_oauth_mint(
     # Before the short-circuit below, so a reconnect that needs no URL still reaps
     # aged orphans. Off-loop: it reads and rewrites the manifest, and may unlink.
     await asyncio.to_thread(_sweep_mint_specs)
+
+    # A chat on KAS reads a remote server's sign-in from Crew's grant vault, never
+    # from kiro-cli's cache, so while chats run there the sign-in runs on a KAS
+    # engine instead (see :mod:`kiro_crew.connections.mint_kas`). Function-local:
+    # that module imports this one.
+    from kiro_crew.connections import mint_kas
+
+    kas_entry = await asyncio.to_thread(mint_kas.kas_sign_in_entry, slug, pinned)
+    if kas_entry is not None:
+        await mint_kas.mint_on_kas(slug, mcp_url, my_token, kas_entry)
+        return
 
     # Whether a validation DISPROVED the pair that was on disk when this attempt
     # started, tracked SEPARATELY from the fingerprint below. The fingerprint can
@@ -1034,8 +1144,9 @@ async def start_oauth_mint(
                 session_key=f"connections-mint-{slug}",
             )
             holdings["client"] = client
-            # session/new with NO prompt: MCP init is eager, so the challenge
-            # buffered during init is available right after ready.
+            # session/new with NO prompt. MCP init is eager, but readiness drains its
+            # frames for about a second only, so the wait runs on until the server
+            # itself reports (see _ready_and_challenged).
             #
             # The PID claim races readiness on purpose. The child is spawned partway
             # THROUGH ensure_ready, and nothing claims it as a session, so the orphan
@@ -1046,20 +1157,26 @@ async def start_oauth_mint(
                 _claim_mint_pid_when_spawned(client, holdings)
             )
             try:
-                await asyncio.wait_for(client.ensure_ready(), timeout=_MINT_READY_TIMEOUT_SECONDS)
+                # Not wait_for: a start this deadline cuts is a startup timeout.
+                async with startup_deadline(_MINT_READY_TIMEOUT_SECONDS):
+                    oauth_url = await _ready_and_challenged(client, slug)
             finally:
                 claim.cancel()
                 # Covers the fast path, where readiness beat the poller's first tick,
                 # AND the failure path, so a spawned child is always released.
                 _claim_mint_pid(client, holdings)
 
-            oauth_url = ""
-            for req in client.pop_pending_oauth_requests():
-                if req.get("serverName") == slug and req.get("oauthUrl"):
-                    oauth_url = str(req["oauthUrl"])
-                    break
+            if oauth_url:
+                # The same discovery step the chat banner runs: a configured server
+                # whose own authorization server is on neither endpoint list has its
+                # PKCE values scanned as secrets unless discovery from the URL the
+                # operator configured advertises this exact (host, path). It never
+                # raises and makes no request for a URL refused for any other reason.
+                await approve_discovered_oauth_endpoint(mcp_server_alias(slug), oauth_url)
             credential_bearing = (
-                await asyncio.to_thread(oauth_url_contains_credential, oauth_url)
+                await asyncio.to_thread(
+                    oauth_url_contains_credential, oauth_url, mcp_server_alias(slug)
+                )
                 if oauth_url
                 else False
             )
@@ -1187,8 +1304,20 @@ async def start_oauth_mint(
     except Exception as exc:  # noqa: BLE001 — background task; record, never raise
         logger.warning("OAuth mint for %r failed: %s", slug, type(exc).__name__)
         await _dispose_mint(holdings)
-        # Coarse code only — never provider- or exception-supplied text.
-        reason = "mint_" + type(exc).__name__.lower()[:32]
+        # Coarse code only — never provider- or exception-supplied text. A missing
+        # kiro-cli is named on its own: this route always runs on kiro-cli, whatever
+        # backend chats use, and a bare ``AcpError`` gives the card nothing to say.
+        reason = (
+            "mint_kiro_cli_missing"
+            if getattr(exc, "kiro_cli_missing", False) is True
+            else getattr(exc, "mint_reason", None) or "mint_" + type(exc).__name__.lower()[:32]
+        )
+        if validation_failed and isinstance(
+            exc, (_MintServerFailed, _MintProcessGone, TimeoutError)
+        ):
+            # No URL after a check disproved the stored grant: the card's
+            # unproven-grant fence keys on this reason, so it wins over the others.
+            reason = "mint_grant_unproven"
         async with _mints_lock:
             entry = _mints.get(slug)
             if entry is not None and entry.get("token") == my_token:

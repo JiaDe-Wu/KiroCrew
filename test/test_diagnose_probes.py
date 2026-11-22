@@ -17,7 +17,7 @@ from kiro_crew import change_card_catalog as catalog
 from kiro_crew import diagnose_probes as dp
 
 #: A credential-shaped value the redactor recognises; it must never reach a finding.
-SECRET = "AKIA" + "Z7Q3XK2LM9PB4TWV"
+SECRET = "xoxb-1234567890" + "-0987654321-AbCdEfGh"
 HOUR_MS = 3600 * 1000
 
 
@@ -244,6 +244,49 @@ def test_cron_whose_last_run_errored(world):
     assert "schedule.update" in f["fix"]["steps"][1]
 
 
+def test_a_failed_one_shot_its_run_parked_is_reported(world):
+    # The park writes the user-pause flags; the run's `last_run_ts` says it is
+    # the run's, so the failure is not hidden as a user pause.
+    when = time.time() - 60
+    at = {"kind": "at", "at_ts": when - 1}
+    _write_crons(
+        world["home"],
+        [
+            {
+                "id": "fired",
+                "name": "remind once",
+                "schedule": at,
+                "enabled": False,
+                "user_paused": True,
+                "last_status": "error",
+                "last_run_ts": when,
+                "last_error": "agent failed",
+            },
+            {
+                "id": "held",
+                "name": "paused one-shot",
+                "schedule": at,
+                "enabled": False,
+                "user_paused": True,
+                "last_status": "error",
+            },
+            {
+                "id": "held_after_run",
+                "name": "paused after its run",
+                "schedule": at,
+                "enabled": False,
+                "user_paused": True,
+                "user_pause_requested": True,
+                "last_status": "error",
+                "last_run_ts": when,
+            },
+        ],
+    )
+    f = _run(world)["cron_failing"]
+    assert f["status"] == dp.PROBLEM
+    assert [j["id"] for j in f["evidence"]["jobs"]] == ["fired"]
+
+
 def test_cron_failing_on_its_timezone_gets_a_schedule_card(world):
     _write_crons(
         world["home"],
@@ -376,6 +419,22 @@ def test_remote_crew_that_does_not_answer(world):
     assert f["status"] == dp.PROBLEM
     assert f["evidence"]["unreachable"] == [{"name": "lab box", "local_port": port}]
     assert "Remote Crew" in f["fix"]["steps"][0]
+
+
+@pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16"])
+def test_remote_crew_probe_reads_every_encoding_the_registry_accepts(world, encoding):
+    # A BOM or UTF-16 file (PowerShell 5.1's default) must not make the check "could not run".
+    port = _closed_port()
+    instances = {"instances": [{"id": "r1", "name": "lab box", "local_port": port}]}
+    (world["home"] / "instances.json").write_bytes(json.dumps(instances).encode(encoding))
+    f = _run(world)["remote_crew_unreachable"]
+    assert f["status"] == dp.PROBLEM
+    assert f["evidence"]["unreachable"] == [{"name": "lab box", "local_port": port}]
+
+
+def test_remote_crew_file_no_encoding_decodes_is_not_ok(world):
+    (world["home"] / "instances.json").write_bytes(b"\xff\xfe\x00\xd8garbage")
+    assert _run(world)["remote_crew_unreachable"]["status"] != dp.OK
 
 
 def test_turn_running_for_half_an_hour(world):

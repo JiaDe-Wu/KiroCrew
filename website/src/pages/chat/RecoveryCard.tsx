@@ -1,5 +1,5 @@
 import { memo } from 'react'
-import { ChevronRight, Info, Layers, RotateCcw, TriangleAlert } from 'lucide-react'
+import { Anchor, ChevronRight, Info, Layers, RotateCcw, TriangleAlert } from 'lucide-react'
 
 import { i18nT } from '../../i18n/t'
 import { DENY_REASON_MARKER } from '../../utils/denyReason'
@@ -267,10 +267,12 @@ export function parseRecoveryMessage(content: string): ParsedRecovery | null {
     // Its own copy rather than a reused interruption label: the turn ran to
     // completion and a Stop hook asked for another, so nothing was interrupted,
     // stalled or recovered. The hook's own instruction is the expandable body.
+    // The card stays in the transcript long after that turn ends, so neither
+    // line may say it is still running.
     return {
       kind,
-      title: i18nT('pages.chat.recoveryCard.continued_by_a_hook'),
-      detail: i18nT('pages.chat.recoveryCard.hook_requested_continuing'),
+      title: i18nT('pages.chat.recoveryCard.hook_asked_for_another_turn'),
+      detail: i18nT('pages.chat.recoveryCard.sent_after_the_previous_turn_ended'),
       chip: '',
       body,
     }
@@ -371,9 +373,11 @@ export function parseRecoveryMessage(content: string): ParsedRecovery | null {
 /**
  * Structural provenance stamped on an `inject` row's `meta` by the gateway.
  *
- * Kept in sync with the `injectKind` values written at the append sites in
- * `src/kiro_crew/dashboard/chat_runner.py`, `dashboard/handlers/messaging.py`
- * and `slack/gateway.py`.
+ * Kept in sync with the `injectKind` values the gateway writes: the queue
+ * drain's `_inject_meta` in `src/kiro_crew/dashboard/chat_turn/queue_drain.py`,
+ * `_run_pending_synthesis` in `dashboard/chat_turn/queue_cycle.py`,
+ * `enqueue_or_run_prompt` in `dashboard/state_parts/chat_slot.py`, and the row
+ * builders in `dashboard/chat_utils_injected_rows.py` and `dashboard/session_deliver.py`.
  *
  * Why this exists rather than more prefix matching: `meta` is persisted and
  * restored, whereas an `inject` row's `cls` is NOT (chat_persistence keeps `cls`
@@ -381,14 +385,24 @@ export function parseRecoveryMessage(content: string): ParsedRecovery | null {
  * emit time — vanishes after a flush + rehydrate. Anything keyed on its absence
  * therefore mis-renders every restored row.
  */
-export type InjectKind = 'cron' | 'mcp_app' | 'recovery' | 'synthesis' | 'user_replay' | 'automation_notice'
+export type InjectKind =
+  | 'cron'
+  | 'mcp_app'
+  | 'resource'
+  | 'recovery'
+  | 'synthesis'
+  | 'user_replay'
+  | 'automation_notice'
+  | 'workflow'
+  | 'heartbeat'
 
 /**
  * Whether each gateway-stamped inject kind OPENS a turn of its own, or
  * continues the one above it.
  *
  * Every kind is a queued prompt the runner drains into a dispatch (the
- * `_inject_meta` stamp in chat_runner.py's drain, `_run_pending_synthesis`), so
+ * `_inject_meta` stamp in chat_turn/queue_drain.py's drain,
+ * `_run_pending_synthesis` in chat_turn/queue_cycle.py), so
  * "a new dispatch" is not the question -- WHOSE request the dispatch carries is.
  * A cron notification is an unrelated prompt with its own reply, and a synthesis
  * row leads the turn that folds a fan-out into one answer (the boundary
@@ -412,12 +426,21 @@ export const INJECT_KIND_OPENS_TURN: Readonly<Record<InjectKind, boolean>> = {
   // this, isFeatureRequestRefusal walks past it to an earlier user row and
   // mis-attributes an app turn's error to that older message.
   mcp_app: true,
+  // An MCP resource-subscription wake dispatches a turn of its own the same way
+  // an app message does (`session_deliver`'s `resource` origin).
+  resource: true,
   // A re-routed automation refusal is drained ALONE and dispatches a turn of
-  // its own (chat_runner `_start_next_queued_turn`), carrying the originating
+  // its own (chat_turn/queue_drain.py `_start_next_queued_turn`), carrying the originating
   // wake's provenance; so it OPENS a turn, and the interrupt-recovery and
   // session-start-failure scans must land on it, not walk past to an earlier
   // reply.
   automation_notice: true,
+  // The gateway's follow-up after a workflow result lands, asking the agent to
+  // answer the request that started the run: a dispatch of its own.
+  workflow: true,
+  // A heartbeat task's prompt delivered to this chat
+  // (`deliver:prompt:dashboard:<slot>`): a dispatch of its own.
+  heartbeat: true,
 }
 
 /**
@@ -459,9 +482,9 @@ export function opensTurn(row: ChatMessage): boolean {
 }
 
 /**
- * Decide which card, if any, an `inject` row gets. The single decision point
- * shared by ChatPage and the transcript-renderer registry, so the surfaces
- * cannot disagree.
+ * Decide which card, if any, an `inject` row gets. The single decision point,
+ * called by the app-sdk default registry that every surface draws through, so
+ * the surfaces cannot disagree.
  *
  * Returns a {@link ParsedRecovery} to render as a folded note, or null to mean
  * "not mine — let the caller's own renderer draw this row".
@@ -491,11 +514,9 @@ export function resolveInjectCard(m: { content: string; meta?: Record<string, un
   // early returns for those three were measured to be unreachable (the allowlist
   // already rejects them), so they are omitted rather than kept as dead code.
   // The behavioural contract for each is pinned in RecoveryCard.test.tsx.
-  // `automation_notice` is also NOT a note here: it is suppressed entirely on
-  // the Sessions page (transcriptRenderers `automation_notice_inject`) because
-  // the refusal's `notice` bar already shows it, and hidden in the crewmate DM
-  // by MACHINERY_ROLES — so it never needs a card.
-  if (kind !== 'recovery' && kind !== 'synthesis') return null
+  // `automation_notice` is not a note: the registry's `automation_notice_inject`
+  // row hides it, because the refusal's `notice` bar already shows it.
+  if (kind !== 'recovery' && kind !== 'synthesis' && kind !== 'workflow' && kind !== 'heartbeat' && kind !== 'resource') return null
 
   return {
     kind: 'generic',
@@ -543,9 +564,18 @@ export default memo(function RecoveryCard({ parsed, disclosureKey }: { parsed: P
   // Synthesis is routine, but the retry glyph would misdescribe it — nothing is
   // being retried, several results are being folded into one. Layers says that.
   // A generic notice makes no claim at all about what happened, so it gets the
-  // neutral info glyph rather than borrowing another kind's meaning.
+  // neutral info glyph rather than borrowing another kind's meaning. A hook
+  // continuation retried nothing either; it wears the Hooks page's anchor.
   const Icon =
-    kind === 'synthesis' ? Layers : kind === 'generic' ? Info : routine ? RotateCcw : TriangleAlert
+    kind === 'synthesis'
+      ? Layers
+      : kind === 'generic'
+        ? Info
+        : kind === 'hook'
+          ? Anchor
+          : routine
+            ? RotateCcw
+            : TriangleAlert
 
   return (
     <div

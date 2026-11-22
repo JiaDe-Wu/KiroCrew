@@ -16,7 +16,11 @@ import { ArtifactChatPanel } from '../components/ArtifactChatPanel'
 import { CommentThreadPopover } from '../components/CommentThreadPopover'
 // Artifact body renderers, extracted here so the chat side panel shares them.
 import { ArtifactBodyNative, ArtifactBodyIframe, ArtifactBodyImage } from '../components/ArtifactBody'
-import { PublishHub, publishNoticeKey } from '../components/PublishHub'
+import { CanvasArtifactBody } from '../components/canvas/lazyCanvas'
+import { PublishHub } from '../components/PublishHub'
+import ArtifactVersionCompare from '../components/ArtifactVersionCompare'
+import { COMPARE_NONE } from '../lib/artifactCompare'
+import { publishNoticeKey } from '../lib/publishHelpers'
 import type { Artifact, ArtifactEvent, ArtifactComment } from '../types'
 
 import { i18nT } from '../i18n/t'
@@ -299,13 +303,13 @@ export function ArtifactDetailPageBody({
   UpstreamSyncBanner: ComponentType<{ artifact: Artifact; busy?: boolean; onPulled: () => void; onBeforeMutate?: () => Promise<void> }>
 }) {
   const {
-    slug, queryClient, selectedVersion, editing, previewDuringEdit, editedContent, setEditedContent, saving,
+    slug, queryClient, selectedVersion, setCompareWith, editing, previewDuringEdit, editedContent, setEditedContent, saving,
     saveError, saveConflict, contextError, setContextError, contextErrorIsRefresh, sendToSessionError,
     setSendToSessionError, showPublish, setShowPublish,
   } = stateRead
   const {
     iframeScrollTarget, previewRef, bodyRef, iframeBodyRef, detailQuery, eventsQuery, effectiveVersion,
-    isCurrent, dirty, usesIframe, contentWidthStyle,
+    isCurrent, dirty, usesIframe, contentWidthStyle, compareKey, compareArtifact, compareVersionQuery, shownKey,
   } = documentRead
   const { reprobing, reprobeError, reprobeNotice, flushLiveEdits, editorRef } = editorRead
   const {
@@ -453,6 +457,7 @@ export function ArtifactDetailPageBody({
           <span className="min-w-0 flex-1">{i18nT(publishNoticeKey({
             rolling_out: 'pages.artifactDetailPage.publication_still_rolling_out',
             distribution_disabled: 'pages.artifactDetailPage.publication_distribution_disabled',
+            origin_mismatch: 'pages.artifactDetailPage.publication_origin_mismatch',
             notice_generic: 'pages.artifactDetailPage.publication_notice_generic',
           }, artifact.publication.notice_code))}</span>
           {/* A notice is recorded once, at publish time, and the ordinary happy path
@@ -502,10 +507,24 @@ export function ArtifactDetailPageBody({
             holds scroll position and, for markdown, an in-progress anchored
             comment selection, and rotating a phone crosses the breakpoint. */}
         <div className={`flex-1 min-w-0 ${narrowPanelOpen ? 'hidden' : ''}`}>
-          {artifact.kind === 'webapp' ? (
+          {compareKey !== null ? (
+            <ArtifactVersionCompare
+              shown={artifact}
+              shownKey={shownKey}
+              otherKey={compareKey}
+              other={compareArtifact}
+              loading={compareVersionQuery.isLoading}
+              error={compareVersionQuery.error}
+              onStop={() => setCompareWith(COMPARE_NONE)}
+            />
+          ) : artifact.kind === 'webapp' ? (
             <WebAppArtifactCard artifact={artifact} />
           ) : artifact.kind === 'image' ? (
             <ArtifactBodyImage artifact={artifact} slug={slug} />
+          ) : artifact.kind === 'canvas' ? (
+            // Keyed per artifact: the route is reused across a param-only
+            // navigation, and the editor's undo history belongs to one canvas.
+            <CanvasArtifactBody key={slug} artifact={artifact} isCurrent={isCurrent} />
           ) : usesIframe ? (
             <div ref={iframeBodyRef}>
               <ArtifactBodyIframe
@@ -531,6 +550,9 @@ export function ArtifactDetailPageBody({
               ref={bodyRef}
               className="relative"
               style={contentWidthStyle}
+              // cli-mode.css anchors its chat rules here when the reading-width
+              // style is set (see its header).
+              data-chat-scope={contentWidthStyle ? '' : undefined}
             >
               <CodeCommentsScope
                 commentable={commentable} isMarkdown={artifact.kind === 'markdown'}
@@ -620,8 +642,10 @@ export function ArtifactDetailPageBody({
             {/* IN THIS COLUMN, its only mount: the remedy names the composer below it, and a
                 page-top banner puts that instruction a column away from the control it means. */}
             {contextNotice}
+            {/* Not until the create returns: the gateway lists the new session before it
+                answers, and a chat mounted from that frame never reads the prompt staged after. */}
             <ArtifactChatPanel
-              slotKey={boundSlot?.key ?? null}
+              slotKey={chatCreating ? null : boundSlot?.key ?? null}
               creating={chatCreating}
               onNewChat={() => { void newCompanionChat() }}
               onOpenFull={openChatFull}

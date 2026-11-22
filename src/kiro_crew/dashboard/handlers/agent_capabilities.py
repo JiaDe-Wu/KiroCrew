@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from typing import cast
 
@@ -11,12 +12,15 @@ from kiro_crew.agent_capabilities import CapabilityError, CapabilityService
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.agent_name_segment import agent_route_name, invalid_agent_name_response
 from kiro_crew.dashboard.chat_utils import drained_to_thread
+from kiro_crew.dashboard.handlers._bounded_read import TIMED_OUT, bounded_read
 from kiro_crew.dashboard.handlers._shared import (
     enumerate_skill_catalog,
     require_owner_dashboard_request,
     skill_uri_for_key,
 )
 from kiro_crew.dashboard.state import DashboardState
+
+logger = logging.getLogger(__name__)
 
 _SERVICE = web.AppKey("member_capability_service", CapabilityService)
 
@@ -66,7 +70,10 @@ async def api_member_capabilities(request: web.Request) -> web.Response:
         return invalid_agent_name_response()
     try:
         if request.method == "GET":
-            result = await drained_to_thread(service.get, name)
+            # Not ``drained_to_thread``: a GET mutates nothing, so a read still
+            # blocked at the deadline is left to its thread instead of holding
+            # the request open until the mount answers.
+            result = await bounded_read(service.get, name, what="Capabilities")
         else:
             try:
                 body = await request.json()
@@ -128,8 +135,20 @@ async def api_member_capabilities(request: web.Request) -> web.Response:
                 {"error": exc.code, "code": exc.code, "ref": exc.ref}, status=exc.status
             )
         return web.json_response({"error": exc.code, "code": exc.code}, status=exc.status)
-    except (OSError, ValueError):
-        # Source/sidecar/parser errors may quote secret-bearing bytes or paths.
+    except TimeoutError:
+        # Before OSError, which TimeoutError is: the pane says why for this one.
+        return web.json_response(
+            {
+                "error": "capabilities_unavailable",
+                "code": "capabilities_unavailable",
+                "reason": TIMED_OUT,
+            },
+            status=503,
+        )
+    except (OSError, ValueError) as exc:
+        # Source/sidecar/parser errors may quote secret-bearing bytes or paths,
+        # so the log names the error's type only.
+        logger.warning("Capabilities %s for Bot %r failed: %s", operation, name, type(exc).__name__)
         return web.json_response(
             {"error": "capabilities_unavailable", "code": "capabilities_unavailable"}, status=503
         )

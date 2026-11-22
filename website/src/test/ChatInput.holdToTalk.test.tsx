@@ -364,7 +364,7 @@ describe('ChatInput — hold-to-talk mode', () => {
     expect(bar.disabled).toBe(true)
     expect(bar.textContent).toContain('Hold to talk')
     expect(bar.textContent).not.toContain('Microphone in use')
-    expect(screen.getByTestId('voice-status-notice')).toHaveTextContent('Microphone in use in another chat')
+    expect(screen.getByTestId('voice-status-notice')).toHaveTextContent('Microphone in use elsewhere')
   })
 
   it('remembers the mode across mounts', () => {
@@ -465,9 +465,9 @@ describe('ChatInput — hold-to-talk send zone', () => {
     }
   })
 
-  // Under Auto (Jev) the send carries the auto flag and Jev may queue it, so the
+  // Under Auto (decision model) the send carries the auto flag and Jev may queue it, so the
   // gesture must not promise a steer.
-  it('says send, not steer, while a turn runs in Auto (Jev) mode', () => {
+  it('says send, not steer, while a turn runs in Auto (decision model) mode', () => {
     vi.useFakeTimers()
     try {
       localStorage.setItem('mc-busy-send-mode:no-slot', 'auto')

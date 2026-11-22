@@ -4,23 +4,27 @@ claude-agent-acp runs one adapter per session, so ``AcpClient`` speaks the reque
 for it. The turn's own read loop reads the answer; ``injected`` is an acceptance,
 and the steer is reported consumed only when the turn ends with ``end_turn``. A
 steer that reaches the adapter after its turn settled is answered
-``promptRequired`` (the request opts into it) and the caller queues the text.
+``promptRequired`` (the request opts into it) and the caller queues the text. A
+steer that arrives while a tool call runs is held and sent once no call is open.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from kiro_crew.acp.client import AcpClient, steering_advertised
+from kiro_crew.acp.transport_errors import AcpError, AcpProcessDied
 from kiro_crew.acp.types import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
     EVENT_STEER_CONSUMED,
+    EVENT_TEXT_CHUNK,
     METHOD_REQUEST_PERMISSION,
     METHOD_SESSION_STEERING,
     JsonRpcMessage,
@@ -203,6 +207,29 @@ async def test_an_injected_answer_after_the_terminal_is_handled_is_undelivered()
             JsonRpcMessage(id=steering_id, result={"outcome": "injected"})
         )
         assert await await_until(steer, what="the steer") is False
+
+
+@pytest.mark.asyncio
+async def test_a_steer_injected_after_its_turn_ended_stays_possibly_delivered():
+    """False to the caller, but the adapter took it: the dashboard must not run it again."""
+    async with _Tasks() as spawned:
+        client = _client()
+        wire = _Wire(client)
+        turn = await _start_turn(client, spawned)
+
+        steer = _spawn(spawned, client.steer("racing"))
+        steering_id = await wire.next_steering_id()
+        wire.end_turn()
+        await await_until(turn, what="the turn")
+        client._settle_steering_answer(
+            JsonRpcMessage(id=steering_id, result={"outcome": "injected"})
+        )
+        assert await await_until(steer, what="the steer") is False
+        assert client.held_steers_possibly_delivered == {"racing"}
+        nxt = await _start_turn(client, spawned)
+        assert client.held_steers_possibly_delivered == frozenset()
+        wire.end_turn()
+        await await_until(nxt, what="the next turn")
 
 
 @pytest.mark.parametrize("stop_reason", ["cancelled", "max_tokens", "refusal"])
@@ -470,10 +497,27 @@ def _close_tool(tool_call_id: str = "tc1") -> JsonRpcMessage:
     )
 
 
+def _steered_texts(wire: _Wire) -> list[str]:
+    return [frame["params"]["prompt"][0]["text"] for frame in wire.steering_frames()]
+
+
+async def _wait_closed(client: AcpClient, tool_call_id: str) -> None:
+    """Until the read loop has handled the call's terminal update.
+
+    The loop releases held steers in the same step that drops the call from the
+    open set, so once the call is gone the release has already decided.
+    """
+    await async_wait_until(
+        lambda: tool_call_id in client._observed_tool_calls
+        and tool_call_id not in client._active_tool_calls,
+        describe=lambda: list(client._active_tool_calls),
+    )
+
+
 @pytest.mark.asyncio
-async def test_a_steer_while_a_tool_runs_is_held_for_the_next_turn():
-    """claude would move the running tool to the background and end the turn
-    early, so nothing is sent; the caller runs the text as the next turn."""
+async def test_a_steer_while_a_tool_runs_is_sent_when_the_tool_finishes():
+    """claude would move a running tool to the background and end the turn early,
+    so the steer is held while the call runs and goes out as soon as it ends."""
     async with _Tasks() as spawned:
         client = _client()
         wire = _Wire(client)
@@ -481,24 +525,457 @@ async def test_a_steer_while_a_tool_runs_is_held_for_the_next_turn():
         wire.inbound.put_nowait(_open_tool())
         await async_wait_until(lambda: client._active_tool_calls.possibly_open)
 
-        assert await client.steer("change course") is False
+        assert await client.steer("change course") is True
+        # Held, not sent: no sender was started while the call is open.
+        assert client._held_steer_task is None
         assert wire.steering_frames() == []
+        # Stamped at the hold, so a `wait` sleep the call is running ends on it.
+        assert client.last_steer_monotonic > 0
 
         wire.inbound.put_nowait(_close_tool())
-        await async_wait_until(lambda: not client._active_tool_calls.possibly_open)
+        wire.answer(await wire.next_steering_id(), "injected")
+        assert _steered_texts(wire) == ["change course"]
+        await async_wait_until(
+            lambda: client._steers_accepted, describe=lambda: client._steers_held
+        )
+        wire.end_turn()
+        events = await await_until(turn, what="the turn")
+        assert [e.kind for e in events if e.kind in (EVENT_STEER_CONSUMED, EVENT_COMPLETE)] == [
+            EVENT_STEER_CONSUMED,
+            EVENT_COMPLETE,
+        ]
+        consumed = [e for e in events if e.kind == EVENT_STEER_CONSUMED]
+        assert consumed[0].text == "<user_message>\nchange course\n</user_message>"
+
+
+@pytest.mark.asyncio
+async def test_a_held_steer_waits_for_every_open_tool_call():
+    async with _Tasks() as spawned:
+        client = _client()
+        wire = _Wire(client)
+        turn = await _start_turn(client, spawned)
+        wire.inbound.put_nowait(_open_tool("tc1"))
+        wire.inbound.put_nowait(_open_tool("tc2"))
+        await async_wait_until(lambda: len(client._active_tool_calls) == 2)
+        assert await client.steer("after both") is True
+
+        wire.inbound.put_nowait(_close_tool("tc1"))
+        await _wait_closed(client, "tc1")
+        assert client._held_steer_task is None
+        assert wire.steering_frames() == []
+
+        wire.inbound.put_nowait(_close_tool("tc2"))
+        wire.answer(await wire.next_steering_id(), "injected")
+        await async_wait_until(
+            lambda: client._steers_accepted, describe=lambda: client._steers_held
+        )
+        wire.end_turn()
+        kinds = [e.kind for e in await await_until(turn, what="the turn")]
+        assert EVENT_STEER_CONSUMED in kinds
+        assert _steered_texts(wire) == ["after both"]
+
+
+@pytest.mark.asyncio
+async def test_held_steers_go_out_in_the_order_they_came():
+    """A steer sent after the call ended, while a held one still waits for its
+    answer, goes out behind it rather than beside it."""
+    async with _Tasks() as spawned:
+        client = _client()
+        wire = _Wire(client)
+        turn = await _start_turn(client, spawned)
+        wire.inbound.put_nowait(_open_tool())
+        await async_wait_until(lambda: client._active_tool_calls.possibly_open)
+        assert await client.steer("first") is True
+        assert await client.steer("second") is True
+
+        wire.inbound.put_nowait(_close_tool())
+        first_id = await wire.next_steering_id()
+        assert await client.steer("third") is True
+        assert _steered_texts(wire) == ["first"]
+
+        wire.answer(first_id, "injected")
+        await async_wait_until(lambda: len(wire.steering_frames()) == 2)
+        wire.answer(wire.steering_frames()[-1]["id"], "injected")
+        await async_wait_until(lambda: len(wire.steering_frames()) == 3)
+        wire.answer(wire.steering_frames()[-1]["id"], "injected")
+        await async_wait_until(lambda: len(client._steers_accepted) == 3)
+        assert _steered_texts(wire) == ["first", "second", "third"]
+
+        wire.end_turn()
+        events = await await_until(turn, what="the turn")
+        assert [e.text for e in events if e.kind == EVENT_STEER_CONSUMED] == [
+            f"<user_message>\n{text}\n</user_message>" for text in ("first", "second", "third")
+        ]
+
+
+@pytest.mark.parametrize("stop_reason", ["end_turn", "cancelled"])
+@pytest.mark.asyncio
+async def test_a_steer_still_held_when_the_turn_ends_is_never_sent(stop_reason):
+    """Nothing reports it consumed, so the caller queues it as the next turn."""
+    async with _Tasks() as spawned:
+        client = _client()
+        wire = _Wire(client)
+        turn = await _start_turn(client, spawned)
+        wire.inbound.put_nowait(_open_tool())
+        await async_wait_until(lambda: client._active_tool_calls.possibly_open)
+        assert await client.steer("never sent") is True
+
+        wire.end_turn(stop_reason)
+        events = await await_until(turn, what="the turn")
+        assert EVENT_STEER_CONSUMED not in [e.kind for e in events]
+        assert client._steers_held == []
+        assert client._held_steer_task is None
+        assert wire.steering_frames() == []
+
+
+@pytest.mark.asyncio
+async def test_a_steer_held_by_a_failed_turn_is_not_carried_into_the_next():
+    """A failed turn has no clean terminal to drop its held steers, so the next
+    turn starts with none and sends only its own."""
+    async with _Tasks() as spawned:
+        client = _client()
+        wire = _Wire(client)
+        failed = await _start_turn(client, spawned)
+        wire.inbound.put_nowait(_open_tool())
+        await async_wait_until(lambda: client._active_tool_calls.possibly_open)
+        assert await client.steer("from the failed turn") is True
+        wire.inbound.put_nowait(
+            JsonRpcMessage(id=PROMPT_ID, error={"code": -32603, "message": "internal error"})
+        )
+        with pytest.raises(AcpError):
+            await await_until(failed, what="the failed turn")
+
+        turn = await _start_turn(client, spawned)
+        wire.inbound.put_nowait(_open_tool("tc2"))
+        await async_wait_until(lambda: client._active_tool_calls.possibly_open)
+        assert await client.steer("from the next turn") is True
+        wire.inbound.put_nowait(_close_tool("tc2"))
+        wire.answer(await wire.next_steering_id(), "injected")
+        await async_wait_until(
+            lambda: client._steers_accepted, describe=lambda: client._steers_held
+        )
+        wire.end_turn()
+        events = await await_until(turn, what="the next turn")
+        assert _steered_texts(wire) == ["from the next turn"]
+        assert [e.text for e in events if e.kind == EVENT_STEER_CONSUMED] == [
+            "<user_message>\nfrom the next turn\n</user_message>"
+        ]
+
+
+@pytest.mark.asyncio
+async def test_no_held_steer_is_written_behind_a_stalled_one():
+    """A held steer whose write stalls the adapter's stdin leaves the rest unsent,
+    so nothing more is written into a pipe the adapter is not reading."""
+    async with _Tasks() as spawned:
+        client = _client()
+        wire = _Wire(client)
+        written = client._write_request_bounded
+
+        async def _stall_on_steering(data: bytes, request_id: int, method: str) -> None:
+            await written(data, request_id, method)
+            if method == METHOD_SESSION_STEERING:
+                client._stdin_stalled = True
+                raise AcpProcessDied("ACP stdin stalled", ambiguous_delivery=True)
+
+        client._write_request_bounded = _stall_on_steering  # type: ignore[method-assign]
+        turn = await _start_turn(client, spawned)
+        wire.inbound.put_nowait(_open_tool())
+        await async_wait_until(lambda: client._active_tool_calls.possibly_open)
+        assert await client.steer("first") is True
+        assert await client.steer("second") is True
+
+        wire.inbound.put_nowait(_close_tool())
+        await _wait_closed(client, "tc1")
+        sender = client._held_steer_task
+        assert sender is not None
+        await await_until(sender, what="the held-steer sender")
+        assert _steered_texts(wire) == ["first"]
+        assert client._steers_held == []
+
         wire.end_turn()
         events = await await_until(turn, what="the turn")
         assert EVENT_STEER_CONSUMED not in [e.kind for e in events]
 
-        # The held text runs as the next turn's own prompt.
-        client._send_prompt.reset_mock()
+
+@pytest.mark.asyncio
+async def test_a_stalled_held_write_is_reported_possibly_delivered_until_the_next_turn():
+    """The adapter may read a stalled frame, so the caller must queue the text as
+    possibly delivered; only the steer whose write stalled is reported, and the
+    report survives the turn's end so the caller's teardown can read it."""
+    async with _Tasks() as spawned:
+        client = _client()
+        wire = _Wire(client)
+        written = client._write_request_bounded
+
+        async def _stall_on_steering(data: bytes, request_id: int, method: str) -> None:
+            await written(data, request_id, method)
+            if method == METHOD_SESSION_STEERING:
+                client._stdin_stalled = True
+                raise AcpProcessDied("ACP stdin stalled", ambiguous_delivery=True)
+
+        client._write_request_bounded = _stall_on_steering  # type: ignore[method-assign]
+        turn = await _start_turn(client, spawned)
+        wire.inbound.put_nowait(_open_tool())
+        await async_wait_until(lambda: client._active_tool_calls.possibly_open)
+        assert await client.steer("  stalled  ") is True
+        assert await client.steer("dropped") is True
+
+        wire.inbound.put_nowait(_close_tool())
+        await _wait_closed(client, "tc1")
+        sender = client._held_steer_task
+        assert sender is not None
+        await await_until(sender, what="the held-steer sender")
+        assert client.held_steers_possibly_delivered == {"stalled"}
+
         wire.end_turn()
+        await await_until(turn, what="the turn")
+        assert client.held_steers_possibly_delivered == {"stalled"}
 
-        async def _next_turn() -> list[Any]:
-            return [e async for e in client.stream_events("change course", timeout=30)]
+        client._stdin_stalled = False
+        client._write_request_bounded = written  # type: ignore[method-assign]
+        nxt = await _start_turn(client, spawned)
+        assert client.held_steers_possibly_delivered == frozenset()
+        wire.end_turn()
+        await await_until(nxt, what="the next turn")
 
-        await await_until(asyncio.ensure_future(_next_turn()), what="the next turn")
-        assert client._send_prompt.await_args.args[0] == "change course"
+
+@pytest.mark.asyncio
+async def test_a_held_write_in_flight_is_reported_possibly_delivered():
+    """A turn that ends while the held steer's write is still draining finds the
+    text reported, as the dashboard counts a direct steer's RPC in flight."""
+    async with _Tasks() as spawned:
+        client = _client()
+        wire = _Wire(client)
+        written = client._write_request_bounded
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow_steering(data: bytes, request_id: int, method: str) -> None:
+            if method == METHOD_SESSION_STEERING:
+                entered.set()
+                await release.wait()
+            await written(data, request_id, method)
+
+        client._write_request_bounded = _slow_steering  # type: ignore[method-assign]
+        turn = await _start_turn(client, spawned)
+        wire.inbound.put_nowait(_open_tool())
+        await async_wait_until(lambda: client._active_tool_calls.possibly_open)
+        assert await client.steer("in flight") is True
+
+        wire.inbound.put_nowait(_close_tool())
+        await await_until(asyncio.ensure_future(entered.wait()), what="the held write")
+        assert client.held_steers_possibly_delivered == {"in flight"}
+        # Still first in the buffer while its write runs, but not unsent.
+        assert client.held_steers_unsent == frozenset()
+
+        release.set()
+        wire.answer(await wire.next_steering_id(), "injected")
+        await async_wait_until(lambda: client._steers_accepted)
+        assert client.held_steers_possibly_delivered == frozenset()
+        assert client.held_steers_unsent == frozenset()
+        wire.end_turn()
+        await await_until(turn, what="the turn")
+
+
+@pytest.mark.asyncio
+async def test_an_unanswered_held_steer_stays_possibly_delivered_until_the_next_turn(monkeypatch):
+    """Spending the answer budget does not prove the adapter ignored the write."""
+    import kiro_crew.acp.client as client_mod
+
+    clock = ManualClock()
+    clock.install(monkeypatch, client_mod)
+    monkeypatch.setattr(client_mod, "_STEERING_WAIT_SLICE_SECS", 0.01)
+    real_wait = asyncio.wait
+
+    async def _spend_budget(fs: Any, *, timeout: Any = None, **kwargs: Any) -> Any:
+        if timeout == 0.01:
+            result = await real_wait(fs, timeout=0, **kwargs)
+            clock.advance(1.0)
+            return result
+        return await real_wait(fs, timeout=timeout, **kwargs)
+
+    monkeypatch.setattr(client_mod.asyncio, "wait", _spend_budget)
+    async with _Tasks() as spawned:
+        client = _client()
+        wire = _Wire(client)
+        turn = await _start_turn(client, spawned)
+        wire.inbound.put_nowait(_open_tool())
+        await async_wait_until(lambda: client._active_tool_calls.possibly_open)
+        assert await client.steer("unanswered") is True
+
+        wire.inbound.put_nowait(_close_tool())
+        steering_id = await wire.next_steering_id()
+        sender = client._held_steer_task
+        assert sender is not None
+        spawned.append(sender)
+        await await_until(sender, what="the expired held-steer sender")
+        assert not turn.done()
+        assert client.held_steers_possibly_delivered == {"unanswered"}
+        assert client._steers_accepted == []
+        assert client._steers_held == []
+        assert (
+            client._settle_steering_answer(
+                JsonRpcMessage(id=steering_id, result={"outcome": "injected"})
+            )
+            is False
+        )
+
+        wire.end_turn()
+        events = await await_until(turn, what="the turn")
+        assert EVENT_STEER_CONSUMED not in [e.kind for e in events]
+        assert client.held_steers_possibly_delivered == {"unanswered"}
+        nxt = await _start_turn(client, spawned)
+        assert client.held_steers_possibly_delivered == frozenset()
+        wire.end_turn()
+        await await_until(nxt, what="the next turn")
+
+
+@pytest.mark.parametrize("stop_reason", ["end_turn", "cancelled"])
+@pytest.mark.parametrize("outcome", [None, "injected"])
+@pytest.mark.asyncio
+async def test_a_held_steer_unresolved_at_turn_end_stays_possibly_delivered(
+    monkeypatch, stop_reason, outcome
+):
+    """An unanswered write or late injection is not confirmed non-delivery."""
+    async with _Tasks() as spawned:
+        client = _client()
+        wire = _Wire(client)
+        release = asyncio.Event()
+        wait_for_answer = client._await_steering_answer
+
+        async def _hold_sender(answer, turn_done):
+            await wait_for_answer(answer, turn_done)
+            await await_until(release, what="the sender's outcome check")
+
+        monkeypatch.setattr(client, "_await_steering_answer", _hold_sender)
+        turn = await _start_turn(client, spawned)
+        wire.inbound.put_nowait(_open_tool())
+        await async_wait_until(lambda: client._active_tool_calls.possibly_open)
+        assert await client.steer("turn ended") is True
+        wire.inbound.put_nowait(_close_tool())
+        steering_id = await wire.next_steering_id()
+        sender = client._held_steer_task
+        assert sender is not None
+        spawned.append(sender)
+
+        wire.end_turn(stop_reason)
+        events = await await_until(turn, what="the turn")
+        assert EVENT_STEER_CONSUMED not in [e.kind for e in events]
+        if outcome is not None:
+            assert (
+                client._settle_steering_answer(
+                    JsonRpcMessage(id=steering_id, result={"outcome": outcome})
+                )
+                is True
+            )
+        release.set()
+        await await_until(sender, what="the held-steer sender")
+        assert client.held_steers_possibly_delivered == {"turn ended"}
+        assert client._steers_accepted == []
+        assert client._steers_held == []
+        nxt = await _start_turn(client, spawned)
+        assert client.held_steers_possibly_delivered == frozenset()
+        wire.end_turn()
+        await await_until(nxt, what="the next turn")
+
+
+@pytest.mark.asyncio
+async def test_a_written_unanswered_held_steer_is_not_named_unsent_when_the_turn_ends():
+    """The steer was written and awaits its answer when the terminal arrives. It is
+    possibly delivered, so naming it unsent too would queue it a second time."""
+    async with _Tasks() as spawned:
+        client = _client()
+        wire = _Wire(client)
+        turn = await _start_turn(client, spawned)
+        wire.inbound.put_nowait(_open_tool())
+        await async_wait_until(lambda: client._active_tool_calls.possibly_open)
+        assert await client.steer("written once") is True
+        wire.inbound.put_nowait(_close_tool())
+        await wire.next_steering_id()
+        sender = client._held_steer_task
+        assert sender is not None
+        spawned.append(sender)
+        # Written, no answer read: still first in the buffer.
+        assert client._steers_held != []
+
+        wire.end_turn()
+        await await_until(turn, what="the turn")
+        await await_until(sender, what="the held-steer sender")
+        assert client.held_steers_possibly_delivered == {"written once"}
+        assert client.held_steers_unsent == frozenset()
+
+
+@pytest.mark.parametrize("outcome", ["promptRequired", "failed", "error"])
+@pytest.mark.asyncio
+async def test_a_held_steer_the_adapter_does_not_inject_is_not_reported(outcome):
+    async with _Tasks() as spawned:
+        client = _client()
+        wire = _Wire(client)
+        turn = await _start_turn(client, spawned)
+        wire.inbound.put_nowait(_open_tool())
+        await async_wait_until(lambda: client._active_tool_calls.possibly_open)
+        assert await client.steer("too late") is True
+
+        wire.inbound.put_nowait(_close_tool())
+        steering_id = await wire.next_steering_id()
+        if outcome == "error":
+            wire.inbound.put_nowait(
+                JsonRpcMessage(id=steering_id, error={"code": -32601, "message": "nope"})
+            )
+        else:
+            wire.answer(steering_id, outcome)
+        # The answer is in once the sender drops the steer from the held list.
+        await async_wait_until(lambda: not client._steers_held)
+        assert client._steers_accepted == []
+        # Answered, so the adapter's verdict is known: not possibly delivered.
+        assert client.held_steers_possibly_delivered == frozenset()
+        # Refused: it never reached the turn.
+        assert client.held_steers_unsent == {"too late"}
+        wire.end_turn()
+        events = await await_until(turn, what="the turn")
+        assert EVENT_STEER_CONSUMED not in [e.kind for e in events]
+
+
+@pytest.mark.asyncio
+async def test_a_held_steer_dropped_unwritten_is_reported_unsent_until_the_next_turn():
+    """Held behind an open call, then dropped by a stop: never sent, so named unsent."""
+    async with _Tasks() as spawned:
+        client = _client()
+        wire = _Wire(client)
+        turn = await _start_turn(client, spawned)
+        wire.inbound.put_nowait(_open_tool())
+        await async_wait_until(lambda: client._active_tool_calls.possibly_open)
+        assert await client.steer("buffered") is True
+        assert client.held_steers_unsent == {"buffered"}, "still buffered"
+
+        wire.end_turn("cancelled")
+        await await_until(turn, what="the turn")
+        assert client._steers_held == []
+        assert client.held_steers_unsent == {"buffered"}, "dropped unwritten"
+        assert client.held_steers_possibly_delivered == frozenset()
+        assert wire.steering_frames() == []
+
+        await _start_turn(client, spawned)
+        assert client.held_steers_unsent == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_held_steers_count_toward_the_turn_bound():
+    from kiro_crew.acp.types import MAX_STEERING_ANSWERS
+
+    async with _Tasks() as spawned:
+        client = _client()
+        wire = _Wire(client)
+        turn = await _start_turn(client, spawned)
+        wire.inbound.put_nowait(_open_tool())
+        await async_wait_until(lambda: client._active_tool_calls.possibly_open)
+        for n in range(MAX_STEERING_ANSWERS):
+            assert await client.steer(f"steer {n}") is True
+        assert await client.steer("one too many") is False
+        assert len(client._steers_held) == MAX_STEERING_ANSWERS
+
+        wire.end_turn("cancelled")
+        await await_until(turn, what="the turn")
         assert wire.steering_frames() == []
 
 
@@ -519,3 +996,68 @@ async def test_a_steer_after_the_tool_finished_is_sent():
         wire.end_turn()
         kinds = [e.kind for e in await await_until(turn, what="the turn")]
         assert EVENT_STEER_CONSUMED in kinds
+
+
+_LIVE_STEER = Path(__file__).parent / "fixtures" / "acp_frames" / "claude" / "steering-live.jsonl"
+
+
+def _live_steer_frames() -> list[dict[str, Any]]:
+    lines = _LIVE_STEER.read_text(encoding="utf-8").splitlines()
+    return [json.loads(line) for line in lines[1:] if line.strip()]
+
+
+@pytest.mark.asyncio
+async def test_the_live_claude_steer_capture_replays_through_the_client():
+    """claude-agent-acp 0.94.0's own frames for a steer sent while Bash ran.
+
+    The steer is held while the call is open and sent once its completed update
+    is read; the adapter's ``injected`` answer and the ``end_turn`` terminal then
+    settle it as consumed in that same turn.
+    """
+    frames = _live_steer_frames()
+    init = frames[0]["result"]
+    assert steering_advertised(init) is True
+    assert init["agentInfo"]["version"] == "0.94.0"
+    # The turn's frames: after session/new, up to the id-3 prompt terminal.
+    turn_frames = [f for f in frames if f.get("id") not in (1, 2)]
+    answer = next(f for f in turn_frames if f.get("id") == 4)
+    terminal = next(f for f in turn_frames if f.get("id") == 3)
+    assert answer["result"] == {"outcome": "injected"}
+    assert terminal["result"]["stopReason"] == "end_turn"
+    closed = next(
+        i
+        for i, f in enumerate(turn_frames)
+        if f.get("params", {}).get("update", {}).get("status") == "completed"
+    )
+    opened, running = turn_frames[:closed], turn_frames[closed : turn_frames.index(answer)]
+    after = turn_frames[turn_frames.index(answer) + 1 : turn_frames.index(terminal)]
+
+    async with _Tasks() as spawned:
+        client = _client("0.94.0")
+        client._session_id = "claude-session-1"
+        wire = _Wire(client)
+        turn = await _start_turn(client, spawned)
+        for frame in opened:
+            wire.inbound.put_nowait(JsonRpcMessage.from_dict(frame))
+        await async_wait_until(lambda: client._active_tool_calls.possibly_open)
+
+        assert await client.steer("STEER-WORD-9: also say banana.") is True
+        assert wire.steering_frames() == []  # held while Bash runs
+
+        for frame in running:
+            wire.inbound.put_nowait(JsonRpcMessage.from_dict(frame))
+        steering_id = await wire.next_steering_id()
+        assert _steered_texts(wire) == ["STEER-WORD-9: also say banana."]
+        wire.inbound.put_nowait(JsonRpcMessage.from_dict(dict(answer, id=steering_id)))
+        await async_wait_until(
+            lambda: client._steers_accepted, describe=lambda: client._steers_held
+        )
+        for frame in after:
+            wire.inbound.put_nowait(JsonRpcMessage.from_dict(frame))
+        wire.inbound.put_nowait(JsonRpcMessage.from_dict(dict(terminal, id=PROMPT_ID)))
+
+        events = await await_until(turn, what="the turn")
+        kinds = [e.kind for e in events]
+        assert kinds[-2:] == [EVENT_STEER_CONSUMED, EVENT_COMPLETE]
+        assert events[-1].stop_reason == "end_turn"
+        assert "STUB-OK" in "".join(e.text or "" for e in events if e.kind == EVENT_TEXT_CHUNK)

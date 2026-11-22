@@ -108,7 +108,7 @@ def test_a_legacy_page_title_finds_its_explicit_canonical_location() -> None:
 def test_the_tasks_alias_keeps_the_task_runner_gate() -> None:
     d = ui_index.find_ui("tasks", "en")
     projects = next(r for r in d["results"] if r["id"] == "page.projects")
-    assert projects["placements"][0]["requires"][0]["id"] == "app_enabled"
+    assert projects["placements"][0]["requires"][0]["id"] == "page_switched_on"
 
 
 def test_no_result_hands_out_a_redirecting_route() -> None:
@@ -150,6 +150,18 @@ def test_a_setting_carries_its_route_setting_id_and_guide() -> None:
         "action_id": "settings.show",
         "params": {"setting_id": "chat.link-previews"},
     }
+
+
+def test_the_ctrl_copy_paste_setting_needs_windows_or_linux() -> None:
+    # The Terminal panel never draws this switch on a Mac, so the answer says so.
+    d = ui_index.find_ui("Ctrl+C and Ctrl+V copy and paste", "en")
+    hit = next(
+        r for r in d["results"] if r.get("setting_id") == "display.ctrl-c-and-ctrl-v-copy-and-paste"
+    )
+    (placement,) = hit["placements"]
+    conds = [r for r in placement["requires"] if r["kind"] == "condition"]
+    assert [c["id"] for c in conds] == ["not_macos"]
+    assert "Windows or Linux, not on a Mac" in conds[0]["description"]
 
 
 def test_a_credential_setting_never_carries_a_guide() -> None:
@@ -208,6 +220,13 @@ def test_ties_are_ordered_by_id_and_flagged_ambiguous() -> None:
     exact = [r["id"] for r in d["results"] if r["match"] == "exact_label"]
     assert exact == sorted(exact) and len(exact) > 1
     assert d["ambiguous"] is True
+
+
+@pytest.mark.parametrize(("query", "lang"), [("minimize to tray", "en"), ("最小化到托盘", "zh-CN")])
+def test_a_settings_own_name_does_not_tie_with_another_rows_term(query: str, lang: str) -> None:
+    d = ui_index.find_ui(query, lang)
+    assert _top(d)["id"] == "setting:display.minimize-to-tray", d["results"]
+    assert d["ambiguous"] is False
 
 
 # ── newcomer wording: curated terms find it, one shared word does not ──
@@ -296,7 +315,7 @@ def test_newcomer_words_find_their_target(query: str, lang: str, target: str) ->
         ("where do I make a schedule", "en", {"schedule.add-job", "schedule.create-first"}),
         ("where can I create a reminder", "en", {"schedule.add-job", "schedule.create-first"}),
         ("在哪里新建提醒", "zh-CN", {"schedule.add-job", "schedule.create-first"}),
-        # MCP: both ways to add one, under the MCP Servers sub-tab.
+        # MCP: both ways to add one, on Customize's MCP Servers tab.
         ("add an MCP server", "en", {"mcp.add-custom", "mcp.add-server"}),
         ("添加 MCP", "zh-CN", {"mcp.add-custom", "mcp.add-server"}),
         ("添加MCP服务器", "zh-CN", {"mcp.add-custom", "mcp.add-server"}),
@@ -333,15 +352,15 @@ def test_schedule_creation_names_the_state_each_host_is_drawn_in() -> None:
         assert r["placements"][0]["route"] == "/schedule"
 
 
-def test_add_mcp_server_walks_through_the_mcp_servers_sub_tab_in_both_languages() -> None:
+def test_add_mcp_server_walks_through_the_mcp_servers_page_in_both_languages() -> None:
     en = {r["id"]: r for r in ui_index.find_ui("add an MCP server", "en")["results"]}
     assert _path(en["mcp.add-custom"]["placements"][0]) == [
         "Customize",
-        "Connections",
         "MCP Servers",
+        "Servers",
         "Add Custom",
     ]
-    assert en["mcp.add-server"]["placements"][0]["route"] == "/capabilities?tab=mcp"
+    assert en["mcp.add-server"]["placements"][0]["route"] == "/capabilities?tab=mcp-servers"
     assert en["mcp.add-custom"]["guide_ref"] == {"action_id": "mcp.open_add"}
     # No action of its own: the generic pointer covers it.
     assert en["mcp.add-server"]["guide_ref"] == {
@@ -349,7 +368,12 @@ def test_add_mcp_server_walks_through_the_mcp_servers_sub_tab_in_both_languages(
         "params": {"location_id": "mcp.add-server"},
     }
     zh = {r["id"]: r for r in ui_index.find_ui("添加 MCP", "zh-CN")["results"]}
-    assert _path(zh["mcp.add-server"]["placements"][0])[-2:] == ["MCP 服务器", "添加服务器"]
+    assert _path(zh["mcp.add-server"]["placements"][0]) == [
+        "自定义",
+        "MCP 服务器",
+        "服务器",
+        "添加服务器",
+    ]
 
 
 def test_new_chat_in_chinese_is_labelled_in_chinese_and_reached_like_the_sidebar() -> None:
@@ -382,6 +406,7 @@ def test_a_shell_control_is_on_every_page_and_survives_a_surface_filter() -> Non
     assert [r.get("id") or r.get("value") for r in p["requires"]] == [
         "desktop",
         "search_bar_unclaimed",
+        "topbar_search_shown",
     ]
     # Drawn on every page, so a page filter keeps it; an unknown surface is still refused.
     assert "shell.search" in _by_id(ui_index.find_ui("command palette", "en", "schedule"))
@@ -527,7 +552,12 @@ def test_a_label_covering_only_part_of_the_question_is_dropped(tmp_path: Path) -
         # chat" is one of its terms), never Voice > Model.
         ("chat model", "en", "settings.sub.chat.models", "setting:voice.model"),
         ("display language", "en", "setting:display.language", "setting:voice.language"),
-        ("slack session folder", "en", "setting:channels.file-sessions-in-a-folder-slack", None),
+        (
+            "slack session folder",
+            "en",
+            "setting:channels.file-sessions-in-a-different-folder-slack",
+            None,
+        ),
         ("语音模型", "zh-CN", "setting:voice.model", "settings.sub.chat.models"),
         ("聊天模型", "zh-CN", "settings.sub.chat.models", "setting:voice.model"),
         # Task phrases ("make a schedule", "新建提醒") now answer with the two

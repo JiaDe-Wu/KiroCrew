@@ -18,6 +18,7 @@ from unittest import mock
 import pytest
 from mcp_apps_render_helpers import spool_fixture  # noqa: F401
 from mcp_apps_render_helpers import _FakeState, _hex, _write_spool
+from redaction_structured_cases import jwt
 
 from kiro_crew import mcp_apps_render
 from kiro_crew.testing.wait import await_until
@@ -28,7 +29,8 @@ from kiro_crew.testing.wait import await_until
 #: one in fragments to slip past that check would be hiding a credential pattern
 #: from a security control for a value that is not a credential at all. What the
 #: redaction tests need is only that the detector matches it, which they assert.
-FAKE_CREDENTIAL = "eyJhbGciOiJIUzI1NiJ9." + "a" * 30 + "." + "s" * 20
+#: A signed JWT: a three-segment run whose payload is no JSON is no JWT.
+FAKE_CREDENTIAL = jwt()
 
 # ── marker regex ─────────────────────────────────────────────────────────────
 
@@ -75,6 +77,25 @@ def test_strip_marker_noop_without_marker():
     assert mcp_apps_render.strip_marker("hello") == "hello"
     assert mcp_apps_render.strip_marker("") == ""
     assert mcp_apps_render.strip_marker(None) == ""
+
+
+def test_strip_quoted_markers_cuts_only_well_formed_markers():
+    """A reply quoting a render result loses the marker (and its one trailing
+    space) and keeps its own words; a line holding only the marker goes; a
+    malformed marker and a marker-free reply stay as written."""
+    sid = _hex()
+    marker = f"[kirocrew-mcp-app:{sid}]"
+    strip = mcp_apps_render.strip_quoted_markers
+
+    assert strip(f"Result:\n{marker} 3 rows found\nDONE") == "Result:\n3 rows found\nDONE"
+    assert strip(f"Shown.\n  {marker}  \nDONE") == "Shown.\nDONE"
+    assert strip(f"see {marker}here") == "see here"
+    # A last line the cut leaves blank keeps the newline before it, so words a
+    # segment cut held back and gives back later land on their own line.
+    assert strip(f"Result:\n{marker} ") == "Result:\n"
+    kept = "[kirocrew-mcp-app:XYZ] stays\n[kirocrew-mcp-app:abc]\nplain"
+    assert strip(kept) == kept
+    assert strip("") == ""
 
 
 # ── load_spool ───────────────────────────────────────────────────────────────

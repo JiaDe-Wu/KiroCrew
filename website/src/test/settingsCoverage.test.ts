@@ -66,40 +66,47 @@ function readPanel(file: string): string {
  * an unlisted file fails, so the choice is always conscious.
  */
 const UNMAPPED_PANELS: Record<string, string> = {
+  'remoteCrewTunnelError.tsx': "a Remote Crew row's connect-failure text (one sentence, the raw error folded under it); zero controls, no setting",
   'BrowserEngineSection.tsx': "the Browser tab's Engine row under More (Harness and Chromium versions) with a Redownload action; status and one action, no setting of its own",
   'BrowserStatusCard.tsx': "the Browser tab's main card (browser, status dot, one state-dependent Install / Retry / Allow / Connect / Disconnect action); it reports the engine and holds no setting",
   'KiroHarnessFallbackNote.tsx': 'informational note ChatPanel mounts above the fallback pickers on a Kiro harness, zero controls',
   'ChannelDisabledPanel.tsx': 'informational placeholder (locked/loading/error states), zero controls',
   'ChannelFolderBackfill.tsx': 'one action button shared by the channel panels; files existing conversations into the folder the OWNING panel configures, and holds no setting of its own',
   'CustomSoundsSection.tsx': 'the Notifications tab\'s add-a-sound form (name + tones) and the list of saved sounds; it creates entries rather than holding settings, and the sounds it saves are chosen through the per-category pickers NotificationsPanel already indexes',
+  'FeatureTipsList.tsx': "the Chat tab's Discovery list of every curated tip, each with its own action button that navigates to the tip's setting; it reads the tip pool and holds no setting",
   'FollowDefaultModelAction.tsx': 'one action button under the Chat tab\'s Default Model that counts, then clears, the model older chats keep; it holds no setting of its own',
   'ChannelsPanel.tsx': 'list-detail shell routing to per-channel panels; carries no controls of its own',
   'CrewVersionStatus.tsx': "a connected Remote Crew row's version badge and its Update action; it reports and acts on one crew, and holds no setting",
-  'DecisionsProviderPicker.tsx': 'the Decisions card\'s provider choice writes a preset id, or a SageMaker endpoint\'s name, region and profile, through the owner-only PUT /api/decisions/provider, not a config path, so there is no configKey to index; it is reached through the card the developer.decisions-jev entry deep-links to',
-  'DiscordPanel.tsx': 'thin BotChannelSpec wrapper; BotChannelPanel fans its entries out to channel=discord',
-  'TelegramPanel.tsx': 'thin BotChannelSpec wrapper; BotChannelPanel fans its entries out to channel=telegram',
-  'FeishuPanel.tsx': 'thin BotChannelSpec wrapper; BotChannelPanel fans its entries out to channel=feishu',
-  'WeComPanel.tsx': 'thin BotChannelSpec wrapper; BotChannelPanel fans its entries out to channel=wecom',
+  'DecisionsProviderPicker.tsx': 'the Decisions card\'s provider choice writes a preset id, or a SageMaker endpoint\'s name, region and profile, through the owner-only PUT /api/decisions/provider, not a config path, so there is no configKey to index; it is reached through the card the developer.decisions entry deep-links to',
   'ImportPanel.tsx': 'single action button launching the import wizard; no persistent settings',
   'InstanceFormFields.tsx': 'per-instance CRUD form fields (add/edit crew), not global settings',
-  'McpManagement.tsx': 'rendered in Customize → Connections → MCP Servers, not on a Settings tab — a settings deep link would be dead; its per-server switches are table rows keyed by server, not Settings* primitives',
-  'McpManagementAssessment.tsx': "McpManagement.tsx's read-only Sharing assessment view, rendered in Customize → Connections → MCP Servers, zero settings",
-  'McpManagementLaunchReview.tsx': "McpManagement.tsx's launch review and refused-row panels, per-server approvals rather than settings, rendered in Customize → Connections → MCP Servers",
-  'McpManagementHero.tsx': "McpManagement.tsx's hero, reload banner and approval card, rendered in Customize → Connections → MCP Servers, zero settings",
+  'McpManagement.tsx': 'rendered on the MCP Servers page (`/mcp`), not on a Settings tab — a settings deep link would be dead; its per-server switches are table rows keyed by server, not Settings* primitives',
+  'McpManagementAssessment.tsx': "McpManagement.tsx's read-only Sharing assessment view, rendered on the MCP Servers page (`/mcp`), zero settings",
+  'McpManagementLaunchReview.tsx': "McpManagement.tsx's launch review and refused-row panels, per-server approvals rather than settings, rendered on the MCP Servers page (`/mcp`)",
+  'McpManagementCwdQuestion.tsx': "McpManagement.tsx's working-folder question dialog, a per-server answer asked before sharing, rendered on the MCP Servers page (`/mcp`), zero settings",
+  'McpManagementHero.tsx': "McpManagement.tsx's hero, reload banner and approval card, rendered on the MCP Servers page (`/mcp`), zero settings",
+  'McpShareDiagram.tsx': "the MCP sharing hero's non-interactive Off/On picture of what sharing does, rendered on the MCP Servers page (`/mcp`); no controls",
   'MobileLoginCard.tsx': 'mint-a-sign-in-link action card; the link it returns is a one-time credential, not a persistent setting',
-  'OptionalSdkCard.tsx': 'read-only install-command card the Feishu, Teams and WhatsApp panels mount when their optional SDK is missing; zero controls, only a copy button',
+  'OptionalSdkCard.tsx': 'read-only install-command card the Feishu, Teams and WhatsApp panels mount when their optional SDK is missing; a copy button and, for Feishu on the desktop app, a one-shot Install action, no setting and no control writes a config path',
   'PeoplePanel.tsx': 'read-only list of who has used this Crew and where access is managed; no setting and no control writes a config path',
-  'PeopleCrew.tsx': 'the People share card, People list and the name-and-picture dialog; display-only edits and one-shot actions with their own routes, no setting and no control writes a config path',
-  'PeopleModes.tsx': 'the per-mode pieces PeoplePanel mounts (invalid state, read-only Team Access, adapter notes); no setting and no control writes a config path',
+  'PeopleCrew.tsx': 'the one People list with source chips and the name-and-picture dialog; display-only edits and one-shot actions with their own routes, no setting and no control writes a config path',
+  'PeopleModes.tsx': 'the pieces PeoplePanel mounts beside the sources (invalid state, a source status badge, the Console link); no setting and no control writes a config path',
+  'PeopleSources.tsx': 'the People connection-source cards: status, people counts, the owner\'s invite buttons and the Crew link to copy; no setting and no control writes a config path',
   'PeopleAdvanced.tsx': 'the owner-only Advanced section of the People tab, which shows only under the Shared Crew preview; its controls write dashboard.shared_crew.* paths, but a search hit would deep-link to a tab that is hidden unless the preview is on, so they stay out of settings search',
-  'SharedAccessSetup.tsx': 'the People empty state shown while no shared-access path is configured; guidance and links to existing guides, no setting and no control writes a config path',
-  'SsmInvite.tsx': 'the SSM tab of the People invite dialog and its row under Invites: a one-time link form with its own create and remove routes; no setting and no control writes a config path',
+  'SecretUsage.tsx': "the Secrets item pane's read-only Used by card and the delete confirmation's in-use line; it lists where an item is used and holds no setting",
+  'secretsOwnerOnly.tsx': "the hook and the one notice the Secrets panel shows in place of the vault when it is held (a teammate, or a relay caller); one StatusNotice, no setting and no control writes a config path",
+  'SharedAccessSetup.tsx': 'the dashed People card for a connection source not set up yet; guidance and links to existing guides, no setting and no control writes a config path',
+  'SsmInvite.tsx': 'the SSM tab of the People invite dialog and its row in the People list: a one-time link form with its own create and remove routes; no setting and no control writes a config path',
   'TailscaleInvites.tsx': 'the People invite dialog: a one-time invite form and the Tailscale credential connect field, both actions with their own Connect and Disconnect routes; no setting and no control writes a config path',
   'PostureDisclosure.tsx': "read-only disclosure rows for SecurityPanel's posture section (manual entry security.live-security-posture)",
-  'ReleasesPanel.tsx': 'read-only changelog viewer, zero persistent settings',
+  'AboutPanelUpdateChanges.tsx': "read-only list of the changes an available update brings, under About > Updates; zero controls",
+  'RemoteCrewWindowsNotice.tsx': "the Remote Crew Set-up tab's Windows-gateway notice in place of the AWS checklist; text and a guide link, zero controls",
   'ReportProblemCard.tsx': 'feedback action card, no settings',
   'SettingsSearch.tsx': 'the settings search box itself — indexing it would be self-referential',
+  'SlackSetupWizard.tsx': "the Slack setup wizard: one-time steps that write the same slack.* fields the Slack panel's own form (indexed) holds, so it adds no searchable setting",
+  'SlackWizardDiagram.tsx': "the setup wizard's non-interactive pictures of where to click in Slack; no controls",
   'SlackManifestUpdate.tsx': "the Slack Code section's update-your-Slack-app panel (install status, copy manifest, App Manifest link, Check again); it reports and acts on the installed app and holds no setting",
+  'SlackOwnerClaim.tsx': "the Slack Identity & access card's Claim in Slack block (open window, candidates, This is me, Clear owner); it acts on the owner the Owner Slack member ID setting beside it already indexes, and holds no setting of its own",
   'SttRetentionNote.tsx': "read-only \"Is my audio kept?\" line under SttSettings' provider picker; an info tip and a docs link, zero controls",
   'ThemeDroppedRulesNotice.tsx': 'informational notice, zero controls',
   'TranslucentPanelsPreview.tsx': 'aria-hidden illustration under the Translucent panels switch (registry id display.translucent-panels, on DisplayPanel); it holds no control of its own',
@@ -240,7 +247,7 @@ const WAIVED_BARE_CONTROLS: Record<string, { counts: BareCounts; reason: string 
     reason:
       'the sampling-share range input has no slider primitive, exactly as ' +
       "NotificationsPanel's volume does; it is reached through the card the " +
-      'developer.decisions-jev entry deep-links to, and a manual entry for it would ' +
+      'developer.decisions entry deep-links to, and a manual entry for it would ' +
       'advertise a row that the capabilities.decisions ceiling can withdraw',
   },
   'DecisionsProviderPicker.tsx': {
@@ -249,7 +256,7 @@ const WAIVED_BARE_CONTROLS: Record<string, { counts: BareCounts; reason: string 
       'the provider radio group and the SageMaker endpoint fields: not a config path ' +
       '(the choice is written through the owner-only provider route as a preset id, ' +
       'or as an endpoint name, region and profile the gateway checks), and they sit ' +
-      'inside the card the developer.decisions-jev entry deep-links to',
+      'inside the card the developer.decisions entry deep-links to',
   },
   'DisplayPanel.tsx': {
     counts: { SimpleSelect: 1, Input: 1, input: 1 },
@@ -267,6 +274,13 @@ const WAIVED_BARE_CONTROLS: Record<string, { counts: BareCounts; reason: string 
     counts: { Input: 1 },
     reason: 'read-only display of the freshly minted sign-in link (select-on-focus for manual copy) — transient, not a persistent setting',
   },
+  'NotificationsBridgeRoute.tsx': {
+    counts: { Select: 1, input: 1 },
+    reason:
+      'the per-channel "Deliver to" chat-app checkboxes and the priority-floor Select ' +
+      'render on runtime-fetched channel rows, offering only the chat apps connected ' +
+      'right now (manual: notifications.sources)',
+  },
   'NotificationsPanel.tsx': {
     counts: { Toggle: 1, Select: 1, input: 1 },
     reason:
@@ -278,13 +292,20 @@ const WAIVED_BARE_CONTROLS: Record<string, { counts: BareCounts; reason: string 
     counts: { input: 6, SimpleSelect: 1 },
     reason: 'backup-restore form: the export\'s include-chat-history, include-agent-templates and memory-only boxes, the export zip file picker, the import\'s memory-only box, the import preview\'s per-template install box (one control rendered once per bundled template) and the merge/replace mode for that one import — per-export and per-import arguments, not persistent settings',
   },
-  'RemoteCrewPanel.tsx': {
-    counts: { input: 7 },
+  'RemoteCrewPanelSetupCards.tsx': {
+    counts: { input: 8 },
     reason:
-      'setup-wizard AWS profile/region convenience fields (localStorage) behind a ' +
-      'non-URL sub-tab a deep link cannot mount; plus the launch form\'s identity ' +
+      'the Add Crew modal\'s setup-form AWS profile/region convenience fields (localStorage), ' +
+      'which a deep link cannot open; plus the launch form\'s sign-in-on-launch checkbox, identity ' +
       'choice (2 radios), Identity Center start-URL/region and subnet ID fields — per-launch ' +
       'arguments sent with the launch request, not persistent settings',
+  },
+  'RemoteCrewPanelCustomType.tsx': {
+    counts: { input: 2 },
+    reason:
+      'the launch form\'s custom instance type: the filter box over the runtime-fetched list ' +
+      'and one radio rendered per offered type -- a per-launch argument sent with the launch ' +
+      'request, not a persistent setting',
   },
   'RemoteCrewPanelCrewRow.tsx': {
     counts: { Toggle: 1 },
@@ -293,11 +314,17 @@ const WAIVED_BARE_CONTROLS: Record<string, { counts: BareCounts; reason: string 
       'crew\'s record, not a global setting',
   },
   'PeopleCrew.tsx': {
-    counts: { Input: 2, input: 1 },
+    counts: { Input: 1, input: 1 },
     reason:
-      'the read-only share link field and the name-and-picture dialog (name, picture file) ' +
-      'are a copy target and display-only edits saved by their own route: nothing here ' +
-      'writes a config path, so there is no row for settings search to find',
+      'the name-and-picture dialog (name, picture file) is a display-only edit saved by ' +
+      'its own route: nothing here writes a config path, so there is no row for settings ' +
+      'search to find',
+  },
+  'PeopleSources.tsx': {
+    counts: { Input: 1 },
+    reason:
+      'the read-only Crew link field on the Tailscale source card is a copy target: nothing ' +
+      'here writes a config path, so there is no row for settings search to find',
   },
   'PeopleAdvanced.tsx': {
     counts: { Toggle: 3, Input: 1 },
@@ -307,8 +334,10 @@ const WAIVED_BARE_CONTROLS: Record<string, { counts: BareCounts; reason: string 
       'settings search because the People tab is hidden unless the Shared Crew preview is on',
   },
   'SecretsPanel.tsx': {
-    counts: { Input: 2 },
-    reason: 'add-secret name/value form — transient CRUD, not persistent knobs',
+    counts: { Input: 6, textarea: 1 },
+    reason:
+      'add/edit form for one vault item (name, value, login fields, a website to add, note text) ' +
+      '— transient CRUD, not persistent knobs',
   },
   'SecurityPanelDeniedCommands.tsx': {
     counts: { Toggle: 4, Checkbox: 1, Input: 5 },
@@ -330,16 +359,28 @@ const WAIVED_BARE_CONTROLS: Record<string, { counts: BareCounts; reason: string 
     counts: { input: 1 },
     reason: 'the settings search box itself',
   },
-  'SlackCodeChannelDefaults.tsx': {
-    counts: { SimpleSelect: 3 },
+  'SlackSetupWizard.tsx': {
+    counts: { Input: 4 },
     reason:
-      'the code-channel default folder, agent and effort pickers: one nested ' +
+      'transient: the setup wizard\'s alias, bot token, app-level token and member-ID entries; ' +
+      'each is a one-time step whose stored field the Slack panel form below indexes',
+  },
+  'SlackCodeChannelDefaults.tsx': {
+    counts: { SimpleSelect: 4 },
+    reason:
+      'the code-channel default folder, agent, effort and approval-mode pickers: one nested ' +
       'slack.code_channel_defaults object, reached through the Code channels switch the ' +
       'extractor indexes (channels.code-channels-slack), which reveals them',
   },
   'SlackPanel.tsx': {
     counts: { Input: 1 },
     reason: "TagListEditor's internal draft input — part of a composite the extractor indexes whole",
+  },
+  'SlackSharedAccess.tsx': {
+    counts: { Input: 1 },
+    reason:
+      'the member-ID draft input of the People with access list: an input to the Add ' +
+      'action, whose list (slack.shared_access.user_ids) is indexed through the section',
   },
   'SsmInvite.tsx': {
     counts: { Input: 1 },
@@ -407,6 +448,14 @@ describe('settings coverage gate — bare controls', () => {
  * skipped"; this pins each one so a new silent skip fails the build.
  */
 const EXPECTED_DYNAMIC_SKIPS: Record<string, { count: number; reason: string }> = {
+  'ChatRuntimeSharingHarnessRows.tsx': {
+    count: 1,
+    reason:
+      'one switch per harness that may share a chat runtime, labelled from the ' +
+      'CHAT_SHARING_HARNESSES table so each later harness is one row; the switches show ' +
+      'only inside the ACP runtime sharing preview row while it is on, and that indexed ' +
+      'row is the search hit that reaches them',
+  },
   'BrowserLiveSection.tsx': {
     count: 1,
     reason:
@@ -429,6 +478,14 @@ const EXPECTED_DYNAMIC_SKIPS: Record<string, { count: number; reason: string }> 
       'the set of apps is whatever is installed, so there is no fixed label to index. ' +
       'The rows sit on the Notifications Sources page beside each app\'s channels',
   },
+  'OAuthAppPanel.tsx': {
+    count: 4,
+    reason:
+      'one OAuth app part per Connections card: Client ID, Client secret (two shapes) and ' +
+      'the Google entry\'s "Also save on …" switch. The card may be closed, so a generic ' +
+      'entry would highlight a hidden field; settingsManual.ts indexes one OAuth app entry ' +
+      'per provider (and one for Google), and that highlight opens the card first',
+  },
   'SessionEnvironmentsCard.tsx': {
     count: 8,
     reason: 'Coder, Sprites, boxd and Kiro Cloud per-profile CRUD fields, the Coder per-profile template field (picker or free text) and the per-profile stop switch depend on configured rows and cannot be global deep links; the Session Environments page owns them behind its provider choice',
@@ -446,7 +503,7 @@ const EXPECTED_DYNAMIC_SKIPS: Record<string, { count: number; reason: string }> 
       'from a Record keyed by the SERVER id (the scope name, the tier), which is what ' +
       'lets a gateway ship another point or scope with no edit here — the same ' +
       'arrangement AgentBackendTab uses for capability labels. Both are one level ' +
-      'inside the card the developer.decisions-jev entry deep-links to, and a manual ' +
+      'inside the card the developer.decisions entry deep-links to, and a manual ' +
       'entry would advertise a row the capabilities.decisions ceiling can withdraw',
   },
   'NotificationsPanel.tsx': {
@@ -459,8 +516,8 @@ const EXPECTED_DYNAMIC_SKIPS: Record<string, { count: number; reason: string }> 
   'SecretsPanel.tsx': {
     count: 1,
     reason:
-      'managed SecretField labels are selected from a closed kind-to-copy map and the ' +
-      'rows are transient server-provided credential slots, not persistent settings',
+      'the managed pane labels its SecretField with the slot copy (managedLabel), the anchor ' +
+      'the settingsManual secrets.* entries highlight; one pane per transient credential slot',
   },
 }
 

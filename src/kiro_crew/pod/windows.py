@@ -82,6 +82,7 @@ port, no tunnel, ``--no-crons``, and the refusal to bind the live port.
 from __future__ import annotations
 
 import contextlib
+import html
 import locale
 import os
 import subprocess
@@ -108,10 +109,14 @@ from kiro_crew.platform_compat import (
 from kiro_crew.pod import _windows_job as jobs
 from kiro_crew.pod import _windows_run as runs
 from kiro_crew.pod import log_mark
-from kiro_crew.pod.config import EXIT_REFUSED_UNRECOVERABLE, PodConfig, environment_vars
+from kiro_crew.pod.config import (
+    EXIT_REFUSED_UNRECOVERABLE,
+    POD_HEALTH_WAIT_SECS_DEFAULT,
+    PodConfig,
+    environment_vars,
+)
 from kiro_crew.pod.unit import _kirocrew_argv as _shared_kirocrew_argv
 from kiro_crew.sandbox import apply_windows_resource_ceiling
-from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 # Task Scheduler folder every pod task lives in. One folder per pod plane, so a
 # hermetic test plane (KIROCREW_POD_UNIT_PREFIX) cannot collide with a
@@ -178,11 +183,17 @@ def _unlink_waiting_out_sharing(
 #: pod's gateway sidecar after the process it supervised exits. Bounds how long a
 #: pod can report itself alive after its LAST gateway is gone, so it is a
 #: correctness ceiling rather than a comfort setting: too short and an in-app
-#: restart is misread as a stop (the fail-OPEN direction — `pod down` would then
-#: reclaim a live pod), too long and a genuinely stopped pod lingers as running.
+#: restart is misread as a stop (the supervisor drains its lifetime Job with the
+#: booting successor inside it, so the pod goes down), too long and a genuinely
+#: stopped pod lingers as running.
+#:
+#: The successor writes that sidecar only once its listener is bound, which is
+#: the END of a full gateway boot, so the window has to fit a whole boot. It is
+#: therefore the same budget `pod up` gives a first boot to answer health, not a
+#: shorter one: a restart successor does the same work on the same host.
 #: The wait is only ever entered while the exited gateway still has a live
 #: attributed child, so an ordinary shutdown never pays it.
-SUCCESSOR_ADOPT_TIMEOUT_SECS = 30.0
+SUCCESSOR_ADOPT_TIMEOUT_SECS = float(POD_HEALTH_WAIT_SECS_DEFAULT)
 
 
 class WindowsTaskError(RuntimeError):
@@ -450,12 +461,14 @@ def render_task_script(cfg: PodConfig, name: str) -> str:
 
 
 def _script_encoding() -> str:
-    """The codec ``cmd.exe`` reads a batch file with.
+    """The codec ``cmd.exe`` reads a batch file with, and ``schtasks.exe`` writes with.
 
     ``cmd.exe`` decodes a ``.cmd`` in the console's OEM code page (``chcp``),
     never UTF-8, so the wrapper is written in that code page: Python's ``oem``
-    codec is exactly that page on Windows. Elsewhere (the render tests run on
-    Linux) there is no OEM page and UTF-8 stands in.
+    codec is exactly that page on Windows. ``schtasks.exe`` writes its messages
+    to a redirected pipe in the same page, so :func:`_schtasks_raw` reads them
+    with it. Elsewhere (the render tests run on Linux) there is no OEM page and
+    UTF-8 stands in.
     """
     return "oem" if IS_WINDOWS else "utf-8"
 
@@ -496,15 +509,55 @@ def write_task_script(cfg: PodConfig, name: str) -> Path:
     return dst
 
 
+#: Task Scheduler priority of a pod's task: 5 is NORMAL_PRIORITY_CLASS with a
+#: normal thread priority. ``schtasks /Create`` has no priority flag and leaves the
+#: default, 7, which is BELOW_NORMAL with low I/O and memory priority. Every process
+#: of the pod inherits it: the wrapper's cmd.exe, its console host, the boot and the
+#: gateway with its children. While other programs keep the CPUs busy at normal
+#: priority that tree barely runs, and `pod up` exhausts its readiness budget.
+TASK_PRIORITY = 5
+
+
+def render_task_xml(script: Path) -> str:
+    """The task definition :func:`start` registers for the wrapper at *script*.
+
+    It is the task ``schtasks /Create /SC ONCE /ST 00:00 /TR <script>`` makes,
+    plus :data:`TASK_PRIORITY`. No ``UserId`` and ``InteractiveToken``: Task
+    Scheduler registers it for the calling user, to run only while that user is
+    logged on, with no password. The trigger lies in the past, so the task never
+    fires on its own and runs only on ``/Run``.
+    """
+    # Element text: `&`, `<` and `>` are the only characters to escape there.
+    command = html.escape(str(script), quote=False)
+    return (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        '  <Principals><Principal id="Author">'
+        "<LogonType>InteractiveToken</LogonType></Principal></Principals>\n"
+        "  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"
+        f"<Priority>{TASK_PRIORITY}</Priority></Settings>\n"
+        "  <Triggers><TimeTrigger><StartBoundary>2000-01-01T00:00:00</StartBoundary>"
+        "</TimeTrigger></Triggers>\n"
+        f'  <Actions Context="Author"><Exec><Command>{command}</Command></Exec></Actions>\n'
+        "</Task>\n"
+    )
+
+
 # Talking to schtasks
 def _schtasks_raw(exe: str, *args: str) -> subprocess.CompletedProcess:
-    """Run *exe* with *args*, no gate — used by the gate's own probe."""
-    return subprocess.run(
+    """Run *exe* with *args*, no gate — used by the gate's own probe.
+
+    Output is decoded in the OEM code page, not UTF-8: a localized refusal
+    would otherwise reach the operator as U+FFFD.
+    """
+    return subprocess.run(  # subprocess-encoding: locale
         [exe, *args],
         capture_output=True,
         timeout=30,
         check=False,
-        **UTF8_TEXT,
+        text=True,
+        encoding=_script_encoding(),
+        errors="replace",
     )
 
 
@@ -529,20 +582,35 @@ def task_exists(cfg: PodConfig, name: str) -> bool:
     return schtasks("/Query", "/TN", task_name(cfg, name)).returncode == 0
 
 
+def scheduler_answers() -> bool:
+    """Whether Task Scheduler answers a query at all.
+
+    Asks for the pod plane's own folder, never the whole tree: a bare
+    ``/Query`` lists every task on the host and took 120 s on a busy 4-CPU
+    host, past ``_schtasks_raw``'s 30 s budget, while this folder query stayed
+    near a single ``/Query /TN``. The trailing ``\\`` makes it a folder
+    query, which exits zero even when the folder holds no task. The folder
+    exists: ``require_backend``'s probe, which every ``schtasks`` call passes
+    first, created a task in it, and Task Scheduler keeps a folder after its
+    last task is deleted. A folder deleted since then reads as "no answer",
+    the fail-closed side.
+    """
+    return schtasks("/Query", "/TN", TASK_FOLDER_ROOT + "\\").returncode == 0
+
+
 def task_absent(cfg: PodConfig, name: str) -> bool:
     """True only when Task Scheduler answered and holds no task for *name*.
 
     ``task_exists`` keys on ``/Query /TN``'s exit code, but that code is
     non-zero both for "no such task" and for "the service did not answer", so a
-    non-zero result alone is NOT proof of absence. A bare ``/Query`` (no
-    ``/TN``) exits zero only when Task Scheduler answers, which separates the
-    two. Only when the service answers AND holds no task is the name proven
-    gone; an unreachable service fails CLOSED here so a residue guard keyed on
-    this never deletes on an unanswered query.
+    non-zero result alone is NOT proof of absence. ``scheduler_answers``
+    separates the two. Only when the service answers AND holds no task is the
+    name proven gone; an unreachable service fails CLOSED here so a residue
+    guard keyed on this never deletes on an unanswered query.
     """
     if schtasks("/Query", "/TN", task_name(cfg, name)).returncode == 0:
         return False  # the task is still present
-    return schtasks("/Query").returncode == 0  # bare /Query: did the service answer?
+    return scheduler_answers()
 
 
 # The supervised pid record
@@ -691,18 +759,19 @@ def finish_boot(cfg: PodConfig, name: str, record: dict, code: int, *, certify: 
 def start(cfg: PodConfig, name: str) -> subprocess.CompletedProcess:
     """Create pod *name*'s task and run it now.
 
-    ``/SC ONCE /ST 00:00`` is a schedule Task Scheduler will not fire on its
-    own: the trigger time is already in the past when the task is created, and
-    Windows does not replay a missed trigger unless the task asks it to. That
-    keeps a pod TRANSIENT, matching the systemd path (``start``, never
-    ``enable``) and the launchd path's deliberate refusal to install under
-    ``~/Library/LaunchAgents``.
+    The task is registered from :func:`render_task_xml`, because only a task
+    definition can carry :data:`TASK_PRIORITY`. Its one-time trigger is in the
+    past, a schedule Task Scheduler will not fire on its own: Windows does not
+    replay a missed trigger unless the task asks it to. That keeps a pod
+    TRANSIENT, matching the systemd path (``start``, never ``enable``) and the
+    launchd path's deliberate refusal to install under ``~/Library/LaunchAgents``.
 
-    Neither ``/RU`` nor ``/RP`` is passed, which is the documented form for "run
-    as the current logged-on user" and the only one that never prompts for a
-    password: ``/RU`` without ``/RP`` asks for one on an interactive console and
-    fails outright without one. So the task runs as the user, unelevated, which
-    is the whole reason this backend is Task Scheduler and not ``sc.exe``.
+    Neither ``/RU`` nor ``/RP`` is passed and the definition names no user, which
+    is the form for "run as the current logged-on user" and the only one that
+    never prompts for a password: ``/RU`` without ``/RP`` asks for one on an
+    interactive console and fails outright without one. So the task runs as the
+    user, unelevated, which is the whole reason this backend is Task Scheduler
+    and not ``sc.exe``. The definition file is deleted once ``/Create`` returns.
     """
     try:
         prior = runs.read(cfg, name)
@@ -720,18 +789,14 @@ def start(cfg: PodConfig, name: str) -> subprocess.CompletedProcess:
         script = write_task_script(cfg, name)
         # Refuse before scheduling if readers could see an old failure result.
         result_path(cfg, name).unlink(missing_ok=True)
-        created = schtasks(
-            "/Create",
-            "/F",
-            "/SC",
-            "ONCE",
-            "/ST",
-            "00:00",
-            "/TN",
-            task_name(cfg, name),
-            "/TR",
-            f'"{script}"',
-        )
+        definition = script.with_suffix(".xml")
+        definition.write_bytes(render_task_xml(script).encode("utf-16"))
+        try:
+            created = schtasks(
+                "/Create", "/F", "/TN", task_name(cfg, name), "/XML", str(definition)
+            )
+        finally:
+            definition.unlink(missing_ok=True)
         if created.returncode != 0:
             raise WindowsTaskError(
                 f"schtasks /Create rc={created.returncode}: "
@@ -1086,6 +1151,16 @@ def _await_successor(record: Path, reaped_pid: int, reaped_token: str) -> int | 
         if not _live_children_of(reaped_pid, reaped_token):
             return None
         time.sleep(0.2)
+    if not _live_children_of(reaped_pid, reaped_token):
+        return None
+    # A live child outlived the whole window without claiming the pod, and the
+    # caller now drains the Job it is in. Said once, in the pod's own log, so a
+    # restart that went down reads as this and not as a successor that crashed.
+    print(
+        f"kirocrew-pod: no restart successor claimed the pod within "
+        f"{SUCCESSOR_ADOPT_TIMEOUT_SECS:.0f}s of gateway pid {reaped_pid} exiting; "
+        "stopping the processes it left"
+    )
     return None
 
 

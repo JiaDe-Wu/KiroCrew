@@ -15,8 +15,10 @@ which :func:`test_added_line_gate_self_test_passes` runs.
 from __future__ import annotations
 
 import ast
+import glob
 import importlib.util
 import inspect
+import logging
 import os
 import re
 import subprocess
@@ -31,6 +33,7 @@ from kiro_crew.acp import client as acp_client
 from kiro_crew.acp import runtime as acp_runtime
 from kiro_crew.acp.harness import KasHarness, KiroHarness
 from kiro_crew.acp.types import (
+    ACP_BACKEND_ANTIGRAVITY,
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
     ACP_BACKEND_COPILOT,
@@ -53,6 +56,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_STRUCTURED_REFUSAL,
     ACP_CLIENT_CAPABILITIES,
     KAS_CLIENT_CAPABILITIES,
+    OWN_STEERING_REQUEST_METHODS,
     PROVIDER_LABEL_BY_BACKEND,
     PROVIDER_LABEL_CLAUDE,
     PROVIDER_LABEL_CODEX,
@@ -66,6 +70,7 @@ from kiro_crew.acp.types import (
 )
 from kiro_crew.acp_backends import (
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
+    ACP_BACKENDS_CONFIG_MODEL_SELECT_IS_CANONICAL,
     ACP_BACKENDS_EFFORT_OVERLAY,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
     ACP_BACKENDS_KIRO_FAMILY,
@@ -218,6 +223,11 @@ def test_config_load_never_reads_the_platform_context(monkeypatch) -> None:
     reached: list = []
     monkeypatch.setattr(pc, "current_context", lambda: reached.append("current_context"))
     monkeypatch.setattr(pc, "installed_context", lambda: reached.append("installed_context"))
+    # The pin is the normalization itself, not whatever handlers an earlier test in
+    # this worker left on ``kiro_crew``: a dashboard server test installs the live log
+    # ring handler for the life of the process, and its redaction reads the
+    # installed context for every warning the unselectable values below log.
+    monkeypatch.setattr(logging.getLogger("kiro_crew"), "handlers", [])
 
     for value in ("", "kas", "byo-harness", "claude", None, 7):
         assert _normalize_acp_backend(value) in ACP_BACKENDS_KNOWN
@@ -318,21 +328,23 @@ def test_the_mate_worker_takes_the_member_rule() -> None:
         source = inspect.getsource(provider.mate_worker_kit_supported.fget)
         assert "in ACP_BACKENDS_MATE_WORKER_KIT" in source
     assert ACP_BACKENDS_MATE_WORKER_KIT == frozenset(
-        {ACP_BACKEND_KAS, ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX}
+        {ACP_BACKEND_KAS, ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_PI}
     )
     assert ACP_BACKENDS_MATE_WORKER_KIT <= ACP_BACKENDS_MEMBER_CAPABILITIES
     assert ACP_BACKEND_KIRO not in ACP_BACKENDS_MATE_WORKER_KIT
-    # The worker's prompt rides the context block exactly where the host's mirror
-    # projects no spec prompt; KAS's wire spec carries it.
+    # The worker's prompt rides the context block exactly where the host reads no
+    # spec prompt of Crew's: a mirror that withholds it, or a BROKER_ONLY host (pi),
+    # which has no mirror at all. KAS's wire spec carries it.
     from kiro_crew.providers.mirrors.base import Concern, Disposition
-    from kiro_crew.providers.mirrors.registry import mirror_for
+    from kiro_crew.providers.mirrors.registry import ProjectionKind, mirror_for, projection_for
 
     assert ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT <= ACP_BACKENDS_MATE_WORKER_KIT
     for backend in ACP_BACKENDS_MATE_WORKER_KIT:
         mirror = mirror_for(backend)
         withheld = (
-            mirror is not None
-            and mirror.rulings()[Concern.PROMPT].disposition is Disposition.WITHHELD
+            mirror.rulings()[Concern.PROMPT].disposition is Disposition.WITHHELD
+            if mirror is not None
+            else projection_for(backend).kind is ProjectionKind.BROKER_ONLY
         )
         assert withheld is (backend in ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT), backend
     allocation = inspect.getsource(get_or_create)
@@ -721,7 +733,7 @@ def test_every_known_backend_has_a_label() -> None:
     labels = dict(PROVIDER_LABEL_BY_BACKEND)
     assert set(labels) == set(ACP_BACKENDS_KNOWN), (
         "a known backend has no label in PROVIDER_LABEL_BY_BACKEND, so it would "
-        "persist under the kiro label — add a row in acp/types.py"
+        "persist under the kiro label — add a row in acp/provider_labels.py"
     )
     assert len(set(labels.values())) == len(labels), "two backends share a label"
     assert labels[ACP_BACKEND_KIRO] == PROVIDER_LABEL_DEFAULT, (
@@ -883,6 +895,8 @@ def test_model_switch_channel_is_opt_in() -> None:
     assert ACP_BACKEND_CODEX in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION
     assert ACP_BACKEND_KIRO not in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION
     assert ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION <= ACP_BACKENDS_KNOWN
+    assert ACP_BACKENDS_CONFIG_MODEL_SELECT_IS_CANONICAL <= ACP_BACKENDS_ADVERTISED_MODEL_SELECTION
+    assert ACP_BACKEND_ANTIGRAVITY in ACP_BACKENDS_CONFIG_MODEL_SELECT_IS_CANONICAL
     source = "\n".join(
         (
             inspect.getsource(acp_client.AcpClient.set_model),
@@ -998,11 +1012,23 @@ def test_codex_resolves_its_own_adapter_and_declares_its_own_handshake() -> None
     )
 
 
-#: The per-harness MCP seams spliced into ``AcpClient``'s session-setup paths, by
-#: harness. Declared rather than discovered so a DELETED splice fails the test below
-#: -- codex is absent because this PR moved its seam onto the harness, and kiro-cli
-#: has none (``--agent`` carries its servers).
-_MCP_SEAM_HOOKS = ["claude", "copilot", "deepseek", "goose", "opencode", "pi"]
+#: The MCP seams spliced into ``AcpClient``'s session-setup paths. Declared rather
+#: than discovered so a DELETED splice fails the test below. ``adapter`` is the one
+#: splice that asks the process adapter for ``self.backend``
+#: (``_adapter_session_mcp_servers``); ``harness`` asks the client class of
+#: ``self.backend`` (``_harness_session_mcp_servers``: empty on ``AcpClient``, claude's
+#: own array on ``ClaudeAcpClient``). codex is absent because its seam is on the
+#: harness, and kiro-cli has none (``--agent`` carries its servers).
+_MCP_SEAM_HOOKS = ["adapter", "harness"]
+
+#: The client hook each process adapter's ``session_mcp_servers`` asks, by adapter.
+#: An adapter absent here keeps the base default, which adds no server.
+_ADAPTER_MCP_SEAMS = {
+    "MimoCodeLaunch": "mimocode",
+    "CopilotLaunch": "copilot",
+    "AntigravityLaunch": "antigravity",
+    "PiLaunch": "pi",
+}
 
 
 def test_each_mcp_seam_is_spliced_only_for_its_own_harness() -> None:
@@ -1034,6 +1060,13 @@ def test_each_mcp_seam_is_spliced_only_for_its_own_harness() -> None:
             "A missing name means a harness lost its mirrored servers; an extra one "
             "means a new seam -- add it here and gate it on its own _is_<harness>."
         )
+        # The shared accessor is never spliced bare: a bare call is invisible to the
+        # per-hook regex above, so its guard would go unchecked. Every harness reaches
+        # it through its own named seam.
+        assert "self._session_mcp_servers()" not in source, (
+            f"{fn.__name__}: a bare _session_mcp_servers() splice; route it through "
+            "the harness's own _<harness>_session_mcp_servers seam"
+        )
         # Each OCCURRENCE carries its own guard, naming its own harness. A search of
         # the whole function body would be satisfied by an unrelated ``if self._is_x``
         # elsewhere in it, so an ungated splice would read as gated -- which is the
@@ -1043,11 +1076,85 @@ def test_each_mcp_seam_is_spliced_only_for_its_own_harness() -> None:
         # session is the worst-consequence version of this defect, not the mildest.
         for m in splice.finditer(source):
             h = m.group("h")
+            if h in ("adapter", "harness"):
+                # Gated by construction: the adapter is the one for ``self.backend``,
+                # and each adapter asks only its own hook (the test below); the
+                # harness hook is the client class's own, and only ClaudeAcpClient,
+                # GooseAcpClient, OpencodeAcpClient and DeepseekAcpClient fill it
+                # (pinned below).
+                continue
             tail = source[m.end() : m.end() + 80]
             assert re.match(rf"\s+if\s+self\._is_{h}\b", tail), (
                 f"{fn.__name__}: the {h} seam is spliced without its own "
                 f"`if self._is_{h}` guard on that same element"
             )
+
+
+def test_only_the_claude_goose_opencode_and_deepseek_clients_fill_the_harness_mcp_seam() -> None:
+    """The ``harness`` splice adds nothing on the shared class, and claude's, goose's,
+    opencode's or deepseek's array on its own class: the gate is which class the
+    backend builds."""
+    shared = acp_client.AcpClient(acp_backend="")
+    assert shared._harness_session_mcp_servers() == []
+    filled = [
+        cls.__name__
+        for cls in (
+            acp_client.AcpClient,
+            acp_client.ClaudeAcpClient,
+            acp_client.GooseAcpClient,
+            acp_client.OpencodeAcpClient,
+            acp_client.DeepseekAcpClient,
+        )
+        if "_harness_session_mcp_servers" in vars(cls)
+        and vars(cls)["_harness_session_mcp_servers"]
+        is not vars(acp_client.AcpClient)["_harness_session_mcp_servers"]
+    ]
+    assert filled == [
+        "ClaudeAcpClient",
+        "GooseAcpClient",
+        "OpencodeAcpClient",
+        "DeepseekAcpClient",
+    ]
+    assert "self._claude_session_mcp_servers()" in inspect.getsource(
+        acp_client.ClaudeAcpClient._harness_session_mcp_servers
+    )
+    assert "self._goose_session_mcp_servers()" in inspect.getsource(
+        acp_client.GooseAcpClient._harness_session_mcp_servers
+    )
+    assert "self._opencode_session_mcp_servers()" in inspect.getsource(
+        acp_client.OpencodeAcpClient._harness_session_mcp_servers
+    )
+    assert "self._deepseek_session_mcp_servers()" in inspect.getsource(
+        acp_client.DeepseekAcpClient._harness_session_mcp_servers
+    )
+
+
+def test_each_process_adapter_asks_only_its_own_mcp_seam() -> None:
+    """H6 at the adapter: the hook a session's array is spliced from is that harness's.
+
+    Every adapter registered for the client is listed, so a new one fails here until
+    it says which client hook it asks, or that it keeps the default of none.
+    """
+    from kiro_crew.acp.harness import _PROCESS_ADAPTERS, ProcessAdapter
+
+    seen = {}
+    for backend, adapter_cls in _PROCESS_ADAPTERS.items():
+        name = adapter_cls.__name__
+        hook = _ADAPTER_MCP_SEAMS.get(name)
+        override = adapter_cls.session_mcp_servers
+        if hook is None:
+            assert (
+                override is ProcessAdapter.session_mcp_servers
+            ), f"{name} overrides session_mcp_servers; declare its hook above"
+            assert adapter_cls().session_mcp_servers(MagicMock()) == []
+            continue
+        seen[name] = hook
+        assert override is not ProcessAdapter.session_mcp_servers, name
+        source = inspect.getsource(override)
+        assert source.count("_session_mcp_servers()") == 1, (name, source)
+        assert f"session._{hook}_session_mcp_servers()" in source, (name, source)
+        assert adapter_cls.backend == backend
+    assert seen == _ADAPTER_MCP_SEAMS
 
 
 def test_codex_mcp_seam_projects_through_its_mirror() -> None:
@@ -1086,7 +1193,7 @@ def test_opencode_mcp_seam_projects_through_its_mirror() -> None:
     ``http`` and ``sse`` elements too, so dropping them would remove capability the
     session would have had.
     """
-    source = inspect.getsource(acp_client.AcpClient._opencode_session_mcp_servers)
+    source = inspect.getsource(acp_client.OpencodeAcpClient._opencode_session_mcp_servers)
     assert "self._session_mcp_servers()" in source
     assert acp_backends.ACP_BACKEND_OPENCODE in acp_backends.ACP_BACKENDS_SESSION_MCP_ARRAY
     assert mirrors.mirror_for(acp_backends.ACP_BACKEND_OPENCODE) is not None
@@ -1263,38 +1370,14 @@ def test_vocabulary_home_exempts_the_vocabulary_module_and_its_listed_owners_onl
 # good -- a reviewer does that -- but it makes adding a seventh site a deliberate
 # act with a written justification instead of a line nobody notices.
 
-_RUNTIME_PATH_MODULES = (
-    "src/kiro_crew/acp/runtime.py",
-    "src/kiro_crew/acp/runtime_tree_kill.py",
-    "src/kiro_crew/acp/runtime_spawn_launch.py",
-    "src/kiro_crew/acp/runtime_spawn_entry.py",
-    "src/kiro_crew/acp/runtime_session_setup.py",
-    "src/kiro_crew/acp/runtime_session_create.py",
-    "src/kiro_crew/acp/runtime_session_load.py",
-    "src/kiro_crew/acp/runtime_session_registry.py",
-    "src/kiro_crew/acp/runtime_mode_activation.py",
-    "src/kiro_crew/acp/runtime_wire.py",
-    "src/kiro_crew/acp/runtime_liveness.py",
-    "src/kiro_crew/acp/runtime_host_requests.py",
-    "src/kiro_crew/acp/runtime_frame_accounting.py",
-    "src/kiro_crew/acp/runtime_reader_loop.py",
-    "src/kiro_crew/acp/runtime_remote_workspace.py",
-    "src/kiro_crew/acp/runtime_class.py",
-    "src/kiro_crew/acp/session_handle.py",
-    "src/kiro_crew/acp/session_handle_runtime_contract.py",
-    "src/kiro_crew/acp/session_handle_watchdog.py",
-    "src/kiro_crew/acp/session_handle_lifecycle.py",
-    "src/kiro_crew/acp/session_handle_compaction.py",
-    "src/kiro_crew/acp/session_handle_turn.py",
-    "src/kiro_crew/acp/session_handle_dispatch.py",
-    "src/kiro_crew/acp/session_handle_mcp.py",
-    "src/kiro_crew/acp/session_handle_kas.py",
-    "src/kiro_crew/acp/session_handle_native_children.py",
-    "src/kiro_crew/acp/session_handle_model_selection.py",
-    "src/kiro_crew/acp/session_handle_steering.py",
-    "src/kiro_crew/acp/session_handle_permissions.py",
-    "src/kiro_crew/acp/session_handle_updates.py",
-    "src/kiro_crew/acp/session_handle_class.py",
+#: The runtime-path modules: every ``runtime*.py`` and ``session_handle*.py`` file in
+#: ``acp/``, read from the tree so a module split off either one is scanned too.
+_RUNTIME_PATH_MODULES = tuple(
+    sorted(
+        os.path.relpath(path, _REPO_ROOT).replace(os.sep, "/")
+        for pattern in ("runtime*.py", "session_handle*.py")
+        for path in glob.glob(os.path.join(_REPO_ROOT, "src", "kiro_crew", "acp", pattern))
+    )
 )
 
 #: Backend-identity comparisons the runtime path is allowed to make, keyed by
@@ -1302,6 +1385,44 @@ _RUNTIME_PATH_MODULES = (
 #: comparison against an ``ACP_BACKEND_*`` constant that is not listed here fails
 #: :func:`test_every_runtime_path_identity_test_is_declared`.
 _DECLARED_IDENTITY_TESTS: dict[tuple[str, str], str] = {
+    (
+        "src/kiro_crew/acp/session_handle_tool_silence.py",
+        "note_kas_subtask_frame",
+    ): "Positive KAS gate (H5): only KAS streams a native sub-agent on its parent's own "
+    "session, each frame naming the subtask in ``agentSubtaskId``; kiro-cli streams a "
+    "child under the child's own ``sessionId``, so no table holds this answer.",
+    (
+        "src/kiro_crew/acp/runtime_session_create.py",
+        "create_session",
+    ): "the KAS engine that registered a member's agent loads the operator's global "
+    "~/.kiro/steering tree itself, with no switch for it "
+    "(kas_steering.inheritance_off_notice), so that session records the load as "
+    "native; kiro-cli's launch record already carries it, a Kiro Cloud sandbox "
+    "registers no agent, and no other harness reads that tree",
+    (
+        "src/kiro_crew/acp/runtime_session_create.py",
+        "_finish_create_session",
+    ): "wording only: the Kiro CLI harness is the one launch that runs kiro-cli's v2 "
+    "engine, which leaves out of its modes a file kiro-cli lists as the v3 agent "
+    "format, so only its mode refusal may name that format "
+    "(``side_readonly_spec.unavailable_mode_explanation``); the refusal itself is "
+    "raised for every harness alike, and no capability table holds an engine version",
+    (
+        "src/kiro_crew/acp/runtime_spawn_entry.py",
+        "spawn",
+    ): "moving kiro-cli's broken KAS extract aside and retrying is a repair for the "
+    "KAS relay alone (kiro-cli's v3 engine copy); every other harness, Kiro CLI "
+    "included, starts exactly as before",
+    (
+        "src/kiro_crew/acp/runtime_liveness.py",
+        "_drain_stderr",
+    ): "the broken-KAS-extract stderr latch feeds only the KAS repair; a non-KAS "
+    "runtime never latches it. "
+    '"V3 is currently not supported on this system" is kiro-cli refusing the v3 '
+    "engine KAS runs on, so the host verdict it records is KAS's alone "
+    "(``mark_backend_unservable`` of KAS). No other harness runs that engine, and "
+    "recording it from another child would move KAS off a host on a line about "
+    "something else.",
     (
         "src/kiro_crew/acp/session_handle_turn.py",
         "_build",
@@ -1320,6 +1441,12 @@ _DECLARED_IDENTITY_TESTS: dict[tuple[str, str], str] = {
     "the agent's local tools on the gateway machine.",
     (
         "src/kiro_crew/acp/session_handle_permissions.py",
+        "reject_tool",
+    ): "``_meta.kiro.rejectionReason`` on a one-time Deny is a key only the KAS engine "
+    "reads (it hands the text to the model); every other harness must be sent the bare "
+    "reject, so a positive identity test keeps the key off their wire.",
+    (
+        "src/kiro_crew/acp/session_handle_permissions.py",
         "_build_permission_event",
     ): "``_meta.kiro.consent`` on a permission request is KAS's own vocabulary (toolId "
     "plus consent capability). No other harness sends it, and reading it elsewhere would "
@@ -1335,6 +1462,13 @@ _DECLARED_IDENTITY_TESTS: dict[tuple[str, str], str] = {
         "_spawn_admitted",
     ): "Only native Kiro loads the alias agent files and workspace resource-inheritance "
     "setting used to bound skill metadata. Other harnesses must keep their own spawn plans.",
+    (
+        "src/kiro_crew/acp/runtime_spawn_launch.py",
+        "_initialize_handshake",
+    ): "``_meta.kiro.settings.memory`` is a KAS engine setting: while orchestrator memory "
+    "is on, a local KAS process starts with native memory disabled so no device default "
+    "can turn it on. No other harness defines the key, so a positive identity test keeps "
+    "it off their handshake.",
     (
         "src/kiro_crew/acp/runtime_session_setup.py",
         "_guard_unresolved_mcp_refs",
@@ -1373,7 +1507,9 @@ _DECLARED_IDENTITY_TESTS: dict[tuple[str, str], str] = {
         "load_session",
     ): "KAS alone must have its custom agents re-attached on resume, and no harness "
     "property means 'this host needs its agent re-sent'. Adding one would cost the "
-    "kiro path an awaited step it does not need (H13).",
+    "kiro path an awaited step it does not need (H13). Its mode refusal also asks "
+    "whether the harness is Kiro CLI's, as ``_finish_create_session`` does, for the "
+    "wording alone.",
     (
         "src/kiro_crew/acp/session_handle_turn.py",
         "command_is_native",
@@ -1396,11 +1532,24 @@ _DECLARED_IDENTITY_TESTS: dict[tuple[str, str], str] = {
     "own ``model`` select does not list, onto an id that select does list.",
     (
         "src/kiro_crew/acp/session_handle_model_selection.py",
-        "store_session_config",
+        "store_config_options",
     ): "KAS sends no ``models`` object, so its ``model`` select's ``currentValue`` is "
     "the only place it names the model a session runs. It stays out of "
     "``ACP_BACKENDS_ADVERTISED_MODEL_SELECTION`` because that select is its catalog, "
     "not its advertised list, so only the current value is adopted, and only here.",
+    (
+        "src/kiro_crew/acp/session_handle_model_selection.py",
+        "absorb_config_options",
+    ): "From engine 0.66.117 KAS sends its ``model`` select in a "
+    "``config_option_update`` rather than in ``session/new``, so on KAS that update "
+    "runs the same select reader as the answer. Other backends keep their own "
+    "select in the answer, and the update only replaces their options.",
+    (
+        "src/kiro_crew/acp/session_handle_model_selection.py",
+        "settle_kas_model_select",
+    ): "Only KAS answers ``session/new`` without the ``model`` select it then sends "
+    "separately (engine 0.66.117 and later), so only a KAS start waits for it before "
+    "the served-default check; every other backend's answer already carries its list.",
     (
         "src/kiro_crew/acp/session_handle_compaction.py",
         "_kas_compact_request",
@@ -1414,8 +1563,14 @@ _DECLARED_IDENTITY_TESTS: dict[tuple[str, str], str] = {
     "KAS's own extension verbs behind a person's ``/context``, ``/knowledge`` and "
     "``/code``. The positive test keeps them off every other harness's wire.",
     (
+        "src/kiro_crew/acp/session_handle_dispatch.py",
+        "_dispatch_events",
+    ): "Only kiro-cli answers a cancelled prompt ahead of the ``_kiro.dev/metadata`` frame "
+    "that bills it (live probe, 3.1.0), so only there does the stopped turn read one more "
+    "frame. No other harness sends that frame, and the read would spend its grace on every Stop.",
+    (
         "src/kiro_crew/acp/session_handle_updates.py",
-        "_handle_update",
+        "_handle_update_frame",
     ): "KAS emits its own notification discriminants. The positive gate restores those "
     "displays without touching the kiro parser, and returns None for anything not "
     "KAS-specific so shared frames still fall through (H5).",
@@ -1453,8 +1608,12 @@ def test_steer_advertisement_matches_the_steer_table(backend):
     ``True`` for years and was honest only while ``AcpRuntime`` served one host.
     """
     handle = _handle_for(backend)
-    # A ``_session/steering`` member steers only once its handshake advertised it.
-    assert handle.supports_steer is (backend in ACP_BACKENDS_STEER)
+    # A ``_session/steering`` member steers only once its handshake advertised it;
+    # one whose own request the handle speaks (``OWN_STEERING_REQUEST_METHODS``:
+    # goose) is offered it without.
+    assert handle.supports_steer is (
+        backend in ACP_BACKENDS_STEER or backend in OWN_STEERING_REQUEST_METHODS
+    )
     handle._runtime.initialize_result = {"_meta": {"steering": {"supported": True}}}
     assert handle.supports_steer is (
         backend in ACP_BACKENDS_STEER or backend in ACP_BACKENDS_STEERING_REQUEST
@@ -1712,6 +1871,9 @@ def test_every_runtime_path_identity_test_is_declared():
     """
     import ast
 
+    assert "src/kiro_crew/acp/runtime.py" in _RUNTIME_PATH_MODULES and any(
+        rel.startswith("src/kiro_crew/acp/session_handle") for rel in _RUNTIME_PATH_MODULES
+    ), f"the runtime-path module glob found neither family: {_RUNTIME_PATH_MODULES}"
     undeclared: list[str] = []
     for rel in _RUNTIME_PATH_MODULES:
         path = os.path.join(_REPO_ROOT, rel)
@@ -1788,3 +1950,34 @@ def test_the_identity_test_declarations_are_all_still_live():
 
     stale = sorted(set(_DECLARED_IDENTITY_TESTS) - seen)
     assert not stale, f"prune these dead _DECLARED_IDENTITY_TESTS entries: {stale}"
+
+
+@pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
+def test_merge_card_kept_prompt_rule_is_kiro_only(backend: str) -> None:
+    """H5: only the Kiro "kept the prompt" contract consumes an unlanded merge card.
+
+    The turn below left before landing after a real ``end_turn``: on kiro-cli
+    and on KAS (the default, which also runs the Kiro CLI pick) the live
+    session kept the prompt, so its card is consumed. No other harness has been
+    checked against that contract, so its card stays queued and a wrong guess
+    sends it twice instead of losing it.
+    """
+    from types import SimpleNamespace
+
+    from kiro_crew.dashboard.chat_runner import STOP_REASON_END_TURN
+    from kiro_crew.dashboard.chat_turn.turn_stats import _merge_cards_reached_the_model
+
+    turn = SimpleNamespace(
+        client=providers_acp.AcpProvider(acp_backend=backend),
+        _turn_lands=False,
+        _empty_verdict_left_prompt_unanswered=False,
+        _compaction_completed=False,
+        _had_empty_response_verdict=False,
+        _recovering_compaction=False,
+        _stop_reason=STOP_REASON_END_TURN,
+        _terminal_synthetic=False,
+        _turn_emitted=True,
+        needs_conversation_discard=False,
+        needs_session_reset=False,
+    )
+    assert _merge_cards_reached_the_model(turn) is (backend in ACP_BACKENDS_KIRO_FAMILY)

@@ -153,6 +153,14 @@ class TestHooksConfigFromDict:
         # No duplicates even when the operator listed a bundled pattern too.
         assert len(cfg.auto_approve_tools) == len(set(cfg.auto_approve_tools))
 
+    def test_tool_identity_grants_parse_and_round_trip(self):
+        cfg = HooksConfig.from_dict({"auto_approve_tool_identities": ["@notes/lookup", 4]})
+        assert cfg.auto_approve_tool_identities == ["@notes/lookup"]
+        assert "@notes/lookup" not in cfg.auto_approve_tools
+        assert cfg.to_dict()["auto_approve_tool_identities"] == ["@notes/lookup"]
+        junk = HooksConfig.from_dict({"auto_approve_tool_identities": "x"})
+        assert junk.to_dict()["auto_approve_tool_identities"] == []
+
     def test_subagent_flags_fail_safe_on_junk(self):
         cfg = HooksConfig.from_dict(
             {
@@ -1226,6 +1234,18 @@ class TestSafeReadPrefix:
         assert safe_read_prefix("", 4) is None
         assert safe_read_prefix(str(tmp_path / "gone"), 4) is None
         assert safe_read_prefix(str(Path.home() / ".aws" / "config"), 4) is None
+
+    def test_refuse_judges_the_kernel_path_of_the_opened_file(self, tmp_path):
+        f = _write(tmp_path / "a.txt", "abcdef")
+        seen: list[str] = []
+
+        def refuse(opened: str) -> bool:
+            seen.append(opened)
+            return True
+
+        assert safe_read_prefix(str(f), 3, refuse=refuse) is None
+        assert [os.path.normcase(p) for p in seen] == [os.path.normcase(os.path.realpath(f))]
+        assert safe_read_prefix(str(f), 3, refuse=lambda _opened: False) == b"abc"
 
 
 class TestIsAccessControlXattr:

@@ -11,7 +11,7 @@ import { screen, fireEvent, waitFor, act, within } from '@testing-library/react'
 import { QueryClient } from '@tanstack/react-query'
 import { memberProjectionStore } from '../../state/memberProjectionStore'
 import { sseConnected, sseSlots } from '../../store/dashboardSlice'
-import { __resetPaneDraftsForTests } from '../../utils/chatPaneDrafts'
+import { __resetPaneDraftsForTests, readPaneDraft } from '../../utils/chatPaneDrafts'
 import { _resetViewedThreadForTests } from '../../lib/viewedThread'
 import {
   __resetErrorJournalForTests,
@@ -25,6 +25,8 @@ import {
 vi.mock('../../api/client', () => ({
   api: {
     members: vi.fn(),
+    // The owner check behind Import from file (`useViewerIsNotOwner`): the owner.
+    viewerOwnerOk: vi.fn(() => Promise.resolve(true)),
     // The roster's team grouping reads the team list; "no teams" keeps the
     // list flat, which is the shape every case here was written against.
     teams: { list: vi.fn(() => Promise.resolve({ teams: [] })), create: vi.fn(), update: vi.fn(), remove: vi.fn() },
@@ -178,11 +180,13 @@ vi.mock('../chat/FolderPanel', () => ({ default: () => null }))
 // (CrewDynamicDashboard.test.tsx); here the stub reports the identity the tab
 // passes it, which is all a page case can claim.
 vi.mock('./CrewDynamicDashboard', () => ({
-  default: ({ target, displayName, preview, onPreviewGone }: {
+  default: ({ target, displayName, preview, onPreviewGone, onAct, onSend }: {
     target: { slug?: string; member?: string }
     displayName: string
     preview?: boolean
     onPreviewGone?: (gone: boolean) => void
+    onAct?: (text: string) => void
+    onSend?: (text: string) => Promise<unknown>
   }) => (
     <div
       data-testid="crew-dashboard-stub"
@@ -194,6 +198,13 @@ vi.mock('./CrewDynamicDashboard', () => ({
       {onPreviewGone && (
         <button type="button" data-testid="crew-dashboard-stub-gone" onClick={() => onPreviewGone(true)}>gone</button>
       )}
+      {/* A page's `kirocrew-dashboard:send`, the way the real frame routes it: to
+          `onSend` when the host offers one, otherwise into the composer (`act`). */}
+      <button
+        type="button"
+        data-testid="crew-dashboard-stub-send"
+        onClick={() => { if (onSend) void onSend('Approve the plan'); else onAct?.('Approve the plan') }}
+      >send</button>
     </div>
   ),
 }))
@@ -287,6 +298,7 @@ vi.mock('react-router-dom', async (importOriginal) => {
 
 import { api } from '../../api/client'
 import { resetDashboardOnLoad } from './dashboardOnLoad'
+import { CREW_SESSIONS_TAB_ID } from './membersPageModel'
 import { CREW_DASHBOARD_TAB_ID, CREW_PANEL_TAB_IDS, MEMBERS_UNCONFIRMED_WITHHELD_VIEWS, MEMBERS_UNFED_VIEWS, MEMBERS_WITHHELD_VIEWS } from './MembersPage'
 import { resetFirstGreetingRequests } from './useFirstGreeting'
 import { __resetPanelTabs, VIEW_DATA_SOURCE } from '../../hooks/usePanelTabs'
@@ -393,14 +405,17 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     expect(screen.getByTestId('member-roster')).toHaveClass('hidden')
     expect(screen.getByTestId('crewmate-switcher')).toBeInTheDocument()
     // No count on the chip (issue #19045): the open list says how many. The
-    // unread column hangs from the header's bottom edge, absolutely, so it adds
-    // nothing to the header's measured height: the thread is never pushed down.
+    // unread column hangs from the switcher chip's bottom edge (the header's
+    // py-2 plus the 42px chip), absolutely, so it adds nothing to the header's
+    // measured height: the thread is never pushed down. Not from the header's
+    // bottom: the identity stack makes the header far taller than the chip.
     expect(screen.queryByTestId('crewmate-switcher-count')).toBeNull()
     const header = screen.getByTestId('member-thread-header')
     const slot = screen.getByTestId('crewmate-unread-column-slot')
     expect(header.contains(slot)).toBe(true)
-    expect(slot.className).toContain('absolute')
-    expect(slot.className).toContain('top-full')
+    expect(slot).toHaveClass('absolute', 'top-[calc(0.5rem+42px)]')
+    expect(slot).not.toHaveClass('top-full')
+    expect(screen.getByTestId('crewmate-switcher').className).toContain('h-[42px]')
   })
 
   it('the panel opener names itself in an instant tip on hover, not a delayed native title (issue #27335)', async () => {
@@ -452,6 +467,57 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     localStorage.setItem('mc-members-assistant-panel-open', '0')
     await renderPage(rows, 'kirocrew', { route: '/members?member=oncall' })
     expect(await screen.findByTestId('member-dashboard', undefined, PANE_READY)).toBeInTheDocument()
+  })
+
+  it('each crewmate keeps its own docked panel choice: closing it on one leaves the next open, and switching back restores it', async () => {
+    await renderPage([
+      row({ name: 'oncall', slug: 'oncall', bound: true, slot_key: 'member-oncall' }),
+      row({ name: 'research', slug: 'research', bound: true, slot_key: 'member-research' }),
+    ])
+    const switchTo = async (name: string) => {
+      fireEvent.click(screen.getByTestId('crewmate-switcher'))
+      const rows = await screen.findAllByTestId('crewmate-switcher-row')
+      fireEvent.click(rows.find((r) => r.textContent?.includes(name))!)
+      await waitFor(() => expect(screen.getByTestId('member-identity-pill')).toHaveTextContent(name))
+    }
+    fireEvent.click(await rosterRow('oncall'))
+    expect(await screen.findByTestId('member-dashboard', undefined, PANE_READY)).toBeInTheDocument()
+    // Close it on oncall.
+    act(() => { window.dispatchEvent(new Event('toggle-activity-panel')) })
+    await screen.findByTestId('member-panel-toggle')
+    expect(localStorage.getItem('mc-members-panel-open:oncall')).toBe('0')
+    // research has never been touched: it opens on the default, not oncall's choice.
+    await switchTo('research')
+    expect(await screen.findByTestId('member-dashboard', undefined, PANE_READY)).toBeInTheDocument()
+    expect(screen.queryByTestId('member-panel-toggle')).toBeNull()
+    // Back on oncall: its own closed choice, while research's panel stays open.
+    await switchTo('oncall')
+    await waitFor(() => expect(screen.getByTestId('member-panel-toggle')).toBeInTheDocument())
+    expect(localStorage.getItem('mc-members-panel-open:research')).toBeNull()
+    expect(localStorage.getItem(PANEL_OPEN_KEY)).not.toBe('0')
+  })
+
+  it("a crewmate named after an Object.prototype key keeps its own saved closed choice", async () => {
+    localStorage.setItem(`${PANEL_OPEN_KEY}:constructor`, '0')
+    await renderPage([row({ name: 'constructor', slug: 'constructor', bound: true, slot_key: 'member-constructor' })])
+    fireEvent.click(await rosterRow('constructor'))
+    expect(await screen.findByTestId('member-panel-toggle')).toBeInTheDocument()
+    expect(screen.queryByTestId('member-side-panel')).toBeNull()
+  })
+
+  it("another window's toggle of the open crewmate's panel reaches this window", async () => {
+    await renderPage([row({ name: 'oncall', slug: 'oncall', bound: true, slot_key: 'member-oncall' })])
+    fireEvent.click(await rosterRow('oncall'))
+    expect(await screen.findByTestId('member-dashboard', undefined, PANE_READY)).toBeInTheDocument()
+    // Close it here first, so this window holds a cached choice the event must replace.
+    act(() => { window.dispatchEvent(new Event('toggle-activity-panel')) })
+    await screen.findByTestId('member-panel-toggle')
+    act(() => {
+      localStorage.setItem(`${PANEL_OPEN_KEY}:oncall`, '1')
+      window.dispatchEvent(new StorageEvent('storage', { key: `${PANEL_OPEN_KEY}:oncall`, newValue: '1' }))
+    })
+    expect(await screen.findByTestId('member-dashboard', undefined, PANE_READY)).toBeInTheDocument()
+    expect(screen.queryByTestId('member-panel-toggle')).toBeNull()
   })
 
   it('the switcher\'s "Show the full roster" pins the roster beside the thread on desktop, where team headers and New team are reachable', async () => {
@@ -577,20 +643,68 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     expect(classes()).not.toContain('md:flex')
   })
 
-  it('the side panel has Dashboard and Workspace as its two standing tabs', async () => {
+  it('the side panel has Dashboard, Sessions and Workspace as its standing tabs', async () => {
     await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
     fireEvent.click(await rosterRow('oncall'))
     await screen.findByTestId('member-dashboard')
 
     const leading = within(screen.getByTestId('side-panel-leading-tabs')).getAllByRole('tab')
-    expect(leading).toHaveLength(1)
-    expect(leading[0]).toHaveAccessibleName('Dashboard')
+    expect(leading.map((t) => t.getAttribute('aria-label'))).toEqual(['Dashboard', 'Sessions'])
+    // Dashboard stays first and is the tab the panel opens on.
+    expect(leading[0]).toHaveAttribute('aria-selected', 'true')
     expect(screen.getByRole('tab', { name: 'Workspace' })).toBeInTheDocument()
     expect(screen.queryByRole('tab', { name: 'Notes' })).toBeNull()
     expect(screen.queryByRole('tab', { name: 'Work log' })).toBeNull()
     expect(screen.queryByRole('tab', { name: 'Schedules' })).toBeNull()
     // Side Chat remains dynamic rather than standing.
     expect(screen.queryByRole('tab', { name: 'Side Chat' })).toBeNull()
+  })
+
+  it('the Sessions tab lists the Bot\'s sessions, opens one to chat in, and keeps it open across Dashboard', async () => {
+    const { store } = await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
+    fireEvent.click(await rosterRow('oncall'))
+    await screen.findByTestId('member-dashboard')
+    act(() => {
+      store.dispatch(sseSlots([
+        { key: 'member-oncall', mode: 'member', running: false, messages: 0 },
+        { key: 'chat-w1', title: 'Fix login bug', mate_root: 'member-oncall', pending_approval: true, running: false, messages: 2 },
+      ] as never))
+    })
+    // The chip counts the one session waiting on the person.
+    expect(await screen.findByTestId(`side-panel-leading-tab-${CREW_SESSIONS_TAB_ID}-badge`)).toHaveTextContent('1')
+    fireEvent.click(screen.getByRole('tab', { name: 'Sessions' }))
+    fireEvent.click(await screen.findByText('Fix login bug'))
+    expect(await screen.findByTestId('bot-session-title')).toHaveTextContent('Fix login bug')
+    // The worker's own pane, beside the Bot's thread pane, which stays put.
+    expect(screen.getAllByTestId('chat-pane-stub').map((p) => p.firstChild?.textContent)).toEqual(['member-oncall', 'chat-w1'])
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Dashboard' }))
+    expect(await screen.findByTestId('member-dashboard')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('tab', { name: 'Sessions' }))
+    expect(await screen.findByTestId('bot-session-title')).toHaveTextContent('Fix login bug')
+
+    fireEvent.keyDown(screen.getByTestId('bot-session-view'), { key: 'Escape' })
+    expect(await screen.findByTestId('bot-sessions-panel')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Fix login bug'))
+    fireEvent.click(await screen.findByTestId('bot-session-back'))
+    expect(await screen.findByTestId('bot-sessions-panel')).toBeInTheDocument()
+  })
+
+  it('a click on a Profile > Sessions row opens that session in the side panel', async () => {
+    const { store } = await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
+    fireEvent.click(await rosterRow('oncall'))
+    await screen.findByTestId('member-dashboard')
+    act(() => {
+      store.dispatch(sseSlots([
+        { key: 'member-oncall', mode: 'member', running: false, messages: 0 },
+        { key: 'chat-w1', title: 'Fix login bug', mate_root: 'member-oncall', running: true, messages: 2 },
+      ] as never))
+    })
+    fireEvent.click(await screen.findByTestId('member-identity-pill'))
+    const card = await screen.findByTestId('crew-profile-panel')
+    fireEvent.click(await within(card).findByText('Fix login bug'))
+    expect(await screen.findByTestId('bot-session-title')).toHaveTextContent('Fix login bug')
+    expect(screen.getByTestId(`side-panel-leading-tab-${CREW_SESSIONS_TAB_ID}`)).toHaveAttribute('aria-selected', 'true')
   })
 
   it('the Workspace tab heads its file browser "Workspace" too, not "Files" (issue #28031)', async () => {
@@ -612,6 +726,51 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     const stub = await screen.findByTestId('crew-dashboard-stub', undefined, PANE_READY)
     expect(stub).toHaveAttribute('data-slug', 'oncall')
     expect(screen.queryByTestId('member-identity-row')).toBeNull()
+  })
+
+  describe('a card reply on the Dashboard tab', () => {
+    const clickCardSend = async () => {
+      // The thread must be confirmed first: before that no send is offered either
+      // way, and the off case would pass without the switch being read at all.
+      await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)
+      const stub = await screen.findByTestId('crew-dashboard-stub', undefined, PANE_READY)
+      fireEvent.click(within(stub).getByTestId('crew-dashboard-stub-send'))
+    }
+
+    it('with one-click sends off (the default), fills the composer and never calls the gateway', async () => {
+      const sendMock = api.sendChat as ReturnType<typeof vi.fn>
+      sendMock.mockClear()
+      // A send that would fail if it were made: the off path must not make it.
+      sendMock.mockImplementation(() => Promise.reject(new Error('network down')))
+      try {
+        await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
+        fireEvent.click(await rosterRow('oncall'))
+        await clickCardSend()
+        await waitFor(() => expect(readPaneDraft('member-oncall').text).toContain('Approve the plan'))
+        expect(sendMock).not.toHaveBeenCalled()
+      } finally {
+        sendMock.mockReset()
+        sendMock.mockImplementation(() =>
+          Promise.resolve(new Response(JSON.stringify({ ok: true, delivered: true }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })))
+      }
+    })
+
+    it('with one-click sends on, sends into the confirmed thread tagged as a card', async () => {
+      const sendMock = api.sendChat as ReturnType<typeof vi.fn>
+      sendMock.mockClear()
+      await renderPage([row({ bound: true, slot_key: 'member-oncall', dashboard_card_send: true })])
+      fireEvent.click(await rosterRow('oncall'))
+      await clickCardSend()
+      await waitFor(() => expect(sendMock).toHaveBeenCalledTimes(1))
+      const call = sendMock.mock.calls[0]
+      expect(call[0]).toBe('Approve the plan')
+      expect(call[1]).toBe('member-oncall')
+      expect(call[8]).toBe('dashboard_card')
+      expect(readPaneDraft('member-oncall').text).not.toContain('Approve the plan')
+    })
   })
 
   describe('a refresh opens the Dashboard tab, not the last focused one', () => {
@@ -1170,7 +1329,7 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
       [...(Object.keys(VIEW_DATA_SOURCE) as string[]), 'terminal', 'app'].sort(),
     )
     expect(MEMBERS_UNCONFIRMED_WITHHELD_VIEWS).toEqual(expect.arrayContaining([...MEMBERS_WITHHELD_VIEWS]))
-    expect(CREW_PANEL_TAB_IDS).toEqual([CREW_DASHBOARD_TAB_ID])
+    expect(CREW_PANEL_TAB_IDS).toEqual([CREW_DASHBOARD_TAB_ID, CREW_SESSIONS_TAB_ID])
 
     const { store } = await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
     fireEvent.click(await rosterRow('oncall'))
@@ -1179,9 +1338,9 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     act(() => {
       store.dispatch(sseSlots([{ key: 'member-oncall', mode: 'member', running: false, messages: 0 }] as never))
     })
-    // Standing tabs: Dashboard (leading) + Files (pinned, labelled Workspace
-    // here) — no Artifacts, no Changes.
-    expect(screen.getAllByRole('tab').map((t) => t.getAttribute('aria-label'))).toEqual(['Dashboard', 'Workspace'])
+    // Standing tabs: Dashboard and Sessions (leading) + Files (pinned, labelled
+    // Workspace here) — no Artifacts, no Changes.
+    expect(screen.getAllByRole('tab').map((t) => t.getAttribute('aria-label'))).toEqual(['Dashboard', 'Sessions', 'Workspace'])
     fireEvent.pointerDown(
       screen.getByRole('button', { name: 'Open side panel tab' }),
       { button: 0, ctrlKey: false, pointerType: 'mouse' },
@@ -1219,12 +1378,21 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     expect(await screen.findByTestId('crew-profile-workspace')).toHaveTextContent('default')
   })
 
-  it('the identity pill carries a chevron, so it reads as a door and not as a second switcher chip', async () => {
+  it('the identity pill carries a chevron, revealed on hover or focus, so it reads as a door', async () => {
     await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
     fireEvent.click(await rosterRow('oncall'))
     const pill = await screen.findByTestId('member-identity-pill')
     const chevron = within(pill).getByTestId('member-identity-pill-chevron')
     expect(chevron).toHaveAttribute('aria-hidden', 'true')
+    // Hidden at rest; the stack's hover or keyboard focus reveals it.
+    expect(chevron.getAttribute('class')).toContain('opacity-0')
+    expect(chevron.getAttribute('class')).toContain('group-hover:opacity-100')
+    expect(chevron.getAttribute('class')).toContain('group-focus-visible:opacity-100')
+    // Pinned to the chip's right edge, centred on its height, out of the
+    // name row, so it never takes width from the name.
+    expect(chevron).toHaveClass('absolute', 'top-1/2', '-translate-y-1/2')
+    expect(within(pill).getByTestId('member-title-row')).not.toContainElement(chevron)
+    expect(chevron).not.toHaveClass('lucide-inline')
     // Decorative: the pill's name stays the crewmate's.
     expect(pill).toHaveAccessibleName(/oncall/)
   })
@@ -1234,7 +1402,7 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     await rosterRow('oncall')
     await openAddMenu()
     const menu = await screen.findByTestId('member-add-menu')
-    expect(within(menu).getAllByRole('menuitem').map(el => el.textContent?.trim())).toEqual(['New Bot', 'Import from file'])
+    expect(within(menu).getAllByRole('menuitem').map(el => el.textContent?.trim())).toEqual(['New bot', 'Import from file'])
   })
 
   it('the roster header "+" menu\'s New mate opens the card as a modal with Advanced settings folded, and they unfold inline — no trip to the crew manager', async () => {
@@ -1262,7 +1430,7 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     expect(await screen.findByRole('textbox', { name: 'Goal' })).toBeInTheDocument()
     expect(screen.getByTestId('crewmate-create-advanced-toggle')).toHaveAttribute('aria-expanded', 'true')
     // A modal named "New crewmate", holding the form — no in-place page region.
-    expect(screen.getByRole('dialog')).toHaveAccessibleName('New Bot')
+    expect(screen.getByRole('dialog')).toHaveAccessibleName('New bot')
     expect(screen.getByRole('dialog')).toContainElement(screen.getByTestId('crewmate-create-form'))
     expect(navigateSpy).not.toHaveBeenCalledWith(expect.stringContaining('/capabilities'))
   })

@@ -214,21 +214,34 @@ async def api_kirocrew_agent_resolved_model(request: web.Request) -> web.Respons
             CrewmateHarnessUnavailable,
             crewmate_backend_pin,
             crewmate_harnesses,
+            crewmate_inherited_source,
             crewmate_pin_for,
+            kas_pin_harnesses,
+            kas_pin_landing,
+            pinned_backend,
             worker_harnesses,
         )
 
         pin = crewmate_pin_for(cfg, crew)
+        inherited = crewmate_inherited_source(cfg, crew)
         out: dict[str, object] = {
             "acp_backend": pin.display_stored if pin is not None else "",
             # What Inherited gives, pinned or not, so the picker can always say it.
-            "inherited_harness": backend_to_stored(
-                resolve_selected_backend(cfg.agent.member_acp_backend)
-            ),
-            # The picker's choices, from the one server-side list a save accepts.
+            "inherited_harness": inherited.harness,
+            # Where Inherited comes from: the legacy agent.member_acp_backend, the
+            # Settings harness, KAS because Crew bots cannot run on that one, or
+            # KAS because it cannot apply this Crew bot's worker tool limits.
+            "inherited_source": inherited.source,
+            "settings_harness": inherited.settings_harness,
+            # The picker's choices: what a save accepts, bar a harness this host's
+            # sandbox refuses.
             "harnesses": crewmate_harnesses(cfg),
             # Known limit shown beside a choice: where workers run at all.
             "worker_harnesses": worker_harnesses(cfg),
+            # A pin to one of these runs the Bot on KAS, so its models are KAS's.
+            "kas_pin_harnesses": kas_pin_harnesses(),
+            # Where such a pin lands: KAS, or the floor when a policy denies KAS.
+            "kas_pin_landing": kas_pin_landing(),
         }
         key: str | None = None
         if getattr(cfg.agents[crew], "member_id", ""):
@@ -237,10 +250,8 @@ async def api_kirocrew_agent_resolved_model(request: web.Request) -> web.Respons
             except ValueError:
                 key = None
         try:
-            runtime = (
-                pin.resolve()
-                if pin is not None
-                else resolve_selected_backend(cfg.agent.member_acp_backend)
+            runtime = pinned_backend(
+                cfg, crew, resolve_selected_backend(cfg.agent.member_acp_backend)
             )
             # The backend session start picks for the crewmate's DM key, through the same gate.
             session_backend = (
@@ -377,14 +388,13 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
 
 async def _api_kirocrew_agents_create(request: web.Request) -> web.Response:
     """The create itself — see :func:`api_kirocrew_agents_create`."""
-
     denied = await _require_owner(request, "agent.create")
     if denied is not None:
         return denied
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     if not isinstance(body, dict):
         return web.json_response(
             {"error": "body must be an object", "code": "body_not_object"}, status=400
@@ -506,6 +516,19 @@ async def _api_kirocrew_agents_create(request: web.Request) -> web.Response:
             },
             status=400,
         )
+    if "approval_mode" in body and body["approval_mode"]:
+        from kiro_crew.approval_mode_policy import session_mode_permitted
+
+        if not session_mode_permitted(body["approval_mode"]):
+            return web.json_response(
+                {
+                    "error": f"approval mode {body['approval_mode']!r} is disabled by your "
+                    "organization's policy",
+                    "code": "mode_disabled_by_policy",
+                    "mode": body["approval_mode"],
+                },
+                status=403,
+            )
     approval_mode = body.get("approval_mode", "")
     # Same placement rule as the other pre-lock validations: refused before any
     # state is touched. Presentation only, but strictly a string — every roster
@@ -582,6 +605,21 @@ async def _api_kirocrew_agents_create(request: web.Request) -> web.Response:
             },
             status=400,
         )
+    # Start from a kept memory store instead of a fresh one: the store a deleted
+    # crewmate left behind, named explicitly (member_memory_adopt). Absent or
+    # empty keeps the fresh allocation; a name is checked against the store's
+    # recorded identity under the namespace lock, never matched by crew name.
+    adopt_store = body.get("adopt_memory_store", "")
+    if not isinstance(adopt_store, str) or (
+        adopt_store and memory_store_binding_defect(adopt_store) is not None
+    ):
+        return web.json_response(
+            {
+                "error": "adopt_memory_store must name a kept memory store",
+                "code": "invalid_adopt_memory_store",
+            },
+            status=400,
+        )
     # Absent or empty means a workspace of the crew's own, allocated with the
     # record (member_workspace.provision_member_workspace); a name is the explicit
     # opt-in to share one, stored as given like every other create always did.
@@ -620,16 +658,34 @@ async def _api_kirocrew_agents_create(request: web.Request) -> web.Response:
     access = await asyncio.to_thread(check_data_home, data_home())
     if not access.ok:
         # Files another account owns fail this create part way through with a
-        # bare permission error; say the cause and the repair line instead.
+        # bare permission error; say the cause, the owner and where the docs
+        # explain giving them back instead.
+        found = access.to_json()
         return web.json_response(
             {
-                "error": "Some Kiro Crew files belong to another user, so Kiro Crew "
-                f"can't read them: {', '.join(access.foreign)}",
+                "error": access.explain(),
                 "code": DATA_HOME_NOT_OWNED,
-                "fix_command": access.fix_command,
+                "home": found["home"],
+                "owner": found["owner"],
+                "help_url": found["help_url"],
             },
             status=409,
         )
+    if adopt_store:
+        # The adopted thread key is the deleted Bot's: a slot still live there is
+        # closed before anything is published, or nothing is.
+        from kiro_crew.dashboard.handlers.members import retire_stale_member_slot
+
+        snapshot = await asyncio.to_thread(KiroCrewConfig.load)
+        if not await retire_stale_member_slot(request.app.get("state"), snapshot, adopt_store):
+            return web.json_response(
+                {
+                    "error": "The deleted bot's chat is still open and could not be closed; "
+                    "nothing was created",
+                    "code": "member_thread_busy",
+                },
+                status=409,
+            )
     async with _get_config_lock():
         cfg = KiroCrewConfig.load()
         # The config key is an id and the name the user typed is its label
@@ -757,9 +813,21 @@ async def _api_kirocrew_agents_create(request: web.Request) -> web.Response:
 
         from kiro_crew._sqlite_compat import sqlite3
 
+        # Only the store's own refusal tells the dialog to drop the pick; a host
+        # or storage failure leaves it, since the store is still there to take.
+        adopt_refused = False
         try:
             try:
-                await _drained_to_thread(provision_member_memory, cfg, name)
+                if adopt_store:
+                    from kiro_crew.member_memory_adopt import adopt_member_memory
+
+                    try:
+                        await _drained_to_thread(adopt_member_memory, cfg, name, adopt_store)
+                    except UnknownMemoryStore:
+                        adopt_refused = True
+                        raise
+                else:
+                    await _drained_to_thread(provision_member_memory, cfg, name)
                 new_workspace = await _drained_to_thread(provision_member_workspace, cfg, name)
                 await _drained_to_thread(
                     lambda: persist_member_config(
@@ -771,7 +839,8 @@ async def _api_kirocrew_agents_create(request: web.Request) -> web.Response:
                     cfg, name, new_workspace, previous_workspace=previous_workspace
                 )
                 allocated = cfg.agents[name].memory_store
-                if allocated != previous_store:
+                # An adopted store was never allocated here: it stays as it was.
+                if allocated != previous_store and not adopt_store:
                     await _drained_to_thread(
                         lambda: retire_unpublished_allocation(
                             cfg,
@@ -805,9 +874,8 @@ async def _api_kirocrew_agents_create(request: web.Request) -> web.Response:
             # A memory database the host could not create (locked, read-only,
             # a disk I/O error) is the same refusal as a directory it could not
             # make: said with its code instead of escaping as a bare 500.
-            return web.json_response(
-                {"error": str(exc), "code": "member_memory_unavailable"}, status=409
-            )
+            code = "adopt_memory_unavailable" if adopt_refused else "member_memory_unavailable"
+            return web.json_response({"error": str(exc), "code": code}, status=409)
     # Eager copy (``rfc-mate-owned-agent-config`` §5.4), FIRST. The crewmate owns
     # a custom-agent file in ``~/.kiro/mates/agents/<name>.json``, copied from
     # whatever ``kiro_agent`` resolves to right now (its chosen template), with
@@ -842,6 +910,14 @@ async def _api_kirocrew_agents_create(request: web.Request) -> web.Response:
     # session naming that crew would take the chat default instead. Creation is
     # therefore always a change by `_effort_inputs` (None -> a tuple).
     await _refresh_session_defaults(request, name)
+    if adopt_store:
+        from kiro_crew import member_goals
+        from kiro_crew.member_memory_adopt import turn_off_kept_check_ins
+
+        try:
+            await asyncio.to_thread(turn_off_kept_check_ins, cfg.agents[name].member_id, name)
+        except (member_goals.GoalError, member_goals.GoalsUnreadable, OSError):
+            logger.warning("new Bot %s: could not turn off the kept check-ins", name, exc_info=True)
     if body.get("first_greeting") is True:
         await _mark_first_greeting_owed(name, cfg)
     if request_id:
@@ -854,7 +930,7 @@ async def _api_kirocrew_agents_create(request: web.Request) -> web.Response:
         operation="agent.create",
         outcome="success",
         source="dashboard",
-        resources=name,
+        resources=f"{name} memory_store={adopt_store}" if adopt_store else name,
     )
     return _created_response(cfg, name)
 
@@ -866,13 +942,24 @@ def _created_response(cfg: KiroCrewConfig, name: str) -> web.Response:
     memory; ``member_config_for_id`` resolves it and never a name or slug), so a
     client that must bind something to the crew it just made -- the Meet
     CrewMates flow's schedule -- can do so without going back through the
-    mutable display name.
+    mutable display name. A stored workspace that is not configured adds the
+    ``warnings`` line the update route answers.
     """
-    return web.json_response(
-        {
-            "ok": True,
-            "name": name,
-            "memory_store": cfg.agents[name].memory_store,
-            "member_id": cfg.agents[name].member_id,
-        }
-    )
+    from kiro_crew.member_workspace import DEFAULT_WORKSPACE
+
+    agent = cfg.agents[name]
+    result: dict[str, object] = {
+        "ok": True,
+        "name": name,
+        "memory_store": agent.memory_store,
+        "member_id": agent.member_id,
+    }
+    # Read from the stored record, not the request, so a repeat of the same
+    # request_id is answered with the same warning as the create.
+    ws = agent.workspace
+    if ws and ws not in cfg.workspaces and ws not in (DEFAULT_WORKSPACE, cfg.default_workspace):
+        logger.warning("crew %r bound to unconfigured workspace %r", name, ws)
+        result["warnings"] = [
+            f"workspace '{ws}' is not configured; the crew shares a fallback workspace directory"
+        ]
+    return web.json_response(result)

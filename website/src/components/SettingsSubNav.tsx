@@ -6,6 +6,7 @@ import { NavBackBar } from './NavBackBar'
 import { SUBNAV_PARAM, SUBNAV_LEGACY_PARAMS, deleteSubSelection, COARSE_TOUCH_TARGET, SUBNAV_PUSH_STATE, toPathSegment, parsePathSegments } from './subNavParams'
 import { useContainerWidth } from '../hooks/useContainerWidth'
 import { useIsMobile } from '../hooks/useIsMobile'
+import { useRenderedLocationIsCurrent } from '../hooks/useRenderedLocationIsCurrent'
 import { useScrollEdgesY } from '../hooks/useScrollEdges'
 import { guideTarget, maybe } from '../uiLocations/targetRegistry'
 
@@ -124,6 +125,7 @@ export function SettingsSubNav<K extends string>({
   const [params, setParams] = useSearchParams()
   const location = useLocation()
   const navigate = useNavigate()
+  const renderedLocationIsCurrent = useRenderedLocationIsCurrent()
   const [containerRef, width] = useContainerWidth<HTMLDivElement>()
   const isMobile = useIsMobile()
   // null width = first paint before measurement; assume wide to avoid flashing
@@ -195,6 +197,7 @@ export function SettingsSubNav<K extends string>({
   // not push: a healed URL is a correction, not a level.
   useEffect(() => {
     if (raw != null && selectedKey == null) {
+      if (!renderedLocationIsCurrent()) return
       if (pathMode) {
         if (tabSeg != null) navigate(pathTarget(null), { replace: true })
         return
@@ -206,7 +209,7 @@ export function SettingsSubNav<K extends string>({
       }, { replace: true })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [raw, selectedKey])
+  }, [raw, selectedKey, renderedLocationIsCurrent])
 
   const select = (key: K | null) => {
     // Clearing the selection (the back bar) POPS when this stack pushed the
@@ -251,10 +254,13 @@ export function SettingsSubNav<K extends string>({
   // reports would make a fresh narrow visit open a pane instead of the list.
   // tabSegment is a dep so a path-mode mount that predates the tab's own
   // canonicalization (select() no-ops without a tab) retries once it lands.
+  // The measurement that arms this write can commit while a tab click's
+  // navigation is still pending, so the write is gated on the rendered
+  // location still being the current entry.
   useEffect(() => {
-    if (width !== null && twoPane && !selectedKey && items.length > 0) select(items[0].key)
+    if (width !== null && twoPane && !selectedKey && items.length > 0 && renderedLocationIsCurrent()) select(items[0].key)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [width, twoPane, selectedKey, tabSegment])
+  }, [width, twoPane, selectedKey, tabSegment, renderedLocationIsCurrent])
 
   // Height cap for the pinned two-pane list. The observer callback owns every
   // measuring setState; render reads the cap only while two-pane, and tearing
@@ -267,6 +273,12 @@ export function SettingsSubNav<K extends string>({
   // The capped list scrolls inside the nav, so the "More below" cue follows the
   // scroller's edges. Both refs below are attached in two-pane mode only.
   const [attachScroller, edges, , attachEdgeContent] = useScrollEdgesY<HTMLDivElement>()
+  // The cue scrolls this box when clicked.
+  const scrollerRef = useRef<HTMLDivElement | null>(null)
+  const attachScrollerNode = useCallback((node: HTMLDivElement | null) => {
+    scrollerRef.current = node
+    attachScroller(node)
+  }, [attachScroller])
   const attachListbox = useCallback((node: HTMLDivElement | null) => {
     listboxRef.current = node
     attachEdgeContent(node)
@@ -325,7 +337,9 @@ export function SettingsSubNav<K extends string>({
         // as an untranslated-attribute site on the i18n render gate.
         // min-h-11 under a coarse pointer = Apple HIG's 44pt touch minimum;
         // desktop pointer density is unchanged.
-        className={`flex items-center gap-2.5 w-full px-2.5 py-2 ${COARSE_TOUCH_TARGET} rounded-md text-left cursor-pointer border-none transition-colors ${
+        // The focus ring is drawn inside the row (`focus-visible:outline-offset-[-2px]`),
+        // because the capped two-pane list scrolls and its scroller clips the x axis.
+        className={`flex items-center gap-2.5 w-full px-2.5 py-2 ${COARSE_TOUCH_TARGET} rounded-md text-left cursor-pointer border-none transition-colors focus-visible:outline-offset-[-2px] ${
           active ? 'bg-accent-subtle text-accent' : 'bg-transparent text-muted hover:text-text hover:bg-bg-hover'
         } ${item.dimmed ? 'opacity-60' : ''}`}
       >
@@ -366,15 +380,14 @@ export function SettingsSubNav<K extends string>({
     // scroller and the "More below" strip under it, a flex sibling outside the
     // scrolling box so it stays on the visible bottom edge while the rows
     // scroll. The scroller is a child of the nav in both layouts so a width
-    // change never remounts the list. Overflow is set only while capped because
-    // it would clip the rows' outset focus ring.
+    // change never remounts the list. Overflow is set only while capped.
     <nav
       ref={twoPane ? navRef : undefined}
       className={twoPane ? 'shrink-0 -ml-2.5 sticky flex flex-col' : 'w-full'}
       style={twoPane ? { width: railWidth, top: RAIL_PIN_INSET_PX, ...(railCap != null && { maxHeight: railCap }) } : undefined}
     >
       <div
-        ref={twoPane ? attachScroller : undefined}
+        ref={twoPane ? attachScrollerNode : undefined}
         className={twoPane && railCap != null ? 'min-h-0 overflow-y-auto' : undefined}
       >
       <div ref={twoPane ? attachListbox : undefined} className="flex flex-col gap-0.5" role={twoPane ? 'listbox' : 'list'} aria-label={listLabel}>
@@ -397,7 +410,7 @@ export function SettingsSubNav<K extends string>({
       </div>
       </div>
       {railCap != null && (edges.top || edges.bottom) && (
-        <MoreBelowCue visible={edges.bottom} testId="settings-subnav-more" />
+        <MoreBelowCue visible={edges.bottom} testId="settings-subnav-more" scrollerRef={scrollerRef} />
       )}
     </nav>
   )

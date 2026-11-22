@@ -3,8 +3,8 @@ title: Portable `prepare-pr` via pluggable project profiles
 status: implemented
 author: Bolin Chen
 created: 2026-07-28
-last-audited: 2026-10-06
-audited-at: 9348a25a34
+last-audited: 2026-11-20
+audited-at: cdb601611f
 doc-pr:
 implementation-prs: [662]
 tracking-issues: []
@@ -441,6 +441,7 @@ src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/
     resolve_profile.py        # NEW — resolves the profile to JSON
     diff_signals.py
     _review_contract.py       # shared marker/finding/disposition contract
+    _tool_argv.py             # shared argv[0] lookup + .cmd/.bat argument guard for the runners
     pr_status.py              # + optional --readiness-context / env override
     pr_findings.py
     enable_automerge.py

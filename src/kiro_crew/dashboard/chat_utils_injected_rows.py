@@ -54,6 +54,52 @@ def _remove_queued_by_id(messages: list[dict], queue_id: str) -> bool:
     return False
 
 
+def _queued_row_id(m: dict) -> str | None:
+    """The queue id of a 'queued' placeholder, or ``None`` when it has none.
+
+    Two spellings, matching the two twin shapes: the cron twin stores
+    ``queue_id`` in a JSON ``cls``, while the app twin wears a plain CSS
+    ``cls`` and carries ``queueId`` in ``meta`` (the hydration spelling).
+    The reorder matches through here, so it re-seats an app twin's row as
+    well as a cron twin's. Only a string is an id: a malformed restored value
+    (a list, say) reads as no id rather than raising mid-operation, and a row
+    whose ``meta`` names an id is never re-matched by its ``cls``.
+    """
+    if m.get("role") != "queued":
+        return None
+    meta = m.get("meta")
+    if isinstance(meta, dict) and meta.get("queueId"):
+        qid = meta["queueId"]
+        return qid if isinstance(qid, str) else None
+    try:
+        qid = json.loads(m.get("cls", "{}")).get("queue_id")
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return None
+    return qid if isinstance(qid, str) else None
+
+
+def _reorder_queued_rows(messages: list[dict], order: list[str]) -> None:
+    """Re-seat the 'queued' placeholders so they follow *order* (queue ids).
+
+    The rows named in *order* come first in that order, then any other queued
+    rows in their existing order; every non-queued row keeps its place ahead of
+    them. Matched through ``_queued_row_id``. Shared by the queue card's reorder
+    route and ``session_queue``'s move, so the two cannot disagree about where a
+    moved entry's row lands.
+    """
+    order = list(dict.fromkeys(order))  # one row per id, at its first place
+    queued_msgs = [m for m in messages if m.get("role") == "queued"]
+    other_msgs = [m for m in messages if m.get("role") != "queued"]
+    queued_by_id: dict[str, dict] = {}
+    for m in queued_msgs:
+        qid = _queued_row_id(m)
+        if qid is not None:
+            queued_by_id[qid] = m
+    reordered_msgs = [queued_by_id[qid] for qid in order if qid in queued_by_id]
+    remaining_msgs = [m for m in queued_msgs if m not in reordered_msgs]
+    messages[:] = other_msgs + reordered_msgs + remaining_msgs
+
+
 def _edit_queued_by_id(messages: list[dict], queue_id: str, content: str) -> bool:
     """Update the content of a 'queued' placeholder by queue_id stored in cls JSON."""
     for m in messages:
@@ -216,11 +262,26 @@ EMPTY_TURN_NOTICE_KIND = "empty_turn"
 #: notice of any kind (the "crewmate chat draws messages only" decision record).
 SPEC_HOOKS_NOTICE_KIND = "spec_hooks"
 
+#: ``meta.spec_hooks_notice`` of the one :data:`SPEC_HOOKS_NOTICE_KIND` row that
+#: says nothing runs the agent spec's hooks on this backend. The dashboard offers
+#: a Dismiss link on this row alone and hides it by this value, so dismissing it
+#: hides no other notice of the kind (``website/src/pages/chat/SpecHooksNotice.tsx``).
+#: A row that names a ``preToolUse`` hook does not carry it, because such a hook
+#: is there to refuse calls. It changes only what the dashboard draws: which
+#: hooks run is decided elsewhere.
+SPEC_HOOKS_RUN_NOWHERE_NOTICE = "run_nowhere"
+
 #: ``meta.kind`` of the session-start notice that says Crew's tools are off in
 #: this session because a settings file Crew does not govern holds its path.
 #: Sessions draws it; crewmate chat drops it (``crewmateBubbles.isCrewmateChatRow``)
 #: for the same reason as :data:`SPEC_HOOKS_NOTICE_KIND`.
 SEED_DECLINED_NOTICE_KIND = "seed_declined"
+
+#: ``meta.kind`` of the session-start notice that names MCP servers whose sign-in
+#: cannot work on this backend. The dashboard keeps it out of the collapsed steps
+#: of the turn (``isAlwaysVisible`` in ``website/src/pages/chat/TurnBlock.tsx``):
+#: it is the only sign that such a server never connects in this session.
+MCP_SIGN_IN_UNSUPPORTED_NOTICE_KIND = "mcp_sign_in_unsupported"
 
 
 #: Row-level kind for the terminal `error` row a prompt-time MODEL ENTITLEMENT
@@ -231,14 +292,29 @@ SEED_DECLINED_NOTICE_KIND = "seed_declined"
 #: entitlement.
 MODEL_UNENTITLED_KIND = "model_unentitled"
 
+#: Row-level kind for the terminal `error` row that ends a spent retry ladder
+#: on a model the backend refused for capacity or a region rollout ("Model 'X'
+#: is unavailable on the backend right now"). The ladder already re-sent the
+#: turn to that model and the ``agent.fallback_model`` chain found nothing that
+#: served it, so the frontend offers the model picker instead of Resume, and
+#: ``is_turn_interrupted`` reads the row as the turn's settled ending: a Resume
+#: would send the same turn to the same refused model, and each failed new chat
+#: would otherwise sit in the sidebar as an interrupted session.
+MODEL_UNAVAILABLE_KIND = "model_unavailable"
+
 #: Row-level kind for the terminal `error` row an ``AcpAuthRequired`` turn
 #: produces (the agent process reported it is not signed in). Like
 #: MODEL_UNENTITLED_KIND, no recovery is queued -- a retry hits the same wall --
 #: and the frontend uses the kind to offer the fix that does end it: a deep link
-#: to the dashboard's Kiro sign-in card (Settings > Agent Harness), where the
+#: to the dashboard's Kiro sign-in card (Settings > Kiro account), where the
 #: user signs in to Kiro Crew's own identity again. The prose stays as the
 #: backend formatted it.
 AUTH_REQUIRED_KIND = "auth_required"
+
+#: Row-level kind for the same signed-out turn on the Kiro CLI harness, which
+#: runs on kiro-cli's own sign-in: the frontend shows the setup gate's two kiro-cli
+#: sign-in commands, read from the prerequisite status, instead of Crew's card.
+KIRO_CLI_SIGN_IN_KIND = "kiro_cli_sign_in"
 
 #: Row-level kind for the terminal `error` row a SPENT PLAN ALLOWANCE produces
 #: ("The monthly usage limit has been reached"). Like the two above, no
@@ -323,8 +399,15 @@ CRON_NOTIFICATION_KIND = "cron_notification"
 #: into user-authored, persisted, channel-mirrored history).
 MCP_APP_MESSAGE_KIND = "mcp_app_message"
 
+#: A wake for an MCP resource subscription
+#: (``rfc-mcp-resource-subscriptions.md`` §4.9.2), queued behind a running turn by
+#: ``session_deliver``'s ``resource`` origin. System injection like the app
+#: message above: its URI is server-written, so it is never user speech and must
+#: never be mirrored to a linked channel as the person's words.
+RESOURCE_WAKE_KIND = "resource_wake"
+
 #: A runner notice re-routed into a crew member's own next turn — today the
-#: automation arm/revision/stop refusal (``session_directive_apply``). A member
+#: automation arm/revision/stop or person-only refusal (``session_directive_apply``). A member
 #: DM draws messages only and never replays a ``notice`` row to the model, so a
 #: refused directive there would reach neither the person nor the crewmate; this
 #: kind delivers it as an ``inject`` row the crewmate's turn carries. System
@@ -332,6 +415,26 @@ MCP_APP_MESSAGE_KIND = "mcp_app_message"
 #: break a user-message merge (folding it into a user turn would flip
 #: runner-authored text into user-authored, persisted history).
 AUTOMATION_NOTICE_KIND = "automation_notice"
+
+#: The gateway's follow-up prompt after a chat-launched workflow's result lands
+#: (``server_runtime/workflow_startup``), asking the agent to answer the request
+#: that started the run. Runner-authored like the kinds above, so it drains as an
+#: ``inject`` row (``injectKind: workflow``), never the person's bubble.
+WORKFLOW_FOLLOWUP_KIND = "workflow_followup"
+
+#: A heartbeat task's prompt delivered with ``deliver:prompt:dashboard:<slot>``
+#: (``slack/gateway_runtime/result_egress``): ``<title>\n\n<result>``, which starts
+#: an agent turn in that chat. The gateway's words, like the follow-up above, so it
+#: drains as an ``inject`` row (``injectKind: heartbeat``), never the person's bubble.
+HEARTBEAT_PROMPT_KIND = "heartbeat_prompt"
+
+#: The gateway prompts ``_ChatSlot.enqueue_or_run_prompt`` can carry, each mapped
+#: to the ``injectKind`` of the row it writes on the run arm and drains to when
+#: queued, so both arms draw the same row.
+GATEWAY_PROMPT_INJECT_KINDS = {
+    WORKFLOW_FOLLOWUP_KIND: "workflow",
+    HEARTBEAT_PROMPT_KIND: "heartbeat",
+}
 
 #: Provenance banner wrapped around every app-originated message. Structural
 #: classification is by the queue entry's ``kind`` tag (unforgeable, set at
@@ -349,8 +452,10 @@ _SYSTEM_INJECTION_KINDS = SUBAGENT_DELIVERY_KINDS | frozenset(
     (
         CRON_NOTIFICATION_KIND,
         MCP_APP_MESSAGE_KIND,
+        RESOURCE_WAKE_KIND,
         AUTOMATION_NOTICE_KIND,
         FALSE_TOOL_BLOCKER_REPLAY_KIND,
+        *GATEWAY_PROMPT_INJECT_KINDS,
     )
 )
 
@@ -367,6 +472,25 @@ def app_inject_row(label: str) -> tuple[str, str, dict]:
     travels in ``meta`` only, and is never re-derived from the banner text.
     """
     return "inject", "msg msg-inject", {"injectKind": "mcp_app", "appLabel": label}
+
+
+def resource_inject_row(server: str, subscription_id: str) -> tuple[str, str, dict]:
+    """The ONE builder for a resource-wake transcript row (both delivery paths).
+
+    The same shape as :func:`app_inject_row`, for the same reason: a plain CSS
+    ``cls`` and the identity in ``meta``, so an HTTP rebuild keeps ``injectKind``.
+    The chip names the server; the subscription id lets a queued wake be found
+    again to fold a later update into it.
+    """
+    return (
+        "inject",
+        "msg msg-inject",
+        {
+            "injectKind": "resource",
+            "resourceServer": server,
+            "resourceSubscription": subscription_id,
+        },
+    )
 
 
 def is_synthetic_recovery_item(item: dict) -> bool:
@@ -425,12 +549,14 @@ def is_synthetic_payload_item(item: dict) -> bool:
     An MCP-App message entry (``MCP_APP_MESSAGE_KIND``) is synthetic by the same
     asymmetry: its text is app-authored (server-authored), so mirroring it to a
     linked channel as the human's own words would attribute machine speech to a
-    person.
+    person. A gateway prompt (``GATEWAY_PROMPT_INJECT_KINDS``: a workflow follow-up,
+    a heartbeat prompt) is the gateway's own text, so it is synthetic too.
     """
     payload = item.get("payload")
     if payload:
         return payload == RecoveryPayload.CONTINUATION
-    if item.get("kind") == MCP_APP_MESSAGE_KIND:
+    kind = item.get("kind")
+    if kind in (MCP_APP_MESSAGE_KIND, RESOURCE_WAKE_KIND) or kind in GATEWAY_PROMPT_INJECT_KINDS:
         return True
     return is_synthetic_recovery_item(item)
 
@@ -458,6 +584,14 @@ def is_system_injection_item(item: dict) -> bool:
 #: have been delivered. The drain prefixes the turn's model input with
 #: ``STEER_POSSIBLY_DELIVERED_NOTE``; the user's row keeps the text as typed.
 STEER_POSSIBLY_DELIVERED_META = "steer_possibly_delivered"
+#: Queue-entry meta key: the ``mid`` of the transcript row a requeued steer
+#: ALREADY has. A steer the RPC accepted is persisted as a row at once; when the
+#: turn then ends without consuming it, that row is patched to ``requeued`` and
+#: the text is queued to run as its own turn. The drain reads this key, appends
+#: the turn's own row after the stop card, and then marks the existing row
+#: ``superseded`` so the client draws the text once. Queue plumbing only: the
+#: drain pops it, so it never reaches a row.
+REQUEUED_STEER_ROW_MID_META = "requeued_steer_row_mid"
 STEER_POSSIBLY_DELIVERED_NOTE = (
     "[The message below was sent into your previous turn, which then lost its "
     "backend connection before confirming it. It may already have been "
@@ -480,6 +614,10 @@ COMPOSER_SEND_META = "composer_send"
 #: ``nudge`` row instead of a ``user`` row, and the entry drains alone: merged,
 #: its text would be glued onto the human's own queued words in one row.
 AUTOMATION_STEER_META = "automation_steer"
+#: The wire mark (``queue_push`` meta and the slot-detail queue view) of a queue
+#: entry carrying :data:`AUTOMATION_STEER_META`, so the client never draws its
+#: card as the person's own words.
+AUTOMATION_STEER_WIRE_KEY = "automationSteer"
 
 
 def releases_past_subagent_hold(item: dict) -> bool:
@@ -563,10 +701,15 @@ def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:
     (``meta.decisions_strip``) and where the stamped turn actor
     changes, so an app's queued send never folds into the user's own words, and
     where the stamped source channels change, so a turn admission refuses for one
-    channel never carries another message with it; an entry that starts no run
+    channel never carries another message with it, and where the channel challenge
+    mark changes (``channel_prompt``), so a typed message keeps its echo; an
+    entry that starts no run
     pops alone.
     """
     if merge_enabled and len(slot._queue) > 1:
+        # Local: a module-level import would serve the name through the chat_utils facade.
+        from kiro_crew.dashboard.channel_prompt import entry_prompt_on_channel
+
         to_merge: list[dict] = []
         for item in list(slot._queue):
             if (
@@ -587,6 +730,9 @@ def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:
             # so entries from different channels (or one with none) never share a
             # turn: a refusal of one channel's words must not take another's.
             if to_merge and source_channels_of(item) != source_channels_of(to_merge[0]):
+                break
+            # Words already in the linked thread skip its echo; typed words keep it.
+            if to_merge and entry_prompt_on_channel(item) != entry_prompt_on_channel(to_merge[0]):
                 break
             to_merge.append(item)
         if len(to_merge) > 1:

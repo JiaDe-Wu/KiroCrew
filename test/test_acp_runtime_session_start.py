@@ -181,7 +181,7 @@ class TestServedDefaultAfterSetMode:
         assert rt._switched_models == {}
 
 
-# ── set_mode availableModes guard (regression: "Mode '<agent>' not found") ──
+# ── set_mode availableModes guard (avoids "Mode '<agent>' not found") ──
 
 
 def _new_resp(modes: dict | None) -> dict:
@@ -260,6 +260,117 @@ async def test_create_session_refusal_explains_a_derived_readonly_spec(tmp_path,
     assert "read-only spec Kiro Crew derives from 'scout'" in message
     assert "name 'scout'" in message
     assert "Refusing to run the backend default mode kirocrew in its place" in message
+
+
+@pytest.mark.asyncio
+async def test_create_session_refusal_for_a_bots_agent_names_the_dashboard(tmp_path, monkeypatch):
+    """A Bot chats on the mate conductor, kept in ``mates/agents/``, which kiro-cli
+    does not list and setup does not write: the refusal says so and names the
+    dashboard instead of the setup hint that cannot fix a Bot."""
+    from kiro_crew import agent as agent_mod
+    from kiro_crew.config import paths as paths_mod
+
+    mates = tmp_path / "mates" / "agents"
+    mates.mkdir(parents=True)
+    monkeypatch.setattr(agent_mod, "KIRO_AGENTS_DIR", tmp_path)
+    monkeypatch.setattr(paths_mod, "_mate_agents_dir_override", lambda: mates)
+    rt, _, _ = _make_runtime()
+    rt._finish_session_init = MagicMock(return_value=[])  # type: ignore[method-assign]
+    resp = _new_resp({"currentModeId": "kirocrew", "availableModes": [{"id": "kirocrew"}]})
+    rt._send_and_await = AsyncMock(side_effect=[resp, {}])  # type: ignore[method-assign]
+    with patch.object(AcpSessionHandle, "drain_init", AsyncMock()):
+        with pytest.raises(AcpRuntimeError, match="not available") as exc:
+            await rt.create_session(agent="kirocrew-mate-conductor", mcp_servers=[])
+    message = str(exc.value)
+    assert "kirocrew setup --agent-only` does not write it" in message
+    assert "Run `kirocrew setup --agent-only`" not in message
+    assert "is likely missing" not in message
+    assert "'kirocrew-mate-conductor' is a Bot's agent" in message
+    assert message.endswith("Chat with the Bot from the dashboard's Bots page.")
+
+
+@pytest.mark.asyncio
+async def test_create_session_refusal_names_the_v3_format_on_the_kiro_cli_harness(
+    tmp_path, monkeypatch
+):
+    """kiro-cli's v2 engine leaves a file it reads as the v3 agent format out of its
+    modes, and ``kiro-cli agent validate`` passes it: on the Kiro CLI harness the
+    refusal points at kiro-cli's own listing and at backend ``kas``. Another harness
+    keeps the validate answer (``test_spawn_internal_agent_specs``)."""
+    from kiro_crew import agent as agent_mod
+    from kiro_crew import kiro_on_kas_notice
+
+    monkeypatch.setattr(agent_mod, "KIRO_AGENTS_DIR", tmp_path)
+    monkeypatch.setattr(kiro_on_kas_notice, "kas_backend_offered", lambda: True)
+    spec = {"name": "narrow", "tools": ["fs_read"], "permissions": {"rules": [{"x": 1}]}}
+    (tmp_path / "narrow.json").write_text(json.dumps(spec), encoding="utf-8")
+    rt, _, _ = _make_runtime()
+    assert rt._harness.backend == ""
+    rt._finish_session_init = MagicMock(return_value=[])  # type: ignore[method-assign]
+    resp = _new_resp({"currentModeId": "kirocrew", "availableModes": [{"id": "kirocrew"}]})
+    rt._send_and_await = AsyncMock(side_effect=[resp, {}])  # type: ignore[method-assign]
+    with patch.object(AcpSessionHandle, "drain_init", AsyncMock()):
+        with pytest.raises(AcpRuntimeError, match="not available") as exc:
+            await rt.create_session(agent="narrow", mcp_servers=[])
+    message = str(exc.value)
+    assert "marks it (v3 format)" in message
+    assert "Spawn it with backend 'kas'" in message
+    assert "agent validate" not in message
+
+
+def _configure_missing_default_agent(tmp_path, monkeypatch, name: str) -> None:
+    """``agent.default_agent`` names *name*, and the agents directory has no spec for it."""
+    from kiro_crew import agent as agent_mod
+    from kiro_crew.config import config_path
+
+    monkeypatch.setattr(agent_mod, "KIRO_AGENTS_DIR", tmp_path)
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"agent": {"default_agent": name}}), encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_create_session_refusal_for_a_missing_default_agent_names_the_setting(
+    tmp_path, monkeypatch
+):
+    """A plain session runs ``agent.default_agent``. When that names an agent with
+    no spec, setup cannot help (it writes only Kiro Crew's own specs), so the
+    refusal names the setting and the command that changes it."""
+    _configure_missing_default_agent(tmp_path, monkeypatch, "default")
+    rt, _, _ = _make_runtime()
+    rt._finish_session_init = MagicMock(return_value=[])  # type: ignore[method-assign]
+    resp = _new_resp({"currentModeId": "kiro_default", "availableModes": [{"id": "kirocrew"}]})
+    rt._send_and_await = AsyncMock(side_effect=[resp, {}])  # type: ignore[method-assign]
+    with patch.object(AcpSessionHandle, "drain_init", AsyncMock()):
+        with pytest.raises(AcpRuntimeError, match="not available") as exc:
+            await rt.create_session(agent="default", mcp_servers=[])
+    message = str(exc.value)
+    assert "agent.default_agent names 'default'" in message
+    assert "`kirocrew config set agent.default_agent kirocrew`" in message
+    assert "kirocrew setup" not in message
+
+
+@pytest.mark.asyncio
+async def test_spawn_guard_for_a_missing_default_agent_names_the_setting(tmp_path, monkeypatch):
+    """Guard (B) words the same state the same way: the spawn agent is the
+    configured default and has no spec, so setup is not the remedy."""
+    _configure_missing_default_agent(tmp_path, monkeypatch, "default")
+    rt, _, _ = _make_runtime()
+    rt._agent = "default"
+    rt.terminate_session = AsyncMock()  # type: ignore[method-assign]
+    with pytest.raises(AcpRuntimeError, match="spawned with --agent") as exc:
+        await rt._verify_spawn_agent_active(
+            "s1",
+            _new_resp(
+                {"currentModeId": "kiro_default", "availableModes": [{"id": "kiro_default"}]}
+            ),
+            override=None,
+        )
+    message = str(exc.value)
+    assert "agent.default_agent names 'default'" in message
+    assert "`kirocrew config set agent.default_agent kirocrew`" in message
+    assert "kirocrew setup" not in message
+    rt.terminate_session.assert_awaited_once()
 
 
 @pytest.mark.asyncio

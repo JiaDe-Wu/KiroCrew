@@ -125,7 +125,7 @@ _KEPT_ROUTE_READS = {
 _BASE_IMPORTS = frozenset("""
     AUTOCOMPACT_PCT_MAX AUTOCOMPACT_PCT_MIN Any CHAT_TURN_TIMEOUT_MAX CHAT_TURN_TIMEOUT_MIN
     COMPACT_WAIT_SECS_MAX COMPACT_WAIT_SECS_MIN COMPLETION_KEEP_CHARS_MIN
-    ClientConnectionResetError ConfigReadError ConfigWriteRefused Coroutine
+    ConfigReadError ConfigWriteRefused Coroutine
     DECISION_BUCKET_MAX DECISION_BUCKET_MIN DECISION_MODEL_ROUTE_TIERS
     DEDUP_EVERY_N_SWEEPS_MAX DashboardState EFFORT_LEVELS EMBED_RATE_LIMIT_MAX
     EXTERNAL_TERMINAL_APPS EXTRACTION_POOL_SIZE_MAX EXTRACTION_POOL_SIZE_MIN
@@ -142,7 +142,7 @@ _BASE_IMPORTS = frozenset("""
     VOCABULARIES_ACCESS_DENIED VOCABULARIES_LIST_FAILED VOCABULARIES_LIST_PERMISSION
     VocabularyListError _CU_MAX_SCREENSHOT_MAX_PX _CU_MAX_TREE_NODES_LIMIT
     _CU_MIN_SCREENSHOT_MAX_PX _STREAMING_PROVIDERS _VALID_STT_PROVIDERS
-    _clamp_compact_wait_secs _ct_eq _find_ffmpeg _metrics_provider _owner_denial_response
+    _clamp_compact_wait_secs _ct_eq _find_ffmpeg _owner_denial_response
     _pip_install_channel_available _redact_external _resolution _unix_request_socket
     _whisper_language ack_explicit_write annotations asyncio audio_exceeds_secs
     availability_detail aws_consent batch_duration_cap_secs beacon

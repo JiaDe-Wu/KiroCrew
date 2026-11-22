@@ -18,13 +18,15 @@ the stdio server itself and relays each message to that url with the recorded
 headers added (:mod:`kiro_crew.kas_http_bridge`).
 
 Standard library only and at the top of the package: the engine starts this once
-per server, so it must not import the ACP stack. The bridge path adds only the
-package's trust bootstrap (:mod:`kiro_crew._ssl_compat`). It prints no env value.
+per server, so it must not import the ACP stack. The bridge path adds the
+package's trust bootstrap (:mod:`kiro_crew._ssl_compat`) and, once a request
+fails, :mod:`kiro_crew.asset_downloader`. It prints no env value.
 """
 
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -34,8 +36,14 @@ import subprocess
 import sys
 from typing import Any, NoReturn
 
+from kiro_crew.bounded_read import bounded_read
+
 #: The crew data-home leaf the snapshots live in.
 SNAPSHOT_LEAF = "kas-mcp-launch"
+#: The leaf Crew-owned Connection bridge snapshots live in: a connection slug, the
+#: gateway port and a per-bridge token, no vendor credential. Unlike
+#: :data:`SNAPSHOT_LEAF` an enforced harness's child may read it.
+BRIDGE_LEAF = "crew-oauth-bridge"
 #: The module KAS runs (``python -m``).
 SHIM_MODULE = "kiro_crew.kas_env_shim"
 #: The key and value that mark a file as a launch snapshot of this format.
@@ -55,8 +63,10 @@ def _digest(*parts: str) -> str:
 def snapshot_name(session_key: str, agent: str, server: str, version: str) -> str:
     """The snapshot file name for one write of one session's server.
 
-    *version* is random per write, so two projections never share a file, even
-    for the same session: each one owns, and removes, only what it wrote. Every
+    A Connection bridge's *version* is random per write, so two of its
+    projections never share a file. A stdio launch or a header bridge is shared
+    by every session of its agent (``kas_env_launch.SHARED_SESSION``), and its
+    version is keyed to the file's content, so they all read one file. Every
     part is hashed, so no reference can name a path outside the leaf.
     """
     return (
@@ -106,7 +116,7 @@ def _read_snapshot(path: str, server: str) -> dict[str, Any]:
             _refuse(server, "its launch snapshot is too large")
         with os.fdopen(fd, "rb") as fh:
             fd = -1
-            raw = fh.read(_MAX_SNAPSHOT_BYTES + 1)
+            raw = bounded_read(fh, _MAX_SNAPSHOT_BYTES + 1)
     finally:
         if fd != -1:
             os.close(fd)
@@ -152,10 +162,15 @@ def _resolve_snapshot(
     home = environ.pop(_HOME_ENV, "")
     if not home or not os.path.isabs(home):
         _refuse(server, "the launcher was not told where Kiro Crew's data home is")
-    path = os.path.join(
-        home, SNAPSHOT_LEAF, snapshot_name(ns.session, ns.agent, server, ns.version)
+    name = snapshot_name(ns.session, ns.agent, server, ns.version)
+    # A Connection bridge's snapshot lives in its own leaf, the one an enforced
+    # harness's child may read; it may only ever name a Connection.
+    bridge = os.path.join(home, BRIDGE_LEAF, name)
+    doc = _read_snapshot(
+        bridge if os.path.lexists(bridge) else os.path.join(home, SNAPSHOT_LEAF, name), server
     )
-    doc = _read_snapshot(path, server)
+    if os.path.lexists(bridge) and "connection" not in doc:
+        _refuse(server, "a Connection bridge snapshot names no Connection")
     if doc.get(SNAPSHOT_MARKER) != SNAPSHOT_FORMAT:
         _refuse(server, "its launch snapshot has an unknown format")
     for key in ("session", "agent", "server", "version"):
@@ -179,6 +194,35 @@ def _stdio_launch(
     return [command, *args], {**environ, **env}
 
 
+def _unstartable(command: str, exc: OSError) -> NoReturn:
+    """End the launch with the one line both platforms print when the command won't start."""
+    reason = exc.strerror or exc
+    print(
+        f"kirocrew: MCP server command {command!r} could not be started: {reason}",
+        file=sys.stderr,
+        flush=True,
+    )
+    raise SystemExit(127) from None
+
+
+def windows_child_command(command: str, env: dict[str, str]) -> str | None:
+    """The file a Windows launcher should start for *command*, or ``None``.
+
+    A bare name is looked up only in the absolute entries of *env*'s ``PATH``, by
+    full path: on Windows a bare-name ``shutil.which`` searches the current
+    directory first, and so does ``CreateProcess``, so neither is given a bare
+    name. ``PATHEXT`` still applies. A command with a directory part is used as
+    given. ``None`` means nothing was found, and the caller must not start it.
+    """
+    if os.path.dirname(command):
+        return shutil.which(command) or command
+    for entry in env.get("PATH", "").split(os.pathsep):
+        found = shutil.which(os.path.join(entry, command)) if os.path.isabs(entry) else None
+        if found:
+            return found
+    return None
+
+
 def _spawn_child(argv: list[str], env: dict[str, str]) -> NoReturn:
     """Windows has no in-place exec: run the server as a child on this process's stdio.
 
@@ -186,8 +230,13 @@ def _spawn_child(argv: list[str], env: dict[str, str]) -> NoReturn:
     launcher stays alive as the server's parent and exits with its status, the
     shape ``mcp_gateway.stub_fallback._fallback_spawn_child`` uses.
     """
-    resolved = shutil.which(argv[0], path=env.get("PATH")) or argv[0]
-    proc = subprocess.Popen([resolved, *argv[1:]], env=env, stdin=0, stdout=1, stderr=2)
+    resolved = windows_child_command(argv[0], env)
+    if resolved is None:
+        _unstartable(argv[0], FileNotFoundError(errno.ENOENT, "not found on its PATH"))
+    try:
+        proc = subprocess.Popen([resolved, *argv[1:]], env=env, stdin=0, stdout=1, stderr=2)
+    except OSError as exc:
+        _unstartable(argv[0], exc)
     try:
         rc = proc.wait()
     except BaseException:
@@ -201,10 +250,8 @@ def main(argv: list[str] | None = None) -> NoReturn:
         list(sys.argv[1:] if argv is None else argv), dict(os.environ)
     )
     if "connection" in doc:
-        # A Crew-owned Connection: this process relays to the gateway's proxy over
-        # the attested Unix socket, which holds the token (kas_connection_bridge).
-        if os.name == "nt":
-            _refuse(server, "Crew-owned Connections need a Unix socket, absent on Windows")
+        # A Crew-owned Connection: this process relays to the gateway's proxy, which
+        # holds the token, over an attested channel (kas_connection_bridge).
         port, token = doc.get("port"), doc.get("bridge_token")
         if not isinstance(port, int) or not isinstance(token, str) or not token:
             _refuse(server, "its launch snapshot names no Connection bridge")
@@ -231,13 +278,7 @@ def main(argv: list[str] | None = None) -> NoReturn:
         # nosemgrep: python.lang.security.audit.dangerous-os-exec-tainted-env-args.dangerous-os-exec-tainted-env-args
         os.execvpe(launch[0], launch, env)
     except OSError as exc:
-        print(
-            f"kirocrew: MCP server command {launch[0]!r} could not be started: "
-            f"{exc.strerror or exc}",
-            file=sys.stderr,
-            flush=True,
-        )
-        raise SystemExit(127) from None
+        _unstartable(launch[0], exc)
     raise SystemExit(1)
 
 

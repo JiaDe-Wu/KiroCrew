@@ -253,6 +253,7 @@ _OAUTH_AUTHORIZATION_ENDPOINTS: frozenset[tuple[str, str]] = frozenset(
         # the registry test maps issuer host to consent host for these two.
         ("www.figma.com", "/oauth/mcp"),
         ("mixpanel.com", "/oauth/authorize"),
+        ("slack.com", "/oauth/v2_user/authorize"),  # issuer mcp.slack.com (user token)
     }
 )
 
@@ -290,30 +291,29 @@ _OAUTH_QUERY_PARAMS = frozenset(
     }
 )
 
-# Salesforce Connected App consumer keys: a fixed public prefix followed by 70
-# to 100 letters, digits, dots or underscores. The set has no `%`, so a value
-# that matches decodes to itself and every decoded form has the same shape.
-_OAUTH_SALESFORCE_CLIENT_ID_RE = re.compile(r"3MVG9[A-Za-z0-9._]{70,100}\Z")
+# A client_id an operator-listed endpoint may carry unscanned: RFC 7591 lets a
+# DCR server pick any unique string. The set has no `%` or `+`, so a value that
+# is made of them decodes to itself and every decoded form has the same shape.
+_OAUTH_OPERATOR_CLIENT_ID_CHARS = frozenset(string.ascii_letters + string.digits + "._-")
 
 
-def _salesforce_client_id_shaped(value: str) -> bool:
-    """Return whether *value* has the Salesforce consumer-key shape."""
-    return bool(_OAUTH_SALESFORCE_CLIENT_ID_RE.fullmatch(value))
+def _operator_client_id_shaped(value: str) -> bool:
+    """Return whether *value* is a client_id an operator-listed endpoint may carry."""
+    return 16 <= len(value) <= 128 and all(c in _OAUTH_OPERATOR_CLIENT_ID_CHARS for c in value)
 
 
-def _operator_listed_salesforce_query(host: str, path: str, query: str) -> bool:
-    """Check operator trust only for a non-builtin Salesforce client_id query.
+def _operator_listed_client_id_query(host: str, path: str, query: str) -> bool:
+    """Check operator trust only for a query carrying a token-safe client_id.
 
-    Endpoint approval is checked by the caller. Builtins and queries without
-    this client_id shape need no additional operator-file lookup.
+    Endpoint approval is checked by the caller. Builtins are looked up too, so
+    listing one clears the rejection whose remedy text names the operator file.
     """
-    key = (host.lower(), path)
-    if key in _OAUTH_AUTHORIZATION_ENDPOINTS or not any(
-        name == "client_id" and bool(separator) and _salesforce_client_id_shaped(value)
+    if not any(
+        name == "client_id" and bool(separator) and _operator_client_id_shaped(value)
         for name, separator, value in (segment.partition("=") for segment in query.split("&"))
     ):
         return False
-    return _operator_listed_oauth_endpoint(*key)
+    return _operator_listed_oauth_endpoint(host, path)
 
 
 def _operator_listed_oauth_endpoint(host: str, path: str) -> bool:
@@ -360,7 +360,6 @@ _ENDPOINT_EXTENSION_CAP = 50
 # rejects wildcards, schemes, ports, userinfo, percent-escapes, whitespace,
 # backslashes, and bracketed IPv6. Empty labels reject leading/trailing dots.
 # The lookahead bounds total length to the DNS maximum.
-# ``redaction_allow`` validates allowed link hosts with this same regex.
 _OAUTH_EXTENSION_HOST_RE = re.compile(
     r"\A(?=.{1,253}\Z)"
     r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
@@ -547,7 +546,9 @@ def _log_operator_list_use(
         logger.debug("SEL audit failed for %s (allow stands)", event_type, exc_info=True)
 
 
-def _approved_oauth_authorization_endpoint(host: str, path: str) -> bool:
+def _approved_oauth_authorization_endpoint(
+    host: str, path: str, server_name: str | None = None
+) -> bool:
     """Exact-match endpoint approval for the banner-only OAuth entropy carve-out.
 
     Union of the code-owned builtin set and the operator's keystone extension,
@@ -555,12 +556,15 @@ def _approved_oauth_authorization_endpoint(host: str, path: str) -> bool:
     restart. The builtin set is consulted first so the common providers never
     touch the disk; an approval that came from an operator entry is SEL-audited
     (deduped per process). Callers keep enforcing HTTPS-only / no-explicit-port
-    — this helper only answers endpoint identity.
+    — this helper only answers endpoint identity. A discovery approval holds for
+    the one server it was verified for, so it clears a caller only when that
+    caller names the same *server_name*; a caller that names none gets no
+    discovery approval.
     """
     key = (host.lower(), path)
     if key in _OAUTH_AUTHORIZATION_ENDPOINTS:
         return True
-    if _discovered_oauth_endpoint_approved(key):
+    if server_name and _discovered_oauth_endpoint_approved((*key, server_name)):
         return True
     if key in _load_operator_oauth_endpoints():
         _emit_oauth_extension_used_event(*key)
@@ -569,18 +573,18 @@ def _approved_oauth_authorization_endpoint(host: str, path: str) -> bool:
 
 
 # ── Discovered OAuth endpoints (verified from an operator-configured MCP server) ──
-# Filled only by ``mcp_oauth_discovery``; trust anchor, bounds and why this does
-# not lower the agent's ceiling: docs/system-specs/modules/security.md,
+# Filled by ``mcp_oauth_discovery`` and Crew's owner-server sign-in. Anchor, bounds,
+# why the ceiling holds: docs/system-specs/modules/security.md,
 # "Discovery-verified consent endpoints".
 _OAUTH_DISCOVERED_TTL_SECONDS = 24 * 60 * 60
 _OAUTH_DISCOVERED_CAP = 64
 # Bound on the server URL copied into the SEL event; nothing else retains it.
 _OAUTH_DISCOVERED_MCP_URL_MAX_LEN = 512
-# (host, path) -> monotonic expiry. Host and path are bounded by the validators.
-_OAUTH_DISCOVERED_ENDPOINTS: dict[tuple[str, str], float] = {}
+# (host, path, server name) -> monotonic expiry. Host and path are bounded by the validators.
+_OAUTH_DISCOVERED_ENDPOINTS: dict[tuple[str, str, str], float] = {}
 
 
-def _discovered_oauth_endpoint_approved(key: tuple[str, str]) -> bool:
+def _discovered_oauth_endpoint_approved(key: tuple[str, str, str]) -> bool:
     """Whether *key* was verified by discovery and has not expired."""
     expiry = _OAUTH_DISCOVERED_ENDPOINTS.get(key)
     if expiry is None:
@@ -591,19 +595,25 @@ def _discovered_oauth_endpoint_approved(key: tuple[str, str]) -> bool:
     return True
 
 
-def record_discovered_oauth_endpoint(host: str, path: str, *, mcp_url: str) -> bool:
+def record_discovered_oauth_endpoint(
+    host: str, path: str, *, mcp_url: str, server_name: str
+) -> bool:
     """Approve an authorization endpoint verified by MCP OAuth discovery.
 
-    Called ONLY by ``kiro_crew.mcp_oauth_discovery`` after it matched the
-    endpoint against the metadata advertised for an operator-configured MCP
-    server. Returns False (and records nothing) for a host or path the operator
-    file's validators would refuse. A newly recorded endpoint is SEL-audited
-    with the server URL it was verified from.
+    Called by ``kiro_crew.mcp_oauth_discovery`` and by ``connections.crew_oauth``'s
+    sign-in for an owner-recorded server, each after its own discovery from the
+    configured url found the endpoint. The approval is for *server_name* alone.
+    Returns False (and records nothing) for a host or path the operator file's
+    validators would refuse, or for a server name that is empty or longer than
+    256 characters. A newly recorded endpoint is
+    SEL-audited with the server URL it was verified from.
     """
     host_norm = host.lower()
     if not _OAUTH_EXTENSION_HOST_RE.fullmatch(host_norm) or not _valid_oauth_extension_path(path):
         return False
-    key = (host_norm, path)
+    if not server_name or len(server_name) > 256:  # the name is part of the dict key
+        return False
+    key = (host_norm, path, server_name)
     fresh = not _discovered_oauth_endpoint_approved(key)
     _OAUTH_DISCOVERED_ENDPOINTS.pop(key, None)
     while len(_OAUTH_DISCOVERED_ENDPOINTS) >= _OAUTH_DISCOVERED_CAP:
@@ -611,11 +621,13 @@ def record_discovered_oauth_endpoint(host: str, path: str, *, mcp_url: str) -> b
         _OAUTH_DISCOVERED_ENDPOINTS.pop(next(iter(_OAUTH_DISCOVERED_ENDPOINTS)), None)
     _OAUTH_DISCOVERED_ENDPOINTS[key] = time.monotonic() + _OAUTH_DISCOVERED_TTL_SECONDS
     if fresh:
-        _emit_oauth_discovered_endpoint_event(host_norm, path, mcp_url)
+        _emit_oauth_discovered_endpoint_event(host_norm, path, mcp_url, server_name)
     return True
 
 
-def _emit_oauth_discovered_endpoint_event(host: str, path: str, mcp_url: str) -> None:
+def _emit_oauth_discovered_endpoint_event(
+    host: str, path: str, mcp_url: str, server_name: str
+) -> None:
     """Best-effort SEL record that discovery approved a consent endpoint."""
     if len(mcp_url) > _OAUTH_DISCOVERED_MCP_URL_MAX_LEN:
         mcp_url = mcp_url[: _OAUTH_DISCOVERED_MCP_URL_MAX_LEN - 1] + "…"
@@ -635,6 +647,7 @@ def _emit_oauth_discovered_endpoint_event(host: str, path: str, mcp_url: str) ->
                     "host": host,
                     "path": path,
                     "mcp_url": mcp_url,
+                    "server_name": server_name,
                     "mechanism": "OAUTH_ENDPOINT_DISCOVERY",
                 },
             )

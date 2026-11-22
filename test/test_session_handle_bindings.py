@@ -48,17 +48,86 @@ SHARED_BINDINGS_CHECKS = (
     "the_field_scan_counts_every_read_and_write_shape",
     "the_signature_digest_ignores_an_object_address_in_either_spelling",
     "the_bound_function_scans_include_every_static_method",
+    "the_class_only_scan_can_fail",
+    "leaf_test_scope_derives_this_file_as_a_corpus_gate",
 )
 
 #: Member -> (kind, coroutine, signature digest, owning module). Frozen at the split: the
 #: kind, coroutine flag and signature are BASE's; the owner is where the member lives now.
 _MEMBERS: dict[str, tuple[str, object, str, str]] = {
-    "__init__": ("function", False, "b84baaa24675", "session_handle_class"),
+    "_acp_config_options": ("property", False, "7eb96c2fda05", "session_handle_class"),
+    "_harness_mode": ("data", False, "", ""),
+    "_harness_mode_names": ("data", False, "", ""),
+    "backend": ("property", False, "bb418bb7ece8", "session_handle_class"),
+    "_claude_children_declared": (
+        "function",
+        False,
+        "a6632a57e602",
+        "session_handle_claude_children",
+    ),
+    "_native_child_roster": (
+        "function",
+        False,
+        "58ee5ea89856",
+        "session_handle_claude_children",
+    ),
+    "_native_child_of": (
+        "function",
+        False,
+        "b1aa20258b70",
+        "session_handle_claude_children",
+    ),
+    "_reset_claude_child_turn": (
+        "function",
+        False,
+        "b60c5fea256e",
+        "session_handle_claude_children",
+    ),
+    "_claude_child_events": (
+        "function",
+        False,
+        "aeeca3d9cefe",
+        "session_handle_claude_children",
+    ),
+    "_note_native_child_request": (
+        "function",
+        False,
+        "87459833bc5c",
+        "session_handle_claude_children",
+    ),
+    "native_child_requests": (
+        "function",
+        False,
+        "eaf9ac925104",
+        "session_handle_claude_children",
+    ),
+    "cancel_native_child": (
+        "function",
+        True,
+        "c809563db429",
+        "session_handle_claude_children",
+    ),
+    "_raw_sdk": ("property", False, "b028d93ed84c", "session_handle_class"),
+    "spec_shell_allowlist": ("data", False, "", ""),
+    "spec_write_allowlist": ("data", False, "", ""),
+    "spec_write_cwd": ("data", False, "", ""),
+    "_agent_turn_hold_end": ("data", False, "", ""),
+    "_agent_turn_reading": ("data", False, "", ""),
+    "_agent_turn_start": ("data", False, "", ""),
+    "_on_agent_turn": ("data", False, "", ""),
+    "_note_queued_frame": ("function", False, "87459833bc5c", "session_handle_agent_turns"),
+    "_take_agent_turn_frames": ("function", False, "f546b68d1845", "session_handle_agent_turns"),
+    "_rearm_agent_turn": ("function", False, "b60c5fea256e", "session_handle_agent_turns"),
+    "agent_turn_pending": ("function", False, "a6632a57e602", "session_handle_agent_turns"),
+    "stream_unsolicited": ("function", "agen", "38f8aabafd49", "session_handle_agent_turns"),
+    "watch_agent_turns": ("function", False, "42d751137554", "session_handle_agent_turns"),
+    "__init__": ("function", False, "a01004fc4c51", "session_handle_class"),
     "_accept_oauth_request": ("function", False, "668a15b0478d", "session_handle_mcp"),
     "_active_tool_calls": ("property", False, "d150141e37db", "session_handle_class"),
     "_advertised_model_ids": ("function", False, "6806e867af4e", "session_handle_model_selection"),
     "_answer_kas_hook_execute": ("function", True, "b922d8462af7", "session_handle_kas"),
     "_answer_kas_hooks_request": ("function", True, "87459833bc5c", "session_handle_kas"),
+    "_announced_row": ("function", False, "e6c5ee661479", "session_handle_native_children"),
     "_apply_init_notification": ("function", False, "ac6a24522ec0", "session_handle_mcp"),
     "_apply_kas_context_pct": ("function", False, "386e4643466b", "session_handle_kas"),
     "_apply_kas_turn_completion": ("function", False, "7f31b87afeac", "session_handle_kas"),
@@ -78,6 +147,12 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     ),
     "_build_permission_event": ("function", False, "e64128661dfa", "session_handle_permissions"),
     "_cancel_hook_tasks": ("function", False, "b60c5fea256e", "session_handle_kas"),
+    "_child_text_activity": (
+        "function",
+        False,
+        "243a606ae7f3",
+        "session_handle_native_children",
+    ),
     "_classify": ("function", False, "b92a06811c94", "session_handle_dispatch"),
     "_cleanup_transcript": ("function", False, "b60c5fea256e", "session_handle_lifecycle"),
     "_close_abandoned_turn": ("function", True, "b60c5fea256e", "session_handle_turn"),
@@ -86,6 +161,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_consult_oracle_offloaded": ("function", True, "a74b2cf7aa76", "session_handle_watchdog"),
     "_crew_agent_name": ("function", False, "9854751dbafb", "session_handle_model_selection"),
     "_deny_spec_disabled_tool": ("function", True, "2dfacffa6279", "session_handle_permissions"),
+    "_deny_zero_tools": ("function", True, "2dfacffa6279", "session_handle_permissions"),
     "_died": ("function", False, "687ef4e00210", "session_handle_lifecycle"),
     "_dispatch_events": ("function", "agen", "883a50b3b1fa", "session_handle_dispatch"),
     "_drain_post_compaction_metadata": (
@@ -97,12 +173,25 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_emit_tool_interrupted_sel": ("function", False, "866fc4f75f7c", "session_handle_updates"),
     "_emit_watchdog_metric": ("function", False, "8cf581201a27", "session_handle_watchdog"),
     "_end_human_wait": ("function", False, "b60c5fea256e", "session_handle_watchdog"),
-    "_end_stalled_tool": ("function", "agen", "1fcba2664f9e", "session_handle_watchdog"),
+    "_end_stalled_tool": ("function", "agen", "b1d688a00791", "session_handle_watchdog"),
     "_feed_advertised_model_cache": (
         "function",
         False,
         "b60c5fea256e",
         "session_handle_model_selection",
+    ),
+    "_flush_announced_child_text": (
+        "function",
+        False,
+        "56174177c198",
+        "session_handle_native_children",
+    ),
+    "_forget_sent_images": ("function", False, "b60c5fea256e", "session_handle_turn"),
+    "_handle_announced_subagent": (
+        "function",
+        False,
+        "c1db800dea61",
+        "session_handle_native_children",
     ),
     "_handle_elicitation_request": ("function", True, "e64128661dfa", "session_handle_elicitation"),
     "_handle_kas_session_info": ("function", False, "f3c17ef22460", "session_handle_kas"),
@@ -114,7 +203,16 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
         "session_handle_native_children",
     ),
     "_handle_kas_update": ("function", False, "761fcd4d2d41", "session_handle_kas"),
-    "_handle_update": ("function", False, "74878d3f1402", "session_handle_updates"),
+    "_handle_legacy_codex_subagent": (
+        "function",
+        False,
+        "5f796c64544c",
+        "session_handle_native_children",
+    ),
+    "_handle_update": ("function", False, "74878d3f1402", "session_handle_harness_surfaces"),
+    "_handle_update_frame": ("function", False, "74878d3f1402", "session_handle_updates"),
+    "_held_calls": ("function", False, "335484fda27a", "session_handle_tool_silence"),
+    "_held_state": ("function", False, "4a8fa3c2de12", "session_handle_tool_silence"),
     "_identity_unreadable_cache_for_wire": (
         "function",
         False,
@@ -146,19 +244,25 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_mcp_attribution_launches": ("function", False, "146e34524e76", "session_handle_mcp"),
     "_no_tool_in_flight": ("function", False, "a6632a57e602", "session_handle_updates"),
     "_normalize_models": ("staticmethod", False, "0587318c8e24", "session_handle_model_selection"),
+    "_note_call_frame": ("function", False, "640278a21156", "session_handle_tool_silence"),
+    "_note_child_calls": ("function", False, "2362e63eea68", "session_handle_tool_silence"),
+    "_note_mcp_call_disconnected": ("function", False, "9afd0349ed2f", "session_handle_mcp"),
     "_note_mcp_sign_in_status": ("function", False, "d0d2b0689553", "session_handle_mcp"),
     "_note_native_child": ("function", False, "09a8133eda4c", "session_handle_native_children"),
     "_note_native_roster": ("function", False, "7a20326749ff", "session_handle_native_children"),
+    "_note_permission_state": ("function", False, "aa7b59b6efad", "session_handle_permissions"),
     "_note_status_rejected": ("function", False, "a9ff3d5a4447", "session_handle_updates"),
     "_note_steering_denial": ("function", False, "b60c5fea256e", "session_handle_steering"),
     "_offer_mcp_sign_in": ("function", False, "b60c5fea256e", "session_handle_mcp"),
     "_owns_mcp_frame": ("function", False, "50405edf7b6a", "session_handle_mcp"),
+    "_park_baseline": ("function", False, "382bb660b58b", "session_handle_tool_silence"),
     "_persist_advertised_models_if_changed": (
         "function",
         True,
         "b60c5fea256e",
         "session_handle_model_selection",
     ),
+    "_probe_mcp_sign_in": ("function", False, "e1215a3a5237", "session_handle_mcp"),
     "_push_model_config_option": (
         "function",
         True,
@@ -166,6 +270,13 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
         "session_handle_model_selection",
     ),
     "_reattempt_failed_mcp_servers": ("function", False, "b60c5fea256e", "session_handle_mcp"),
+    "_refuse_by_harness": ("function", True, "2dfacffa6279", "session_handle_permissions"),
+    "_refuse_moved_permission_state": (
+        "function",
+        True,
+        "b60c5fea256e",
+        "session_handle_permissions",
+    ),
     "_refuse_unidentifiable_mcp_approval": (
         "function",
         True,
@@ -184,6 +295,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
         "5e39ccd3f4ad",
         "session_handle_permissions",
     ),
+    "_reject_with_host_notice": ("function", True, "f809f6dddf9e", "session_handle_permissions"),
     "_release_ending": ("function", False, "2b4c95edbd2b", "session_handle_lifecycle"),
     "_release_for_later_delete": ("function", True, "a93eb1095904", "session_handle_lifecycle"),
     "_release_proven_steers": ("function", False, "dbae1777abcc", "session_handle_steering"),
@@ -191,8 +303,25 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_remote_flat_launches": ("function", False, "b809e9b1faeb", "session_handle_mcp"),
     "_report_evicted_attributions": ("function", False, "b60c5fea256e", "session_handle_updates"),
     "_restore_withdrawn": ("function", False, "491a23344d9c", "session_handle_permissions"),
+    "_retire_call_timer": ("function", False, "79fea74e472a", "session_handle_tool_silence"),
+    "_roster_event": ("function", False, "58ee5ea89856", "session_handle_native_children"),
+    "_reset_tool_silence": ("function", False, "b60c5fea256e", "session_handle_tool_silence"),
     "_retire_liveness_state": ("function", False, "b60c5fea256e", "session_handle_watchdog"),
-    "_run_turn": ("function", "agen", "7fdec7e9ef27", "session_handle_turn"),
+    "_retire_silence_timers": ("function", False, "be327158455b", "session_handle_tool_silence"),
+    "_retire_unreachable_crew_timers": (
+        "function",
+        False,
+        "fa6cfecd5574",
+        "session_handle_tool_silence",
+    ),
+    "_retire_unseen_subagent_timers": (
+        "function",
+        False,
+        "0a3ee8878a8b",
+        "session_handle_tool_silence",
+    ),
+    "_roster_route_proven": ("function", False, "a6632a57e602", "session_handle_tool_silence"),
+    "_run_turn": ("function", "agen", "23084a57ba5b", "session_handle_turn"),
     "_runtime_idle_secs": ("function", False, "59162e39f6f1", "session_handle_watchdog"),
     "_runtime_reattempts_mcp": ("function", False, "a6632a57e602", "session_handle_mcp"),
     "_send_awaited": ("function", True, "99990f4299d3", "session_handle_lifecycle"),
@@ -206,11 +335,17 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_settle_abandoned_steering": ("function", True, "b60c5fea256e", "session_handle_steering"),
     "_settle_codex_compaction": ("function", False, "01ddf3eeedf2", "session_handle_compaction"),
     "_settle_kas_compaction": ("function", False, "d0076098f390", "session_handle_compaction"),
+    "_silence_class_for": ("function", False, "8e7914610fac", "session_handle_tool_silence"),
+    "_silent_tool_call": ("function", False, "3e2b7e87c1c0", "session_handle_tool_silence"),
     "_steer_clear_refused": ("data", False, "", ""),
-    "_steer_via_steering_request": ("function", True, "e2662ac6ac7a", "session_handle_steering"),
+    "_steer_via_steering_request": ("function", True, "008232824c49", "session_handle_steering"),
+    "_steer_via_goose_request": ("function", True, "e2662ac6ac7a", "session_handle_steering"),
+    "_note_goose_run": ("function", False, "87459833bc5c", "session_handle_steering"),
+    "_goose_steer_echo": ("function", False, "e64128661dfa", "session_handle_steering"),
     "_structured_status_event": ("function", False, "f8008b3ce042", "session_handle_updates"),
     "_sync_effort_levels": ("function", False, "b60c5fea256e", "session_handle_model_selection"),
     "_sync_mcp_reattempting": ("function", False, "b60c5fea256e", "session_handle_mcp"),
+    "_sync_silence_hold": ("function", False, "a6632a57e602", "session_handle_tool_silence"),
     "_take_injected_steers": ("function", False, "c42020aec8dd", "session_handle_steering"),
     "_tool_call_cache_overflow_for_wire": (
         "function",
@@ -219,6 +354,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
         "session_handle_updates",
     ),
     "_tool_kind_cache_for_wire": ("function", False, "b7b9268c0112", "session_handle_updates"),
+    "_tool_call_unclassified": ("function", False, "2dfacffa6279", "session_handle_permissions"),
     "_track_metadata": ("function", False, "87459833bc5c", "session_handle_compaction"),
     "_track_prompt_usage": ("function", False, "c8d5c402278d", "session_handle_compaction"),
     "_tripwire_spec_disabled_tool": (
@@ -226,6 +362,12 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
         False,
         "8e767352900b",
         "session_handle_permissions",
+    ),
+    "_unrouted_child_frames_now": (
+        "function",
+        False,
+        "8dc15be1dfda",
+        "session_handle_tool_silence",
     ),
     "_wait_for_response": ("function", True, "87f499e313b4", "session_handle_lifecycle"),
     "_working_tool_bound_reached": ("function", False, "c7051eec1093", "session_handle_watchdog"),
@@ -243,6 +385,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "awaiting_permission": ("property", False, "a6632a57e602", "session_handle_class"),
     "bind_session_key": ("function", False, "57eca86d38c3", "session_handle_lifecycle"),
     "cancel": ("function", True, "4b75d9a5e0c7", "session_handle_lifecycle"),
+    "cancel_went_unacked": ("property", False, "a6632a57e602", "session_handle_class"),
     "cancel_pending_elicitations": ("function", True, "fa6cfecd5574", "session_handle_elicitation"),
     "cleanup_transcript_files": ("staticmethod", False, "a9cece317161", "session_handle_lifecycle"),
     "clear_pending_steers": ("function", True, "16180c63d5e6", "session_handle_steering"),
@@ -254,6 +397,12 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "discard_unanswered_prompt": ("function", True, "a6632a57e602", "session_handle_kas"),
     "drain_init": ("function", True, "c9912f3fb68d", "session_handle_mcp"),
     "ensure_served_default": ("function", True, "4740fd0e8b58", "session_handle_model_selection"),
+    "flush_native_child_text": (
+        "function",
+        False,
+        "cd7af0b62a79",
+        "session_handle_native_children",
+    ),
     "get_valid_effort_levels": (
         "function",
         False,
@@ -261,6 +410,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
         "session_handle_model_selection",
     ),
     "has_unfinished_turn": ("property", False, "a6632a57e602", "session_handle_class"),
+    "held_steers_possibly_delivered": ("property", False, "602c14087aa8", "session_handle_class"),
     "inflight_interactive": ("property", False, "7949c1538a15", "session_handle_class"),
     "is_responsive": ("function", False, "4b2fc7c136b8", "session_handle_watchdog"),
     "is_turn_active": ("property", False, "a6632a57e602", "session_handle_class"),
@@ -282,11 +432,16 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
         "session_handle_native_children",
     ),
     "native_child_sessions": ("property", False, "602c14087aa8", "session_handle_class"),
+    "note_ask_answered": ("function", False, "49d00197599a", "session_handle_tool_silence"),
+    "note_kas_subtask_frame": ("function", False, "5fb2e25e4441", "session_handle_tool_silence"),
     "note_keepalive": ("function", False, "b60c5fea256e", "session_handle_watchdog"),
+    "note_subagent_frame": ("function", False, "fa6cfecd5574", "session_handle_tool_silence"),
+    "note_tool_call_activity": ("function", False, "79fea74e472a", "session_handle_tool_silence"),
+    "note_tool_heartbeat": ("function", False, "7879d661dde4", "session_handle_tool_silence"),
     "parked_for_secs": ("function", False, "59162e39f6f1", "session_handle_watchdog"),
     "parked_since": ("property", False, "c2eec8a41739", "session_handle_class"),
     "pop_pending_oauth_requests": ("function", False, "92d6193dbe19", "session_handle_mcp"),
-    "prompt": ("function", "agen", "c2b3e88c0a7c", "session_handle_turn"),
+    "prompt": ("function", "agen", "9a14234a06a8", "session_handle_turn"),
     "prompt_or_tool_seen": ("property", False, "a6632a57e602", "session_handle_class"),
     "prompt_outstanding_on_stall": ("property", False, "a6632a57e602", "session_handle_class"),
     "queued_frame_count": ("function", False, "fa6cfecd5574", "session_handle_mcp"),
@@ -298,7 +453,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
         "de8486367b30",
         "session_handle_model_selection",
     ),
-    "reject_tool": ("function", True, "84bed4474307", "session_handle_permissions"),
+    "reject_tool": ("function", True, "8f224062db90", "session_handle_permissions"),
     "report_native_children": ("function", False, "ccfc57bdf135", "session_handle_native_children"),
     "send_command": ("function", True, "068aab573b43", "session_handle_lifecycle"),
     "served_model": ("property", False, "bb418bb7ece8", "session_handle_class"),
@@ -306,10 +461,13 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "session_id": ("property", False, "bb418bb7ece8", "session_handle_class"),
     "set_config_option": ("function", True, "d17f94a912fd", "session_handle_model_selection"),
     "set_mode": ("function", True, "50a35c0990a8", "session_handle_model_selection"),
-    "set_model": ("function", True, "bcd0cd3aa159", "session_handle_model_selection"),
+    "set_model": ("function", True, "5ea5af170474", "session_handle_model_selection"),
     "status_rejections": ("property", False, "d8be45664668", "session_handle_class"),
-    "steer": ("function", True, "b0a837a37097", "session_handle_steering"),
+    "steer": ("function", True, "19314a5fce4a", "session_handle_steering"),
     "steer_needs_loss_recovery": ("property", False, "a6632a57e602", "session_handle_class"),
+    "store_config_options": ("function", False, "83d029971996", "session_handle_model_selection"),
+    "absorb_config_options": ("function", False, "8174d98869b1", "session_handle_model_selection"),
+    "settle_kas_model_select": ("function", True, "b60c5fea256e", "session_handle_model_selection"),
     "store_session_config": ("function", False, "83d029971996", "session_handle_model_selection"),
     "stream_command": ("function", "agen", "07d1ae72fdc6", "session_handle_turn"),
     "supports_config_option": ("function", False, "b86d69c93890", "session_handle_model_selection"),
@@ -319,9 +477,11 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "take_batch_refusal": ("function", False, "85a6851f62f8", "session_handle_class"),
     "wait_for_compaction": ("function", True, "0258399cca12", "session_handle_compaction"),
     "wait_for_declared_mcp": ("function", True, "921c3727b83c", "session_handle_mcp"),
-    "wait_mcp_ready": ("function", True, "dc863b4461ff", "session_handle_mcp"),
+    "wait_mcp_ready": ("function", True, "893413045ac2", "session_handle_mcp"),
+    "wait_mounted_mcp": ("function", True, "8a1f54daaf86", "session_handle_mcp"),
     "wait_turn_done": ("function", True, "0ae71757d428", "session_handle_turn"),
     "want_mcp_sign_in_named": ("function", False, "ce7410240196", "session_handle_mcp"),
+    "zero_tool_ban_notice": ("function", False, "bb418bb7ece8", "session_handle_permissions"),
 }
 
 #: Class-level annotations the split adds: fields first set by a member an owner defines,
@@ -330,11 +490,15 @@ _DECLARED = frozenset({"_compaction_terminal_seen", "_kas_compact_turn"})
 
 #: The owner modules, lowest layer first.
 _OWNERS = (
+    "kiro_crew.acp.session_handle_agent_turns",
+    "kiro_crew.acp.session_handle_harness_surfaces",
     "kiro_crew.acp.session_handle_runtime_contract",
     "kiro_crew.acp.session_handle_watchdog",
+    "kiro_crew.acp.session_handle_tool_silence",
     "kiro_crew.acp.session_handle_mcp",
     "kiro_crew.acp.session_handle_kas",
     "kiro_crew.acp.session_handle_native_children",
+    "kiro_crew.acp.session_handle_claude_children",
     "kiro_crew.acp.session_handle_model_selection",
     "kiro_crew.acp.session_handle_steering",
     "kiro_crew.acp.session_handle_lifecycle",
@@ -545,11 +709,6 @@ def _class_only_constructs(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[s
     return found
 
 
-def test_the_class_only_scan_can_fail() -> None:
-    tree = ast.parse("def f(self):\n    super().g()\n    return __class__, self.__hidden\n")
-    assert sorted(_class_only_constructs(tree.body[0])) == ["__class__", "__hidden", "super()"]
-
-
 @pytest.mark.parametrize("owner", _OWNERS)
 def test_no_bound_function_needs_its_class_body(owner: str) -> None:
     tree = _tree(sys.modules[owner])
@@ -723,6 +882,7 @@ _FACADE_MODULE_CLASSES = (
     "AcpRuntimeDead",
     "AcpRuntimeError",
     "AcpRuntimeOverloaded",
+    "AcpScopeAdmissionTimeout",
 )
 
 #: Moved classes no reader names by module: they keep the module that defines them.
@@ -1066,16 +1226,3 @@ def test_the_inventory_check_reports_a_planted_import() -> None:
 
 def test_every_base_import_stays_bound_on_the_facade() -> None:
     assert sorted(_BASE_IMPORTS - set(vars(session_handle))) == []
-
-
-def test_leaf_test_scope_derives_this_file_as_a_corpus_gate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """It reads the whole test tree, so a leaf-only diff must still run it."""
-    import source_corpus
-
-    root = source_corpus.repo_root()
-    monkeypatch.syspath_prepend(str(root / "scripts"))
-    leaf_test_scope = importlib.import_module("leaf_test_scope")
-    this_file = Path(__file__).resolve()
-    assert this_file.relative_to(root).as_posix() in leaf_test_scope.corpus_gates(root)

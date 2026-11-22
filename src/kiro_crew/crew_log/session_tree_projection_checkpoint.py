@@ -11,8 +11,8 @@ the ``SessionTreeProjection`` attribute of the same name in
 :mod:`kiro_crew.crew_log.session_tree_projection`, which keeps the projection's state,
 so ``self.<name>(...)`` calls and instance and class patches reach it as they reach a
 method defined in the class body. They read ``_cancel_epoch``, ``_dirty``, ``_edges``,
-``_lock``, ``_records``, ``_root``, ``_scans``, ``_seed_retry_timer``, ``_spawn_scans``,
-``_spawned`` and ``_write_scheduled``, and write ``_cancel_epoch``, ``_dirty``,
+``_lock``, ``_marks``, ``_records``, ``_root``, ``_seed_retry_timer``, ``_spawned`` and
+``_write_scheduled``, and write ``_cancel_epoch``, ``_dirty``,
 ``_seed_retry_timer`` and ``_write_scheduled``. New checkpoint work goes here.
 """
 
@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
-from kiro_crew.crew_log.checkpoint import CHECKPOINT_DIR, MAX_CHECKPOINT_BYTES
+from kiro_crew.crew_log.checkpoint import CHECKPOINT_DIR
 from kiro_crew.crew_log.schema import KIND_SESSION
 from kiro_crew.crew_log.session_tree import EdgeRecord, OpenedRecord
 from kiro_crew.crew_log.store import log_exception_text
@@ -42,6 +42,18 @@ logger = logging.getLogger("kiro_crew.crew_log.session_tree_projection")
 #: package that is, which is why it gets its own file rather than a name in a unit's
 #: bundle.
 CHECKPOINT_NAME: Final[str] = "session-tree.json"
+#: Beside the checkpoint: present while the last save was refused or failed, so an
+#: operator tool in ANOTHER process (``kirocrew doctor``) can see that the shortcut has
+#: stopped being written. Removed by the next save that lands.
+REFUSAL_NAME: Final[str] = "session-tree.refused.json"
+#: Largest session tree checkpoint this module reads or writes, on both sides. Its own
+#: number, not the crew-log payload ceiling (``MAX_PAYLOAD_BYTES``, 2 MiB): that one
+#: bounds every other savepoint and stays where it is. The tree holds at most
+#: ``TREE_UNIT_CAP`` (4096) records, decisions and spawns, and a row at its string bounds
+#: is about 1.3 KB, so the largest file the caps admit is about 16 MiB. 32 MiB is twice
+#: that, which keeps the ceiling a backstop on those caps and not a limit a store can
+#: reach by growing within them.
+MAX_SESSION_TREE_CHECKPOINT_BYTES: Final[int] = 32 * 1024 * 1024
 #: Serialized-state version. Bump when the stored fields or the fold's semantics
 #: change: a mismatch DISCARDS the file and falls back to a cold rebuild, which costs
 #: one scan and is always correct. Migrating a checkpoint would mean trusting an older
@@ -53,26 +65,26 @@ CHECKPOINT_NAME: Final[str] = "session-tree.json"
 #: why this is a bump rather than a key read additively: a file written before
 #: adoptions existed would load as "no session has ever been adopted", which looks
 #: exactly like the truth and is wrong.
-CHECKPOINT_VERSION: Final[int] = 5
+#: 6 replaced the scan caches (``scans``, ``spawn_scans``) with per-unit ``marks``.
+CHECKPOINT_VERSION: Final[int] = 6
 
 
-#: One unit's log identity for the scan cache: the directory's mtime, its segment count,
-#: and the newest segment's size and mtime. Named because it appears in the state, in the
-#: checkpoint and in two signatures, and four bare ints in a tuple say nothing at a call
-#: site about which four.
-ScanIdentity = tuple[int, int, int, int]
+#: One unit's watermark: the ``ResumePoint`` its last boot's ``iter_from`` walk reached,
+#: the spawned entries counted so far, and the files' identity
+#: (``session_tree_projection_seed._read_unit`` names the ten fields).
+ScanIdentity = tuple[int, int, int, int, int, int, int, int, int, int]
 
 #: What a checkpoint load yields, and what a tail replay yields on top of it. Aliased for
 #: the same reason: a five-place tuple in a signature is not readable at the call site.
 _LoadedCheckpoint = tuple[
     "dict[str, OpenedRecord]",
     "dict[tuple[str, str], EdgeRecord]",
-    "dict[str, ScanIdentity]",
     "dict[tuple[str, str], EdgeRecord]",
     "dict[str, ScanIdentity]",
 ]
 _ReplayResult = tuple[
     "dict[str, OpenedRecord]",
+    "dict[tuple[str, str], EdgeRecord]",
     "dict[tuple[str, str], EdgeRecord]",
     "dict[str, ScanIdentity]",
     bool,
@@ -366,14 +378,10 @@ def _debounced_write(
             "root": self._root or root or "",
             "records": [_record_to_json(r) for r in self._records.values()],
             "edges": [_edge_to_json(e) for e in self._edges.values()],
-            # The unit identities at which a complete read found NO decision, so the
-            # next boot can skip re-deriving that per unit. A cache, never evidence:
-            # see ``_scans``.
-            "scans": {sid: list(ident) for sid, ident in self._scans.items()},
-            # The creators' records of the sessions they created, and the unit
-            # identities those were read at (see ``_spawned``, ``_spawn_scans``).
+            # The creators' records of the sessions they created (see ``_spawned``).
             "spawned": [_edge_to_json(s) for s in self._spawned.values()],
-            "spawn_scans": {sid: list(ident) for sid, ident in self._spawn_scans.items()},
+            # Per unit, where the last boot's read of its log stopped (see ``_marks``).
+            "marks": {sid: list(mark) for sid, mark in self._marks.items()},
         }
         # Cleared BEFORE the write, and deliberately: an apply landing during it
         # re-dirties the state and arms another write, where clearing after would
@@ -403,14 +411,10 @@ def flush_checkpoint(self: SessionTreeProjection) -> bool:
             "root": self._root or _current_root(),
             "records": [_record_to_json(r) for r in self._records.values()],
             "edges": [_edge_to_json(e) for e in self._edges.values()],
-            # The unit identities at which a complete read found NO decision, so the
-            # next boot can skip re-deriving that per unit. A cache, never evidence:
-            # see ``_scans``.
-            "scans": {sid: list(ident) for sid, ident in self._scans.items()},
-            # The creators' records of the sessions they created, and the unit
-            # identities those were read at (see ``_spawned``, ``_spawn_scans``).
+            # The creators' records of the sessions they created (see ``_spawned``).
             "spawned": [_edge_to_json(s) for s in self._spawned.values()],
-            "spawn_scans": {sid: list(ident) for sid, ident in self._spawn_scans.items()},
+            # Per unit, where the last boot's read of its log stopped (see ``_marks``).
+            "marks": {sid: list(mark) for sid, mark in self._marks.items()},
         }
         self._dirty = False
         # Pinned from the SAME locked block that built the payload. Resolving it
@@ -425,8 +429,8 @@ def flush_checkpoint(self: SessionTreeProjection) -> bool:
 
 
 def _load_checkpoint() -> "_LoadedCheckpoint | None":
-    """The checkpoint's records, decisions and scan cache, or ``None`` when there is no
-    usable one.
+    """The checkpoint's records, decisions, spawns and marks, or ``None`` when there is
+    no usable one.
 
     ``None`` is every failure, undifferentiated on purpose: absent, unreadable,
     oversized, unparseable, wrong ``ver``, or a payload whose shape this does not
@@ -442,21 +446,31 @@ def _load_checkpoint() -> "_LoadedCheckpoint | None":
     try:
         path = _checkpoint_path()
         size = path.stat().st_size
-        if size > MAX_CHECKPOINT_BYTES:
+        if size > MAX_SESSION_TREE_CHECKPOINT_BYTES:
             logger.warning(
                 "session tree checkpoint is %d bytes, past the %d-byte ceiling; "
                 "discarding it and rebuilding",
                 size,
-                MAX_CHECKPOINT_BYTES,
+                MAX_SESSION_TREE_CHECKPOINT_BYTES,
             )
             return None
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
-    except (OSError, ValueError):
-        logger.debug("session tree checkpoint unreadable; rebuilding", exc_info=True)
+    except (OSError, ValueError, RecursionError):
+        logger.warning(
+            "session tree checkpoint is unreadable; a full rebuild from the store follows",
+            exc_info=True,
+        )
         return None
-    if not isinstance(payload, dict) or payload.get("ver") != CHECKPOINT_VERSION:
+    found_version = payload.get("ver") if isinstance(payload, dict) else None
+    if found_version != CHECKPOINT_VERSION:
+        logger.warning(
+            "session tree checkpoint is version %r, expected %d; "
+            "a full rebuild from the store follows",
+            found_version,
+            CHECKPOINT_VERSION,
+        )
         return None
     # The file says which store it describes; a mismatch is DISCARDED. Without this the
     # only thing tying a checkpoint to a store is its path, and a file that reached the
@@ -465,7 +479,10 @@ def _load_checkpoint() -> "_LoadedCheckpoint | None":
     # one's, silently and with no recovery path.
     stored_root = payload.get("root")
     if not isinstance(stored_root, str) or stored_root != _current_root():
-        logger.debug("session tree checkpoint describes another store; rebuilding")
+        logger.warning(
+            "session tree checkpoint describes another store; "
+            "a full rebuild from this store follows"
+        )
         return None
     rows = payload.get("records")
     if not isinstance(rows, list):
@@ -479,11 +496,11 @@ def _load_checkpoint() -> "_LoadedCheckpoint | None":
     if not isinstance(edge_rows, list):
         return None
     # Same reasoning as ``edges`` for the key having to be PRESENT, and the opposite
-    # reasoning for a malformed VALUE inside it: this one is a cache, so a row that does
-    # not parse is dropped and its unit is simply re-read, where dropping a decision row
-    # would change the tree.
-    scan_rows = payload.get("scans")
-    if not isinstance(scan_rows, dict):
+    # reasoning for a malformed VALUE inside it: a mark only saves a read, so a row that
+    # does not parse is dropped and its unit is simply read in full, where dropping a
+    # decision row would change the tree.
+    mark_rows = payload.get("marks")
+    if not isinstance(mark_rows, dict):
         return None
     records: dict[str, OpenedRecord] = {}
     for raw in rows:
@@ -493,35 +510,84 @@ def _load_checkpoint() -> "_LoadedCheckpoint | None":
     # Required for the reason ``edges`` is: a file missing it would load as "no
     # session recorded a child", which looks exactly like the truth.
     spawn_rows = payload.get("spawned")
-    spawn_scan_rows = payload.get("spawn_scans")
-    if not isinstance(spawn_rows, list) or not isinstance(spawn_scan_rows, dict):
+    if not isinstance(spawn_rows, list):
         return None
     edges: dict[tuple[str, str], EdgeRecord] = {}
-    for raw in edge_rows:
-        edge = _edge_from_json(raw)
-        if edge is not None:
-            edges[(edge.slot, edge.sid)] = edge
     spawned: dict[tuple[str, str], EdgeRecord] = {}
-    for raw in spawn_rows:
-        spawn = _edge_from_json(raw)
-        if spawn is not None and spawn.parent_slot:
-            spawned[(spawn.slot, spawn.sid)] = spawn
-    return records, edges, _scans_from_json(scan_rows), spawned, _scans_from_json(spawn_scan_rows)
+    marks = _marks_from_json(mark_rows)
+    for rows, into in ((edge_rows, edges), (spawn_rows, spawned)):
+        for raw in rows:
+            row = _edge_from_json(raw)
+            if row is not None and (into is edges or row.parent_slot):
+                into[(row.slot, row.sid)] = row
+                continue
+            # The unit's mark does not cover a dropped row, so that unit is read in full.
+            sid = raw.get("sid") if isinstance(raw, dict) else None
+            if not isinstance(sid, str) or not sid:
+                return None
+            marks.pop(sid, None)
+    return records, edges, spawned, marks
 
 
-def _scans_from_json(scan_rows: "dict[Any, Any]") -> "dict[str, ScanIdentity]":
-    """A scan-identity cache from the checkpoint. A row that does not parse is dropped,
-    which only costs its unit a re-read."""
+def _marks_from_json(mark_rows: "dict[Any, Any]") -> "dict[str, ScanIdentity]":
+    """The per-unit marks from the checkpoint. A row that does not parse is dropped,
+    which only costs its unit a full read."""
     scans: dict[str, ScanIdentity] = {}
-    for sid, raw in scan_rows.items():
+    for sid, raw in mark_rows.items():
         if not isinstance(sid, str) or not sid:
             continue
-        if not isinstance(raw, list) or len(raw) != 4:
+        if not isinstance(raw, list) or len(raw) != 10:
             continue
         if not all(isinstance(part, int) and not isinstance(part, bool) for part in raw):
             continue
-        scans[sid] = (raw[0], raw[1], raw[2], raw[3])
+        if min(raw) < -1 or min(raw[:4] + raw[5:]) < 0:
+            continue
+        scans[sid] = tuple(raw)  # type: ignore[assignment]
     return scans
+
+
+def _note_refusal(target: Path, reason: str, size: "int | None" = None) -> None:
+    """Leave the marker :func:`checkpoint_refusal` reads. Never raises: the save already
+    failed, and a marker that cannot be written must not turn that into a second fault."""
+    try:
+        from kiro_crew.atomic_write import atomic_write
+
+        marker: dict[str, Any] = {
+            "at": int(time.time() * 1000),
+            "reason": reason,
+            "ceiling": MAX_SESSION_TREE_CHECKPOINT_BYTES,
+        }
+        if size is not None:
+            marker["bytes"] = size
+        atomic_write(
+            target.with_name(REFUSAL_NAME),
+            json.dumps(marker, separators=(",", ":")),
+            fsync=False,
+            newline="",
+        )
+    except Exception:
+        log_exception_text(logger, logging.DEBUG, "session tree checkpoint refusal not recorded")
+
+
+def _clear_refusal(target: Path) -> None:
+    """Remove the marker after a save landed. Never raises."""
+    try:
+        target.with_name(REFUSAL_NAME).unlink(missing_ok=True)
+    except OSError:
+        log_exception_text(logger, logging.DEBUG, "session tree checkpoint refusal not cleared")
+
+
+def checkpoint_refusal() -> "dict[str, Any] | None":
+    """The marker's fields (``at`` in ms, ``reason``, ``ceiling``, and ``bytes`` when the
+    refusal was for size), or ``None`` when the last save landed or none was tried.
+
+    Read from the file, so a process that is not the gateway answers too. Never raises.
+    """
+    try:
+        raw = json.loads(_checkpoint_path().with_name(REFUSAL_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    return raw if isinstance(raw, dict) else None
 
 
 def _save_checkpoint(payload: dict[str, Any], path: "Path | None" = None) -> bool:
@@ -532,25 +598,35 @@ def _save_checkpoint(payload: dict[str, Any], path: "Path | None" = None) -> boo
     came from; ``None`` resolves it here, which is right for a synchronous caller whose
     environment cannot have changed underneath it.
 
+    A refused or failed save logs a WARNING and leaves :data:`REFUSAL_NAME` beside the
+    checkpoint, which ``kirocrew doctor`` reports; the save that next lands removes it.
+
     No ``fsync``, the same choice ``checkpoint.save`` makes for the same reason: what a
     crash leaves unpersisted is an older shortcut or none, and both are states the
     reconciliation already handles. Paying for durability on a value that is explicitly
     disposable would be paying for the wrong thing.
     """
+    target: "Path | None" = path
     try:
         from kiro_crew.atomic_write import atomic_write
 
+        target = path or _checkpoint_path()
         blob = json.dumps(payload, separators=(",", ":"))
-        if len(blob.encode("utf-8")) > MAX_CHECKPOINT_BYTES:
+        size = len(blob.encode("utf-8"))
+        if size > MAX_SESSION_TREE_CHECKPOINT_BYTES:
             logger.warning(
                 "session tree checkpoint would exceed the %d-byte ceiling; not written",
-                MAX_CHECKPOINT_BYTES,
+                MAX_SESSION_TREE_CHECKPOINT_BYTES,
             )
+            _note_refusal(target, "over_ceiling", size)
             return False
         # ``atomic_write`` creates its target's parents itself, which is why there is no
         # ``mkdir`` here -- the same reason ``checkpoint.save`` has none.
-        atomic_write(path or _checkpoint_path(), blob, fsync=False, newline="")
-        return True
+        atomic_write(target, blob, fsync=False, newline="")
     except Exception:
-        logger.debug("session tree checkpoint could not be written", exc_info=True)
+        logger.warning("session tree checkpoint could not be written", exc_info=True)
+        if target is not None:
+            _note_refusal(target, "write_failed")
         return False
+    _clear_refusal(target)
+    return True

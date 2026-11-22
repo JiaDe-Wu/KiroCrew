@@ -9,12 +9,14 @@ The backend has the sibling mechanism, Composed Platform Providers: see
 [`docs/system-specs/modules/platform-context.md`](../../docs/system-specs/modules/platform-context.md).
 The two are independent. Nothing here reads `CONTRACT_VERSION`.
 
-## The sixteen registry seams
+## The eighteen registry seams
 
 Each entry is one registrar the edition may call, paired with the reader the core
-already calls. `src/extensions.ts` names exactly these sixteen in its header.
+already calls. `src/extensions.ts` names exactly these eighteen in its header.
 `src/test/extensionSeams.test.tsx` exercises each one except the source-provider
-seam, which has its own suite in `src/test/sourceProviderSeam.test.ts`.
+seam (`src/test/sourceProviderSeam.test.ts`), the Feature Preview row seam
+(`src/pages/settings/FeaturePreviewsEditionRows.test.tsx`) and the document-tab
+seam (`src/pages/chat/DocumentPanelTabs.test.tsx`), which have their own suites.
 
 File/tree/folder menu rows are **not** a composition-root seam: an installed app
 declares them in its manifest under `contributes.fileMenuItems[]` and core
@@ -30,6 +32,7 @@ POSTs the file context to the app's endpoint — see the App Kit publishing guid
 | Top-bar widgets | `apps/topBarWidgets.tsx` | `registerTopBarWidgets()` to `getTopBarWidgets()` |
 | Readout-capsule segments | `apps/capsuleSegments.tsx` | `registerCapsuleSegment()` to `getCapsuleSegments()` |
 | Overview status cards | `pages/overviewStatCards.tsx` | `registerOverviewStatCards()` to `getOverviewStatCards()` |
+| Feature Preview rows | `pages/settings/featurePreviewRows.ts` | `registerFeaturePreviewRows()` to `getFeaturePreviewRows()` (duplicate id refused through `reportSeamCollision`) |
 | Overview lower panel (single owner) | `pages/overviewPanel.tsx` | `registerOverviewPanel()` to `getOverviewPanel()` |
 | Overview built-in suppression (subtractive) | `pages/overviewBuiltins.ts` | `suppressOverviewBuiltin()` to `isOverviewBuiltinSuppressed()` |
 | Panel-navigation chords | `hooks/useKeyboardShortcuts.ts` | `registerPanelShortcut()`, read by the shortcut handler and `DEFAULT_SHORTCUTS` |
@@ -39,6 +42,7 @@ POSTs the file context to the app's endpoint — see the App Kit publishing guid
 | Remote-instance provisioner forms | `components/remoteProvisionerRenderers.tsx` | `registerRemoteProvisionerRenderer()` to `getRemoteProvisionerRenderer()` / `canRenderRemoteProvisionerKind()` |
 | Remote-crew row actions (keyed by the row's `provisioner_id`; refuses `aws_ec2`, a chained row, an empty contribution and a duplicate) | `components/remoteCrewRowActions.tsx` | `registerCrewRowActions()` to `getCrewRowActions(inst)` |
 | Bare-token autolink rules | `utils/autolinkRules.ts` | `registerAutolinkRules()` to `getAutolinkRules()` |
+| Tabs beside an opened file or artifact (side panel) | `pages/chat/documentPanelTabRegistry.ts` | `registerDocumentPanelTabs()` to `getDocumentPanelTabs()`, rendered by `DocumentPanelTabs` |
 
 Plus two **exported-setter** seams for a value the core consumes itself (the
 product name and the feedback tracker), one **exported-transport** seam for
@@ -48,9 +52,9 @@ methods" and "Highlighting languages" below.
 
 Other `register*()` functions in `src/` (built-in surfaces, command-palette
 providers, tool pills, terminal sockets) are core-internal wiring, not edition
-seams. Only the sixteen above are called from the composition root.
+seams. Only the eighteen above are called from the composition root.
 
-Fifteen of the sixteen are **additive** — the edition contributes a surface. The
+Seventeen of the eighteen are **additive** — the edition contributes a surface. The
 remaining one is **subtractive**: `suppressOverviewBuiltin()` removes a built-in
 Overview surface for a distribution whose environment makes it permanently
 inapplicable, which no additive seam can express. It is named `suppress*` rather
@@ -90,7 +94,7 @@ Why the opt-in exists in this direction: an edition build compiles that edition'
 proprietary sources into `website/dist`, and that `dist` is staged into the public
 OSS wheel. A published release cannot be unpublished, so contamination is a
 one-way door. With the opt-in as the gate, every pipeline (release, publish, and
-the backend `setup.py` to `build-frontend.sh` path) is protected **by default**: a
+the runtime rebuild below) is protected **by default**: a
 stray or inherited `KIROCREW_EDITION_DIR` fails the build instead of silently
 compiling edition sources into a public artifact. Only the edition's own build
 script sets the opt-in. Forgetting it fails safe before any artifact is emitted;
@@ -130,7 +134,8 @@ Everything the registry seams brand is rendered by React — which means none of
 exists before React mounts. Four surfaces are shown earlier: the `<title>` during
 boot (and whenever a PWA-install dialog or bookmark samples it), the
 `<meta name="theme-color">`, the boot-failure panel's "worth reporting at" issue
-tracker links (shown when the bundle never arrived), and the PWA identity
+tracker links (shown when the bundle never arrived; the panel's heading also names
+the product from that `<title>` when it reveals), and the PWA identity
 (`manifest.json` plus `icon-192.png` / `icon-512.png`). `registerThemeBranding()`
 cannot reach any of them. The edition plugin patches them instead — the HTML
 fields on every build and dev transform, the `public/` overlay at build emit —
@@ -242,7 +247,7 @@ must stay deduplicated or hooks bind to a second React.
 The core's `tsc -p tsconfig.app.json` covers `website/src` only (`tsconfig.app.json` has
 `"include": ["src"]`), so the edition's sources are outside every typecheck the
 core runs. The bundler does not fill the gap: TypeScript is erased, and a free
-identifier — a typo like `registerThemee` — compiles into the bundle as an
+identifier — a typo such as `registerTheme` with one `e` too many — compiles into the bundle as an
 assumed **global**. The build succeeds, the type check stays green, and the app
 throws `ReferenceError` at module load. Because the composition root runs
 before `App` mounts, that is a blank page, not a broken widget.
@@ -274,7 +279,10 @@ will never run it for you:
 `paths` relative to the config that declares them), so the edition's
 `import { registerTheme } from '@/hooks/useTheme'` typechecks against the real
 core sources. With this in place the typo above is caught at build time:
-`TS2552: Cannot find name 'registerThemee'. Did you mean 'registerTheme'?`
+
+```text
+TS2552: Cannot find name 'registerThemee'. Did you mean 'registerTheme'?
+```
 
 ### A default theme needs configuration, not a seam
 
@@ -428,7 +436,8 @@ theme, including the first render for the initially-active theme, because the
 "previous theme" ref starts empty. Keep it idempotent and cheap. `shell/branding.ts`
 wraps the call in a `try`/`catch` so an edition-owned effect that throws cannot take
 down the shell, but it still logs. `favicon` is handled the same generic way: the
-core has no per-theme favicon and falls back to `/logo.png`.
+core has no per-theme favicon and falls back to a tile of `dashboard.instance_label`'s
+initial on the theme accent when that label is set, else to `/logo.png`.
 
 **Readout-capsule segments.** `registerCapsuleSegment([{ id, order?, component, hideOnMobile? }])`
 mounts a status segment INSIDE the header's readout capsule, sharing its border,
@@ -447,6 +456,14 @@ Widgets render in insertion order, take no props (each reads its own state or
 queries), and are each `ErrorBoundary`-isolated. The same rule as for capsule
 segments applies: a widget's size must not depend on the collapse classes or
 level.
+
+**A widget that owns the desktop update flow.** A widget that offers and arms
+the desktop app's update itself (through `window.updateAPI`) also needs the
+core's two update prompts to stay closed, or they open over it. That is not a
+frontend registration: the edition sets `"updatePrompts": "edition"` in the
+`EXTERNALLY-MANAGED` marker it bakes into the app, and every update push then
+carries the flag the prompts read
+([desktop-app.md → Externally-managed installs](../../docs/build/desktop-app.md#externally-managed-installs-repackagers)).
 
 **Theme centre decoration is a backdrop, not a cell.** Under the three-track grid
 `branding.topBar` renders as a full-header background layer, not as a sized flow
@@ -505,6 +522,28 @@ adds a self-contained `StatCard` (owning its own query and state, like the core
 `TunnelStatus`) to the Settings Overview grid, after the core cards, in ascending
 `order`. Each receives a `delay` prop for the grid's stagger animation.
 
+**Feature Preview rows.** `registerFeaturePreviewRows([{ id, component }])` adds a
+self-contained row to Settings > Developer > Feature Previews, after the core cards
+and before the Decisions card, in registration order. The component renders its
+own `SettingsCard` and switch and owns its own read and write, through the
+edition's own route (`contribute_routes`) and API module (`apiTransport`). Each
+row is wrapped in its own `ErrorBoundary` with the standard crash card, so a
+throwing row shows that card in its place and the other rows stay. A duplicate
+`id` is a collision (`reportSeamCollision`) and is ignored.
+
+**Document tabs.** `registerDocumentPanelTabs([{ id, label, requiresApp?, component }])`
+adds a tab beside a file or artifact opened in the chat side panel. App panel
+tabs (`contributes.panelTabs`) are free-standing and do not know which document
+is open; this seam's component receives it as `target` (`{ kind: 'file', path }`
+or `{ kind: 'artifact', slug, artifactKind }`), plus `active` and `slot`. The
+strip's first tab is the document itself, named by its file name or slug, and the
+document stays mounted while another tab shows. `label` is a function, read at
+render, so it follows the language picked after registration. `requiresApp`
+shows the tab only while that installed app is enabled, the same opt-in rule app
+contributions follow. Each tab body sits in its own `ErrorBoundary`. A
+working-tree diff gets no strip, and with no visible tab the document renders
+exactly as in the stock build.
+
 **Overview lower panel.** `registerOverviewPanel({ id, component })` claims the
 region below the Usage/Memory summary grid, which the stock build leaves empty.
 Unlike every other registry here this slot holds **at most one** entry: the first
@@ -549,7 +588,8 @@ mutation are served by a backend plugin the edition registers with
 `src/kiro_crew/dashboard/source_providers/plugins.py` (still importable from
 `dashboard/handlers/source_providers.py`), under the same id. The
 two registries validate the same id grammar (`/^[a-z][a-z0-9_-]{0,31}$/`) and
-both refuse the built-in ids (`github`, `gitlab`, `jira`), so a descriptor can
+both refuse the built-in ids (`github`, `gitlab`, `jira`, `bitbucket_server`,
+`gerrit`; the backend also refuses `linear`), so a descriptor can
 never restyle a core provider and a payload provider id round-trips through both
 layers. A descriptor missing `parse`/`chipLabel`/`refLabel`/`capabilities`
 routes through `reportSeamCollision`.
@@ -607,7 +647,7 @@ unoffered method draws nothing.
 
 **Remote-instance provisioner forms.**
 `registerRemoteProvisionerRenderer({ kind, component })` supplies the launch form
-that Settings → Remote Crew → "Set up a new one" draws for one provisioner
+that Settings → Remote Crew → Add Crew → "Set up a new Crew" draws for one provisioner
 the backend offers. It keys on `kind`, not `id`, for the same reason as the seam
 above: `id` is what `POST /api/cloud/launch` names in `provider_id` (an id the
 server does not offer is refused with `unknown_provisioner`), while `kind` exists
@@ -698,8 +738,8 @@ Three surfaces send a user to the project's issue tracker, and the stock build
 points every one of them at the public GitHub repository: the top bar's **Request
 a Feature** (the hidden prompt it seeds, which tells the agent to search, label
 and file with `gh`; the copy/paste route that prompt offers; and the
-non-inference form link the `usage_limit` row shows when the plan is spent,
-#13342), the prerelease **report it** link in Settings › About, and the
+non-inference form link the `usage_limit` row shows when the plan is spent),
+the prerelease **report it** link in Settings › About, and the
 false-positive report a redaction card offers. On an edition where that
 repository is unreachable each of them dead-ends, and the agent, handed `gh`
 instructions it cannot follow, improvises a fallback nobody designed.
@@ -750,7 +790,13 @@ composition benefit.
 So `api/apiTransport.ts` **exports** the blessed `apiTransport`, the same
 `get`/`post`/`put`/`del`/`patch` plus `j`/`jNullable` the core methods use
 (`client.ts` defines them and installs them via `installApiTransport` at its
-module load). An edition builds its OWN fully-typed API module on it:
+module load), and `getWithSignal`, the same `get` aborted by an `AbortSignal`
+for a read its caller bounds with `lib/withDeadline`. `request` takes the global
+`fetch`'s arguments and sends them unchanged, adding no header, through the
+transport's journal and its edge-throttle write retry; a core component whose
+request fits none of the helpers uses it instead of the bare `fetch`, and the
+lint rule for issue #40178 refuses a write on the bare `fetch` outside
+`src/api/` and `src/apps/`. An edition builds its OWN fully-typed API module on it:
 
 ```ts
 import { apiTransport as t } from '../api/apiTransport'
@@ -765,7 +811,7 @@ static types on the edition side and no new *registry* contract. It never forks
 `client.ts` and never writes raw `fetch`, which would silently drop the session
 key.
 
-`ApiTransport` (the five request helpers plus the `j`/`jNullable` semantics) **is**
+`ApiTransport` (the request helpers plus the `j`/`jNullable` semantics) **is**
 a small, intentionally frozen downstream contract, because a separately built
 edition compiles against it. There is no version guard on this seam, and the stock
 build stays green whatever you do to it (the seam is inert), so breakage surfaces
@@ -784,13 +830,14 @@ the shared `X-Session-Key` header, the session-expiry hooks a
 method that reads its own response calls, and `withJournaledDeadline` (a
 deadline that also records a timed-out read in the error journal). The
 route-specific parsers (`jInstancesDisabled`, `jCrewBoard`, `jSlotEnvironment`,
-`jSharedCrewPreview`, `jMembers` and `jApps`)
+`jSharedCrewPreview`, `jMembers`, `jApps`, `jRelayViewer` and `jConfigPending`)
 are core-only and deliberately absent from `ApiTransport` above: each opts one
 specific benign denial on one core route out of the error journal (a disabled
 instances control plane's 403, a conductor with no ledger's 404 `no_ledger`, and
-the slot-environment, Shared Crew preview and members roster reads' 403 `owner_only`
-for a caller that is not the dashboard owner, and the app list's 403
-`relay_apps_teammate` for a teammate reaching the Crew through the relay), which is not an edition's decision to make. None of them imports a
+the slot-environment, Shared Crew preview, members roster and config-pending reads' 403 `owner_only`
+for a caller that is not the dashboard owner, the app list's 403
+`relay_apps_teammate` for a teammate reaching the Crew through the relay, and the
+relay viewer's routine refusals of `GET /api/relay-viewer/crews`), which is not an edition's decision to make. None of them imports a
 runtime value
 from `client.ts` (the telemetry module takes the Kiro usage types defined there
 as types only), so the transport and its recovery keep one definition.
@@ -800,9 +847,10 @@ their wire types. That split is core-internal: the seam is still
 `apiTransport`, and an edition never imports a domain module.
 
 Two tests ratchet the split. A new method goes in its domain's `create*Endpoints`
-segment and joins `API_KEY_ORDER` in `ApiClient.refactor.surface.test.ts` where
-the facade spreads it; it joins `NO_SESSION_KEY` there only when it deliberately
-bypasses the request helpers. A method defined inline on the facade instead of in
+segment; `ApiClient.refactor.surface.test.ts` rebuilds the groups the facade
+spreads from the same factories and fails when a member comes from two groups or
+an inline member shadows one. The method joins `NO_SESSION_KEY` there only when it
+deliberately bypasses the request helpers. A method defined inline on the facade instead of in
 a segment joins `INLINE` in `ApiClient.refactor.facade.test.ts`.
 
 Trust boundary: the transport carries the session key. It is for the edition

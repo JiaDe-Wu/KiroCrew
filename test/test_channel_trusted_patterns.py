@@ -120,6 +120,29 @@ async def test_matching_shell_command_is_auto_approved(monkeypatch):
     assert "auto_approved_trusted_pattern" in outcomes
 
 
+@pytest.mark.asyncio
+async def test_a_trusted_command_does_not_approve_a_held_bot_limit(monkeypatch):
+    """``mate_held_rules``: a granted command a held Bot limit covers reaches the card."""
+    from kiro_crew import mate_held_rules
+
+    monkeypatch.setattr("kiro_crew.sel.sel", lambda: MagicMock())
+    _stub_name_grant_verdict(monkeypatch, None)
+    monkeypatch.setattr(mate_held_rules, "held_for", lambda *a, **k: ["deny shell"])
+    agent = _make_agent(bases={"ls"})
+    ch = _make_channel(agent)
+    event = _perm_event(
+        title="Running: ls /tmp",
+        tool_input=json.dumps({"command": "ls /tmp"}),
+        is_shell=True,
+    )
+    client = _make_client([event, _done()])
+
+    await _stream_task(agent, ch, client, "hi")
+
+    client.approve_tool.assert_not_awaited()
+    assert len(_approval_posts(ch)) == 1
+
+
 def _stub_name_grant_verdict(monkeypatch, refusal):
     """Pin the off-loop name-grant verdict (the seam test_name_grant_surfaces
     stubs): the real check resolves names against the host PATH and declines
@@ -158,6 +181,24 @@ async def test_name_grant_refusal_falls_through_to_interactive_card(monkeypatch)
     client.reject_tool.assert_awaited_once_with(7)
     outcomes = [kw.get("outcome") for _, kw in sel_mock.log_tool_invocation.call_args_list]
     assert "auto_approved_trusted_pattern" not in outcomes
+
+
+@pytest.mark.asyncio
+async def test_declined_grant_card_says_why_it_asks_again(monkeypatch):
+    """The reader trusted this command, so the card that asks again names why
+    -- with the refusal's constant text, never its command-built detail."""
+    monkeypatch.setattr("kiro_crew.sel.sel", lambda: MagicMock())
+    refusal = name_grant.Refusal(name_grant.AMBIGUOUS_ENV, "BASH_FUNC_*%% is set")
+    _stub_name_grant_verdict(monkeypatch, refusal)
+    agent = _make_agent(commands={"echo hi"})
+    ch = _make_channel(agent)
+    event = _perm_event(tool_input=json.dumps({"command": "echo hi"}), is_shell=True)
+
+    await _stream_task(agent, ch, _make_client([event, _done()]), "hi")
+
+    (prose,) = [args[1] for args in _approval_posts(ch)]
+    assert prose.endswith(f"\nAsking again even though this is trusted: {refusal.log_text}.")
+    assert refusal.detail not in prose
 
 
 @pytest.mark.asyncio

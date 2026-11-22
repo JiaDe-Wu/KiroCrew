@@ -64,7 +64,10 @@ _CRON_POSTTOKEN_CONTINUE_MSG = _TRANSIENT_CONTINUE_MSG
 
 def _defer_cron_before_dispatch(job: CronJob, reason: str) -> None:
     """Retain an undispatched run without counting success or failure."""
-    job.clear_carried_result()
+    # Scoped as close_run's result-less clear: a message job keeps
+    # ``last_result``, the "do NOT repeat" context the next run carries.
+    if job.command or job.script:
+        job.clear_carried_result()
     job.last_status = "error"
     job.last_error = reason
     job.run_never_started = True
@@ -426,6 +429,7 @@ async def _cron_stream_with_posttoken_resume(
     message: str,
     *,
     job_name: str,
+    directive_refusals: list[str],
     on_resume: Callable[[], None] | None = None,
     **stream_kwargs: Any,
 ) -> tuple[str, float | None]:
@@ -461,7 +465,21 @@ async def _cron_stream_with_posttoken_resume(
     only before any text streams, and we ASSUME (not enforced) a prompt-busy
     error is raised only at submission, so no chunks from an abandoned attempt
     end up in the text.
+
+    A cron turn is never a person's, and no session applier reads its stream,
+    so a directive only a person's turn may issue (``set_project``, ...) would
+    end with only the tool's own "requested" text. Each one this turn completes
+    is refused instead, audited as the chat path's refusal is, and its refusal
+    is appended to ``directive_refusals`` for the caller to lead the run's
+    result with (``person_only_directive_refuser``, shared with workflow agent
+    steps).
     """
+    from kiro_crew.dashboard.session_directive_apply import person_only_directive_refuser
+
+    _refuse_person_only = person_only_directive_refuser(
+        stream_kwargs.get("session_key", ""), directive_refusals
+    )
+
     parts: list[str] = []
     preserved = ""
     carried_credits: float | None = None
@@ -480,6 +498,7 @@ async def _cron_stream_with_posttoken_resume(
                 # inner replay — amplifying the one-shot. The first call keeps
                 # the default (existing pre-token behaviour, unchanged).
                 retry_transient=not _resume_used,
+                on_event=_refuse_person_only,
                 **stream_kwargs,
             )
             return preserved + text, carried_credits
@@ -492,6 +511,7 @@ async def _cron_stream_with_posttoken_resume(
                 try:
                     setattr(exc, TOOL_ACTIVITY_ATTR, True)
                 except Exception:
+                    # An exception type that refuses attributes cannot carry the tag.
                     pass
             if _resume_used or not partial or not acp_error_is_transient(exc):
                 raise

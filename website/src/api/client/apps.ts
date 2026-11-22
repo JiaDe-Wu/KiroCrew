@@ -5,10 +5,18 @@
  * actions.
  */
 
-import { normalizeInstalledApps, normalizeInstalledApp } from '../../components/appstore/types'
+import {
+  normalizeInstalledApps,
+  normalizeInstalledApp,
+  type MarketInstallConfirm,
+  type MarketListingResponse,
+  type MarketListingsResponse,
+  type MarketRegistriesResponse,
+  type MarketSignInView,
+} from '../../components/appstore/types'
 import { i18nT } from '../../i18n/t'
 import { SESSION_CONTROL_STATUS_PATH_RE } from '../../lib/sessionControlStatusPath'
-import { ApiError, isRelayAppsRefusal, toApiError } from '../apiError'
+import { ApiError, toApiError } from '../apiError'
 import type { ClientTransport } from './transport'
 
 /** Final payload resolved by installFromRegistryStream's SSE `done` event. */
@@ -23,6 +31,12 @@ export interface InstallStreamResult {
    * consent modal to open at all.
    */
   code?: string
+  /**
+   * On an `app_trust_local_only` refusal: the repository this update installs
+   * from, as the server normalized it. The update route takes it back as consent
+   * proof (`updateApp(name, 'registry:' + name, trustRepository)`).
+   */
+  trustRepository?: string
   needsClientInstall?: boolean
   clientInstall?: { shell?: string; postInstall?: string }
 }
@@ -48,6 +62,15 @@ export type ExternalRegistryRow = {
   review?: string
 }
 
+/** `GET/PUT /api/apps/{name}/bot-grants`: the ticked Bot slugs and the Bot scopes. */
+export interface AppBotGrants {
+  bots: string[]
+  /** What the manifest's `permissions.bots` declares. */
+  declaredScopes: string[]
+  /** The declared scopes the owner approved; an update's new scope waits until then. */
+  scopes: string[]
+}
+
 /** The surfaces a contributed file-menu row can appear on. */
 export type FileMenuSurface = 'file-overflow' | 'tree-context' | 'folder-row'
 
@@ -68,20 +91,10 @@ export interface FileMenuContext {
 }
 
 export function createAppsEndpoints({ get, post, put, del, j, jApps, jfetch: fetch, sessionKeyHeader: _sk, checkSessionExpired, removeAuthBanner }: ClientTransport) {
-  // The relay refuses the app surface to a teammate (`relay_apps_teammate`), and
-  // nothing this document does can change who its caller is. Once that answer
-  // arrives it is kept and handed back without a request, so the shell's retry
-  // ladder, a tab-return re-read and every newly mounted `['apps']` observer stop
-  // asking `/api/apps` the same question (#32031). Only that one code is kept: any
-  // other failure, an `owner_only` 403 included, still reaches the gateway next time.
-  let appsRefusedForTeammate: unknown = null
-  const listApps = (): Promise<ReturnType<typeof normalizeInstalledApps>> => {
-    if (appsRefusedForTeammate) return Promise.reject(appsRefusedForTeammate)
-    return fetch('/api/apps').then(jApps).then(normalizeInstalledApps).catch((e: unknown) => {
-      if (isRelayAppsRefusal(e)) appsRefusedForTeammate = e
-      throw e
-    })
-  }
+  // A `relay_apps_teammate` refusal is kept by the transport (`refusedReads` in
+  // `api/client.ts`), so a later ask of `/api/apps` makes no request (#32031).
+  const listApps = (): Promise<ReturnType<typeof normalizeInstalledApps>> =>
+    fetch('/api/apps').then(jApps).then(normalizeInstalledApps)
   const platform = {
     // --- Apps ---
     // Installed-app payloads are normalized HERE rather than in a queryFn. The
@@ -92,9 +105,18 @@ export function createAppsEndpoints({ get, post, put, del, j, jApps, jfetch: fet
     listApps,
     getApp: (name: string) => fetch('/api/apps/' + encodeURIComponent(name)).then(j).then(normalizeInstalledApp),
     getAppManifest: (name: string) => fetch('/api/apps/' + encodeURIComponent(name) + '/manifest').then(j),
+    // The Bots the owner ticked for an app (`permissions.bots`), and its approved scopes.
+    getAppBotGrants: (name: string) => fetch('/api/apps/' + encodeURIComponent(name) + '/bot-grants').then(j) as Promise<AppBotGrants>,
+    setAppBotGrants: (name: string, bots: string[]) => put('/api/apps/' + encodeURIComponent(name) + '/bot-grants', { bots }).then(j) as Promise<AppBotGrants>,
     installApp: (source: string) => post('/api/apps/install', { source }).then(j),
     // grantsConsent names the staged entries the owner was shown; only those are approved.
-    enableApp: (name: string, sessionApprovalConsent = false, grantsConsent?: { api: string[]; events: string[]; linkPreviewHosts?: string[]; linkPreviewTextPatterns?: string[]; linkPreviewFullUrl?: string[]; messageActions?: string[]; linkOpenHosts?: string[]; linkOpenFullUrl?: string[]; composerActions?: string[]; selectionActions?: string[] }) => post('/api/apps/' + encodeURIComponent(name) + '/enable', grantsConsent ? { sessionApprovalConsent, grantsConsent } : { sessionApprovalConsent }).then(j),
+    enableApp: (name: string, sessionApprovalConsent = false, grantsConsent?: { api: string[]; events: string[]; bots?: string[]; linkPreviewHosts?: string[]; linkPreviewTextPatterns?: string[]; linkPreviewFullUrl?: string[]; messageActions?: string[]; linkOpenHosts?: string[]; linkOpenFullUrl?: string[]; composerActions?: string[]; selectionActions?: string[]; workerAutoApprove?: string[]; reachableByUserSessions?: string[]; desktopCapabilities?: string[]; frameSources?: string[]; browserSites?: string[]; kiroOperations?: string[]; browser?: string[] }, memberThreadsConsent = false) => post('/api/apps/' + encodeURIComponent(name) + '/enable', {
+      sessionApprovalConsent,
+      // Only a consent whose disclosure named member threads says so; the
+      // server refuses a consent that omits a scope the live manifest declares.
+      ...(sessionApprovalConsent && memberThreadsConsent ? { memberThreadsConsent: true } : {}),
+      ...(grantsConsent ? { grantsConsent } : {}),
+    }).then(j),
     disableApp: (name: string) => post('/api/apps/' + encodeURIComponent(name) + '/disable').then(j),
     openApp: (name: string) => post('/api/apps/' + encodeURIComponent(name) + '/open').then(j),
     uninstallApp: (name: string, keepData = true, keepDependencies?: boolean, keepSpecific?: string[]) =>
@@ -113,13 +135,19 @@ export function createAppsEndpoints({ get, post, put, del, j, jApps, jfetch: fet
           userInstalled: { id: string; type: string; reason: string }[]
         }
       }>,
-    updateApp: (name: string, source?: string) => post('/api/apps/' + encodeURIComponent(name) + '/update', source ? { source } : {}).then(j),
+    // `trustRepository` is the consent proof from an `app_trust_local_only`
+    // refusal, sent with `source: registry:<name>` to switch the app's local-only
+    // grant to that repository for this update (the server puts it back on failure).
+    updateApp: (name: string, source?: string, trustRepository?: string) => post(
+      '/api/apps/' + encodeURIComponent(name) + '/update',
+      { ...(source ? { source } : {}), ...(trustRepository ? { trustRepository } : {}) },
+    ).then(j),
     migrateCleanup: (name: string) => del('/api/apps/' + encodeURIComponent(name) + '/migrate-cleanup').then(j),
     // apps is intentionally `any[]`: each page (AppsPage/MigrationPage/AppDetailPage)
     // narrows it to its own local RegistryApp shape at the call site. Typing it as
     // unknown[] here would break those structural assignments across files.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    listRegistry: () => fetch('/api/apps/registry').then(j) as Promise<{ apps: any[]; serverPlatform: { os: string; arch: string }; categoryOrder?: string[]; editorialSections?: unknown[] }>,
+    listRegistry: () => fetch('/api/apps/registry').then(j) as Promise<{ apps: any[]; catalogUnavailable?: boolean; registryStatus?: unknown[]; serverPlatform: { os: string; arch: string }; categoryOrder?: string[]; editorialSections?: unknown[] }>,
     listRegistries: () => fetch('/api/apps/registries').then(j) as Promise<{ registries: ExternalRegistryRow[]; pinned?: ExternalRegistryRow[] }>,
     updateRegistries: (registries: { name: string; repo: string; branch: string; trust?: string }[]) => put('/api/apps/registries', { registries }).then(j) as Promise<{ ok: boolean; registries: ExternalRegistryRow[]; newlyTrustedHosts: string[] }>,
     // Drops the server's on-disk caches of the published documents (catalog /
@@ -130,7 +158,7 @@ export function createAppsEndpoints({ get, post, put, del, j, jApps, jfetch: fet
     // /api/apps/: that namespace grants an app named `registry` implicit
     // path ownership (token_auth._app_owns_path).
     refreshAppStore: () => post('/api/app-store/refresh').then(j) as Promise<{ ok: boolean }>,
-    refreshRegistries: (repo?: string) => post('/api/apps/registries/refresh', repo ? { repo } : {}).then(j) as Promise<{ ok: boolean; refreshed: string[]; failed: string[]; results: { name: string; ok: boolean; reason?: 'auth'; host?: string }[]; apps: number; lastSyncedAt: string }>,
+    refreshRegistries: (repo?: string) => post('/api/apps/registries/refresh', repo ? { repo } : {}).then(j) as Promise<{ ok: boolean; refreshed: string[]; failed: string[]; results: { name: string; ok: boolean; reason?: string; host?: string; cached?: boolean }[]; apps: number; lastSyncedAt: string }>,
     installFromRegistry: (name: string) => post('/api/apps/registry/install', { name }).then(j),
     /**
      * Stream install logs via SSE.  Calls `onLog` for each line and resolves
@@ -147,7 +175,15 @@ export function createAppsEndpoints({ get, post, put, del, j, jApps, jfetch: fet
         body: JSON.stringify({ name }),
         signal,
       })
-      if (!res.ok || !res.body) {
+      if (!res.ok) {
+        // A refusal answered before the stream opens (owner-only, a bad body, an
+        // expired or stale-owner session) is a JSON error body: read it through
+        // the shared parser every other call uses, so the page shows its message
+        // and code, not the raw JSON, and the sign-in recovery runs. `j` always
+        // throws on a non-2xx.
+        await j(res)
+      }
+      if (!res.body) {
         const text = await res.text()
         throw new Error(text || `HTTP ${res.status}`)
       }
@@ -184,6 +220,20 @@ export function createAppsEndpoints({ get, post, put, del, j, jApps, jfetch: fet
         reader.releaseLock()
       }
     },
+    // Kiro Space stores as App Store sources (`apps/routes_market_registry.py`).
+    // The open-source build has no store provider: the first answers `offers: []`.
+    getMarketRegistries: () => fetch('/api/apps/market/registries').then(j) as Promise<MarketRegistriesResponse>,
+    setMarketRegistries: (added: string[]) => put('/api/apps/market/registries', { added }).then(j) as Promise<{ ok: boolean; added: string[] }>,
+    marketSignIn: (id: string) => post('/api/apps/market/registries/' + encodeURIComponent(id) + '/signin', {}).then(j) as Promise<MarketSignInView>,
+    marketSignOut: (id: string) => post('/api/apps/market/registries/' + encodeURIComponent(id) + '/signout', {}).then(j) as Promise<MarketSignInView>,
+    listMarketListings: (registry: string) => fetch('/api/apps/market/listings?' + new URLSearchParams({ registry })).then(j) as Promise<MarketListingsResponse>,
+    getMarketListing: (registry: string, ref: string) => fetch('/api/apps/market/listing?' + new URLSearchParams({ registry, ref })).then(j) as Promise<MarketListingResponse>,
+    prepareMarketInstall: (ref: string, account?: string, registry?: string) => post('/api/apps/market/install', {
+      ref,
+      ...(account === undefined ? {} : { account }),
+      ...(registry === undefined ? {} : { registry }),
+    }).then(j) as Promise<{ ok: boolean; stagingId: string; confirm: MarketInstallConfirm }>,
+    confirmMarketInstall: (stagingId: string, confirmed: boolean) => post('/api/apps/market/install/confirm', { stagingId, confirmed }).then(j) as Promise<{ ok: boolean; name?: string; discarded?: boolean }>,
     registerApp: (body: object) => post('/api/apps/register', body).then(j),
   }
 

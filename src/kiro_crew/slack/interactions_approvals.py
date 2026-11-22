@@ -20,18 +20,24 @@ import logging
 import aiohttp
 
 from kiro_crew.config.loader import ACTIVATION_REVIEW
+from kiro_crew.http_proxy import resolve_proxy
 from kiro_crew.messaging.identity import channel_inbound_permitted
 from kiro_crew.messaging.renderer import count_redaction_tags, redaction_notice
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.slack.channel_policy import channel_refusal
+from kiro_crew.slack.events_queue import _configured_approval_mode
 from kiro_crew.slack.handler import (
-    APPROVAL_INTERACTIVE,
     handle_interaction,
     handle_message,
+    is_allowed_user,
     is_owner,
+    is_shared_listed,
+    is_shared_user,
+    shared_user_refused_for_session,
 )
 from kiro_crew.slack.interactions_context import _orch, register_view_handler
+from kiro_crew.slack.shared_access import SHARED_OWNER_ONLY_TEXT, shared_command_refused
 from kiro_crew.start_priority import StartPriority
 
 logger = logging.getLogger("kiro_crew.slack.interactions")
@@ -125,6 +131,7 @@ async def _post_review_auth_error(response_url: str) -> None:
         async with aiohttp.ClientSession() as sess:
             await sess.post(
                 response_url,
+                proxy=resolve_proxy(response_url),
                 json={
                     "replace_original": True,
                     "response_type": "ephemeral",
@@ -145,8 +152,46 @@ def _parse_draft_key(meta: str) -> tuple[str, str, str] | None:
 
 
 def _can_act_on_review_draft(caller: str, requester: str) -> bool:
-    """Authorize a review-mode action: bot owner OR the requester who triggered the draft."""
-    return bool(caller) and (caller == requester or is_owner(caller))
+    """Authorize a review-mode action: bot owner OR the requester who triggered the draft.
+
+    The requester must still be admitted (``is_allowed_user``): a shared user removed
+    while their draft's modal was open posts nothing.
+    """
+    return bool(caller) and (
+        is_owner(caller)
+        or (caller == requester and (is_allowed_user(caller) or is_shared_user(caller)))
+    )
+
+
+# Draft-key suffix _post_review_draft adds for a channel-level (unthreaded) card.
+_REVIEW_ROOT_SUFFIX = "|root"
+
+
+async def _restore_review_card(
+    channel: str, thread_ts: str, draft_key: str, text: str, requester: str, caller: str
+) -> None:
+    """Store ``text`` as the draft again and re-post its review card to ``caller``.
+
+    Used after a failed post from the edit modal: the modal has closed and the
+    original card was deleted when it opened, so a fresh card is the only way
+    back to the text.
+    """
+    if not _orch or not _orch.slack:
+        return
+    from kiro_crew.slack.blocks import review_draft_blocks
+    from kiro_crew.slack.handler import _review_drafts_set
+
+    _review_drafts_set(draft_key, text, requester)
+    try:
+        await _orch.slack.post_ephemeral(
+            channel,
+            caller,
+            text,
+            blocks=review_draft_blocks(text, draft_key),
+            thread_ts=None if draft_key.endswith(_REVIEW_ROOT_SUFFIX) else thread_ts,
+        )
+    except Exception:
+        logger.exception("Failed to re-post review card for %s", draft_key)
 
 
 async def _handle_review_approve(payload: dict, action: dict) -> None:
@@ -159,7 +204,9 @@ async def _handle_review_approve(payload: dict, action: dict) -> None:
         return
     channel, thread_ts, draft_key = parsed
 
-    from kiro_crew.slack.handler import _review_drafts_get, _review_drafts_pop
+    from slack_sdk.errors import SlackApiError
+
+    from kiro_crew.slack.handler import _review_drafts_get, _review_drafts_pop, _review_drafts_set
 
     _, requester = _review_drafts_get(draft_key)
     if not _can_act_on_review_draft(caller, requester):
@@ -177,19 +224,25 @@ async def _handle_review_approve(payload: dict, action: dict) -> None:
     if not draft:
         logger.warning("Review approve: no draft found for %s", draft_key)
         return
+    original = draft
     draft, _ = redact_exfiltration_urls(draft)
     draft, _ = redact_credentials(draft)
-    await _orch.slack.post_message(channel, draft, thread_ts)
+    try:
+        await _orch.slack.post_message(channel, draft, thread_ts)
+    except SlackApiError:
+        # Popped first so a double press cannot post twice; put it back when
+        # Slack answered with an error, so the buttons still on screen can
+        # retry. Only then: a dropped connection may have posted it already.
+        _review_drafts_set(draft_key, original, _requester)
+        raise
     # Approving a draft posts it publicly to the channel, so this egress carries
     # the same silent-corruption hazard as the streaming reply path: the two lines
-    # above replaced a credential or a suspicious URL in the draft with a
-    # placeholder, and a channel member who copies the command hits an opaque
-    # downstream failure with no hint the text was rewritten. Count the tags in
-    # the redacted draft that actually shipped -- credential tags exactly, the URL
-    # tag by `EXFILTRATION_REDACTION_TAG_PREFIX` prefix since it interpolates the
-    # domain -- and post one best-effort follow-up notice worded by kind (the
-    # remedies differ). The notice carries only counts, never secret bytes or the
-    # redacted domain, and its failure must not undo the posted draft -- the draft
+    # above replaced a credential in the draft with a placeholder, and a channel
+    # member who copies the command hits an opaque downstream failure with no hint
+    # the text was rewritten. Count the tags in the redacted draft that actually
+    # shipped (`count_redaction_tags`) and post one best-effort follow-up notice.
+    # The notice carries only counts, never secret bytes, and its failure must not
+    # undo the posted draft -- the draft
     # is already public, so raising here would lose the warning and the approve's
     # remaining teardown too.
     _cred_redactions, _url_redactions = count_redaction_tags(draft)
@@ -206,7 +259,9 @@ async def _handle_review_approve(payload: dict, action: dict) -> None:
     if response_url:
         try:
             async with aiohttp.ClientSession() as sess:
-                await sess.post(response_url, json={"delete_original": True})
+                await sess.post(
+                    response_url, proxy=resolve_proxy(response_url), json={"delete_original": True}
+                )
         except Exception:
             logger.debug("Failed to delete review ephemeral", exc_info=True)
     sel().log_api_access(
@@ -257,7 +312,9 @@ async def _handle_review_edit(payload: dict, action: dict) -> None:
     if response_url:
         try:
             async with aiohttp.ClientSession() as sess:
-                await sess.post(response_url, json={"delete_original": True})
+                await sess.post(
+                    response_url, proxy=resolve_proxy(response_url), json={"delete_original": True}
+                )
         except Exception:
             logger.debug("Failed to delete review ephemeral", exc_info=True)
     sel().log_api_access(
@@ -300,7 +357,9 @@ async def _handle_review_cancel(payload: dict, action: dict) -> None:
     if response_url:
         try:
             async with aiohttp.ClientSession() as sess:
-                await sess.post(response_url, json={"delete_original": True})
+                await sess.post(
+                    response_url, proxy=resolve_proxy(response_url), json={"delete_original": True}
+                )
         except Exception:
             logger.debug("Failed to delete review ephemeral", exc_info=True)
     sel().log_api_access(
@@ -336,10 +395,15 @@ async def _handle_review_edit_submit(payload: dict) -> None:
         logger.info("slack review-edit submit dropped: channel refused by policy")
         return
 
+    from kiro_crew.slack.code_channels.routing import shared_user_refused_here
     from kiro_crew.slack.handler import _review_drafts_get, _review_drafts_pop
 
     _, requester = _review_drafts_get(draft_key)
-    if not _can_act_on_review_draft(caller, requester):
+    # A code channel is the owner's (slack.shared_access): the modal may have opened
+    # before Slack Code went on, so a shared user's edit is not posted there.
+    if not _can_act_on_review_draft(caller, requester) or (
+        is_shared_listed(caller) and await shared_user_refused_here(_orch.slack, channel)
+    ):
         sel().log_api_access(
             caller=caller,
             operation="slack.review_edit_submit",
@@ -353,10 +417,24 @@ async def _handle_review_edit_submit(payload: dict) -> None:
     if not edited:
         return
 
-    _review_drafts_pop(draft_key)
-    edited, _ = redact_exfiltration_urls(edited)
-    edited, _ = redact_credentials(edited)
-    await _orch.slack.post_message(channel, edited, thread_ts)
+    # Claim the draft: a stale modal whose draft was already approved, cancelled
+    # or expired must not post.
+    stored, requester = _review_drafts_pop(draft_key)
+    if not stored:
+        logger.warning("Review edit submit: no draft found for %s", draft_key)
+        return
+    to_post, _ = redact_exfiltration_urls(edited)
+    to_post, _ = redact_credentials(to_post)
+    from slack_sdk.errors import SlackApiError
+
+    try:
+        await _orch.slack.post_message(channel, to_post, thread_ts)
+    except SlackApiError:
+        # Only when Slack answered with an error: a dropped connection may have
+        # posted it already, and a second card would invite a double post.
+        logger.exception("Review edit submit: post failed for %s", draft_key)
+        await _restore_review_card(channel, thread_ts, draft_key, edited, requester, caller)
+        return
     await _delete_review_placeholder(channel, thread_ts)
     sel().log_api_access(
         caller=caller,
@@ -407,7 +485,9 @@ async def _handle_review_revise(payload: dict, action: dict) -> None:
     if response_url:
         try:
             async with aiohttp.ClientSession() as sess:
-                await sess.post(response_url, json={"delete_original": True})
+                await sess.post(
+                    response_url, proxy=resolve_proxy(response_url), json={"delete_original": True}
+                )
         except Exception:
             logger.debug("Failed to delete review ephemeral", exc_info=True)
     sel().log_api_access(
@@ -417,6 +497,19 @@ async def _handle_review_revise(payload: dict, action: dict) -> None:
         source="slack",
         resources=channel,
     )
+
+
+def _revision_destination(thread_ts: str) -> str:
+    """The session a revision in *thread_ts* runs in: its linked slot, else its owner."""
+    from kiro_crew.slack.handler import get_dashboard_state
+
+    state = get_dashboard_state()
+    slot = state.get_linked_slot(thread_ts) if hasattr(state, "get_linked_slot") else None
+    if slot is not None:
+        return str(getattr(slot, "key", "") or "")
+    sessions = getattr(state, "sessions", None) or getattr(_orch, "sessions", None)
+    owner = sessions.get_session_for_thread(thread_ts) if sessions is not None else None
+    return owner if isinstance(owner, str) else ""
 
 
 async def _handle_review_revise_submit(payload: dict) -> None:
@@ -444,7 +537,20 @@ async def _handle_review_revise_submit(payload: dict) -> None:
     from kiro_crew.slack.handler import _review_drafts_get, _review_drafts_pop
 
     _, requester = _review_drafts_get(draft_key)
-    if not _can_act_on_review_draft(caller, requester):
+    from kiro_crew.slack.code_channels.routing import shared_user_refused_here
+
+    # Before the pop, as the edit submit: a refused revision keeps the draft. The
+    # revision runs in the thread's session, which may be a code channel's; one
+    # relinked while it is judged is refused too (the draft is kept).
+    _dest = _revision_destination(thread_ts)
+    if not _can_act_on_review_draft(caller, requester) or (
+        is_shared_listed(caller)
+        and (
+            await shared_user_refused_here(_orch.slack, channel)
+            or await shared_user_refused_for_session(caller, _dest, thread_ts, channel)
+            or _revision_destination(thread_ts) != _dest
+        )
+    ):
         sel().log_api_access(
             caller=caller,
             operation="slack.review_revise_submit",
@@ -458,6 +564,23 @@ async def _handle_review_revise_submit(payload: dict) -> None:
         values.get("mc_review_revise_block", {}).get("mc_review_revise_input", {}).get("value", "")
     )
     if not feedback:
+        return
+    # A shared user's feedback is what they typed, judged before the draft is
+    # consumed; the draft in the synthesized prompt is the model's, never a command.
+    if is_shared_listed(caller) and shared_command_refused(caller, feedback):
+        sel().log_api_access(
+            caller=caller,
+            operation="slack.review_revise_submit",
+            outcome="denied",
+            source="slack",
+            error="shared user command",
+        )
+        try:
+            await _orch.slack.post_ephemeral(
+                channel, caller, SHARED_OWNER_ONLY_TEXT, thread_ts=thread_ts
+            )
+        except Exception:
+            logger.debug("review revise: refusal notice failed", exc_info=True)
         return
 
     draft, _requester = _review_drafts_pop(draft_key)
@@ -494,7 +617,7 @@ async def _handle_review_revise_submit(payload: dict) -> None:
                 thread_ts,
                 thread_ts,  # msg_ts = thread_ts for revision
                 caller,
-                approval_mode=APPROVAL_INTERACTIVE,
+                approval_mode=_configured_approval_mode(_orch),
                 context_builder=_orch.ctx_builder,
                 cron_service=_orch.cron_svc,
                 conversation_log=_orch.conv_log,
@@ -503,6 +626,7 @@ async def _handle_review_revise_submit(payload: dict) -> None:
                 task_runner=_orch.task_runner,
                 channel_activation=ACTIVATION_REVIEW,
                 start_priority=StartPriority.FOREGROUND,
+                spool_text=feedback if is_shared_listed(caller) else None,
             )
             logger.info("Review revision requested by %s in %s", caller, channel)
         except Exception:
@@ -522,3 +646,71 @@ async def _handle_review_revise_submit(payload: dict) -> None:
 
 
 register_view_handler("mc_review_revise_submit", _handle_review_revise_submit)
+
+
+#: What the owner is told, privately, about a stale bridged press. Anyone else is told
+#: nothing, so a press reveals nothing about a decision to someone who is not the owner.
+BRIDGE_ACTION_STALE_NOTICE = "This request was already answered or has expired."
+
+
+async def _handle_bridge_action(
+    payload: dict, action: dict, action_id: str, channel: str, user_id: str
+) -> None:
+    """Resolve a bridged notification's action button (RFC bridge actions, B4c).
+
+    The button's ``value`` is the token ``BridgeActionRegistry.bind`` minted and its
+    ``action_id`` names the answer. ``dispatch`` admits only allow-listed users; this
+    adds the inbound ``channels`` gate an approval runs a tool behind, and the
+    registry adds the rest: owner-only (``is_owner``, the configured ``owner_id``),
+    single-use, an offered answer, before its deadline. ``user_id`` is the payload's
+    ``user.id``, which only Slack writes: interactions arrive on the app-token Socket
+    Mode connection, never as text a user typed. Every press that reaches the
+    registry is audited through ``bridge_action_audit.audit_action``, a refused or
+    stale one included. Fail closed: with the ``bridge_approvals`` preview off, no
+    registry, or a press that does not parse, nothing is resolved.
+    """
+    # Lazy: the bridge's names stay out of this owner's globals, so the
+    # interactions facade does not serve them.
+    from kiro_crew.notifications.bridge_action_audit import audit_action
+    from kiro_crew.notifications.bridge_actions import (
+        SLACK_ACTION_PREFIX,
+        ActionOutcome,
+        actions_enabled,
+    )
+
+    # The live config is read off the loop, so turning the preview off stops a
+    # press on a button posted before it.
+    if not await asyncio.to_thread(actions_enabled):
+        return
+    state = _orch.dashboard_state if _orch else None
+    registry = getattr(state, "bridge_actions", None)
+    if registry is None:
+        return
+    token = action.get("value")
+    choice = action_id.removeprefix(SLACK_ACTION_PREFIX)
+    if not isinstance(token, str) or not token or not user_id:
+        return  # Does not parse: no answer is given.
+    # Resolving an approval runs a governed tool, so a channels policy denying
+    # ``slack`` stops the press here, as it stops the native approval buttons. A
+    # denied press resolves nothing; the dashboard can still answer.
+    if not (
+        await channel_inbound_permitted("slack")
+        and not channel_refusal(channel, operation="slack.bridge_action", caller=user_id)
+    ):
+        logger.info("slack bridged action dropped: denied by channels governance policy")
+        return
+    from_owner = is_owner(user_id)
+    outcome = registry.resolve(token, choice, from_owner=from_owner)
+    audit_action(
+        registry, token, outcome, transport="slack", choice=choice, actor=user_id, channel=channel
+    )
+    if outcome is ActionOutcome.ADMITTED or not from_owner:
+        return
+    thread_ts = payload.get("message", {}).get("thread_ts") or ""
+    if _orch and _orch.slack and channel and user_id:
+        try:
+            await _orch.slack.post_ephemeral(
+                channel, user_id, BRIDGE_ACTION_STALE_NOTICE, thread_ts=thread_ts or None
+            )
+        except Exception:
+            logger.debug("Failed to send a bridged-action notice", exc_info=True)

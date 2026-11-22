@@ -33,9 +33,12 @@
  *  3. Any other part hit, discounted ×0.6 — the row merely mentions the term
  *     in its description/keywords/tab.
  */
+import { crewModeEnabled } from '../../lib/crewMode'
+import { isStandaloneDisplay } from '../../lib/standaloneLastRoute'
 import { fuzzyMatch } from '../../utils/fuzzyMatch'
-import { PREVIEW_EXPLORE, PREVIEW_SESSION_ENVIRONMENTS, readPreviewFlag } from '../../utils/previewFlags'
+import { PREVIEW_DASHBOARD_STALE_FIELDS, PREVIEW_EXPLORE, PREVIEW_SESSION_ENVIRONMENTS, previewFlagsLocked, readPreviewFlag } from '../../utils/previewFlags'
 import { i18nT } from '../../i18n/t'
+import { isMac } from '../../utils/platform'
 import { KIRO_SIGN_IN_SETTING_ID } from './kiroSignInSettingId'
 import { SETTINGS_KEYWORDS } from './settingsKeywords'
 import { settingsTabLabel } from './settingsTabLabel'
@@ -66,7 +69,7 @@ export interface SettingEntryScore {
  * re-append it.
  */
 /**
- * Registry id of the Decisions (Jev) main toggle — the card's own switch.
+ * Registry id of the Decisions main toggle — the card's own switch.
  *
  * The card carries more rows than this one; :data:`DECISIONS_SETTING_IDS` below is
  * the whole governed set, and the predicate reads that.
@@ -74,16 +77,16 @@ export interface SettingEntryScore {
  * The registry is CODEGEN'd from the static settings tree, so it lists every entry
  * the build ships regardless of whether the running gateway offers it. This one is
  * governed: `capabilities.decisions` can withdraw the feature, and
- * `FeaturePreviewsSection` then renders no card at all. A search result is a promise
+ * the card then draws only the administrator's notice, with none of its controls. A search result is a promise
  * that the page has the row, so an unfiltered corpus would land the user on a section
  * where nothing is there — which reads as a broken page rather than an absent feature.
  */
-export const DECISIONS_SETTING_ID = 'developer.decisions-jev'
+export const DECISIONS_SETTING_ID = 'developer.decisions'
 
 /**
- * Every registry id the Decisions (Jev) card owns, the main toggle included.
+ * Every registry id the Decisions card owns, the main toggle included.
  *
- * The card is one governed unit: `capabilities.decisions` withdraws the WHOLE card,
+ * The card is one governed unit: `capabilities.decisions` withdraws every control on it,
  * so a search that knows the feature is denied must withhold the address field and
  * the credential row too. Withholding only the toggle left the rest reachable, and a
  * result row is a promise that the page has the control — landing a user on a
@@ -115,6 +118,24 @@ export const DECISIONS_SETTING_IDS: ReadonlySet<string> = new Set([
   'developer.also-send-screenshots-of-the-agent-s-browser-tab',
 ])
 
+/**
+ * Registry ids of the Feature Preview switch cards in `FeaturePreviewsSection.tsx`.
+ * An LTS build draws none of them (RFC D12), so a search must not offer them.
+ */
+export const PREVIEW_FLAG_SETTING_IDS: ReadonlySet<string> = new Set([
+  'developer.artifact-deploy',
+  'developer.webhooks',
+  'developer.explore',
+  'developer.mcp-sign-in-by-kiro-crew',
+  'developer.chat-on-a-crew',
+  'developer.folder-conductor',
+  'developer.mark-out-of-date-dashboard-fields',
+  'developer.wake-bots-to-update-out-of-date-fields',
+  'developer.agent-harness-for-worker-chats',
+  'developer.visual-refresh',
+  'developer.session-environments',
+])
+
 /** With `dashboard.tips_enabled` off the rail can drop Discovery, and `sub=discovery`
  *  then self-heals to the first group -- so an offered hit would land without its control. */
 export const FEATURE_TIPS_SETTING_ID = 'chat.feature-tips'
@@ -122,6 +143,25 @@ export const FEATURE_TIPS_SETTING_ID = 'chat.feature-tips'
 /** Registry ids of the two update switches on the About tab (`utils/updateSwitches`). */
 export const GATEWAY_AUTO_UPDATE_SETTING_ID = 'about.update-the-gateway-automatically'
 export const APP_AUTO_DOWNLOAD_SETTING_ID = 'about.install-app-updates-automatically'
+
+/** The config key of Channels' switch, which `ChannelsSetting` draws only while it is on. */
+export const CHANNELS_SWITCH_KEY = 'dashboard.channels_enabled'
+
+/** The config key of the Slack tools switch, which Settings > Slack draws only while
+ *  Connections offers the Slack card or the switch is already on. */
+export const SLACK_TOOLS_SWITCH_KEY = 'slack.slack_mcp'
+
+/** Registry ids of the Instances tab's two rows: RemoteCrewPanel draws the enable
+ *  card only while remote crews are off, and the auto-connect switch only while on. */
+export const ENABLE_REMOTE_CREWS_SETTING_ID = 'instances.enable-remote-crew-management'
+/** Settings > Remote Crew's Remote Control card (manual entry in settingsManual.ts). */
+const REMOTE_CONTROL_SETTING_ID = 'instances.remote-control'
+export const AUTO_CONNECT_CREWS_SETTING_ID = 'instances.auto-connect-crews'
+
+/** Registry id of "Reopen where I left off", which DisplayPanel draws only in the installed app. */
+export const REOPEN_LAST_PAGE_SETTING_ID = 'display.reopen-where-i-left-off'
+/** Registry id of the terminal's Ctrl+C / Ctrl+V switch, which DisplayPanel draws only off macOS. */
+export const TERMINAL_CTRL_COPY_PASTE_SETTING_ID = 'display.ctrl-c-and-ctrl-v-copy-and-paste'
 
 /** The governance answers the search needs, as the two surfaces resolve them. */
 export interface SettingsSearchGovernance {
@@ -145,10 +185,36 @@ export interface SettingsSearchGovernance {
   updateSwitches: { app: boolean; gateway: boolean }
   /**
    * Whether the Kiro sign-in entry may be offered. False only once the config
-   * read SUCCEEDED and names a harness other than KAS: the card signs out Crew's
-   * own Kiro sign-in, which agents run as only on KAS. Omitted means offered.
+   * schema read SUCCEEDED and this build's harness choices do not list KAS:
+   * then no Kiro account tab exists. Omitted means offered.
    */
   kiroSignInOffered?: boolean
+  /**
+   * Whether remote crews are on, from the `['instances']` read: true once it
+   * SUCCEEDED, false once it failed with `instances_disabled`. Omitted means
+   * unknown, and both Instances rows are offered.
+   */
+  remoteCrewsEnabled?: boolean
+  /**
+   * Whether Channels is turned on (`dashboard.channels_enabled`), from the
+   * `['kirocrewConfig']` read. Display > View draws Channels' switch only while it
+   * is, because Channels is an opt-in the dashboard does not advertise, so its
+   * entry is offered only once the read SUCCEEDED and said `true`.
+   */
+  channelsOn?: boolean
+  /**
+   * Whether Settings > Slack draws the Slack tools switch, from the `['slack-config']`
+   * read that page itself renders from: the server says Connections offers the Slack
+   * card (`slack_mcp_card`) or the switch is already on. `false` only on a read that
+   * SUCCEEDED and said neither; `undefined` (no answer) keeps the entry.
+   */
+  slackToolsShown?: boolean
+  /**
+   * Whether Remote Crew draws the Remote Control card: the `['remote-control']`
+   * read SUCCEEDED and said the setting is on or the relay is running. The card
+   * is drawn only then, so its entry is offered only then, as `channelsOn` is.
+   */
+  remoteControlShown?: boolean
 }
 
 /**
@@ -170,16 +236,34 @@ export function settingEntryOffered(
   entry: SettingEntry,
   governance: SettingsSearchGovernance,
 ): boolean {
+  if (PREVIEW_FLAG_SETTING_IDS.has(entry.id) && previewFlagsLocked()) return false
   // By tab too: a row with no configKey (the default picker) still opens that tab.
   if (entry.tab === 'session-environments' || entry.configKey?.startsWith('session_environments.')) {
     return readPreviewFlag(PREVIEW_SESSION_ENVIRONMENTS)
   }
   // Display > Explore is drawn only while the Explore preview is on.
   if (entry.configKey === 'dashboard.milestones_enabled') return readPreviewFlag(PREVIEW_EXPLORE)
+  // Chat > Sessions draws Start New Chats in conductor mode in every build that offers conductor mode.
+  if (entry.configKey === 'dashboard.new_chat_crew_mode') return crewModeEnabled()
+  // Chat > Side panel draws Auto-Open Board in Side Panel in every build that offers conductor mode.
+  if (entry.configKey === 'dashboard.auto_open_conductor_board') return crewModeEnabled()
+  // Slack > Code channels draws Always use conductor mode wherever conductor mode is offered.
+  if (entry.configKey === 'slack.code_channel_defaults.conductor_mode') return crewModeEnabled()
+  // Feature Previews draws the stale-wake switch only while the stale-fields mark is on.
+  if (entry.labelKey === 'pages.developer.featurePreviewsTab.dashboard_stale_wake') {
+    return readPreviewFlag(PREVIEW_DASHBOARD_STALE_FIELDS)
+  }
+  if (entry.id === REOPEN_LAST_PAGE_SETTING_ID) return isStandaloneDisplay()
   if (entry.id === FEATURE_TIPS_SETTING_ID) return governance.tipsEnabled
   if (entry.id === GATEWAY_AUTO_UPDATE_SETTING_ID) return governance.updateSwitches.gateway
   if (entry.id === APP_AUTO_DOWNLOAD_SETTING_ID) return governance.updateSwitches.app
   if (entry.id === KIRO_SIGN_IN_SETTING_ID) return governance.kiroSignInOffered !== false
+  if (entry.id === ENABLE_REMOTE_CREWS_SETTING_ID) return governance.remoteCrewsEnabled !== true
+  if (entry.id === AUTO_CONNECT_CREWS_SETTING_ID) return governance.remoteCrewsEnabled !== false
+  if (entry.configKey === CHANNELS_SWITCH_KEY) return governance.channelsOn === true
+  if (entry.id === REMOTE_CONTROL_SETTING_ID) return governance.remoteControlShown === true
+  if (entry.id === TERMINAL_CTRL_COPY_PASTE_SETTING_ID) return !isMac
+  if (entry.configKey === SLACK_TOOLS_SWITCH_KEY) return governance.slackToolsShown !== false
   if (!DECISIONS_SETTING_IDS.has(entry.id)) return true
   return governance.decisionsEnabled
 }

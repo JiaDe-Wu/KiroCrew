@@ -109,6 +109,12 @@ _READ_ONLY_PIPE_RE = re.compile(
 # newline (arithmetic and quoting carry both). A later `=` costs only a prompt.
 # That check is a substring test in `_classify_bash`: as a regex it backtracks
 # quadratically on a long command, on the event loop.
+#
+# Some `${` expansion forms re-evaluate their result rather than substitute it
+# literally — indirection, a subscript, a substring offset, the `@`
+# transformations, and the bash 5.3 command forms — so they are treated as not
+# read-only. See `_runs_through_expansion`; it is coarse in the same direction as
+# the `=` test.
 _UNSAFE_SHELL_RE = re.compile(r">|`|\$\(|<\(|(?<!&)&(?!&)|\$\[")
 
 
@@ -151,6 +157,9 @@ _WRITE_FLAGS: dict[str, tuple[str, ...]] = {
     "git diff": ("--output",),
     "git show": ("--output",),
     "git log": ("--output",),
+    # `git blame` takes the diff options too, so `--output=FILE` truncates FILE.
+    # No `-o`: git rejects it for blame, and `-L:open` would match it.
+    "git blame": ("--output",),
     # A pager, and not on the prefix allowlist — but the PIPE-TARGET check runs
     # this table too, and `cat f | less -O FILE` writes FILE from a segment whose
     # leading verb is a read.
@@ -1371,14 +1380,45 @@ def _side_effect_reason(segment: str) -> str:
     # too, so a word after it is an operand however it is spelled:
     # `uniq -- input -pwned` writes `-pwned`, while a leading-dash test counted
     # one operand and passed the segment as a read.
+    #
+    # `_operands` is not used here, for two reasons. A bare `-` is the stdin
+    # OPERAND, so `cat a | uniq - out` writes `out`. And BSD `uniq` stops reading
+    # options at the first operand, so `uniq in -c` writes a file named `-c`.
+    # So every word after the first operand counts as an operand, dash or not.
     if verb == "uniq":
-        operands = _operands(args)
+        operands: list[str] = []
+        options_done = False
+        takes_value = False
+        for tok in args:
+            if not operands and not options_done:
+                if takes_value:
+                    # The value of `-f N` / `--skip-fields N` and kin.
+                    takes_value = False
+                    continue
+                if tok == "--":
+                    options_done = True
+                    continue
+                if tok.startswith("-") and tok != "-":
+                    # Exact names only: an abbreviation like `--c` is
+                    # `--count` on BSD, which takes no value.
+                    takes_value = tok in (
+                        "-f",
+                        "-s",
+                        "-w",
+                        "--skip-fields",
+                        "--skip-chars",
+                        "--check-chars",
+                    )
+                    continue
+            operands.append(tok)
         # Counting the tokens is only sound if each one stays ONE word. A glob
         # here decides by count: with `in1` and `in2` present, `uniq in*` runs
         # `uniq in1 in2`, and the second operand is the OUTPUT file — so a single
         # pattern passed a segment that truncates a file. `uniq`'s operands are
-        # positional, which is what makes this different from `ls *.py`.
-        if any(_glob_shifts_arguments(tok) for tok in operands):
+        # positional, which is what makes this different from `ls *.py`. Every
+        # word is checked, not only operands: a skipped option value can expand
+        # too (`uniq -f 1*` runs `uniq -f 1 10 11`).
+        if any(_glob_shifts_arguments(tok) for tok in args):
             return "a glob in a 'uniq' operand can expand into a second operand, which it writes"
         if len(operands) > 1:
             return "'uniq INPUT OUTPUT' writes its second operand"
@@ -1394,6 +1434,34 @@ def _side_effect_reason(segment: str) -> str:
             return violation
 
     return ""
+
+
+def _runs_through_expansion(scrubbed: str) -> bool:
+    """Whether a ``${`` expansion in *scrubbed* re-evaluates its result.
+
+    Linear string scans only, for the same event-loop reason as the ``=`` test.
+    From the first ``${`` to the end of the command, refuse a subscript ``[``, a
+    transformation ``@``, and a ``:`` that is not the ``:-`` / ``:+`` / ``:?``
+    default operator (an offset is arithmetic). Refuse indirection ``${!`` and a
+    bash 5.3 command form ``${ `` / ``${|`` wherever they occur.
+    """
+    start = scrubbed.find("${")
+    if start < 0:
+        return False
+    tail = scrubbed[start:]
+    if "[" in tail or "@" in tail or "${!" in tail or "${|" in tail:
+        return True
+    at = tail.find("${")
+    while at >= 0:
+        if tail[at + 2 : at + 3] in (" ", "\t", "\n"):
+            return True
+        at = tail.find("${", at + 2)
+    at = tail.find(":")
+    while at >= 0:
+        if tail[at + 1 : at + 2] not in ("-", "+", "?"):
+            return True
+        at = tail.find(":", at + 1)
+    return False
 
 
 def _classify_bash(cmd: str) -> str:
@@ -1416,6 +1484,8 @@ def _classify_bash(cmd: str) -> str:
             "unsafe shell pattern (redirect, command/process substitution, "
             "backgrounding, or a variable-assigning expansion)"
         )
+    if _runs_through_expansion(scrubbed):
+        return "unsafe shell pattern (an expansion whose result is re-evaluated)"
     parts = re.split(r"\s*(?:&&|\|\||;|\n)\s*", cmd.strip())
     for part in parts:
         if not part.strip():
@@ -1584,3 +1654,37 @@ def writes_through_redirect(cmd: str) -> bool:
     or not, since telling a quoted ``>`` apart needs bash's full quoting rules.
     """
     return ">" in _DEVNULL_REDIR_RE.sub(" ", cmd)
+
+
+def may_write_through_git_flag(cmd: str) -> bool:
+    """Whether a git ``diff``/``show``/``log``/``blame`` segment of ``cmd`` visibly
+    supplies its file-writing flag (``--output``), before any ``--``.
+
+    Each line is split into shell words with the control operators (``&&``, ``|``,
+    ``;``) as their own tokens, so another program's ``--output`` is never read as
+    git's. A line whose quoting will not parse is skipped: the read check refuses it.
+    shortcut: a flag built at run time (an expansion, a glob, ``xargs``) is not seen;
+    refusing every no-approver git command closes that, and is a separate decision.
+    """
+    for line in cmd.splitlines():
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        try:
+            tokens = list(lexer)
+        except ValueError:
+            continue
+        for at, tok in enumerate(tokens):
+            if not _is_git(tok):
+                continue
+            rest = tokens[at + 1 :]
+            while rest and rest[0].startswith("-"):
+                rest = rest[2:] if rest[0] in ("-C", "-c") else rest[1:]
+            flags = _WRITE_FLAGS.get(f"git {rest[0].lower()}", ()) if rest else ()
+            args = []
+            for word in rest[1:]:
+                if word == "--" or word[:1] in ("&", "|", ";", "(", ")"):
+                    break
+                args.append(word)
+            if flags and _matched_flag(args, flags):
+                return True
+    return False

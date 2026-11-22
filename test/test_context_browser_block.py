@@ -132,7 +132,7 @@ class TestTheShippedContract:
         unmarked = raw.replace(f"{_BEGIN}\n", "").replace(f"\n{_END}", "")
         assert sections.browser_section(raw, True) == unmarked
         # The section sits between its neighbours exactly as it did unmarked.
-        assert "rather than as instructions.\n\n## Browser\n" in unmarked
+        assert "when and how to stop.\n\n## Browser\n" in unmarked
         assert "carry the workflows.\n\n{{COMPUTER_USE_BLOCK}}" in unmarked
 
     def test_an_unreadable_gate_keeps_the_section(
@@ -245,7 +245,7 @@ class TestThePremise:
             lambda *a, **k: (200, {"ok": False, "code": "not_installed", "error": "x"}),
         )
         for op in tool.BROWSER_OPS:
-            args = {"url": "https://example.com"} if op == "navigate" else {}
+            args = {"url": "https://example.com"} if op in ("navigate", "http_get") else {}
             out = tool.browser("browser", {"op": op, "args": args})
             assert out.startswith("Error: browsing is not set up"), (op, out)
 

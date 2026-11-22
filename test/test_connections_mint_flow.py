@@ -15,7 +15,9 @@ import os
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 import connections_mint_helpers
 import pytest
@@ -29,6 +31,12 @@ from connections_mint_helpers import (
 from oauth_url_corpus import OPERATOR_EXTENSION_OAUTH_URLS
 
 from kiro_crew import mcp_grant
+from kiro_crew.acp.types import (
+    METHOD_MCP_OAUTH_REQUEST,
+    METHOD_MCP_SERVER_INIT_FAILURE,
+    METHOD_MCP_SERVER_INITIALIZED,
+    JsonRpcMessage,
+)
 from kiro_crew.connections import mint
 from kiro_crew.testing.wait import await_until, finished
 
@@ -206,6 +214,63 @@ async def test_validation_bounds_readiness_and_both_commands_with_one_deadline(
         "oauth_url": _AUTHORIZE,
     }
     await mint._dispose_mint(mint._mints["notion"])
+
+
+def _hung_start_client(outcomes: list[str | None]) -> type[_FakeClient]:
+    """A fake client whose start waits until it is cancelled, recording what the cancel stands for."""
+    from kiro_crew.startup_deadline import cancel_outcome
+
+    class _HungStart(_FakeClient):
+        async def ensure_ready(self) -> None:
+            try:
+                await asyncio.Event().wait()  # unblocked only by the deadline
+            except asyncio.CancelledError as exc:
+                outcomes.append(cancel_outcome(exc))
+                raise
+
+    return _HungStart
+
+
+@pytest.mark.asyncio
+async def test_a_validation_start_its_deadline_cuts_is_a_startup_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # The startup metric files a start its caller's deadline cut as `timeout` (a
+    # startup fault) and any other cancel as `cancelled`. A zero deadline has run
+    # out by the time the start first waits, so no clock decides the run.
+    monkeypatch.setattr(mint, "_MINT_READY_TIMEOUT_SECONDS", 0)
+    outcomes: list[str | None] = []
+    monkeypatch.setattr(mint, "_acp_client_factory", lambda: _hung_start_client(outcomes))
+
+    proven = await finished(mint._validate_existing_grant("notion", _URL), "validation")
+
+    assert outcomes == ["timeout"]
+    # The caller still reads an unproven grant, and the validator is disposed.
+    assert proven is False
+    validator = _FakeClient.instances[-1]
+    assert validator.commands == []
+    assert validator.shutdowns == 1
+
+
+@pytest.mark.asyncio
+async def test_a_mint_start_its_ready_deadline_cuts_is_a_startup_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # Same rule for the mint's own ready wait: no grant on disk, so the flow
+    # spawns the mint client, and a zero deadline cuts its start.
+    monkeypatch.setattr(mint, "_MINT_READY_TIMEOUT_SECONDS", 0)
+    outcomes: list[str | None] = []
+    monkeypatch.setattr(mint, "_acp_client_factory", lambda: _hung_start_client(outcomes))
+
+    await finished(mint.start_oauth_mint("notion", _URL), "mint")
+
+    assert outcomes == ["timeout"]
+    # The flow still fails the way a ready timeout always has.
+    view = mint.pending_mint_for("notion")
+    assert view is not None
+    assert view["state"] == "failed"
+    assert view["reason"] == "mint_timeouterror"
+    assert _FakeClient.instances[-1].shutdowns == 1
 
 
 # ── the watcher must not resurrect a disproven pair ──
@@ -438,6 +503,13 @@ async def test_the_revalidation_fallback_is_rate_limited(
     await mint._dispose_mint(entry)
 
 
+def _started_without_challenge(client: _FakeClient) -> None:
+    """Queue what kiro-cli sends for a server that started and asked for no sign-in."""
+    client.frames.append(
+        JsonRpcMessage(method=METHOD_MCP_SERVER_INITIALIZED, params={"serverName": "notion"})
+    )
+
+
 @pytest.mark.asyncio
 async def test_a_refuted_grant_with_no_challenge_is_not_republished_as_granted(
     monkeypatch: pytest.MonkeyPatch,
@@ -457,6 +529,7 @@ async def test_a_refuted_grant_with_no_challenge_is_not_republished_as_granted(
         def __init__(self, **kwargs: Any) -> None:
             super().__init__(**kwargs)
             self.requests = []  # no challenge on the fresh spawn
+            _started_without_challenge(self)
 
     _FakeClient.command_results["/mcp"] = {
         "data": {"servers": [{"name": "notion", "status": "failed", "toolCount": 0}]}
@@ -469,6 +542,49 @@ async def test_a_refuted_grant_with_no_challenge_is_not_republished_as_granted(
     view = mint.pending_mint_for("notion")
     assert view is not None
     assert _state_only(view) == {"state": "failed", "reason": "mint_grant_unproven"}
+    assert logged == ["error reason=mint_grant_unproven"]
+
+
+@pytest.mark.parametrize("fresh_spawn", ["fails", "never_reports"])
+@pytest.mark.asyncio
+async def test_a_refuted_grant_whose_fresh_spawn_fails_stays_unproven(
+    monkeypatch: pytest.MonkeyPatch, fresh_spawn: str
+):
+    # A check disproved the stored grant, and the fresh spawn then fails the same
+    # way (or never reports). The card's unproven-grant fence keys on
+    # mint_grant_unproven, so that reason must win over the spawn's own failure.
+    _write_paired_grant_artifacts(_URL)
+    logged: list[str] = []
+    monkeypatch.setattr(
+        mint,
+        "_log_mint_outcome",
+        lambda slug, outcome, detail: logged.append(f"{outcome} {detail}"),
+    )
+
+    class _RefutedThenFailing(_FakeClient):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.requests = []
+            if fresh_spawn == "fails":
+                self.frames.append(
+                    JsonRpcMessage(
+                        method=METHOD_MCP_SERVER_INIT_FAILURE,
+                        params={"serverName": "notion", "error": "connection refused"},
+                    )
+                )
+
+    _FakeClient.command_results["/mcp"] = {
+        "data": {"servers": [{"name": "notion", "status": "failed", "toolCount": 0}]}
+    }
+    attempts = iter([_FakeClient, _RefutedThenFailing])
+    monkeypatch.setattr(mint, "_acp_client_factory", lambda: next(attempts))
+
+    await mint.start_oauth_mint("notion", _URL)
+
+    assert _state_only(mint.pending_mint_for("notion")) == {
+        "state": "failed",
+        "reason": "mint_grant_unproven",
+    }
     assert logged == ["error reason=mint_grant_unproven"]
 
 
@@ -558,6 +674,7 @@ async def test_a_server_that_never_challenges_is_granted_and_disposed(
         def __init__(self, **kwargs: Any) -> None:
             super().__init__(**kwargs)
             self.requests = []
+            _started_without_challenge(self)
 
     monkeypatch.setattr(mint, "_acp_client_factory", lambda: _NoChallenge)
 
@@ -569,6 +686,50 @@ async def test_a_server_that_never_challenges_is_granted_and_disposed(
 
 
 @pytest.mark.asyncio
+async def test_a_server_that_never_reports_ends_as_a_timeout_not_a_grant(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # No stored grant, a live process, and a server that neither asks for sign-in
+    # nor reports ready or failed before the wait ends. Silence is not an open
+    # endpoint, so this must not be recorded as granted.
+    class _Silent(_FakeClient):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.requests = []
+
+    monkeypatch.setattr(mint, "_acp_client_factory", lambda: _Silent)
+
+    await mint.start_oauth_mint("notion", _URL)
+
+    assert _state_only(mint.pending_mint_for("notion")) == {
+        "state": "failed",
+        "reason": "mint_timeouterror",
+    }
+
+
+@pytest.mark.parametrize("reported", [False, True])
+@pytest.mark.asyncio
+async def test_the_fake_declared_wait_drains_exactly_when_the_real_one_does(reported: bool):
+    # The fake stands in for AcpClient.wait_for_declared_mcp in every mint test,
+    # so it must drain under the same rule: only while a declared server is unreported.
+    from kiro_crew.acp import client_mcp_array
+
+    fake = _FakeClient()
+    if reported:
+        _started_without_challenge(fake)
+        await fake._drain_notifications()
+    real = SimpleNamespace(
+        _mcp_report=fake.report, _drain_notifications=mock.AsyncMock(return_value=None)
+    )
+    before = fake.drains
+
+    await fake.wait_for_declared_mcp(5.0)
+    await client_mcp_array.wait_for_declared_mcp(real, 5.0)
+
+    assert fake.drains - before == real._drain_notifications.await_count == (0 if reported else 1)
+
+
+@pytest.mark.asyncio
 async def test_a_challenge_for_another_server_is_not_claimed(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -576,12 +737,95 @@ async def test_a_challenge_for_another_server_is_not_claimed(
         def __init__(self, **kwargs: Any) -> None:
             super().__init__(**kwargs)
             self.requests = [{"serverName": "linear", "oauthUrl": _AUTHORIZE}]
+            _started_without_challenge(self)
 
     monkeypatch.setattr(mint, "_acp_client_factory", lambda: _WrongServer)
 
     await mint.start_oauth_mint("notion", _URL)
 
     assert _state_only(mint.pending_mint_for("notion")) == {"state": "granted"}
+
+
+@pytest.mark.asyncio
+async def test_a_challenge_that_arrives_after_the_init_drain_is_still_served(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # Readiness drains init frames for about a second, and a remote server that
+    # discovers and registers a client first (Atlassian) asks for sign-in later.
+    # The mint waits for that challenge: silence is not an open endpoint.
+    class _SlowChallenge(_FakeClient):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.requests = []
+
+        async def _drain_notifications(self, **kwargs: Any) -> None:
+            # The challenge arrives only on the drain that waits for the server.
+            if kwargs.get("until_declared"):
+                self.requests.append({"serverName": "notion", "oauthUrl": _AUTHORIZE})
+                self.frames.append(
+                    JsonRpcMessage(
+                        method=METHOD_MCP_OAUTH_REQUEST,
+                        params={"serverName": "notion", "oauthUrl": _AUTHORIZE},
+                    )
+                )
+            await super()._drain_notifications(**kwargs)
+
+    monkeypatch.setattr(mint, "_acp_client_factory", lambda: _SlowChallenge)
+
+    await mint.start_oauth_mint("notion", _URL)
+
+    assert _state_only(mint.pending_mint_for("notion")) == {
+        "state": "waiting",
+        "oauth_url": _AUTHORIZE,
+    }
+    await mint._dispose_mint(mint._mints["notion"])
+
+
+@pytest.mark.asyncio
+async def test_a_server_that_fails_to_start_is_not_reported_granted(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # A failure report is not an open endpoint: the card must say the mint failed
+    # instead of clearing the wait as if the sign-in were done.
+    class _FailsLate(_FakeClient):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.requests = []
+            self.frames.append(
+                JsonRpcMessage(
+                    method=METHOD_MCP_SERVER_INIT_FAILURE,
+                    params={"serverName": "notion", "error": "connection refused"},
+                )
+            )
+
+    monkeypatch.setattr(mint, "_acp_client_factory", lambda: _FailsLate)
+
+    await mint.start_oauth_mint("notion", _URL)
+
+    assert _state_only(mint.pending_mint_for("notion")) == {
+        "state": "failed",
+        "reason": "mint_server_failed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_process_that_dies_before_its_server_reports_fails_as_gone(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class _Dies(_FakeClient):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.requests = []
+            self.alive = False
+
+    monkeypatch.setattr(mint, "_acp_client_factory", lambda: _Dies)
+
+    await mint.start_oauth_mint("notion", _URL)
+
+    assert _state_only(mint.pending_mint_for("notion")) == {
+        "state": "failed",
+        "reason": "mint_process_gone",
+    }
 
 
 @pytest.mark.asyncio
@@ -719,6 +963,45 @@ async def test_the_watcher_completes_teardown_when_it_disposes_its_own_row(
     assert protected_pids == set()
     assert mint._mints["notion"]["state"] == ("granted" if terminal == "grant" else "expired")
     assert "client" not in mint._mints["notion"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("grant_landed", [False, True])
+async def test_a_refused_code_exchange_fails_the_attempt_instead_of_waiting_out_the_ttl(
+    monkeypatch: pytest.MonkeyPatch, protected_pids: set[int], grant_landed: bool
+):
+    # A poll longer than the TTL: the watcher wakes once, so without the frame read it
+    # takes the expiry branch on that wake (see the teardown test above).
+    monkeypatch.setattr(
+        mint, "_MINT_TTL_SECONDS", 0.05  # flake-ok: one wake, ordered by poll > TTL, no margin
+    )
+    monkeypatch.setattr(
+        mint, "_MINT_GRANT_POLL_SECONDS", 0.25  # flake-ok: the same structural ordering
+    )
+    await mint.start_oauth_mint("notion", _URL)
+    entry = mint._mints["notion"]
+    client = _FakeClient.instances[-1]
+    # What kiro-cli sends after its callback answered 200 and the token endpoint refused.
+    client.frames.append(
+        JsonRpcMessage(
+            method=METHOD_MCP_SERVER_INIT_FAILURE,
+            params={"serverName": "notion", "error": "OAuth token exchange failed: invalid_grant"},
+        )
+    )
+
+    if grant_landed:
+        # The server can fail its own start after a good exchange: the grant still wins.
+        monkeypatch.setattr(mcp_grant, "grant_presence", lambda url, **kw: True)
+
+    await await_until(entry["watcher"])
+
+    assert _state_only(mint.pending_mint_for("notion")) == (
+        {"state": "granted"}
+        if grant_landed
+        else {"state": "failed", "reason": "mint_sign_in_rejected"}
+    )
+    assert client.shutdowns == 1
+    assert protected_pids == set()
 
 
 @pytest.mark.asyncio
@@ -922,7 +1205,7 @@ async def test_a_rejected_url_and_its_retry_are_screened_off_the_event_loop(
     seen: list[int] = []
     verdicts = iter([True, False])
 
-    def _screen(_url: str) -> bool:
+    def _screen(_url: str, _server: str | None = None) -> bool:
         seen.append(threading.get_ident())
         return next(verdicts)
 
@@ -1126,6 +1409,26 @@ def test_a_rejected_endpoint_rides_the_card_view_only_beside_its_reason():
 
 
 @pytest.mark.asyncio
+async def test_a_missing_kiro_cli_records_its_own_reason(monkeypatch: pytest.MonkeyPatch):
+    from kiro_crew.acp.transport_errors import AcpError
+
+    class _NoCli(_FakeClient):
+        async def ensure_ready(self) -> None:
+            missing = AcpError("kiro-cli not found in /opt/example/bin")
+            missing.kiro_cli_missing = True
+            raise missing
+
+    monkeypatch.setattr(mint, "_acp_client_factory", lambda: _NoCli)
+
+    await mint.start_oauth_mint("notion", _URL)
+
+    assert _state_only(mint.pending_mint_for("notion")) == {
+        "state": "failed",
+        "reason": "mint_kiro_cli_missing",
+    }
+
+
+@pytest.mark.asyncio
 async def test_a_failure_records_an_audit_event_with_no_exception_text(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -1145,3 +1448,172 @@ async def test_a_failure_records_an_audit_event_with_no_exception_text(
 
     assert logged == ["error reason=mint_timeouterror"]
     assert "10.0.0.5" not in json.dumps(logged)
+
+
+# ── discovery-verified consent endpoints ──
+
+# A configured server whose own authorization server is on neither endpoint list.
+# kiro-cli's PKCE challenge and state are 43 high-entropy characters each, so the
+# gate reads them as bare secrets unless the endpoint is approved.
+_SELF_HOSTED = "https://git.self-hosted.example"
+_SELF_HOSTED_MCP = f"{_SELF_HOSTED}/api/v4/mcp"
+_SELF_HOSTED_AUTHORIZE = f"{_SELF_HOSTED}/oauth/authorize"
+_FORGED_AUTHORIZE = "https://collector.attacker.example/oauth/authorize"
+
+
+def _pkce_consent_url(endpoint: str = _SELF_HOSTED_AUTHORIZE) -> str:
+    from urllib.parse import urlencode
+
+    query = urlencode(
+        {
+            "response_type": "code",
+            "client_id": "mcp_7f3a9c2e41b84d0f9e6a5c3b2d1e0f4a",
+            "redirect_uri": "http://127.0.0.1:49152/oauth/callback",
+            "scope": "mcp",
+            "state": "Zr8pW2kQ9xL4mN7vB1cT6yH3sD0fG5jK8aE2uRwXq9P",
+            "code_challenge": "Qm9xVf3kLr8sT1uWz0aYcD6eHgJ2nPq5RtXv7BnMk4E",
+            "code_challenge_method": "S256",
+            "resource": _SELF_HOSTED_MCP,
+        }
+    )
+    return f"{endpoint}?{query}"
+
+
+@pytest.fixture
+def _self_hosted_discovery(monkeypatch: pytest.MonkeyPatch):
+    """Serve the self-hosted server's metadata; the test names the configured server."""
+    from unittest.mock import MagicMock
+
+    from kiro_crew import link_unfurl
+    from kiro_crew import mcp_oauth_discovery as discovery
+    from kiro_crew.security import exfil, exfil_oauth
+
+    monkeypatch.setattr(exfil_oauth, "_OAUTH_DISCOVERED_ENDPOINTS", {})
+    monkeypatch.setattr(
+        exfil, "_OAUTH_DISCOVERED_ENDPOINTS", exfil_oauth._OAUTH_DISCOVERED_ENDPOINTS
+    )
+    monkeypatch.setattr(discovery, "_NEGATIVE", {})
+    monkeypatch.setattr(exfil, "_load_operator_oauth_endpoints", lambda: frozenset())
+    monkeypatch.setattr(exfil, "SecurityEventLog", MagicMock())
+    monkeypatch.setattr(exfil_oauth, "SecurityEventLog", MagicMock(), raising=False)
+    monkeypatch.setattr(discovery, "_servers_from_settings_registry", lambda: {})
+    docs = {
+        f"{_SELF_HOSTED}/.well-known/oauth-authorization-server": {
+            "issuer": _SELF_HOSTED,
+            "authorization_endpoint": _SELF_HOSTED_AUTHORIZE,
+            "token_endpoint": f"{_SELF_HOSTED}/oauth/token",
+        }
+    }
+    fetched: list[str] = []
+
+    async def _get_json(_session, url, _timeout):
+        fetched.append(url)
+        if url not in docs:
+            raise ValueError(f"{url} returned HTTP 404, expected 200")
+        return docs[url]
+
+    monkeypatch.setattr(discovery, "_get_json", _get_json)
+    monkeypatch.setattr(
+        discovery,
+        "vet_unfurl_url",
+        lambda url: link_unfurl.vet_unfurl_url(url, resolve=lambda _h, _p: ["93.184.216.34"]),
+    )
+
+    def _configure(server: str) -> list[str]:
+        monkeypatch.setattr(
+            discovery, "_servers_from_agent_spec", lambda: {server: {"url": _SELF_HOSTED_MCP}}
+        )
+        return fetched
+
+    return _configure
+
+
+def _mint_yielding(monkeypatch: pytest.MonkeyPatch, server: str, url: str) -> None:
+    class _Consent(_FakeClient):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.requests = [{"serverName": server, "oauthUrl": url}]
+
+    monkeypatch.setattr(mint, "_acp_client_factory", lambda: _Consent)
+    monkeypatch.setattr(mint, "_log_mint_outcome", lambda *_a: None)
+
+
+# A registry provider, and an owner-added server minted from its pinned entry.
+_MINT_TARGETS = [
+    pytest.param("notion", None, id="registry"),
+    pytest.param("docsServer", {"url": _SELF_HOSTED_MCP}, id="owner-pinned"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("server, pinned", _MINT_TARGETS)
+async def test_a_configured_servers_advertised_endpoint_is_served_by_the_mint(
+    monkeypatch: pytest.MonkeyPatch,
+    protected_pids: set[int],
+    _self_hosted_discovery,
+    server: str,
+    pinned: dict[str, Any] | None,
+):
+    from kiro_crew import security
+
+    _self_hosted_discovery(server)
+    consent = _pkce_consent_url()
+    assert security.oauth_url_contains_credential(consent)  # refused before discovery
+    _mint_yielding(monkeypatch, server, consent)
+    token, prior = await mint.reserve_mint_row(server)
+
+    await mint.start_oauth_mint(server, _SELF_HOSTED_MCP, token, prior, pinned=pinned)
+
+    view = mint.pending_mint_for(server)
+    assert view is not None
+    assert _state_only(view) == {"state": "waiting", "oauth_url": consent}
+    assert len(_FakeClient.instances) == 1
+    await mint._dispose_mint(mint._mints[server])
+
+
+@pytest.mark.asyncio
+async def test_discovery_for_another_server_does_not_approve_this_mint(
+    monkeypatch: pytest.MonkeyPatch, protected_pids: set[int], _self_hosted_discovery
+):
+    from kiro_crew.security import exfil_oauth
+
+    # Only "otherServer" is configured at the self-hosted URL: the mint's own
+    # server has no configured URL, so nothing is fetched or approved for it.
+    fetched = _self_hosted_discovery("otherServer")
+    _mint_yielding(monkeypatch, "docsServer", _pkce_consent_url())
+    token, prior = await mint.reserve_mint_row("docsServer")
+
+    await mint.start_oauth_mint(
+        "docsServer", _SELF_HOSTED_MCP, token, prior, pinned={"url": _SELF_HOSTED_MCP}
+    )
+
+    view = mint.pending_mint_for("docsServer")
+    assert view is not None
+    assert (view["state"], view["reason"]) == ("failed", "mint_url_rejected")
+    assert fetched == []
+    assert exfil_oauth._OAUTH_DISCOVERED_ENDPOINTS == {}
+
+
+@pytest.mark.asyncio
+async def test_an_authorize_shaped_url_the_server_does_not_advertise_stays_refused(
+    monkeypatch: pytest.MonkeyPatch, protected_pids: set[int], _self_hosted_discovery
+):
+    from kiro_crew.security import exfil_oauth
+
+    # Same parameters, same /oauth/authorize path, a host the configured server's
+    # metadata never names: the URL's shape earns it nothing.
+    fetched = _self_hosted_discovery("notion")
+    forged = _pkce_consent_url(_FORGED_AUTHORIZE)
+    _mint_yielding(monkeypatch, "notion", forged)
+    token, prior = await mint.reserve_mint_row("notion")
+
+    await mint.start_oauth_mint("notion", _URL, token, prior)
+
+    view = mint.pending_mint_for("notion")
+    assert view is not None
+    assert (view["state"], view["reason"]) == ("failed", "mint_url_rejected")
+    assert "oauth_url" not in view
+    # Discovery ran against the configured server only, and approved nothing.
+    assert fetched
+    assert not any("attacker" in url for url in fetched)
+    assert exfil_oauth._OAUTH_DISCOVERED_ENDPOINTS == {}

@@ -41,6 +41,7 @@ from slack_gateway_coverage_helpers import (
     _loop,
     _make_orchestrator,
     _mock_dashboard_state,
+    _slack_nudge_orchestrator,
     _within_lost_run,
 )
 
@@ -61,34 +62,6 @@ from kiro_crew.session import SessionBusyError, SessionClosingError
 from kiro_crew.slack import gateway as gw
 
 # ─── Helpers ─────────────────────────────────────────────────────────────
-
-
-def _nudge_sessions(client: object) -> MagicMock:
-    s = MagicMock()
-    s.is_busy = MagicMock(return_value=False)
-    s.get_channel = MagicMock(return_value="C123")
-    s.get_thread = MagicMock(return_value="111.222")
-    s.get_or_create = AsyncMock(return_value=(client, True, False))
-    s.cancel_current = AsyncMock()
-    s.release = MagicMock()
-    return s
-
-
-def _slack_nudge_orchestrator() -> Any:
-    """Orchestrator wired for the Slack auto-nudge path."""
-    orch = _make_orchestrator()
-    orch.sessions = _nudge_sessions(SimpleNamespace())
-    orch.slack = MagicMock()
-    orch.slack.post_message = AsyncMock()
-    orch.ctx_builder = SimpleNamespace(hooks=object(), build_message=lambda *a, **k: ("MSG", None))
-    orch.conv_log = None
-    orch.autonudge_svc = None
-
-    async def _approve(_event: object, _parent: str = "") -> bool:
-        return True
-
-    orch._interactive_approval = lambda *a, **k: _approve
-    return orch
 
 
 def _discord_transport(*, authorized: bool = True, current_key: str | None = None) -> MagicMock:
@@ -338,6 +311,29 @@ class TestFireDiscordNudge:
         transport.dispatcher.sessions = None
         orch = _discord_orchestrator(transport)
         assert await orch._fire_discord_nudge(_loop(_DKEY)) is True
+
+    @pytest.mark.asyncio
+    async def test_an_owed_final_turn_opens_with_the_result(self):
+        """A Bot DM watching a pull request reads the merge before its instruction."""
+        transport = _discord_transport()
+        orch = _discord_orchestrator(transport)
+        loop = _loop(_DKEY, gate=True)
+        loop.monitor = MonitorState(
+            kind="gh-pr",
+            target="acme/widgets#7",
+            objective="review_ready",
+            created_ts=1.0,
+            terminal_pending="success",
+            terminal_note="PR acme/widgets#7 merged at 2026-11-15T14:37:24Z, head e0a19a0a2e69.",
+        )
+
+        assert await orch._fire_discord_nudge(loop) is True
+
+        args, _kwargs = _awaited(transport.dispatcher.handle_message)
+        assert args[0].text.startswith(
+            "[monitor finished] PR acme/widgets#7 merged at 2026-11-15T14:37:24Z, head e0a19a0a2e69."
+        )
+        assert "[auto-nudge cycle 1]" in args[0].text
 
     @pytest.mark.asyncio
     async def test_happy_path_injects_tagged_message_as_non_command(self):

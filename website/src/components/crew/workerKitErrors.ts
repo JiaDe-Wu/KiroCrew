@@ -9,6 +9,7 @@
  */
 import { i18nT } from '../../i18n/t'
 import { ApiError, apiErrorCode } from '../../api/apiError'
+import { isDeadlineError } from '../../api/queryClient'
 
 // Literal keys, so the catalog gates can see each one.
 const CODE_TEXT: Record<string, (detail: string) => string> = {
@@ -24,15 +25,18 @@ const CODE_TEXT: Record<string, (detail: string) => string> = {
   not_a_mate_file: () => i18nT('crewWorkerKit.error_not_a_mate_file'),
   invalid_json: () => i18nT('crewWorkerKit.error_invalid_request'),
   invalid_request: () => i18nT('crewWorkerKit.error_invalid_request'),
+  // The GET's read of the crewmate's file did not finish in time: the same
+  // load failure the Abilities pane above it names.
+  capabilities_unavailable: () => i18nT('crewEditorNext.load_error'),
 }
 
-/** The `detail` a refusal body names, or `''`. */
-function refusalDetail(err: unknown): string {
+/** A string field of a refusal body (`detail`, `reason`), or `''`. */
+function refusalField(err: unknown, field: 'detail' | 'reason'): string {
   if (!(err instanceof ApiError)) return ''
   try {
     const parsed = JSON.parse(err.body) as unknown
-    const detail = parsed && typeof parsed === 'object' ? (parsed as { detail?: unknown }).detail : undefined
-    return typeof detail === 'string' ? detail : ''
+    const value = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>)[field] : undefined
+    return typeof value === 'string' ? value : ''
   } catch {
     return ''
   }
@@ -41,7 +45,13 @@ function refusalDetail(err: unknown): string {
 /** The sentence a worker-kit failure shows, or `null` when there is none. */
 export function workerKitErrorText(err: unknown): string | null {
   if (!err) return null
+  // A read past either deadline: the dashboard's own (the untranslated
+  // `deadline exceeded`) or the gateway's (`reason: timed_out`). Both read as
+  // the same load failure, with its likely causes.
+  if (isDeadlineError(err) || refusalField(err, 'reason') === 'timed_out') {
+    return i18nT('crewEditorNext.load_error_timed_out')
+  }
   const code = apiErrorCode(err)
-  if (Object.hasOwn(CODE_TEXT, code)) return CODE_TEXT[code](refusalDetail(err))
+  if (Object.hasOwn(CODE_TEXT, code)) return CODE_TEXT[code](refusalField(err, 'detail'))
   return err instanceof Error ? err.message : String(err)
 }

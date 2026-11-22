@@ -3,7 +3,7 @@
  *
  * Nothing mounted this panel before: `ChannelsPanel.test.tsx` and
  * `SettingsPage.test.tsx` only assert that the nav routes to it. So every branch
- * in the file was unexecuted — the three status pills, the four connection
+ * in the file was unexecuted — the three status pills, the connection
  * hints, the manifest card's loaded and failed shapes, the read-only remote
  * view, the whole `TagListEditor` (add / reject / dedupe / remove), the save
  * payload's folder and credential folding, and both mutation arms.
@@ -22,6 +22,7 @@ import { screen, fireEvent, waitFor, within, act } from '@testing-library/react'
 
 import { renderWithProviders } from './helpers'
 import { api, type SlackConfigData } from '../api/client'
+import { ApiError } from '../api/apiError'
 import { SlackPanel } from '../pages/settings/SlackPanel'
 
 /* ── timers ───────────────────────────────────────────────────────────────── */
@@ -162,7 +163,7 @@ describe('SlackPanel connection status', () => {
     seed({ connected: true })
     await hydrated()
     expect(screen.getByText('Connected')).toBeInTheDocument()
-    expect(screen.queryByText(/Restart the gateway to connect/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Click Reconnect to connect/)).not.toBeInTheDocument()
   })
 
   it('reads Needs setup when no credentials are configured yet', async () => {
@@ -172,12 +173,28 @@ describe('SlackPanel connection status', () => {
     expect(screen.queryByText(/not yet active/)).not.toBeInTheDocument()
   })
 
-  it('explains a saved-but-inactive channel as needing a restart', async () => {
+  it('names the missing owner id when both tokens are saved without one', async () => {
+    seed({
+      configured: false,
+      bot_token_set: true,
+      app_token_set: true,
+      owner_id: '',
+      connect_error: 'KIROCREW_OWNER_ID is not set',
+    })
+    await hydrated()
+    expect(screen.getByText('Needs setup')).toBeInTheDocument()
+    expect(
+      screen.getByText('Slack stays off until an owner is set. Add your Owner Slack member ID (KIROCREW_OWNER_ID) below.'),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/Slack connection failed/)).not.toBeInTheDocument()
+  })
+
+  it('explains a saved-but-inactive channel as needing a reconnect', async () => {
     seed()
     await hydrated()
     expect(screen.getByText('Not connected')).toBeInTheDocument()
     expect(
-      screen.getByText('Tokens are saved but not yet active. Restart the gateway to connect.'),
+      screen.getByText('Tokens are saved but not yet active. Click Reconnect to connect.'),
     ).toBeInTheDocument()
   })
 
@@ -187,10 +204,10 @@ describe('SlackPanel connection status', () => {
     expect(screen.getByText(/Slack rejected the stored tokens \(invalid_auth\)/)).toBeInTheDocument()
   })
 
-  it('surfaces any other startup failure with its own error string', async () => {
+  it('surfaces any other recorded failure with its own error string', async () => {
     seed({ connect_error: 'dns_failure' })
     await hydrated()
-    expect(screen.getByText(/Slack connection failed at startup \(dns_failure\)/)).toBeInTheDocument()
+    expect(screen.getByText(/Slack connection failed \(dns_failure\)/)).toBeInTheDocument()
   })
 })
 
@@ -199,7 +216,8 @@ describe('SlackPanel connection status', () => {
 describe('SlackPanel manifest card', () => {
   it('links the one-click create URL and copies the YAML, reverting the pill after 1.5s', async () => {
     const writeText = stubClipboard(() => Promise.resolve())
-    seed()
+    // An existing install: the setup wizard starts closed, so the card's own Create shows.
+    seed({ connected: true, bot_token_set: true })
     await hydrated()
 
     expect(screen.getByRole('link', { name: 'Create Slack app' })).toHaveAttribute('href', MANIFEST.create_url)
@@ -215,7 +233,8 @@ describe('SlackPanel manifest card', () => {
 
   it('keeps the pill unchanged when the clipboard write is refused', async () => {
     stubClipboard(() => Promise.reject(new Error('clipboard denied')))
-    seed()
+    // An existing install: the setup wizard starts closed, so the card's own Create shows.
+    seed({ connected: true, bot_token_set: true })
     await hydrated()
 
     fireEvent.click(screen.getByRole('button', { name: 'Copy manifest YAML' }))
@@ -226,7 +245,7 @@ describe('SlackPanel manifest card', () => {
 
   it('inertly disables create + copy while the manifest is unavailable', async () => {
     const writeText = stubClipboard(() => Promise.resolve())
-    seed({}, { manifestFails: true })
+    seed({ connected: true, bot_token_set: true }, { manifestFails: true })
     await hydrated()
 
     const create = screen.getByRole('link', { name: 'Create Slack app' })
@@ -260,6 +279,7 @@ describe('SlackPanel read-only session', () => {
       ),
     ).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Save Slack settings' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Reconnect' })).not.toBeInTheDocument()
     expect(screen.getByText('xoxb-••••aaaa')).toBeInTheDocument()
     // The app-level credential is unset, so its read-only row says so.
     expect(screen.getByText('(not set)')).toBeInTheDocument()
@@ -273,6 +293,26 @@ describe('SlackPanel read-only session', () => {
     await hydrated()
     expect(screen.getByText('E000ONE')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Remove E000ONE' })).not.toBeInTheDocument()
+  })
+})
+
+/* ── placeholder tone ─────────────────────────────────────────────────────── */
+
+describe('SlackPanel placeholder tone', () => {
+  // The colour itself is measured per palette in SlackPanel.placeholderTone.test.ts;
+  // this pins that every placeholder the panel renders sits under the class.
+  it('puts every field with a placeholder under the faded-placeholder class', async () => {
+    const { container } = seed({ session_folder: 'Slack' })
+    await hydrated()
+
+    const fields = [...container.querySelectorAll<HTMLElement>('input[placeholder], textarea[placeholder]')]
+    expect(fields.map(f => f.getAttribute('placeholder'))).toEqual(expect.arrayContaining([
+      'U0123ABC456', 'E0123ABC456', 'kirocrew',
+    ]))
+    const bare = fields
+      .filter(f => !f.closest('[class*="[&_:is(input,textarea)::placeholder]:text-muted/"]'))
+      .map(f => f.getAttribute('placeholder'))
+    expect(bare).toEqual([])
   })
 })
 
@@ -363,8 +403,56 @@ describe('SlackPanel save payload', () => {
       show_thinking: true,
       session_folder: '',
       auto_link_sessions: false,
+      show_in_session_list: false,
     })
     expect(await screen.findByText('Saved.', undefined, { timeout: 5_000 })).toBeInTheDocument()
+  })
+
+  it('leaves the owner out of a save that did not edit it, so a claim confirmed meanwhile stays', async () => {
+    const { save } = seed()
+    await hydrated()
+
+    fireEvent.change(screen.getByPlaceholderText('kirocrew'), { target: { value: 'crew' } })
+    fireEvent.click(saveBtn())
+
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1))
+    expect(save.mock.calls[0][0]).not.toHaveProperty('owner_id')
+  })
+
+  it('leaves Slack conversations out by default and saves the switch turned on', async () => {
+    const { save } = seed()
+    await hydrated()
+
+    const toggle = screen.getByRole('switch', { name: 'Show Slack conversations in the session list' })
+    // A gateway that sends no value reads as off, the gateway's own default.
+    expect(toggle).toHaveAttribute('aria-checked', 'false')
+    expect(screen.getByText('Lists conversations that start in Slack with your other sessions.')).toBeInTheDocument()
+    fireEvent.click(toggle)
+    fireEvent.click(saveBtn())
+
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1))
+    expect(save.mock.calls[0][0]).toMatchObject({ show_in_session_list: true })
+  })
+
+  it('shows a stored on as on and saves it turned off', async () => {
+    const { save } = seed({ show_in_session_list: true })
+    await hydrated()
+
+    const toggle = screen.getByRole('switch', { name: 'Show Slack conversations in the session list' })
+    expect(toggle).toHaveAttribute('aria-checked', 'true')
+    fireEvent.click(toggle)
+    fireEvent.click(saveBtn())
+
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1))
+    expect(save.mock.calls[0][0]).toMatchObject({ show_in_session_list: false })
+  })
+
+  it.each([false, undefined])('shows a stored %s as off', async (stored) => {
+    seed({ show_in_session_list: stored })
+    await hydrated()
+
+    const toggle = screen.getByRole('switch', { name: 'Show Slack conversations in the session list' })
+    expect(toggle).toHaveAttribute('aria-checked', 'false')
   })
 
   it('saves the auto-connect toggle once it is flipped on, with no target to pick', async () => {
@@ -387,7 +475,7 @@ describe('SlackPanel save payload', () => {
     const { save } = seed()
     await hydrated()
 
-    fireEvent.click(screen.getByRole('switch', { name: 'File sessions in a folder' }))
+    fireEvent.click(screen.getByRole('switch', { name: 'File sessions in a different folder' }))
     expect(screen.getByPlaceholderText('Slack')).toHaveValue('')
     fireEvent.click(saveBtn())
 
@@ -399,7 +487,7 @@ describe('SlackPanel save payload', () => {
     const { save } = seed({ session_folder: 'Inbox' })
     await hydrated()
 
-    expect(screen.getByRole('switch', { name: 'File sessions in a folder' })).toHaveAttribute(
+    expect(screen.getByRole('switch', { name: 'File sessions in a different folder' })).toHaveAttribute(
       'aria-checked',
       'true',
     )
@@ -414,7 +502,7 @@ describe('SlackPanel save payload', () => {
     const { save } = seed({ session_folder: 'Inbox' })
     await hydrated()
 
-    fireEvent.click(screen.getByRole('switch', { name: 'File sessions in a folder' }))
+    fireEvent.click(screen.getByRole('switch', { name: 'File sessions in a different folder' }))
     expect(screen.queryByPlaceholderText('Slack')).not.toBeInTheDocument()
     fireEvent.click(saveBtn())
 
@@ -423,7 +511,7 @@ describe('SlackPanel save payload', () => {
   })
 
   it('sends pasted credentials and confirms they were verified with Slack', async () => {
-    const { save } = seed({}, { save: { ok: true, restart_required: true, verify_warning: '' } })
+    const { save } = seed({}, { save: { ok: true, restart_required: false, reconnect_required: true, verify_warning: '' } })
     await hydrated()
 
     fireEvent.change(screen.getByLabelText('Slack bot token'), { target: { value: ' xoxb-not-a-real-value ' } })
@@ -436,7 +524,7 @@ describe('SlackPanel save payload', () => {
       app_token: 'xapp-not-a-real-value',
     })
     expect(
-      await screen.findByText('Verified with Slack and saved. Restart the gateway to connect.', undefined, {
+      await screen.findByText('Verified with Slack and saved. Click Reconnect to connect.', undefined, {
         timeout: 5_000,
       }),
     ).toBeInTheDocument()
@@ -468,10 +556,9 @@ describe('SlackPanel save payload', () => {
     expect(
       await screen.findByText('Verified with Slack and saved.', undefined, { timeout: 5_000 }),
     ).toBeInTheDocument()
-    // the restart-flavoured verified text must not also render (a separate
-    // channel-not-running banner may legitimately mention a restart)
+    // the reconnect-flavoured verified text must not also render
     expect(
-      screen.queryByText('Verified with Slack and saved. Restart the gateway to connect.'),
+      screen.queryByText('Verified with Slack and saved. Click Reconnect to connect.'),
     ).not.toBeInTheDocument()
   })
 
@@ -483,6 +570,41 @@ describe('SlackPanel save payload', () => {
     expect(
       await screen.findByText('Saved. Restart the gateway to apply.', undefined, { timeout: 5_000 }),
     ).toBeInTheDocument()
+  })
+
+  it('says restart and offers no Reconnect for verified tokens saved with an owner change', async () => {
+    // Reconnect refuses an owner change, so that save asks for a restart only.
+    const { save } = seed({}, { save: { ok: true, restart_required: true, reconnect_required: false, verify_warning: '' } })
+    await hydrated()
+
+    fireEvent.change(screen.getByLabelText('Slack bot token'), { target: { value: 'xoxb-not-a-real-value' } })
+    fireEvent.change(screen.getByPlaceholderText('U0123ABC456'), { target: { value: 'U000OTHER' } })
+    fireEvent.click(saveBtn())
+
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1))
+    expect(
+      await screen.findByText('Saved. Restart the gateway to apply.', undefined, { timeout: 5_000 }),
+    ).toBeInTheDocument()
+    expect(screen.queryByText('Verified with Slack and saved.')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('slack-reconnect-save-row')).not.toBeInTheDocument()
+  })
+
+  it('retires an earlier token save Reconnect offer once an owner change needs a restart', async () => {
+    const { save } = seed({}, { save: { ok: true, restart_required: false, reconnect_required: true, verify_warning: '' } })
+    await hydrated()
+    fireEvent.click(saveBtn())
+    expect(await screen.findByTestId('slack-reconnect-save-row', undefined, { timeout: 5_000 })).toBeInTheDocument()
+
+    save.mockResolvedValue({ ok: true, restart_required: true, reconnect_required: false, verify_warning: '' })
+    fireEvent.change(screen.getByPlaceholderText('U0123ABC456'), { target: { value: 'U000OTHER' } })
+    fireEvent.click(saveBtn())
+
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(2))
+    expect(
+      await screen.findByText('Saved. Restart the gateway to apply.', undefined, { timeout: 5_000 }),
+    ).toBeInTheDocument()
+    expect(screen.queryByTestId('slack-reconnect-save-row')).not.toBeInTheDocument()
+    expect(screen.queryByText('The slash command applies after a gateway restart.')).not.toBeInTheDocument()
   })
 
   it('shows the verify warning alongside the saved pill and withholds the verified claim', async () => {
@@ -606,5 +728,264 @@ describe('SlackPanel save failure', () => {
     fireEvent.click(saveBtn())
     await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument())
     expect(within(screen.getByRole('button', { name: 'Saving…' })).queryByRole('alert')).toBeNull()
+  })
+})
+
+/* ── Reconnect ────────────────────────────────────────────────────────────── */
+
+type ReconnectResult = Awaited<ReturnType<typeof api.reconnectSlack>>
+
+/** The header's Reconnect button (the save row may render a second one). */
+function headerReconnect() {
+  return screen.getByTestId('slack-reconnect')
+}
+
+describe('SlackPanel Reconnect', () => {
+  it('re-runs the handshake in place and confirms the connection', async () => {
+    seed()
+    const reconnect = vi.spyOn(api, 'reconnectSlack').mockResolvedValue({ connected: true, connect_error: '' })
+    await hydrated()
+
+    fireEvent.click(headerReconnect())
+    expect(await screen.findByText('Connected to Slack.', undefined, { timeout: 5_000 })).toBeInTheDocument()
+    expect(reconnect).toHaveBeenCalledTimes(1)
+    // The recorded "saved but not yet active" hint steps aside for the click's answer.
+    expect(screen.queryByText(/not yet active/)).not.toBeInTheDocument()
+  })
+
+  it('reads Reconnecting… and is disabled while the handshake runs', async () => {
+    seed({ connect_error: 'invalid_auth' })
+    let settle: (v: ReconnectResult) => void = () => {}
+    vi.spyOn(api, 'reconnectSlack').mockReturnValue(new Promise<ReconnectResult>(r => { settle = r }))
+    await hydrated()
+
+    fireEvent.click(headerReconnect())
+    const pending = await screen.findByRole('button', { name: 'Reconnecting…' }, { timeout: 5_000 })
+    expect(pending).toBeDisabled()
+    // The recorded failure is off screen while the retry is in flight.
+    expect(screen.queryByText(/Slack rejected the stored tokens/)).not.toBeInTheDocument()
+
+    await act(async () => { settle({ connected: true, connect_error: '' }) })
+    expect(await screen.findByText('Connected to Slack.', undefined, { timeout: 5_000 })).toBeInTheDocument()
+  })
+
+  it('labels a declined reconnect in the same words as a recorded failure, as the only notice', async () => {
+    seed({ connect_error: 'invalid_auth' })
+    vi.spyOn(api, 'reconnectSlack').mockResolvedValue({ connected: false, connect_error: 'invalid_auth' })
+    await hydrated()
+
+    fireEvent.click(headerReconnect())
+    const alert = await screen.findByText(/^Reconnect failed: Slack rejected the stored tokens \(invalid_auth\)/, undefined, {
+      timeout: 5_000,
+    })
+    expect(alert).toBeInTheDocument()
+    expect(screen.getAllByText(/Slack rejected the stored tokens/)).toHaveLength(1)
+  })
+
+  it.each([
+    ['owner_id_missing', /The owner Slack member ID is missing/],
+    ['tokens_missing', /The bot token or the app-level token is missing/],
+    ['enterprise_validation_failed', /not in the allowed enterprise orgs/],
+    ['denied_by_policy', /A channels policy on this machine does not allow Slack/],
+    ['workspace_switch_needs_restart', /Restart the gateway to switch workspaces/],
+    ['owner_change_needs_restart', /Restart the gateway to change the owner/],
+  ])('explains the %s decline', async (code, text) => {
+    seed()
+    vi.spyOn(api, 'reconnectSlack').mockResolvedValue({ connected: false, connect_error: code })
+    await hydrated()
+
+    fireEvent.click(headerReconnect())
+    expect(await screen.findByText(text, undefined, { timeout: 5_000 })).toBeInTheDocument()
+  })
+
+  it('shows a refusal that left the connection up as a refusal, not a success', async () => {
+    seed({}, { save: { ok: true, restart_required: false, reconnect_required: true, verify_warning: '' } })
+    vi.spyOn(api, 'reconnectSlack').mockResolvedValue({ connected: true, connect_error: 'workspace_switch_needs_restart' })
+    await hydrated()
+    fireEvent.click(saveBtn())
+    expect(await screen.findByTestId('slack-reconnect-save-row', undefined, { timeout: 5_000 })).toBeInTheDocument()
+
+    fireEvent.click(headerReconnect())
+    expect(
+      await screen.findByText(/^Reconnect failed: .*Restart the gateway to switch workspaces/, undefined, { timeout: 5_000 }),
+    ).toBeInTheDocument()
+    expect(screen.queryByText('Connected to Slack.')).not.toBeInTheDocument()
+    // The saved credentials are still not live, so the reminder stays.
+    expect(screen.getByTestId('slack-reconnect-save-row')).toBeInTheDocument()
+  })
+
+  it('drops the last reconnect outcome when a later save changes the credentials', async () => {
+    seed({}, { save: { ok: true, restart_required: false, reconnect_required: true, verify_warning: '' } })
+    vi.spyOn(api, 'reconnectSlack').mockResolvedValue({ connected: true, connect_error: '' })
+    await hydrated()
+    fireEvent.click(headerReconnect())
+    expect(await screen.findByText('Connected to Slack.', undefined, { timeout: 5_000 })).toBeInTheDocument()
+
+    fireEvent.click(saveBtn())
+    expect(await screen.findByTestId('slack-reconnect-save-row', undefined, { timeout: 5_000 })).toBeInTheDocument()
+    expect(screen.queryByText('Connected to Slack.')).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['slack_reconnect_unavailable', 503, 'This server does not run the Slack connection, so it cannot reconnect.'],
+    ['credential_store_unreadable', 500, 'The saved Slack credentials could not be read. Check the credential store, then try again.'],
+  ])('shows the gateway refusal %s in its own words', async (code, status, text) => {
+    seed()
+    vi.spyOn(api, 'reconnectSlack').mockRejectedValue(
+      new ApiError(status, 'refused', JSON.stringify({ error: 'refused', code })),
+    )
+    await hydrated()
+
+    fireEvent.click(headerReconnect())
+    expect(await screen.findByText(text, undefined, { timeout: 5_000 })).toBeInTheDocument()
+  })
+
+  it.each([
+    ['a network error', new Error('Failed to fetch')],
+    ['an unstructured 5xx', new ApiError(502, 'Bad Gateway', '<html>proxy</html>')],
+  ])('asks whether the gateway is running after %s', async (_label, err) => {
+    seed()
+    vi.spyOn(api, 'reconnectSlack').mockRejectedValue(err)
+    await hydrated()
+
+    fireEvent.click(headerReconnect())
+    expect(
+      await screen.findByText('Reconnect failed. Is the gateway running?', undefined, { timeout: 5_000 }),
+    ).toBeInTheDocument()
+  })
+
+  it('points a credential save at Reconnect and keeps the save-row button until it succeeds', async () => {
+    const { save } = seed({}, { save: { ok: true, restart_required: false, reconnect_required: true, verify_warning: '' } })
+    const reconnect = vi.spyOn(api, 'reconnectSlack').mockResolvedValue({ connected: false, connect_error: 'invalid_auth' })
+    await hydrated()
+
+    fireEvent.change(screen.getByPlaceholderText('U0123ABC456'), { target: { value: 'U000NEW' } })
+    fireEvent.click(saveBtn())
+    expect(await screen.findByText('Saved. Click Reconnect to apply.', undefined, { timeout: 5_000 })).toBeInTheDocument()
+    expect(screen.getByTestId('slack-reconnect-save-row')).toBeInTheDocument()
+
+    // A later config-only save does not hide the reminder.
+    save.mockResolvedValue({ ok: true, restart_required: false, reconnect_required: false, verify_warning: '' })
+    fireEvent.click(saveBtn())
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(2))
+    expect(screen.getByTestId('slack-reconnect-save-row')).toBeInTheDocument()
+
+    // A failed reconnect keeps it; a successful one retires it.
+    fireEvent.click(screen.getByTestId('slack-reconnect-save-row'))
+    expect(await screen.findByText(/^Reconnect failed:/, undefined, { timeout: 5_000 })).toBeInTheDocument()
+    expect(screen.getByTestId('slack-reconnect-save-row')).toBeInTheDocument()
+    reconnect.mockResolvedValue({ connected: true, connect_error: '' })
+    fireEvent.click(screen.getByTestId('slack-reconnect-save-row'))
+    expect(await screen.findByText('Connected to Slack.', undefined, { timeout: 5_000 })).toBeInTheDocument()
+    expect(screen.queryByTestId('slack-reconnect-save-row')).not.toBeInTheDocument()
+  })
+
+  it('keeps the reminder for a credential save that lands while an earlier reconnect runs', async () => {
+    seed({}, { save: { ok: true, restart_required: false, reconnect_required: true, verify_warning: '' } })
+    let settle: (v: ReconnectResult) => void = () => {}
+    vi.spyOn(api, 'reconnectSlack').mockReturnValue(new Promise<ReconnectResult>(r => { settle = r }))
+    await hydrated()
+
+    fireEvent.click(headerReconnect())
+    await screen.findByRole('button', { name: 'Reconnecting…' }, { timeout: 5_000 })
+    fireEvent.change(screen.getByPlaceholderText('U0123ABC456'), { target: { value: 'U000NEW' } })
+    fireEvent.click(saveBtn())
+    expect(await screen.findByTestId('slack-reconnect-save-row', undefined, { timeout: 5_000 })).toBeInTheDocument()
+
+    // The earlier attempt read the credentials from before this save.
+    await act(async () => { settle({ connected: true, connect_error: '' }) })
+    expect(await screen.findByText('Connected to Slack.', undefined, { timeout: 5_000 })).toBeInTheDocument()
+    expect(screen.getByTestId('slack-reconnect-save-row')).toBeInTheDocument()
+  })
+
+  it('names the slash-command restart beside a save that also needs a reconnect', async () => {
+    seed({}, { save: { ok: true, restart_required: true, reconnect_required: true, verify_warning: '' } })
+    await hydrated()
+
+    fireEvent.click(saveBtn())
+    expect(await screen.findByText('Saved. Click Reconnect to apply.', undefined, { timeout: 5_000 })).toBeInTheDocument()
+    expect(screen.getByText('The slash command applies after a gateway restart.')).toBeInTheDocument()
+  })
+})
+
+/* ── setup wizard gating ──────────────────────────────────────────────────── */
+
+describe('SlackPanel setup wizard', () => {
+  const wizard = () => screen.queryByTestId('slack-wizard')
+  /** The wizard is behind React.lazy: config hydration -> dynamic import of
+   *  SlackSetupWizard -> its first render. The default 1s find timeout can be
+   *  shorter than that chain on a loaded CI runner, so the wait is explicit. */
+  const findWizard = () => screen.findByTestId('slack-wizard', undefined, { timeout: 10_000 })
+
+  /** Open it the only way it opens: the header's Setup wizard button. */
+  async function openWizard() {
+    fireEvent.click(screen.getByTestId('slack-wizard-open'))
+    return await findWizard()
+  }
+
+  it('stays closed by default on a new setup, with the card exactly as before', async () => {
+    seed({ connected: false, configured: false, bot_token_set: false })
+    await hydrated()
+    expect(wizard()).not.toBeInTheDocument()
+    expect(screen.getByTestId('slack-wizard-open')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Create Slack app' })).toHaveAttribute('href', MANIFEST.create_url)
+    expect(screen.getByText(/named KiroCrew-tester/)).toBeInTheDocument()  // brand-ok: product emits KiroCrew-<alias> (slack-manifest.yaml)
+  })
+
+  it('offers no Setup wizard button to a read-only remote session', async () => {
+    seed({ read_only: true, connected: false, configured: false, bot_token_set: false })
+    await hydrated()
+    expect(screen.queryByTestId('slack-wizard-open')).not.toBeInTheDocument()
+    expect(wizard()).not.toBeInTheDocument()
+  })
+
+  it('stays closed by default on an existing install whose connection dropped', async () => {
+    seed({ connected: false, bot_token_set: true, app_token_set: true, owner_id: 'U0123ABC456' })
+    await hydrated()
+    expect(screen.getByTestId('slack-wizard-open')).toBeInTheDocument()
+    expect(wizard()).not.toBeInTheDocument()
+  })
+
+  it('keeps Copy manifest YAML reachable while disconnected with the wizard open', async () => {
+    const writeText = stubClipboard(() => Promise.resolve())
+    seed({ connected: false, configured: false, bot_token_set: false })
+    await hydrated()
+    await openWizard()
+    // The card points at the wizard, and its own Create link steps aside;
+    // Copy manifest YAML and the setup guide stay.
+    expect(screen.queryByRole('link', { name: 'Create Slack app' })).not.toBeInTheDocument()
+    expect(screen.getByText(/The setup wizard above creates your Slack app/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Copy manifest YAML' }))
+    expect(writeText).toHaveBeenCalledWith(MANIFEST.manifest)
+    expect(screen.getByRole('link', { name: 'Setup guide' })).toBeInTheDocument()
+  })
+
+  it('opens from the button, closes on the first step, and the card comes back', async () => {
+    seed({ connected: false, configured: false, bot_token_set: false })
+    await hydrated()
+    await openWizard()
+    expect(screen.queryByTestId('slack-wizard-open')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByTestId('slack-wizard-close-header'))
+    expect(wizard()).not.toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Create Slack app' })).toHaveAttribute('href', MANIFEST.create_url)
+    await openWizard()
+  })
+
+  it('stays open after Slack connects, so the test step is reachable', async () => {
+    vi.spyOn(api, 'getSlackManifestStatus').mockResolvedValue({
+      features: [], required_scopes: [], required_events: [], required_features: [], feature_changes: {},
+      install: { status: 'up_to_date', missing_scopes: [], extra_scopes: [], disabled_features: [], app_id: 'A0123ABCD', team_id: 'T0456EFGH', reason: '' },
+      app_manifest_url: null, app_basic_info_url: null, app_dm_url: null,
+    })
+    const reconnect = vi.spyOn(api, 'reconnectSlack').mockResolvedValue({ connected: true, connect_error: '' })
+    seed({ connected: false, configured: false, bot_token_set: false })
+    await hydrated()
+    await openWizard()
+    // A refetch now answers "connected": the wizard must not vanish.
+    vi.mocked(api.getSlackConfig).mockResolvedValue(config({ connected: true, bot_token_set: true, app_token_set: true, owner_id: 'U0123ABC456' }))
+    fireEvent.click(screen.getByTestId('slack-reconnect'))
+    await waitFor(() => expect(reconnect).toHaveBeenCalled())
+    await waitFor(() => expect(screen.getByText('Connected')).toBeInTheDocument())
+    expect(wizard()).toBeInTheDocument()
   })
 })

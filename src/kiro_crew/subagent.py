@@ -21,14 +21,13 @@ import time
 from collections.abc import (
     Awaitable,
     Callable,
-    Container,
     Iterable,
     Iterator,
     Mapping,
     Sequence,
 )
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, AbstractSet, Any, Literal, Optional
+from typing import TYPE_CHECKING, AbstractSet, Any, Literal
 
 from kiro_crew._facade_compose import compose as _facade_compose
 from kiro_crew.acp.liveness import (
@@ -52,6 +51,7 @@ from kiro_crew.agent_sdk.drivers.acp_vocab import (  # noqa: F401 - STOP_* resol
     TERMINAL_TOOL_STATUSES,
     classify_stop_reason,
     is_runtime_death,
+    is_unpinned_pick,
 )
 from kiro_crew.execution_context import read_session_execution
 from kiro_crew.executors import run_in_embed_pool
@@ -77,6 +77,7 @@ from kiro_crew.agent_discovery import (
     is_internal_agent_spec,
     list_agents,
     plain_markdown_document,
+    read_agent_spec_strict,
 )
 from kiro_crew.agent_sdk.capabilities import capabilities_of
 from kiro_crew.agent_sdk.provider_identity import PROVIDER_CLAUDE_CODE
@@ -124,9 +125,9 @@ from kiro_crew.hooks import (
     fire_tool_hooks,
     hook_gate_kwargs,
 )
+from kiro_crew.llm_helpers import FALLBACK_STORY_ATTR  # noqa: F401 - re-exported
 from kiro_crew.llm_helpers import (
     FALLBACK_CANDIDATE_ATTEMPTS,
-    FALLBACK_STORY_ATTR,
     SESSION_NOT_FOUND_GIVE_UP_TEXT,
     SESSION_NOT_FOUND_NOT_REPLAYED_TEXT,
     TRANSIENT_RETRIES,
@@ -135,9 +136,11 @@ from kiro_crew.llm_helpers import (
     _sum_usage,
     acp_error_is_session_not_found,
     acp_error_is_transient,
+    advance_fallback_after_activity,
     advance_fallback_candidate,
     annotate_model_fallback,
     append_fallback_story,
+    attach_fallback_story,
     configured_fallback_chain,
     provider_fallback_active,
     provider_last_turn_usage,
@@ -206,6 +209,7 @@ from kiro_crew.subagent_ending import (  # noqa: F401
     SubagentEnding,
     classify_ending,
 )
+from kiro_crew.subagent_host_decision import HostSpawnDecision  # noqa: F401 - re-exported
 from kiro_crew.subagent_manager import (
     CancellationCoordinator,
     ClaimPoint,
@@ -221,12 +225,16 @@ from kiro_crew.subagent_manager import (
     bind_component_globals,
     copy_component_docs,
 )
+from kiro_crew.subagent_manager.continuation import (  # noqa: F401 - resolved by continuation.py via bind_component_globals
+    _run_silent,
+)
 from kiro_crew.subagent_manager.monitoring import (  # noqa: F401 - resolved by monitoring.py via bind_component_globals
     orphan_carried_fields,
     orphan_resume_hint,
     tombstone_recovery_action,
 )
 from kiro_crew.subagent_manager.run import _PendingDepthEmit, _PendingDepthRetry
+from kiro_crew.subagent_mcp_roster import session_mcp_roster_gb
 from kiro_crew.subagent_parts import admission_surface as _admission_surface
 from kiro_crew.subagent_parts import agent_policy as _agent_policy
 from kiro_crew.subagent_parts import cancellation_surface as _cancellation_surface
@@ -241,48 +249,38 @@ from kiro_crew.subagent_parts import run_limits as _run_limits
 from kiro_crew.subagent_parts import run_output as _run_output
 from kiro_crew.subagent_parts import run_record as _run_record
 from kiro_crew.subagent_parts import run_surface as _run_surface
+from kiro_crew.subagent_parts import spawn_allowlists as _spawn_allowlists
 from kiro_crew.subagent_parts import start_pricing as _start_pricing
 from kiro_crew.subagent_parts import terminal_surface as _terminal_surface
 from kiro_crew.subagent_parts.agent_policy import (  # noqa: F401
     _AGENT_GLOB_RE,
-    _MAX_AVAILABLE_AGENTS_GLOB_CHARS,
-    _MAX_AVAILABLE_AGENTS_GLOBS,
     _MAX_AVAILABLE_IN_ERROR,
-    _PARENT_ALLOWLIST_MEMO,
-    _PARENT_PROJECT_ALLOWLIST_MEMO,
-    _UNRESOLVED_PARENT_WARNED,
-    _UNRESOLVED_PARENT_WARNED_MAX,
     AGENT_INTERNAL_CODE,
     AGENT_NOT_AVAILABLE_CODE,
     AGENT_NOT_FOUND_CODE,
-    UNADVERTISED_AGENTS,
     AgentCheck,
     ParentRecordUnreadable,
     ParentSpawnPolicy,
     _accepted_project_dirs,
     _available_agents_hint,
+    _bot_worker_allowlist,
     _inherited_member_agent,
     _internal_agent_refusal,
     _parent_project_resolver,
     _parent_template_for_spawn,
-    _scan_parent_spawn_allowlists,
-    _scope_spawn_allowlists,
-    _ScopeAllowlists,
-    _surface_unresolved_parent_spec,
+    _spawning_agents,
     _validate_agent,
     _validate_app_agent_ownership,
     _vet_parent_available_agents,
     _vet_spawn_governance,
-    agent_matches_allowlist,
     conductor_spawn_refusal,
     parent_project_dirs,
-    parent_spawn_allowlists,
     parent_spawn_policy,
     parent_template_allowlists,
+    parent_template_spawn_policy,
     set_parent_project_resolver,
-    spawn_allowlist,
     validate_cwd,
-    visible_agent_names,
+    with_cron_dispatched_policy,
 )
 from kiro_crew.subagent_parts.delivery import (  # noqa: F401
     _TEARDOWN_GATE_TTL_SECS,
@@ -304,6 +302,7 @@ from kiro_crew.subagent_parts.host_memory import (  # noqa: F401
     _CGROUP_UNLIMITED,
     _CLK_TCK,
     _LEGACY_DEFAULT_MAX,
+    _MEMORY_PRICE_HOLDERS,
     _MEMORY_STAT_READ_CAP,
     MEMORY_CAUSE_CGROUP_USAGE_UNREADABLE,
     MEMORY_CAUSE_READ_UNANSWERED,
@@ -315,6 +314,7 @@ from kiro_crew.subagent_parts.host_memory import (  # noqa: F401
     _cgroup_memory_roots,
     _configured_max_subagents,
     _container_cgroup_available_gb,
+    _container_cgroup_reading,
     _host_available_gb,
     _host_mem_term,
     _macos_available_memory_gb,
@@ -323,6 +323,7 @@ from kiro_crew.subagent_parts.host_memory import (  # noqa: F401
     _proc_subtree_sample,
     _read_int_file,
     _read_reclaimable_file_bytes,
+    _settled_runtime_hold_total_gb,
     _subtree_cpu_jiffies,
     _working_set,
     check_memory_available,
@@ -416,6 +417,31 @@ from kiro_crew.subagent_parts.run_record import (  # noqa: F401
     _BareStateView,
     _context_groups_field,
     _context_groups_of,
+    _DoneFlag,
+    wait_done,
+)
+from kiro_crew.subagent_parts.spawn_allowlists import (  # noqa: F401
+    _MAX_AVAILABLE_AGENTS_GLOB_CHARS,
+    _MAX_AVAILABLE_AGENTS_GLOBS,
+    _MAX_UNREADABLE_ERROR_CHARS,
+    _MAX_UNREADABLE_IN_ERROR,
+    _PARENT_ALLOWLIST_MEMO,
+    _PARENT_PROJECT_ALLOWLIST_MEMO,
+    _UNRESOLVED_PARENT_WARNED,
+    _UNRESOLVED_PARENT_WARNED_MAX,
+    UNADVERTISED_AGENTS,
+    _describe_unreadable_spec,
+    _describe_unreadable_specs,
+    _ParentSpawnResolution,
+    _resolve_parent_spawn_allowlists,
+    _scan_parent_spawn_allowlists,
+    _scope_spawn_allowlists,
+    _ScopeAllowlists,
+    _surface_unresolved_parent_spec,
+    agent_matches_allowlist,
+    parent_spawn_allowlists,
+    spawn_allowlist,
+    visible_agent_names,
 )
 from kiro_crew.subagent_parts.start_pricing import (  # noqa: F401
     _SETTLED_PROJECTION_CEILING_GB,
@@ -429,17 +455,23 @@ from kiro_crew.subagent_parts.start_pricing import (  # noqa: F401
     _host_memory_reading,
     _host_memory_reading_off_loop,
     _host_read_in_flight,
+    _owes_price_once_settled,
     _owns_dedicated_runtime,
     _parent_runs_remotely,
     _parked_at_spawn_approval,
     _row_settled,
+    _row_start_price_gb,
     _selection_kind,
+    _settled_runtime_hold_gb,
     _shared_start_price_gb,
     _SharingPlan,
     _spawn_memory_floor_and_cost,
     _startup_memory_reserve_gb,
 )
-from kiro_crew.subagent_parts.terminal_surface import write_refusal_tombstone  # noqa: F401
+from kiro_crew.subagent_parts.terminal_surface import (  # noqa: F401
+    write_queued_stop_tombstone,
+    write_refusal_tombstone,
+)
 from kiro_crew.subagent_persistence import (  # noqa: F401 - read_tombstone resolved by run_lifecycle.py via bind_component_globals
     DISMISSAL_FAILED,
     _agent_dir,
@@ -520,7 +552,6 @@ _PARTS_GLOBAL_BINDINGS = (
     COMPLETION_KEEP_DEFAULT_CHARS,
     Callable,
     ClaimPoint,
-    Container,
     ContextBuilder,
     DEFAULT_MODEL,
     InFlightToolTracker,
@@ -530,7 +561,6 @@ _PARTS_GLOBAL_BINDINGS = (
     Literal,
     Mapping,
     MemoryReadPoint,
-    Optional,
     PROVIDER_CLAUDE_CODE,
     PROVIDER_LABEL_CLAUDE,
     PreparedSpawn,
@@ -557,6 +587,7 @@ _PARTS_GLOBAL_BINDINGS = (
     is_internal_agent_spec,
     is_markdown_spec,
     is_registered_agent_name,
+    is_unpinned_pick,
     iter_agent_spec_files,
     list_agents,
     live,
@@ -565,6 +596,7 @@ _PARTS_GLOBAL_BINDINGS = (
     plain_markdown_document,
     project_agents_dir,
     provider_last_turn_usage,
+    read_agent_spec_strict,
     read_cap_costs,
     read_session_execution,
     readonly_base_name,
@@ -594,6 +626,7 @@ _facade_compose(
     (
         _run_limits,
         _run_output,
+        _spawn_allowlists,
         _agent_policy,
         _model_choice,
         _host_memory,
@@ -623,6 +656,7 @@ _COMPONENT_GLOBAL_BINDINGS = (
     cap_buckets,
     learned_settled_for,
     read_learned_costs_checked,
+    session_mcp_roster_gb,
     Any,
     CONTEXT_GROUP_LESSONS,
     CONTEXT_GROUP_MEMORY,
@@ -634,7 +668,6 @@ _COMPONENT_GLOBAL_BINDINGS = (
     EVENT_TOOL_CALL,
     EVENT_TOOL_RESULT,
     FALLBACK_CANDIDATE_ATTEMPTS,
-    FALLBACK_STORY_ATTR,
     FallbackState,
     HOOK_EVENT_POST_TOOL_USE,
     KiroCrewConfig,
@@ -659,11 +692,13 @@ _COMPONENT_GLOBAL_BINDINGS = (
     _ws_result_path,
     acp_error_is_session_not_found,
     acp_error_is_transient,
+    advance_fallback_after_activity,
     advance_fallback_candidate,
     agent_dir_for_display,
     annotate_model_fallback,
     append_cost_sample,
     append_fallback_story,
+    attach_fallback_story,
     apply_completion_keep,
     asyncio,
     pressure_level_held,

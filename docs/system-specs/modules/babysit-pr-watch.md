@@ -23,8 +23,8 @@ advisory review text. Its stateless directive is validated by
 `mcp_tools.control.monitor_start`, then applied by
 `dashboard.session_directive_apply._monitor_start` through
 `autonudge_authz.authorize_and_add_nudge`. `AutoNudgeService` persists and
-schedules the loop. Those two `monitor_start` surfaces are the only callers that
-ask for the gate; the chokepoint defaults every other caller UNGATED, the generic
+schedules the loop. Those two `monitor_start` surfaces and the conductor patrol
+(`conductor_patrol`) are the only callers that ask for the gate; the chokepoint defaults every other caller UNGATED, the generic
 REST route included. Gating is the state that can silently stop work, so a caller
 that names no value resolves toward spending a turn per interval rather than toward
 a watch that deactivates itself.
@@ -64,6 +64,12 @@ loop resolves the same instruction against its own monitor's target
 cannot drift as the log grows. The judge's collector cannot re-read the
 transcript, so `parse_targets(..., watched=)` admits the gh-pr monitor's own subject
 for exactly this shape, and only when the instruction's number is the monitor's.
+Where the tick, the terminal recheck and the judge's `pr_observation_is_about` compare
+the stored subject with a re-inferred or requested one, `probes.targets.same_subject`
+compares a gh-pr subject's owner and repository case-folded, because GitHub slugs are
+case-insensitive; the number, and a host wherever one is compared, stay exact, and
+every other kind compares exactly. So a brief spelling `kirodotdev/kirocrew` against a
+stored `kirodotdev/KiroCrew` keeps the loop gated.
 A loop that does resolve to one subject attaches
 `PrWatchProbe`, which FETCHES that pull request every tick and hands the reading to
 the wake judge. A retarget that changes the subject advances `config_generation`, so a
@@ -154,6 +160,33 @@ different `incomplete` reason, a whole reading (which clears both fields in the 
 that keeps it), an owed judge wake, a brief naming any target other than the watched pull
 request (a session, a second pull request, or none at all), or an
 update that re-aims the loop (a reworded instruction or a replaced brief clears both).
+
+### Delivered-blocker basis
+
+A judge reads prose, so it must never be able to silence a typed blocker the owner has
+not seen -- a narrow custom brief that answers QUIET on the tick a lane goes red (because
+its wording did not name that lane) would otherwise leave the watch asleep until the quiet
+floor. `MonitorState.delivered_failed_checks` (the sorted failing-check identities) and
+`delivered_conflicting` (whether the branch conflicted) hold the blockers the last
+DELIVERED turn carried, written only where delivery is confirmed
+(`_record_delivered_reading`, from the reading read before the dispatch) so a refused fire
+or a stop before the turn lands moves nothing. On a tick that would otherwise go quiet --
+the judge answered QUIET, or no judge ran -- `gate.py` `_newly_blocked` subtracts that
+basis from the live reading's blockers (`_reading_blockers`, read from the same typed facts
+the classifier and the reading digest read; a conflict normalised as `CONFLICTING`
+mergeability or a `DIRTY` merge state): a failing check whose identity is not in the basis,
+or a conflict the basis did not carry, wakes the loop whatever the judge said, with one
+notice row naming the new blocker and -- when it overrides a judge QUIET -- a withdrawal of
+that verdict's suppression row so the calibration log is not mislabelled. A blocker already
+in the basis (a red check on a PR under repair reports the same lane every tick) stays
+quiet, which is why the judge's own override bar still has work to do. The basis is NOT
+cleared by a same-PR re-aim: the blockers belong to the pull request, not the brief, so a
+reworded instruction or a replaced brief on the same subject keeps the monitor and its
+basis; a retarget to a DIFFERENT subject replaces the monitor with a fresh `MonitorState`
+whose basis already starts empty. An unreadable persisted value loads as the empty basis,
+which makes every live blocker read as new and wake -- the safe direction, matching every
+other doubt in the gate. `test_autonudge_newly_failing_wake.py` pins the wakes, the
+same-set quiet, the same-PR-re-aim keep, and the fail-safe load.
 
 Every uncertain path -- no probe, no inferable target, a probe defect, a kernel that
 reached no verdict -- fires, because a wrongly-quiet tick is silence with
@@ -256,7 +289,11 @@ sides of the contract. The `fired` state event carries the cleared deadline, so
 the turn-end re-arm that sets the next one (`_arm_and_announce_deadline`, also
 used when a re-arm was deferred past the fire window) emits `updated`, and the
 dashboard countdown never reads "not yet scheduled" between cycles;
-`test_turn_end_after_fire_announces_the_new_deadline` pins it. Channel-bound loops re-arm after their unattended turn
+`test_turn_end_after_fire_announces_the_new_deadline` pins it. A quiet gated
+tick runs no turn, so no turn end announces the deadline it sets: the quiet
+branch emits `updated` itself when that deadline moved, and a pushed quiet tick
+that keeps the earlier deadline publishes nothing;
+`test_quiet_gated_tick_announces_the_new_deadline` pins both. Channel-bound loops re-arm after their unattended turn
 in `AutoNudgeService._run_fire_cycle` (`autonudge_service/firing.py`) because they do not
 use the dashboard
 turn-lifecycle hooks.
@@ -322,11 +359,14 @@ pins both the request wording and the local-binding behavior.
 ## PR fetcher
 
 `probes.gh_pr` reads one pull request and makes no wake decision. Whether a tick
-is worth the owning session's turn is the wake judge's answer, read against the
-loop's own criteria; the one deterministic mapping -- a merged or closed pull
-request ends the watch -- belongs to the auto-nudge core, which is the layer that
-can act on it. `PrWatchProbe.observe` therefore returns NO observations. The
-reading is published on the probe instance and the driver reads it there.
+is worth the owning session's turn is mostly the wake judge's answer, read against
+the loop's own criteria -- with two deterministic mappings the judge can never
+override, both owned by the auto-nudge core because it is the layer that can act
+on a typed fact: a merged or closed pull request ends the watch, and a blocker the
+owner was not already shown (a failing check, or a conflict) wakes the loop whatever
+the judge said (see *Delivered-blocker basis* below). `PrWatchProbe.observe`
+therefore returns NO observations. The reading is published on the probe instance
+and the driver reads it there.
 
 `_parse_config` accepts a JSON message naming one repository, one pull request,
 and optionally the one pinnable host. A message that can never be valid raises
@@ -456,7 +496,7 @@ what reaches the kernel as a failed tick.
 
 The PR watch is driven in-process by the gateway (`monitor_watch` or a
 `monitor_start` loop); no script asset ships for it and the babysit skill
-directory holds only its `SKILL.md`. A registered script job is refused by the
+directory holds only its `SKILL.md` and the `references/github-helper.md` guide. A registered script job is refused by the
 probe and auto-paused, as described under "There is no script-cron driver"
 above, so script-cron `Skip`/`Report`/`Done` delivery is not this watch's path.
 
@@ -466,13 +506,18 @@ The structured monitor digests comment bodies to detect that one changed, so an
 in-place edit whose `created_at` never moves still wakes the owner. GitHub
 digests its PR-level issue comments; Azure DevOps digests the comments nested
 inside its PR threads, skipping the `system`-type lifecycle narration it posts on
-its own; both reduce each body to a fixed-width fingerprint and fail closed to an
+its own; GitLab digests its MR notes, skipping GitLab's `system` activity notes
+and inline diff notes (`DiffNote`, or any note with a `position`); Bitbucket
+digests `/pullrequests/{id}/comments`, skipping inline (`inline`-anchored)
+comments;
+each reduces every body to a fixed-width fingerprint and fails closed to an
 empty digest (no wake) on an incomplete read. It never interprets what a comment
-says or decides whether an advisory finding is valid, and on GitHub it
-deliberately does not read inline review-thread bodies at all -- it reports only
-the count of unresolved, non-outdated threads there. It reports typed provider
-facts and leaves judgment, source inspection, and any reply to the reactivated
-babysit session.
+says or decides whether an advisory finding is valid, and on GitHub, GitLab and
+Bitbucket it deliberately does not read inline review-thread bodies at all. On
+GitHub and GitLab it reports only the count of unresolved, non-outdated threads
+there; Bitbucket's adapter never reads inline threads, and reports its open PR
+tasks in that place instead. It reports typed provider facts and leaves
+judgment, source inspection, and any reply to the reactivated babysit session.
 `monitor_start` remains appropriate when each delivered cycle requires the agent
 to make progress, the objective requires untyped evidence, or the watched subject
 is unsupported by a structured provider.

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,7 +19,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from shared_crew_host_isolation import host_isolation  # noqa: F401
 
 from kiro_crew.history import ConversationLog
-from kiro_crew.shared_crew import people, routes_identity
+from kiro_crew.shared_crew import people, preview, routes_identity
 from kiro_crew.shared_crew.codec import ContractError
 from kiro_crew.shared_crew.contracts import (
     ACTOR_REQUEST_KEY,
@@ -50,6 +51,12 @@ def _write_session(base, key: str, *, title: str, creator: Principal | None, mti
     row = {"role": "user", "content": "x", "ts": "t"}
     path.write_text(json.dumps(meta) + "\n" + json.dumps(row) + "\n", encoding="utf-8")
     os.utime(path, (mtime, mtime))
+
+
+@pytest.fixture(autouse=True)
+def _preview_on(_floor_monkeypatch):
+    # The People and mode reads list the catalogue only with the Shared Crew preview on.
+    _floor_monkeypatch.setenv(preview.PREVIEW_ENV, "1")
 
 
 @pytest.fixture
@@ -324,6 +331,29 @@ async def test_people_route_separates_observed_from_session_creators(catalog):
     # Alice was never seen by this process; she is known only as a creator.
     assert by_id[ALICE.id]["sources"] == ["session_creator"]
     assert by_id[ALICE.id]["last_seen_at"] is None and by_id[ALICE.id]["sessions_created"] == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path", [routes_identity.SESSIONS_PATH, routes_identity.PEOPLE_PATH, routes_identity.MODE_PATH]
+)
+async def test_identity_routes_scan_the_catalog_off_the_event_loop(catalog, monkeypatch, path):
+    loop_thread = threading.get_ident()
+    threads: list[int] = []
+    real_machine_only = routes_identity._machine_only
+
+    def machine_only(key: str) -> bool:
+        threads.append(threading.get_ident())
+        return real_machine_only(key)
+
+    monkeypatch.setattr(routes_identity, "_machine_only", machine_only)
+    client = await _client(catalog, viewer=BOB)
+    try:
+        resp = await client.get(path)
+    finally:
+        await client.close()
+    assert resp.status == 200
+    assert threads and loop_thread not in threads
 
 
 def test_people_registry_is_bounded_and_drops_the_least_recently_seen():

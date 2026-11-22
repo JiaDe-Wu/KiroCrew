@@ -7,15 +7,16 @@
  *     measured room and the list inside it scrolls on its own; the cap lifts
  *     when the list fits again; the room also leaves the space below the list's
  *     row (at least the top inset), because a sticky list cannot leave its row
- *   - wide, capped: a decorative "More below" strip sits under the scrolling
- *     box while rows remain below, hides at the end, and is absent otherwise
+ *   - wide, capped: a "More below" strip sits under the scrolling box while
+ *     rows remain below, scrolls the box down on click, hides at the end, and
+ *     is absent otherwise
  *   - wide again after a narrow stretch: no cap from the earlier measurement
  *     renders before the fresh one lands
  *   - narrow: the <nav> is exactly the plain full-width element (no sticky
  *     class, no inline style) and no ResizeObserver is created
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, act, fireEvent } from '@testing-library/react'
+import { render, screen, cleanup, act, fireEvent, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { SettingsSubNav } from '../components/SettingsSubNav'
 
@@ -125,6 +126,17 @@ describe('SettingsSubNav two-pane section list stays in view', () => {
     expect(scroller(listbox).classList.contains('overflow-y-auto')).toBe(false)
   })
 
+  it('draws each row\'s focus ring inside the row, so a capped list that scrolls cannot clip it', () => {
+    const { listbox, scrollArea } = renderWide()
+    setSize(scrollArea, 'clientHeight', 200)
+    setSize(listbox, 'offsetHeight', 400)
+    fireObservers()
+    expect(scroller(listbox).classList.contains('overflow-y-auto')).toBe(true)
+    const rows = within(listbox).getAllByRole('option')
+    expect(rows.map(r => r.textContent)).toEqual(['Transcript', 'Composer'])
+    for (const r of rows) expect(r).toHaveClass('focus-visible:outline-offset-[-2px]')
+  })
+
   it('shows a "More below" cue on a capped list while rows remain below and hides it at the end', () => {
     const { nav, listbox, scrollArea } = renderWide()
     const scrolling = scroller(listbox)
@@ -137,8 +149,10 @@ describe('SettingsSubNav two-pane section list stays in view', () => {
 
     const cue = screen.getByTestId(CUE)
     expect(cue.className).not.toContain('invisible')
-    expect(cue).toHaveAttribute('aria-hidden', 'true')
-    expect(cue.querySelector('button, a, [tabindex]')).toBeNull()
+    expect(cue).toBe(screen.getByRole('button', { name: 'More below' }))
+    scrolling.scrollBy = vi.fn()
+    fireEvent.click(cue)
+    expect(scrolling.scrollBy).toHaveBeenCalledWith({ top: 120, behavior: 'smooth' })
     // The strip sits beside the scrolling box, not in it, so it stays on the
     // visible bottom edge while the rows scroll.
     expect(cue.parentElement).toBe(nav)

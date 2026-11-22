@@ -16,12 +16,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from kiro_crew.autonudge_judge import ending_phrase, screen_phrase
+from kiro_crew.autonudge_judge_phrases import ending_phrase, screen_phrase
 from kiro_crew.config.loader import KiroCrewConfig
-from kiro_crew.mcp_tools._limits import (
-    _MONITOR_DEFAULT_MAX_CYCLES,
-    _MONITOR_DEFAULT_MAX_RUNTIME_SECS,
-)
+from kiro_crew.mcp_tools._limits import _MONITOR_DEFAULT_MAX_CYCLES
 from kiro_crew.monitoring.limits import DEFAULT_RUNTIME_CEILING_SECS, runtime_ceiling_secs
 from kiro_crew.monitoring.models import (
     MAX_MONITOR_AGENT_TURNS,
@@ -199,6 +196,21 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                     },
                 },
                 "required": ["seconds", "reason"],
+            },
+        },
+        {
+            "name": "mcp_server_wait",
+            # Short on purpose: it rides in every request of the agents that list
+            # it as a job tool (``agent_sdk.tool_search.JOB_TOOLS``). The turn's
+            # own ``[MCP SERVERS]`` block says when and how to use it.
+            "description": (
+                "Wait for one of this session's MCP servers that is still starting. "
+                "Returns when it is connected, or says why it will not be. Call once."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"server": {"type": "string"}},
+                "required": ["server"],
             },
         },
         {
@@ -390,8 +402,9 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                 "never by simply stopping after a tool. Call it when the turn ran tools "
                 "and found nothing the user needs to read: a quiet patrol cycle, a check "
                 "that found no change, a cron wake with nothing to report. It is "
-                "TERMINAL: write nothing and call nothing after it. Never use it to skip "
-                "answering a direct question, to end a turn the user is waiting on, or "
+                "TERMINAL: after it, write only the end token its result gives you, and "
+                "call nothing. Never use it to skip answering a direct question, to end "
+                "a turn the user is waiting on, or "
                 "when work is still unfinished — the host REFUSES it on a turn a person "
                 "opened (and on every messaging-channel turn), and the normal empty-reply "
                 "handling then runs. The optional note is recorded as a quiet transcript "
@@ -463,6 +476,17 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                         "maxLength": MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS,
                         "description": "Compact instructions used only on an actionable wake",
                     },
+                    "wake_on_terminal": {
+                        "type": "boolean",
+                        "description": (
+                            "Opt-in, default false. When true, this watch wakes its "
+                            "own session once when the pull request merges or is "
+                            "closed unmerged, carrying the reason and the merge "
+                            "revision, then stops. Leave it unset to keep today's "
+                            "behaviour: a terminal transition stops the watch with "
+                            "no agent turn."
+                        ),
+                    },
                 },
                 "required": ["kind", "target", "objective"],
             },
@@ -483,7 +507,9 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                 "Durably stop the monitor on your current session. A structured "
                 "monitor is retained with its terminal outcome for inspection; a "
                 "legacy timer loop is stopped and leaves no record behind, so a "
-                "later monitor_inspect reports it as not armed."
+                "later monitor_inspect reports it as not armed. When a loop's work "
+                "is done, send the user ONE final report (what landed, what is "
+                "left, links) first, and stop the loop in a later step."
             ),
             "inputSchema": {
                 "type": "object",
@@ -493,7 +519,7 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
         {
             "name": "monitor_start",
             "description": (
-                "Start a finite prompt loop for repeated work on YOUR CURRENT session, "
+                "Start a prompt loop for repeated work on YOUR CURRENT session, "
                 "including first-class self-session patrol by conductor agents. For "
                 "monitoring targets, this is also the legacy fallback for targets, "
                 "objectives, or required evidence unsupported by monitor_watch. "
@@ -513,8 +539,12 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                 "the exit "
                 "condition in the message, then reply with one line and END YOUR TURN — the "
                 "loop wakes you on the "
-                "interval. When the exit condition is met (or the user says "
-                "stop), call autonudge_stop — reaching max_cycles is a runaway "
+                "interval. You decide when it is done: check live state yourself "
+                "on each wake (e.g. gh pr view for a PR watch). When the exit "
+                "condition is met (or the user says stop), first send the user ONE "
+                "final report, then in a later step call monitor_stop (or "
+                "autonudge_stop). A gated loop has no cycle cap unless you pass "
+                "one; its runtime defaults to the configured ceiling, a runaway "
                 "backstop, NOT a successful finish. From dashboard, Slack, or "
                 "Discord, use monitor_update to revise or re-arm the instruction "
                 "if what you are watching changes. On Webex, stop the loop and "
@@ -537,8 +567,9 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                 "lane of many finishing, a pending count shrinking, a bot "
                 "posting its own status -- and a raised wake is held briefly, "
                 "so it lands up to about one interval after the tick that "
-                f"observed it. {_ending_clause()} ends the watch rather than "
-                "waking you. "
+                f"observed it. {_ending_clause()} wakes you ONE last time, the "
+                "turn opening with the result (e.g. 'PR owner/repo#N merged at "
+                "<ts>, head <sha>'), then ends the watch; report from that turn. "
                 "max_cycles then counts the turns actually "
                 "DELIVERED to you -- wakes, plus the periodic delivery that "
                 "breaks a long quiet streak and any tick that could not observe "
@@ -591,7 +622,10 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                             "silence is invisible to it. Pass it too for a loop "
                             "that must see lanes land one at a time, since "
                             "per-lane progress raises no wake unless your own "
-                            "wake criteria ask for it. A gated loop is "
+                            "wake criteria ask for it -- though a check that goes "
+                            "red, or a branch that starts conflicting, since the "
+                            "loop last delivered a turn always wakes it whatever "
+                            "the judge says. A gated loop is "
                             "never starved (it is delivered anyway after enough "
                             "quiet intervals) so reach for this only when every "
                             "interval genuinely has work"
@@ -602,9 +636,10 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                         "minimum": 1,
                         "maximum": 1000,
                         "description": (
-                            "Safety cap on delivered cycles (default "
-                            f"{_MONITOR_DEFAULT_MAX_CYCLES}). Use a larger finite "
-                            "value for a longer watch"
+                            "Optional safety cap on delivered cycles. Default: none "
+                            "on a gated loop; "
+                            f"{_MONITOR_DEFAULT_MAX_CYCLES} when the loop re-injects "
+                            "every interval (gate=false, or nothing to observe)"
                         ),
                     },
                     "max_runtime_secs": {
@@ -615,9 +650,8 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                             "Runtime budget in seconds (awake time while the "
                             "gateway runs; a restart counts the time since "
                             "created_ts on the wall clock), measured from when "
-                            "the loop is armed (default "
-                            f"{min(_MONITOR_DEFAULT_MAX_RUNTIME_SECS, runtime_ceiling)}; "
-                            f"configured max {runtime_ceiling}). "
+                            "the loop is armed (default and configured max "
+                            f"{runtime_ceiling}). "
                             "Unlike max_cycles this "
                             "bounds running TIME, so a loop with slow turns or "
                             "a long interval still stops on schedule. The "
@@ -664,7 +698,14 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                             "request's state. It never ends "
                             "the loop and it never silences one indefinitely — after "
                             "a run of quiet cycles one fires anyway — so a wrong "
-                            "answer costs a late turn, not a missed one. You do not "
+                            "answer costs a late turn, not a missed one. It also "
+                            "cannot keep you from a typed blocker you have not been "
+                            "shown: on a pull-request watch, a check that was not "
+                            "failing when the loop last delivered a turn, or a branch "
+                            "that has just started conflicting with its base, wakes "
+                            "the loop whatever these sentences say -- a brief can hold "
+                            "a red check you already saw quiet, but not a new one. You "
+                            "do not "
                             "have to pass it: once the evidence scope is granted, a "
                             "gated loop is screened on every cycle under a default "
                             "brief that asks whether the subject needs its owner, and "
@@ -718,10 +759,13 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                             "'progress', a worker ending its turn and a worker's session "
                             "closing all leave the interval as it is, so a worker that "
                             "crashed or went silent is found by the item's stale flag on "
-                            "an ordinary cycle. For a conductor patrolling "
-                            "dispatched workers this is the field to use, and it lets "
-                            "you set interval_secs in hours -- the timer becomes the "
-                            "liveness fallback, not the delivery path. Omit it and the "
+                            "an ordinary cycle. Closing every item does not end the "
+                            "watch: it wakes you once to say so and stays armed for "
+                            "the next item, until autonudge_stop, a person's stop or "
+                            "the loop's own bounds. For a conductor patrolling "
+                            "dispatched workers this is the field to use, and it fixes "
+                            "interval_secs at the 300 s patrol interval -- the timer is "
+                            "the liveness fallback, not the delivery path. Omit it and the "
                             "subject is inferred from `message`, which is how a pull "
                             "request is named. Gating does not need `gate` as well: "
                             "naming a watch gates the loop on its own"
@@ -888,7 +932,8 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                             "losing its cycle count. After it, a cycle where no worker "
                             "said anything actionable costs no turn, and a worker's "
                             "report of 'blocked', 'question' or 'done' pulls the next "
-                            "cycle forward. Omit it to leave the "
+                            "cycle forward. Closing every item wakes you once and "
+                            "leaves the watch armed. Omit it to leave the "
                             "loop's current subject alone"
                         ),
                     },
@@ -962,7 +1007,10 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                 "\n\n"
                 "Restrictions: headless callers (cron jobs, subagents, task runners) "
                 "are rejected — a cron turn can run on a user's dashboard slot and a "
-                "subagent shares its parent's slot, so neither may wipe it. A "
+                "subagent shares its parent's slot, so neither may wipe it. A turn "
+                "the gateway starts itself, such as a bot's heartbeat, a goal "
+                "check-in or a worker report, is rejected because no person sent "
+                "it. A "
                 "monitor wake is rejected too, unless this session runs a goal or "
                 "ledger conductor and the wake comes from its own live loop, which it "
                 "armed itself, with no question card or tool approval pending."
@@ -1049,24 +1097,74 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "chat_rename",
+            "description": (
+                "Rename THIS chat session's sidebar title. Use it when the person "
+                "asks you to, or when their own instructions say how sessions should "
+                "be named. It renames only the session you are running in, and it is "
+                "not available in a conductor mode chat or a Bot's own chat; to rename "
+                "another session, use session_rename."
+                "\n\n"
+                "The new title is final, like a manual rename: the automatic titler "
+                "stops refreshing it. The person can still rename it or choose "
+                "Regenerate title. You may replace an automatic title, a Bot "
+                "thread's name, or one you set earlier, but never a title someone set "
+                "by hand (a sidebar rename, a "
+                "channel /title, session_rename, or a name given when the session was "
+                "created): that call is refused, and the person can rename it "
+                "themselves or choose Regenerate title, after which you may."
+                "\n\n"
+                "Title rules: surrounding whitespace is stripped; it must be 1 to 200 "
+                "characters on one line, with no control, text-direction or hidden "
+                "characters; credential-shaped text is redacted while credential "
+                "redaction is on. The result reports the title as stored."
+                "\n\n"
+                "Restrictions: refused for a turn a person did not send (cron jobs, "
+                "subagents, task runs, monitor wakes, messages an app sent), a turn a "
+                "channel opened, a turn another session, an app or a channel steered a "
+                "message into, a channel session with no dashboard slot, a channel's "
+                "own tab, a conductor mode chat, a Bot's own chat, "
+                "and a scheduled-run, app-scoped, channel-linked or "
+                "channel-mirrored session. Incognito and temporary sessions can rename "
+                "themselves. The change applies when this turn's result is processed."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "The new sidebar title, at most 200 characters.",
+                    },
+                },
+                "required": ["title"],
+            },
+        },
+        {
             "name": "suggest_followup",
             "description": (
                 "Offer the user up to 3 follow-up items as a card below the chat "
-                "composer in the CURRENT dashboard session. Each item shows a title "
-                "and description with three buttons: 'Start in new worktree' (creates "
-                "a git worktree off origin/HEAD, or the project's current HEAD when "
-                "that does not resolve, opens a new chat "
-                "session scoped to it, and pre-fills the composer with your prompt), "
+                "composer in the CURRENT dashboard session. Each item shows a title, "
+                "a description and the first three lines of your prompt, with a "
+                "'Show prompt' toggle for the rest, and three buttons: 'Start in a "
+                "separate copy' (creates a git worktree off origin/HEAD, or the "
+                "project's current HEAD when that does not resolve, opens a new chat "
+                "session scoped to it, and pre-fills its composer with your prompt), "
                 "'Add to this session' (pre-fills this session's composer with your "
-                "prompt), and 'Skip'. Both non-skip buttons PRE-FILL the composer — "
-                "the user still presses send — so nothing runs without their consent. "
+                "prompt), and 'Skip'. Both non-skip buttons PRE-FILL a composer and "
+                "the user still presses send, so nothing runs without their consent. "
+                "Only when the user has turned on 'Send follow-ups with one click' in "
+                "Settings does Start SEND your prompt as the new session's first "
+                "message instead, so one click starts a turn that runs it in the "
+                "background while the user stays in this session; the "
+                "button then reads 'Run in a separate copy' ('Run in new chat'). "
                 "When the session has no project directory, or its project directory "
                 "is not a git repository (or is only a folder inside a repository "
                 "rooted higher up), the first button is 'Start in new chat' "
                 "instead: it opens a new chat session in the same project directory "
-                "and sidebar folder, with no worktree and no git call, and pre-fills "
-                "its composer (the tool result tells you when the session has no "
-                "project directory); 'Add to this session' always works."
+                "and sidebar folder, with no worktree and no git call, and hands it "
+                "your prompt the same way (the tool result tells you when the "
+                "session has no project directory); 'Add to this session' always "
+                "works."
                 "\n\n"
                 "Call this at the END of a turn when you have finished the requested "
                 "work and see concrete next steps worth doing. Do NOT call it to ask a "
@@ -1077,7 +1175,8 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                 "The 'prompt' field is the real payload: write a COMPLETE, standalone "
                 "handoff instruction for the next agent, which may have none of this "
                 "session's context. Name the files, paths, constraints, and acceptance "
-                "criteria explicitly. 'title'/'description' are only the human-facing "
+                "criteria explicitly. Start may send it verbatim, so write it to be "
+                "safe to run as written. 'title'/'description' are only the human-facing "
                 "label. Prefer 'branch' + the worktree route for work that should not "
                 "share this session's working tree."
                 "\n\n"

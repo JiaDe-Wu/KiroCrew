@@ -22,12 +22,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from closed_peer_helpers import refused_peer_connects  # noqa: F401
 
 from kiro_crew.dashboard import handlers_instances as handlers
 from kiro_crew.dashboard import server
 from kiro_crew.instances.registry import InstancesRegistry
 from kiro_crew.instances.ssh_tunnel_manager import SshTunnelManager, TunnelState, TunnelStatus
 from kiro_crew.pre_exec_stops import register_pre_exec_stop, run_pre_exec_stops
+
+pytestmark = pytest.mark.usefixtures("refused_peer_connects")
 
 #: Bound on reaping a test's own child after a signal. It only names a hang: a
 #: child that ignores SIGTERM is killed at it, and one that outlives the kill
@@ -217,6 +220,37 @@ class TestTheStartupRevive:
         await server._revive_intended_instances(reg, mgr, state)
 
         assert _Tunnel.built == ["cd-1"]
+        await mgr.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_a_shutdown_mid_revive_stops_at_the_next_instance(self, env):
+        """A gateway stop that lands mid-revive tears every tunnel down; the
+        revive must not start the next forwarder after that, or it outlives the
+        gateway holding a loopback port."""
+        from kiro_crew import shutdown_event
+
+        reg, mgr = env
+        reg.add(name="B", ssh_host="b-alias", instance_id="b", remote_port=7778)
+        reg.update("cd-1", was_connected=True)
+        reg.update("b", was_connected=True)
+        state = _state(reg, mgr, restarting=False)
+        real_connect = mgr.connect
+
+        async def _connect_then_stop(instance_id, *args, **kwargs):
+            status = await real_connect(instance_id, *args, **kwargs)
+            shutdown_event.set()
+            await mgr.shutdown()
+            return status
+
+        mgr.connect = _connect_then_stop
+        try:
+            await server._revive_intended_instances(reg, mgr, state)
+        finally:
+            shutdown_event.clear()
+
+        assert _Tunnel.built == ["cd-1"]
+        assert mgr.status("b") is None, "no forwarder may start after shutdown"
+        assert reg.get("b").was_connected is True, "the intent survives for the next start"
         await mgr.shutdown()
 
 

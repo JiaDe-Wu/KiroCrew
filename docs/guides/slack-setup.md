@@ -14,7 +14,8 @@ There are **two independent paths** to create a Slack app. Pick one, and do not 
 
 | Path | Steps | Best for |
 |------|-------|----------|
-| **[Path A: Manifest](#path-a-create-via-manifest-recommended)** (recommended) | 6 steps | Most users; auto-configures all scopes, events, and permissions in one shot |
+| **[Setup wizard](#the-setup-wizard-in-settings)** in the dashboard | 6 screens | Most users; the same manifest as Path A, one screen per step, no restart |
+| **[Path A: Manifest](#path-a-create-via-manifest-recommended)** (recommended for the CLI) | 6 steps | CLI users; auto-configures all scopes, events, and permissions in one shot |
 | **[Path B: Manual](#path-b-manual-setup)** | 11 steps | If you need to customize scopes or understand each setting individually |
 
 Both paths require a Slack workspace where you can install apps (see [Prerequisites](#prerequisites)).
@@ -27,6 +28,29 @@ Both paths require a Slack workspace where you can install apps (see [Prerequisi
 - Python and Kiro Crew installed through a [supported install path](install.md#install-paths), so you can run the `kirocrew` CLI.
 
 > **Tip**: Use a personal or test workspace for your first run. You can always export the app manifest and recreate the app in another workspace later (see [Reusing the App in Another Workspace](#reusing-the-app-in-another-workspace)).
+
+---
+
+## The Setup Wizard in Settings
+
+Open the dashboard → **Settings → Messaging Channels → Slack**. Click **Setup wizard** at the top of the panel to open the setup wizard; it never opens by itself, and **Close** hides it on any step. The panel's own **Copy manifest YAML** and setup-guide link stay available below it. It runs Path A one screen at a time, each with a picture of where to click in Slack:
+
+1. **Workspace**: confirm you have a workspace you may install apps in.
+2. **Create**: type a short name (usually your username), click **Create Slack app**, pick the workspace in Slack and click **Create**, then **I created the app**. The app is named `KiroCrew-<name>` and its slash command `/kirocrew-<name>`, so it does not clash with anyone else's; the wizard saves that command as `slack.command`.
+3. **Bot token**: install the app (**OAuth & Permissions → Install to Workspace**) and paste the `xoxb-` token. In a company workspace the button may read **Request to Install**: an admin approves the app first.
+4. **App-level token**: the wizard links the app's **Basic Information** page; generate a token with `connections:write` and paste the `xapp-` token.
+5. **Owner**: paste your Slack member ID. The wizard saves it and runs **Reconnect**; no gateway restart.
+6. **Test**: open the bot's DM from the wizard, send any message, and confirm you got a reply.
+
+The settings are written only from the machine running the gateway; a remote dashboard sees the steps as text.
+
+**Organization guide link.** An organization can link its own setup guide (for example, how to get a workspace you may install apps in) on the wizard's first step:
+
+```bash
+kirocrew config set slack.setup_guide_url https://wiki.example.com/slack-setup
+```
+
+Only an `https://` URL is shown; any other value is ignored.
 
 ---
 
@@ -44,11 +68,13 @@ This prints a one-click URL that opens Slack's "Create New App" page with all sc
 🔗 Click to create your Slack app:
 https://api.slack.com/apps?new_app=1&manifest_yaml=...
 
-   Slash command: /kirocrew-<alias> — the gateway answers it once slack.command matches:
+   Slash command: /kirocrew-<alias> — the gateway answers it as soon as the app is installed.
+   Save the name so help text and manifest updates keep it (applies live, no restart):
    kirocrew config set slack.command kirocrew-<alias>
+   Slack Code switches rendered: none
 ```
 
-The app's slash command is `/kirocrew-<alias>` (lowercase, cut to Slack's 32-character limit), so people with different aliases in one Enterprise Grid org register different commands. Two aliases that differ only in case, or only after their first 22 characters, still collide; pass `--alias` to pick another. Run the printed `kirocrew config set slack.command` line so the gateway answers it; `kirocrew setup --slack` keeps offering `kirocrew` (or your configured command) as its default.
+The app's slash command is `/kirocrew-<alias>` (lowercase, cut to Slack's 32-character limit), so people with different aliases in one Enterprise Grid org register different commands. Two aliases that differ only in case, or only after their first 22 characters, still collide; pass `--alias` to pick another. The gateway answers `/kirocrew` and any `/kirocrew-<alias>` your app registers right away, with no restart. Run the printed `kirocrew config set slack.command` line too: Settings → Messaging Channels → Slack renders manifest updates from that saved name, so without it an update would rename the command back to `/kirocrew`. The change applies live. `kirocrew setup --slack` keeps offering `kirocrew` (or your configured command) as its default.
 
 ### Step 2. Create the App from the Link
 
@@ -75,11 +101,11 @@ Then:
 
 ### Step 3. Generate App Token
 
-1. **Settings → Socket Mode** → Toggle **OFF** then back **ON**, which triggers the token generation dialog
+1. **Basic Information** → **App-Level Tokens** → **Generate Token and Scopes**
 2. Add scope `connections:write` → **Generate**
 3. Copy the `xapp-...` token. This is your **App Token**
 
-> **Why toggle off/on?** Slack manifests can declare `socket_mode_enabled: true`, but the App Token (`xapp-...`) must still be generated manually through the UI. There is no API or manifest field for token generation. Toggling forces the generation dialog to appear.
+> **Why by hand?** Slack manifests can declare `socket_mode_enabled: true`, but the App Token (`xapp-...`) must still be generated in Slack's UI. There is no API or manifest field for token generation.
 
 ### Step 4. Install to Workspace
 
@@ -163,8 +189,9 @@ Add it only if you want custom workspace emojis to appear in the emoji picker.
 > **reinstalled** to the workspace. After adding scopes (or importing an
 > updated manifest), go to **Settings → Install App → Reinstall to Workspace**
 > and copy the new Bot Token. Importing a manifest from `kirocrew manifest`
-> renames the app's slash command to `/kirocrew-<alias>`: run the
-> `kirocrew config set slack.command` line it prints, then restart the gateway.
+> renames the app's slash command to `/kirocrew-<alias>`. The gateway answers
+> it right away; run the `kirocrew config set slack.command` line it prints so
+> later manifest updates keep that name. No restart is needed.
 
 ### Step 4. Add User Scopes
 
@@ -178,6 +205,13 @@ These scopes belong to the installing user's `xoxp-...` token. The Kiro Crew
 gateway itself uses the bot token; the user token is for a separately configured
 Slack MCP/search integration that lets an agent search Slack as that user. Store
 and configure that token only in the integration that consumes it.
+
+Turning on **Slack tools for your agents** (see
+[Slack Code](#slack-code-agent-sessions-code-channels-and-slack-tools) below)
+replaces this list in the generated manifest with the 18 read-only user scopes
+Slack's MCP server needs: `search:read` goes, and the granular `search:read.*`
+scopes, `files:read`, `canvases:read` and `lists:read` come in. Scopes an
+installed app was already granted stay on it until the app is reinstalled.
 
 ### Step 5. Subscribe to Events
 
@@ -202,7 +236,7 @@ and configure that token only in the integration that consumes it.
 | Short Description | Dashboard access, agent, session, and channel controls |
 | Usage Hint | `dashboard [duration] \| agent [name] \| sessions \| #channel` |
 
-The command name you choose here must match the `slack.command` value in `~/.kiro/crew/config.json` (default: `kirocrew`):
+The gateway answers `/kirocrew` and any `/kirocrew-<alias>` without a restart. Save the name you register as `slack.command` (manifest updates are rendered from it); for any other name, set it as `slack.command` in `~/.kiro/crew/config.json` (default: `kirocrew`); it applies without a restart and is also the name help text shows:
 
 ```json
 {
@@ -315,13 +349,14 @@ Set `reactions_enabled` to `false` to disable both. Valid keys: `queued` (the ac
 
 ---
 
-## Slack Code: Agent Sessions and Code Channels
+## Slack Code: Agent Sessions, Code Channels and Slack Tools
 
-Settings → Messaging Channels → Slack → **Slack Code** has two opt-in switches, **Agent
-sessions** and **Code channels**. Turning either on needs a few more permissions for your
-Slack app, so an app you already installed needs an update and a reinstall. Until the app
-has the new permissions, a switch changes nothing even when it is on, and the **Update
-your Slack app** panel says what is missing.
+Settings → Messaging Channels → Slack → **Slack Code** has three opt-in switches, **Agent
+sessions**, **Code channels** and **Slack tools for your agents**. Turning one on needs a few
+more permissions or settings for your Slack app, so an app you already installed needs an
+update and a reinstall. Until the app has the new permissions, Agent sessions and Code
+channels change nothing even when on, and the **Update your Slack app** panel says what is
+missing.
 
 **Code channels** is marked **Preview**. You can turn it off again, render the manifest
 without those lines and save that in Slack.
@@ -346,15 +381,43 @@ enabled** in the panel, and Slack keeps working as before.
 | Switch | Manifest additions |
 |---|---|
 | Agent sessions (`slack.agent_sessions`) | `features.agent_view`; bot scope `assistant:write`; events `agent_session_stopped`, `agent_session_title_changed` |
-| Code channels (`slack.code_channels`) | `features.code_channels.enabled: true`; bot scopes `code_channels:manage`, `chat:write.customize`, `canvases:write`, `channels:write.invites`, `groups:write.invites`; event `agent_session_stopped` |
+| Code channels (`slack.code_channels`) | `features.code_channels.enabled: true`; bot scopes `code_channels:manage`, `chat:write.customize`, `canvases:write`, `channels:write.invites`, `groups:write.invites`, `pins:write` (the work board pins itself); event `agent_session_stopped`, plus `channel_archive`, `channel_unarchive`, `channel_rename`, `group_archive`, `group_unarchive` and `group_rename`, which keep a code channel's archived state and `#name` in step on its session badge. Slack's manifest editor refuses `code_channel_action` as a bot event, so the manifest does not list it; whether a click on the context bar's Create PR or Stop reaches the app is not yet confirmed in a live workspace. `/create-pr`, `!stop` and Slack's own Stop button do not depend on it |
+| Slack tools for your agents (`slack.slack_mcp`) | `settings.is_mcp_enabled: true`; `oauth_config.pkce_enabled: true`; redirect URL `http://localhost:48106/callback`; the user scopes become exactly these read-only ones, replacing the list from Step 4 (`search:read` goes): `search:read.public`, `search:read.private`, `search:read.mpim`, `search:read.im`, `search:read.files`, `search:read.users`, `channels:history`, `groups:history`, `mpim:history`, `im:history`, `channels:read`, `groups:read`, `im:read`, `mpim:read`, `users:read`, `files:read`, `canvases:read`, `lists:read`. No bot scope or event |
 
 > **Agent view is one-way.** Slack cannot switch an app from `agent_view` back to
 > `assistant_view` once the manifest is saved in Slack.
 
+> **Before you save a manifest with Slack tools for your agents on.** The switch lets this
+> one Slack app also serve Slack's MCP server (`https://mcp.slack.com/mcp`), so each person
+> can connect their agents to Slack as themselves. The switch itself only changes the
+> generated manifest, and you can turn it off again. Saving that manifest in Slack is the
+> step that cannot be undone:
+> - Saving the manifest in Slack turns **PKCE** on, and only Slack support can turn it off.
+> - Keep the app **internal**: do not turn on public distribution. Slack blocks MCP for a
+>   publicly distributed app that is not listed in the Slack Marketplace.
+> - Each person still connects on their own: on the Slack card under **Settings →
+>   Connections** they save this app's **Client ID** and **Client Secret**, then select
+>   **Connect** ([oauth-app-registration/slack.md](oauth-app-registration/slack.md),
+>   sections 5 and 6). The card offers **Connect** once the Crew-owned sign-in preview
+>   is on and chats run on Kiro Agent; until then it links to that setting.
+> - On a PKCE app Slack expires refresh tokens 30 days after sign-in, so each person
+>   reconnects about once a month.
+>
+> **One app for both.** The Slack card's sign-in asks only for user scopes, which is all a
+> PKCE `localhost` sign-in may ask for, so this app keeps its bot scopes and **Install to
+> Workspace** still issues the bot token. The guide above also registers a separate app
+> for the MCP side only, which can leave its Bot Token Scopes empty. Never remove them
+> from an app the bot uses: the bot stops working.
+>
+> Settings shows this switch only while Connections offers a Slack card (the Connections
+> gallery is on), or while the switch is on (with a note, so you can turn it off). The
+> gateway runs nothing for it, and Slack does not report an app's user scopes or settings
+> to the bot token, so the panel lists these lines without checking them.
+
 To update an existing app:
 
 1. Turn the switch on in Settings and **Save**.
-2. In the **Update your Slack app** panel, select **Copy manifest YAML**, then **Open App
+2. In the **Update your Slack app** panel, select **Copy manifest**, then **Open App
    Manifest** (or **App Config → App Manifest** on <https://api.slack.com/apps>).
 3. Replace the YAML with the copied manifest and select **Save Changes**. The copied
    manifest keeps your app's slash command. Only if you edited the app in Slack by hand:
@@ -369,11 +432,174 @@ To update an existing app:
 If the panel reads **Workspace not enabled**, the app has the scopes but Slack has not
 turned code channels on for your workspace; a workspace admin has to enable it.
 
-For code channels you can also set a default folder, agent, model and reasoning effort for
-new code channels; see [Slack integration](../../src/kiro_crew/docs/slack-integration.md#slack-code-agent-sessions-and-code-channels).
+For code channels you can also set a default folder, agent, model, reasoning effort and
+approval mode for new code channels; see [Slack integration](../../src/kiro_crew/docs/slack-integration.md#slack-code-agent-sessions-code-channels-and-slack-tools).
 With nothing set, code channels go into a **Code channels** sidebar folder, created the first
-time one is needed and set to run `kirocrew-conductor`. To use another folder, pick it, or
+time one is needed with no agent of its own, so a new code channel runs your default agent.
+A **Code channels** folder an earlier release created with `kirocrew-conductor`, and left as
+it was, is read the same way by code channels. A dashboard **New chat** started in that
+folder still gets `kirocrew-conductor`; clear the folder's agent in the sidebar to change
+that too. To use another folder, pick it, or
 choose **New folder…** in the folder list to create one there.
+
+A conductor only plans and hands off work, so in a code channel it needs **Let code channels
+start helper agents** (`slack.code_channel_dispatch`), the sub-toggle under **Code channels**. It
+turns on when you first turn Code channels on, and you can turn it off there or in the same save.
+If a value is already saved, including an off, turning Code channels on keeps it, so an existing
+setup does not change on upgrade. A missing, unreadable or malformed value reads as off. Helpers work in the code
+channel's folder and ask you before changing files, unless that channel is set to approve
+automatically (Trust). When on, the channel's conductor can
+create worker sessions and follow them on its work ledger, only on your own messages, only for
+workers it created, one level deep, filed beside the conductor in its folder and nested under it in the sidebar. Channels shared outside the
+workspace (Slack Connect) never qualify. It applies on the next call, with no restart. If `config.local.json` sets
+`slack.code_channel_dispatch`, that file wins: the toggle is disabled and says so, and you change
+it there.
+
+When the conductor tries to hand off work while this is off, it tells you where the toggle is
+(**Settings → Channels → Slack → Code channels → Let code channels start helper agents**), and the
+channel gets one short notice with a **Turn on helper agents for all code channels** button. Only you,
+the owner, can press it; anyone else is told so privately. It asks you to confirm, then saves
+the same setting the toggle saves (it turns helper agents on for every code channel) and the notice
+changes to "Helper agents are on. Send your request again." Nothing is retried for you: send your
+request to the conductor again. The notice is posted once per channel while helper agents stay off.
+
+While its workers run, the conductor can tell you each one's state (working, idle, queued,
+waiting on an approval, closed or lost) and how long since it last did anything, with a link
+to the worker's chat in the dashboard. It never reads a worker's transcript into the channel,
+and the link carries no sign-in: opening it still asks you to sign in to the dashboard.
+
+If the gateway restarts while a code channel is working, it picks the work up by itself once
+Slack reconnects -- the channel's own conversation and the workers it started -- and says so in
+the channel. It does that only once per interrupted piece of work: if that work is cut off
+again, the channel instead gets a **Resume** button that only you can press.
+
+### Choosing each code channel's agent
+
+A new code channel starts on the default agent: the **Agent** set here, else the default
+folder's own default agent, else your default agent (`agent.default_agent`, or `kirocrew`).
+
+**Always use conductor mode** (`slack.code_channel_defaults.conductor_mode`, under the default
+folder, off by default) runs every new code channel in conductor mode on the conductor mode agent
+(`agent.crew_mode_agent`, `kirocrew-conductor` unless you set another). While it is on it
+overrides the **Agent** set here and the folder's agent, and the **Agent** menu is disabled; the
+agent you picked there is kept for when you turn it off. Channels already running keep their
+agent. A conductor hands work to helper agents, so it also needs **Let code channels start
+helper agents**; the card warns while that is off. The LTS edition has no conductor mode, so
+there the switch is hidden and a saved on has no effect.
+
+To run a channel on a different
+agent, use either of these in the channel:
+
+- **The picker in the first message.** The message Kiro Crew posts when a channel opens has
+  an **Agent for this channel** menu, set to the agent the channel runs. Pick another one
+  and the channel's session switches to it. The message then shows the new agent and who
+  picked it.
+- **`/<command> agent <name>`.** Switches the channel to `<name>`. If no agent has that
+  name, the reply lists the agents you can pick. `/<command> agent` with no name shows the
+  channel's current agent and the list. In a code channel this command switches only that
+  channel. Anywhere else it works as before (see [Slash Commands](#slash-commands)).
+
+Both list every agent a code channel can run: your own agents, `kirocrew-conductor` and the
+coding agents. Agents that can't run a channel are left out: `kirocrew-lite` (no tools),
+`kirocrew-guest`, the dashboard manager and the background heartbeat agent. This is the
+same list the **Agent** menu above shows. Model and reasoning effort stay as the channel
+started with them; only the agent changes.
+
+If a turn is running when you pick, nothing changes and you get a message asking you to
+try again when the turn ends. Only the owner can change a channel's agent. Anyone else gets
+a message only they can see, and nothing changes. Each change, and each refused one, is
+recorded in the security event log.
+
+### Approval mode for code channels
+
+A code channel is driven from Slack, where nobody may be watching the dashboard to answer
+an approval prompt. **Approval mode** on the Code channels card
+(`slack.code_channel_defaults.approval_mode`) picks the mode each new code channel's
+session starts in:
+
+| Picker | Config value | A new code channel's session |
+|---|---|---|
+| Normal (default) | `ask` (or unset) | looks things up on its own (file reads, web searches, read-only shell commands); asks for everything else, as before |
+| Reads | `trust_reads` | also searches memory, past chats, skills and the knowledge library without asking; asks for everything else |
+| Trust | `trust` | runs every tool without asking |
+
+> **Trust is a real grant.** With Trust, anyone allowed to talk to the bot in that channel
+> drives an agent whose tools run without prompts, and sessions the agent spawns inherit
+> that posture. Pick it only for channels whose members you would hand a shell.
+
+The mode is applied once, when the code channel's dashboard session is created, through
+the same per-session approval the dashboard's approval picker sets, and is recorded in the
+security event log as `mode_change:<mode>` by `slack:code_channel`. It never turns on
+YOLO and never ends a YOLO grant. After that the session is an ordinary one: change its
+mode in the session's own approval picker at any time. Like every session's approval mode
+it is held in memory, so after a gateway restart the session asks again until someone
+picks a mode on it. A change to this setting applies to the next new code channel;
+existing ones keep the mode they have.
+
+There is no per-channel override hook: Crew's script hooks (`AgentSpawn`,
+`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`) run once a turn is under way
+and can only add context or decide one tool call, not choose a session's approval mode.
+To keep one channel on Normal, change the mode on that channel's session. If that session
+is closed, the channel's next message opens a new session, which starts in the configured
+mode again.
+
+**Changing it from the channel.** Only you (the bot's owner) can change a channel's mode
+from Slack, two ways, using the dashboard's own mode names:
+
+- **The picker in the first message.** Below **Agent for this channel**, the kickoff has an
+  **Approval mode** menu (Normal / Reads / Trust), showing the session's mode as of the
+  last time the message was drawn: a change made on the dashboard, or a gateway restart,
+  does not redraw it. A line under the menu says what each mode does. Picking Normal
+  switches at once. Picking Reads or Trust first sends you a private message naming the
+  mode and what it does, with a **Switch to Reads** / **Switch to Trust** button (good for
+  10 minutes); nothing changes until you press it. The message then shows the new mode and
+  who set it, until the next change to either menu.
+- **`/<command> approval normal|reads|trust`** (code channels only). `normal` sets Normal,
+  `reads` Reads, `trust` Trust. **Trust this channel** asks you to confirm first, as the **Approval mode** menu does for Reads and Trust, since they reach the
+  helper sessions the channel's agent starts too, including ones already running.
+  `/<command> approval` with nothing after it shows the channel's current mode. Outside a code channel it is not a command (you get the help list).
+
+Both go through the same audited change as the session's own approval picker on the
+dashboard. Switching to Trust either way posts a warning line in the channel. Normal also
+ends a YOLO grant if one is on, as Normal does on the dashboard; YOLO covers every
+session, so the reply says so, and while YOLO is on the first message carries a line
+saying tools run without asking whatever the menu shows. Anyone else gets a message only
+they can see, and nothing changes.
+
+**Approval prompts in the channel.** When a code channel's session needs an approval, the
+**Tool approval requested** card is posted in the channel itself, where the agent's
+replies go, not in a thread. Besides **Approve** and **Reject** it has **Trust this
+channel**: only you (the bot's owner) can use it, and it approves that call and puts the
+channel's session on Trust, through the same audited change as the dashboard's Trust
+button. The channel then gets a one-line warning that tools run without asking, for the
+agent and any helper sessions it starts, including ones already running. Anyone else who clicks it is told
+they can't, and nothing changes. A card answered by a switch to Trust (yours or a
+helper session's) changes in place to say it ran under Trust, and its buttons go. A card answered
+some other way while the switch was being made never claims that. The card shows a command once: the
+command line, plus the other arguments only when there are any.
+
+**Workers follow the channel's mode.** Changing the channel's approval mode from the first
+message, `/<command> approval normal|reads|trust` or a **Trust this channel** button changes it
+for the workers the channel's agent is already running as well, each change recorded like
+the dashboard's. A raise reaches only the workers still following the channel, under the
+same rules as raising a session on the dashboard: a worker whose own mode someone set
+keeps it. A lowering reaches every worker above the new mode. Lowering the channel also lowers anything those
+workers started in turn, since a session starts with its creator's mode; nothing below
+the agent's own workers is ever raised. If a worker can't be changed, the reply names it.
+A session whose creator has already closed is no longer counted as under the channel, so
+a lowering doesn't reach it; change its mode from the dashboard. Raising to Trust also answers their waiting tool
+prompts, as switching a session to Trust does on the dashboard. A person-only question
+from a worker is never answered for you. Sessions the agent did not start are left alone.
+
+**Workers ask in the channel too.** When the channel's agent starts worker sessions, a
+worker's approval prompt is also posted in the channel, headed with the worker's title
+(for example **A helper session this channel started (Fix #21964)** wants to run:). The card shows the tool and its
+arguments, with secrets and suspicious links redacted, and nothing from the worker's
+conversation. Only you can answer it: **Approve** and **Reject** answer the worker's
+prompt exactly as the dashboard's buttons do, and **Trust this channel** approves it and
+puts the whole channel on Trust, this worker and its siblings included. If the prompt is
+answered in the dashboard or nobody answers in time, the card changes to say so and its
+buttons go.
 
 ---
 
@@ -504,7 +730,7 @@ message being forwarded to the linked session.
 
 ### Slash Commands
 
-The slash command name is configurable via `slack.command` in config (default: `kirocrew`). It must match the command in your Slack app: `kirocrew manifest` registers `/kirocrew-<alias>` and prints the matching `kirocrew config set slack.command` line.
+The gateway answers `/kirocrew`, any `/kirocrew-<alias>` (what `kirocrew manifest` registers), and `slack.command` if you set a custom name (default: `kirocrew`). Help, usage replies, the Home tab and code-channel replies name the command you last typed (`slack.command` until then). Changing `slack.command` applies without a restart.
 
 | Command | Purpose |
 |---------|---------|
@@ -512,7 +738,8 @@ The slash command name is configurable via `slack.command` in config (default: `
 | `/<command> dashboard 2h` | Dashboard link with custom duration (cap 20h) |
 | `/<command> yolo` | Toggle auto-approve all tool calls |
 | `/<command> agent` | Show agent selector dropdown |
-| `/<command> agent <name>` | Switch to a named agent |
+| `/<command> agent <name>` | Switch to a named agent (in a code channel: switch that channel's agent) |
+| `/<command> approval normal\|reads\|trust` | Code channels only: set that channel's approval mode (Normal / Reads / Trust) |
 | `/<command> voice` | Configure TTS voice settings |
 | `/<command> config` | Manage tracked channels (owner-only; multi-user access is disabled) |
 | `/<command> users` | Report that multi-user access is disabled |
@@ -546,6 +773,7 @@ to use instead.
 | `!voice` | Configure TTS voice settings |
 | `!channel` | Configure the current channel |
 | `!stop` | Interrupt the running turn |
+| `!compact` | Compact the current thread's session context in place |
 | `!restart` | Restart the gateway |
 
 ### Keyword Commands

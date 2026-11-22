@@ -7,20 +7,18 @@
 > This spec describes internals.
 
 Auto-Improvement is an opt-in (`defaultEnabled: false`) built-in app that runs a
-measurement-first self-improvement loop against a GitHub repository. It calibrates
+measurement-first self-improvement loop against a GitHub or GitLab repository
+(`github.com`, `gitlab.com`, or a self-managed GitLab host listed in
+`dashboard.gitlab_hosts`). It calibrates
 a metric (the "ruler"), **proves** the metric can detect a known win, and only
 then runs keep-or-revert improvement cycles. Candidates that survive a
 deterministic gate and an A/B (or RED/GREEN) measurement are opened as **draft**
-GitHub pull requests for human review.
+GitHub pull requests (draft merge requests on GitLab) for human review.
 
 The load-bearing design property is that every *decision* is deterministic Python
 and every *proposal* is an agent: the agent writes candidate fixes, and the gate,
 measurer, keeper, and PR pipeline decide what survives. The agent never grades its
 own work.
-
-The app's origin as a port of an upstream app, and the design decisions the port
-made, are recorded in
-[`PORT_PLAN.md`](../../../src/kiro_crew/apps/builtins/auto_improvement/docs/PORT_PLAN.md).
 
 ## Routes
 
@@ -95,6 +93,7 @@ echoed back in `rejected` rather than silently dropped.
 **Pinned invariants.**
 
 - `POST /setup-clone`'s success path is exercised end to end, asserting the persisted config, not only the 200. (D-82)
+- `POST /setup-clone` stores `target_url` rebuilt from the validated `owner/repo`, never as pasted, so a query, fragment or path tail on the pasted URL never reaches `config.json` (`test_a_token_in_the_pasted_url_is_never_persisted`).
 
 ## PR status and the watcher verdict
 
@@ -132,12 +131,14 @@ and never drive the verdict, or one flaky optional job would nudge forever.
 | Control | Where | Behavior |
 |---|---|---|
 | Push-disabled clone | `backend/clone_setup.py:_disable_push` + `profiles/github_repo/profile.py:RepoIsolation.push_disabled` | **Every** configured fetch/push URL is replaced with exactly one `DISABLED_NO_PUSH` value; setup and runtime fail closed on extra values. The real remote lives in config (`origin_url`), handed only to trusted publishers |
-| Draft-only PRs | `profiles/github_repo/pr_recipe.py` | `gh pr create --draft`; never `--web`, merge, ready, or auto-merge |
-| Generated head branch | same | `auto-improvement/<kind>-<fingerprint>`; never a human's branch |
+| Clone pinned to its project | `backend/clone_setup.py:_clone_identity` + `_record_clone_identity` | A new clone records the SHA-256 of its lower-cased `host/path` as the local git config `kirocrew.cloneidentity`. Reusing an existing clone directory refuses when that value names another project or is ambiguous (more than one value), and records it once on a clone that predates it; setup fails closed when it cannot be written |
+| Draft-only PRs | `profiles/github_repo/pr_recipe.py`, `profiles/gitlab_repo/mr_recipe.py` | `gh pr create --draft` (GitLab: `glab mr create --draft`); never `--web`, merge, ready, or auto-merge |
+| Generated head branch | `profiles/pr_recipe_base.py:branch_name` | `auto-improvement/<kind>-<fingerprint>`; never a human's branch |
 | Protected-branch denylist | `spine/push_policy.py` | non-overridable; a hand-edited config cannot widen it |
 | Edit allowlist | `spine/gate.py` + profile | ruler/harness/tests/auth are mechanically off-limits |
 | Do-not-pollute gate | `spine/pollute.py` | host state hashed before/after; drift blocks the run |
 | Second reproduce | `spine/pr_pipeline.py` | an independent A/B must confirm before a PR is drafted |
+| Candidate admission check (opt-in) | `spine/candidate_admission.py:admit_candidate` | `candidateAdmissionCommand` set (file-only, so a config-API caller cannot unset it; POSIX only, a set value refuses the run on Windows): both keep paths ask it, in the tests' `strict` sandbox and its own process group (killed whole when the check ends, by an answer or the 60 s timeout), before the provisional commit; only a fresh matching `admitted` answer from a clone clean before and unchanged after the check keeps, anything else is `failed_verify` (MANUAL §7) |
 | Pre-push review gate | `spine/driver_publish.py:_prepush_review_clean` | optional, fail-closed; an unfounded "clean" cannot pass it |
 | Tool-request gate | `spine/agent_runner_gate.py:_tool_permitted` + `shell_command_refusal` | the caller's `allowed_tools` is ENFORCED, and state-mutating shell verbs are refused even when Bash is allowed |
 | Audit-or-deny approval | `spine/agent_runner.py:_approve` | the unattended auto-approve is logged to the SEL with `critical=True` **before** it is granted; an unwritable audit REJECTS the tool |
@@ -151,7 +152,7 @@ and never drive the verdict, or one flaky optional job would nudge forever.
 ### Clone setup and reuse contract
 
 `setup_safe_clone` derives the canonical destination from the validated GitHub
-`owner/repo`; it never treats clone contents as trusted. The improvement agent is
+`owner/repo` or GitLab `group/project`; it never treats clone contents as trusted. The improvement agent is
 expected to edit that checkout, so reuse attests only properties the host can
 enforce: the scratch root/destination and Git metadata contain no links or
 redirections, local Git config has no includes/URL rewrites/worktree override,
@@ -316,7 +317,11 @@ build, test and lint commands, find the root cause, and fix it". So the shell st
 and `_FORBIDDEN_BINARIES`; they cover, among others, `git push` and `git remote set-url`,
 `gh pr merge`/`ready`/`close`/`comment`/`review`/`edit`/`create`, every `gh issue` and
 `gh release` verb, `gh api`, `gh auth`, `gh secret`, `gh workflow run`, and the
-`curl`/`wget`/`nc`/`ncat`/`netcat`/`ssh`/`scp`/`sftp`/`telnet` binaries. The repo's own
+`curl`/`wget`/`nc`/`ncat`/`netcat`/`ssh`/`scp`/`sftp`/`telnet` binaries. `gh alias` is denied,
+and each `gh` verb has its `glab` twin. glab's own top-level aliases (`pipe`/`pipeline` for
+`ci`, `var` for `variable`, `sched`/`skd` for `schedule`) are read as the command they name,
+and a `glab` verb outside glab's command list (`_GLAB_COMMANDS`) is refused, because glab runs
+it as a user alias. A `gh` verb outside gh's list is not refused yet. The repo's own
 `is_sensitive_bash_command` does not cover this — it allows `gh pr merge`.
 
 **What that leaves un-confined, stated plainly.** The denylist gates the command a request
@@ -411,7 +416,8 @@ exits — the draft-PR push, the F10 direct push and one-click commit — so wha
 is where a verified change goes. It never returns a stored ``origin_url`` verbatim; every
 caller treats ``""`` as "no push target", so each refusal below fails closed.
 
-1. **Host allowlist.** The network host must match exactly, never by ``endswith`` —
+1. **Host allowlist.** The network host must be ``github.com``, ``gitlab.com`` or a host
+   in ``dashboard.gitlab_hosts`` (``_is_allowed_remote_host``), matched exactly, never by ``endswith`` —
    ``evilgithub.com`` and ``github.com.attacker.net`` both fail. ``http://`` and ``git://``
    are refused because cleartext is never this app's push transport, and the
    ``DISABLED_NO_PUSH`` sentinel is refused because it is a marker rather than a
@@ -420,15 +426,22 @@ caller treats ``""`` as "no push target", so each refusal below fails closed.
    ``git@github.com:owner/repo.git`` whenever ``gh`` prefers ssh.
 2. **Repository identity.** ``github.com`` is itself an allowed host, so the host alone
    would let an edited ``config.json`` keep the host and swap the path. A network
-   ``origin_url`` must therefore name the same ``owner/repo`` as the validated
-   ``target_url``, compared transport-agnostically through ``_remote_slug``. When the two
+   ``origin_url`` must therefore name the same project path and host as the validated
+   ``target_url``, the path compared transport-agnostically through ``_remote_slug`` and
+   the host through ``_remote_host_matches``. When the two
    differ, or ``target_url`` is missing or does not validate, there is no push target.
 3. **Local paths stay allowed.** ``/tmp/x.git`` and ``file://`` have no network host to
    redirect to; they are what the app's own tests push to, and a local bare repo is a
    legitimate offline setup. On Windows a drive path (``C:\work\repo.git`` or
    ``C:/work/repo.git``) is local too, even though ``urlparse`` reads the drive letter as a
    scheme. Elsewhere the same text stays refused, because git on POSIX parses ``C:path``
-   as scp-like ssh to a host named ``C``.
+   as scp-like ssh to a host named ``C``. A value git reads as remote is refused on every
+   platform: git's scp-like rule sends a ``:`` before any ``/`` to ssh (``user@host:path``,
+   and ``file:x`` to a host named ``file``), and a ``file://`` url naming a host other than
+   ``localhost`` reaches that host. On Windows a UNC path (``\\host\share``,
+   ``//host/share``, ``\\?\UNC\host\...``) is refused too, read after the
+   percent-decoding git applies to a url; on POSIX the same text is a local path and stays
+   allowed. Spell a Windows drive url ``file:///C:/...``.
 
 With no ``origin_url``, the legacy ``target_url`` is re-validated and its rebuilt clone URL
 is used. The security guidance on untrusted URL destinations asks for exactly this:
@@ -438,6 +451,7 @@ allowlist the destination rather than trust persisted input.
 
 - `resolve_origin_url` host-allowlists a stored `origin_url` (exact host, no `http://`/`git://`, no sentinel); local paths stay allowed. (D-57)
 - A Windows drive path is a local `origin_url` only when running on Windows; on POSIX the same text is ssh to a one-letter host and stays refused (`test_a_drive_shaped_origin_stays_refused_where_git_reads_it_as_ssh`).
+- A value git reads as remote (scp-like `user@host:path`, `file:x`, `file://<host>/`) is not a local `origin_url` on any platform; `file:///` and `file://localhost/` stay local (`test_a_value_git_reads_as_remote_is_not_a_local_origin`). A UNC path is refused on Windows only (`test_a_unc_path_is_not_a_local_origin_on_windows`); on POSIX it is a local path (`test_a_unc_shaped_path_stays_a_local_origin_on_posix`).
 - A network `origin_url` must name the same `owner/repo` as the validated `target_url` (`_remote_slug`); a mismatch or an invalid `target_url` leaves no push target (`test_origin_url_wins_when_present`). (D-138)
 
 ### Why tool approval is one-shot and a queued change is not "filed"
@@ -510,7 +524,8 @@ gate — can modify same-user files outside the worktree.
 
 **Kiro Crew's own control files are closed.** The paths in `security.write_protected_home_paths()`
 are protected by the platform HOOK layer, which a sandboxed subprocess never passes through. So
-`_run` passes the PARENT directory of each write-protected path as `extra_hidden_dirs`,
+`_run` passes the PARENT directory of each write-protected path as `extra_hidden_dirs`
+(`spine/push_policy.py:write_protected_targets`, shared with the candidate admission checker),
 bind-mounting an empty dir over it, and the write fails at the kernel; the interpreter and the
 real-subprocess gate tests are unaffected.
 
@@ -567,6 +582,23 @@ are seen too. An option's VALUE goes with it (`nice -n 5 git push` must not leav
 like the command), and the recursion budget REFUSES on exhaustion — for a denylist, "gave up"
 must not mean "allowed".
 
+`eval` and `script -c` / `script --command` run a script too, so their script is re-analyzed
+the same way, and `watch` runs its joined arguments through `sh -c`. Two splits find the
+commands. A quote-aware split walks the characters with quote state and splits only on
+UNQUOTED separators, so `sh -c 'git push; true'` still yields `git push` while quoted data
+(`printf '%s\n' ';' curl`, `rg -F '$(curl' src`) runs nothing. Main's quote-blind split
+always runs as well, so anything it refuses stays refused. When the quote-aware split cannot
+read the text (an unclosed quote, an apostrophe in a heredoc body), only the quote-blind
+split runs, as on main; no command is refused for being unreadable.
+The walk reads bash's `$'...'` / `$"..."` as an ordinary quote opening at the `$`, so the
+script inside is re-analyzed: `eval $'gh pr ready 1'` is refused because the command is
+found, and `bash -c "printf $'a\n'"` stays allowed.
+The walk follows bash's comment rule: an unquoted `#` at the start of a word comments out
+the rest of the line, so an apostrophe in `# it's` never pairs with a quote on another
+line. A `#` inside a word (`echo a#b`) is not a comment. Heredoc bodies are not tracked:
+quotes in a body can still pair up across lines, as on main.
+A redirect target is a file name, so `echo hi > ./curl` stays allowed.
+
 Reaching the subcommand also means skipping GLOBAL OPTIONS correctly. A valueless option must not
 swallow the verb: `git --no-pager push`, `--paginate`, `--bare`, `--literal-pathspecs` and
 `--no-replace-objects` must be refused like a bare `git push`. Value-taking global options are
@@ -597,6 +629,7 @@ pushing) and `exec pytest -q` stay allowed. A dedicated test pins that non-over-
 - Value-taking global options are enumerated per binary (`_VALUE_TAKING_OPTIONS`) and everything else is valueless, so `git --no-pager push` is refused like `git push`; `--exec-path` is excluded because its value is optional. (D-63)
 - Value-taking wrapper long options (`_WRAPPER_VALUE_TAKING_LONG_OPTIONS`, such as `env --unset`) consume their value, so the command behind them is inspected. (D-117)
 - A bare `&` splits commands like `;`, and `(` and `)` split too, so `true & gh pr comment …` and `echo $(gh pr ready)` are refused; a benign trailing `& true` passes. (D-128)
+- `eval`, `script -c` and `watch` scripts are re-analyzed; a quoted separator stays in its word, while main's quote-blind split still runs; text the quote-aware split cannot read gets only the quote-blind split, as on main, and is never refused for that alone; `$'...'` / `$"..."` opens a quote at the `$`, so `eval $'gh pr ready 1'` is refused and `bash -c "printf $'a\n'"` passes; an unquoted word-initial `#` comments out the line, so comment apostrophes cannot hide `sh -c "true;gh pr ready"` on the next line, while `eval 'echo hi' # it's`, `echo a#b` and `printf '%s\n' ';' curl` pass. (D-143)
 
 ### Why the protected-branch denylist normalizes before it matches
 
@@ -736,7 +769,7 @@ rather than starting two threads and hoping, so it is deterministic.
 - `POST /setup-clone` re-checks `_run_is_active()` inside `clone_lock` and answers 409 `run_in_progress`. (D-95)
 - `PUT /config` takes `clone_lock` and re-checks `_run_is_active()` inside it; a structural test asserts both workspace-mutating handlers do. (D-96)
 - The draft and commit routes re-check the run status inside `clone_lock`; a structural guard asserts all four clone-mutating handlers do. (D-115)
-- `POST /run` admits under `app_lifecycle_lock` and answers 403 `app_disabled` when `is_app_enabled` is false at admission; otherwise it records `RunSupervisor.stop_seq()` and passes it to `start` as `admitted_at`, which `start` re-checks after `_build_driver` and raises `RuntimeError` ("the run was stopped before it started", mapped to 409 `session_conflict`) when a `stop` or the disable hook landed meanwhile, so a run cannot launch into an app disabled or stopped while its driver was being built (`test_run_start_honors_stop`, `test_start_is_refused_once_the_app_is_disabled`).
+- `POST /run` admits under `app_lifecycle_lock` and answers 403 `app_disabled` when `is_app_enabled` is false at admission; otherwise it records `RunSupervisor.stop_seq()` and passes it to `start` as `admitted_at`, which `start` re-checks after `_build_driver` and raises `RuntimeError` ("the run was stopped before it started", mapped to 409 `session_conflict`) when a `stop` or the disable hook landed meanwhile, so a run cannot launch into an app disabled or stopped while its driver was being built (`test_start_is_refused_once_the_app_is_disabled`).
 
 ### Why the manual draft path materializes its own diff
 
@@ -1038,12 +1071,14 @@ mid-truncate ~31% of the time, reporting a calibrated ruler as uncalibrated.
 
 Session record keys are validated against `^[A-Za-z0-9][A-Za-z0-9._-]{0,249}$` and
 rejected — not sanitized — when unsafe, because silently rewriting a key would
-make two subjects share one record. The frontend sanitizer strips dot-runs and
+make two subjects share one record. The pattern is applied with `fullmatch`, so
+a key with a trailing newline is refused with a 400 rather than reaching the
+file system (where Windows raises an unhandled `OSError`). The frontend sanitizer strips dot-runs and
 path separators before the key is ever sent, so the two gates agree.
 
 **Pinned invariants.**
 
-- `GET /findings/{fp}` joins evidence by the target's BASENAME slug (`mod_py_sym`, matching `proposer._short`), so a nested target like `src/pkg/sub/mod.py::Sym` shows its `signature`/`hypothesis`. (D-1)
+- `GET /findings/{fp}` joins evidence by the target's BASENAME slug (`mod_py_Sym`, matching `proposer._short`), so a nested target like `src/pkg/sub/mod.py::Sym` shows its `signature`/`hypothesis`. (D-1)
 - The direct-commit queue copy writes `<fp>.pr.md`, the name every reader opens; a structural test pins that no non-test source writes `.cr.md`. (D-24)
 - `results.tsv` cells collapse tab, CR and LF to a space (`_cell`); the unaltered value is kept in `candidates.jsonl`. (D-35)
 - Workspace keys include a digest of the repository identity, so repositories that slug alike (`owner/a-b`, `owner/a_b`) get distinct workspaces, while `origin/main` and `main` still share one. (D-85)
@@ -1096,8 +1131,8 @@ Three tiers, each where it fits:
    member activity pointer. The app feed payload includes the member and session
    key; the current feed UI shows the member, and member activity opens the session.
    Generated assignment prompts, assistant text and assignment error metadata pass
-   through the platform context's credential and exfiltration redactor before
-   storage. Completion activity uses the same sanitized error copy; the actual
+   through the platform context's credential redactor (`redact_via_context`) before
+   storage; a URL with no credential in it stays readable. Completion activity uses the same sanitized error copy; the actual
    assignment prompt and returned `AgentResult` remain intact for the deterministic
    driver. Failed redaction withholds the affected field while session release
    and removal still run.
@@ -1174,6 +1209,14 @@ So the sequence is **provisional commit → draft → amend**:
    duplicate, error), so a non-win never advances HEAD.
 
 A diff that will not apply is refused *before* the expensive reproduce A/B.
+An opt-in `candidateAdmissionCommand` checker is asked before step 1 on both tracks, and a
+refusal records `failed_verify` without reaching the provisional commit (on perf it is asked
+before the survivors are archived, and on both tracks the refused winner's archive row reads
+`failed_verify`, not `kept`); the isolation probe runs after every check and before any more
+host git, so a check that left the clone's git metadata unsafe retires it and every later
+keep refuses without running git; otherwise a check that changed the clone, or left git unable
+to read it, has the branch and tracked files restored through `_reset_provisional`, and any
+untracked file left in it refuses later keeps (`test_candidate_admission.py`).
 `TestWinnerIsInTheTreeBeforeDrafting` pins the order and the rollback in both tracks.
 
 **Pinned invariants.**
@@ -1215,7 +1258,11 @@ The engine (`spine/`) consumes a target only through the `TargetProfile` protoco
 trusts it. Adding a target never edits the engine, but it does touch
 `profiles/__init__.py`: `build_profile` always builds `github_repo` today.
 
-`profiles/github_repo/` is the reference profile.
+`profiles/github_repo/` is the reference profile. Its PR recipe (field ⑤) comes from
+`profiles/__init__.py:build_pr_recipe`, which `target_provider` drives from the
+`target_url` host alone: a GitHub host gets `GitHubPRRecipe`, any other host
+`GitLabMRRecipe` (`profiles/gitlab_repo/mr_recipe.py`). The manual draft route calls
+the same function.
 
 **Pinned invariants.**
 
@@ -1365,8 +1412,22 @@ redaction helpers), never the other way round, so it fills no seam in
 core records and the drawer renders without knowing it. Some of those imports are
 private core names (`llm_helpers._steer_host_deny`, `llm_helpers._extract_json_of_type`,
 `agent_discovery._read_agent_spec`, `config.loader._session_work_dir`,
-`workflows.registry._await_owned`); the app's own repository has to reach them through a
-public surface before it can build against an installed Kiro Crew.
+`workflows.registry._await_owned`); the app's own repository resolves each by name from
+the running gateway through a host shim of its own, failing closed when one is missing,
+until a public surface replaces it. Such a name blocks deleting the wheel copy, not
+pinning it (driver decision 4 in #26967, comment 6729725443).
+
+**Adopted onto its own repository.** The wheel pins the app (`apps/adoption-pins.json`,
+[app-kit-platform.md § 33](app-kit-platform.md#33-former-built-in-adoption)) at
+`KiroCrewCaptain/kirocrew-app-auto-improvement` with `minAppSdkLevel` 2, the level of the
+`ctx.lifecycle` admission its run start uses, so a host whose record is builtin-owned
+swaps it in place onto that tree at a restart, keeping `data/`, `.app_secret`, the
+approved grants and `enabled`; the rail keeps `/auto-improvement` and the `Brain` glyph.
+The repository's `app.json` declares the same `permissions`, `agents` and `skills` as the
+wheel copy, and its one MCP server keeps its name and `autoApprove` list, launched by
+`python3` from a launcher file in the adopted tree instead of `-m` on the wheel package
+(the stdio shape § 33 carries). A fix to the app lands in that repository first; a change
+to the wheel copy needs its `App repo:` line.
 
 `test/test_core_auto_improvement_decoupling.py` is the gate, on the shared
 `test/core_app_independence.py` scanner. The core strings left naming the app are a

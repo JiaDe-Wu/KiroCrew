@@ -7,6 +7,7 @@ semantics, and the --approval yolo safety rail.
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import pytest
@@ -78,9 +79,10 @@ class TestNoFlags:
         assert result["no_crons"] is False
         assert result["no_dashboard"] is False
 
-    def test_test_mode_does_not_imply_no_tunnel(self):
+    def test_test_mode_implies_no_tunnel(self):
+        # A test home may hold a team key, which hosts through the relay by default.
         result = _resolve_gateway_args(_ns(test_mode=True))
-        assert result["no_tunnel"] is False
+        assert result["no_tunnel"] is True
 
 
 class TestTestModeBundle:
@@ -242,7 +244,7 @@ class TestApprovalYoloSafetyRail:
         assert "main gateway home" in captured.err
 
     def test_yolo_refused_when_resolves_to_legacy_home(self, monkeypatch, capsys):
-        # GPT 5.6 HIGH regression: after the data-home move, the rail must reject the
+        # After the data-home move, the rail must reject the
         # LEGACY ~/.kirocrew too, not just ~/.kiro/crew. On an unmigrated/downgraded
         # install the legacy home still holds the LIVE data, so yolo against it is
         # exactly as destructive as against the new home.
@@ -280,6 +282,32 @@ class TestApprovalYoloSafetyRail:
             monkeypatch.delenv("KIROCREW_HOME", raising=False)
         result = _resolve_gateway_args(_ns(approval=approval))
         assert result["approval_mode"] == approval
+
+
+# ─── --approval help text ────────────────────────────────────────────────
+
+
+class TestApprovalHelp:
+    """The `--approval` help states what each choice and an omitted flag do."""
+
+    def test_help_names_the_configured_default_and_where_reads_applies(self, monkeypatch, capsys):
+        from kiro_crew.cli import main
+        from kiro_crew.config.fields import field_default
+        from kiro_crew.config.sections import AgentConfig
+
+        monkeypatch.setattr(sys, "argv", ["kirocrew", "gateway", "--help"])
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 0
+        # argparse wraps help at the terminal width; collapse whitespace so the
+        # assertions do not depend on where a wrap falls.
+        flat = " ".join(capsys.readouterr().out.split())
+        default = field_default(AgentConfig, "approval_mode")
+        assert f"When omitted, config agent.approval_mode (default: {default}) decides" in flat
+        assert "interactive behavior is preserved" not in flat
+        # A channel turn resolves 'reads' to the interactive prompt, so the help
+        # must not present it as a read auto-approve on every turn.
+        assert "a channel turn under 'reads' asks about every tool" in flat
 
 
 # ─── _is_read_only_tool helper ───────────────────────────────────────────

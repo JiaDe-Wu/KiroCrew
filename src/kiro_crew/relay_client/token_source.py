@@ -5,14 +5,9 @@ from the lease (``RenewCrewLease``). The client only ever talks to a
 :class:`HostTokenSource`, so where the token comes from never touches the
 connection code. The lease client is
 :class:`~kiro_crew.relay_client.lease.LeaseHostTokenSource`; this module ships the
-seam and two more sources:
-
-* :class:`StaticHostTokenSource` holds one credential, for tests and for driving a
-  fake relay by hand. :meth:`StaticHostTokenSource.publish` stands in for a lease
-  renewal that brought a new host token.
-* :class:`UnavailableHostTokenSource` is the default while no lease service is
-  configured: it refuses, so turning the relay on without a source reports why it
-  cannot connect instead of dialling with nothing.
+seam and :class:`UnavailableHostTokenSource`, the default for a provider built
+with no source: it refuses, so turning the relay on without a source reports why
+it cannot connect instead of dialling with nothing.
 
 A credential is never logged and never part of a ``repr``.
 """
@@ -30,6 +25,8 @@ from kiro_crew.relay_client.protocol import crew_url_problem, host_url_problem
 NewTokenCallback = Callable[["HostCredential"], Awaitable[None]]
 #: Answers whether a host connection is up right now (from ``ready`` until it ends).
 RelayConnected = Callable[[], bool]
+#: Answers how many people are connected through the relay right now.
+ConnectedPeople = Callable[[], int]
 
 
 @dataclass(frozen=True)
@@ -114,11 +111,24 @@ class HostTokenUnavailable(Exception):
     """
 
 
+#: What a lease says while it simply has not issued the first host token yet. The
+#: client reads this prefix to tell that wait (still starting) from a failure that
+#: needs the owner (a sign-in that cannot host, an unreachable service).
+HOST_TOKEN_NOT_ISSUED_YET = "the lease service has not issued a host token yet"
+
+
 class HostTokenRetryLater(Exception):
     """No host token right now, for a reason that can pass (the backend is down).
 
     The client backs off with the same steps as a reconnect and asks again.
+    *cannot_host_yet* says the wait is on this Crew's own eligibility (its sign-in,
+    or remote access refused for its account or organization), not a fault on the
+    way to the service.
     """
+
+    def __init__(self, message: str = "", *, cannot_host_yet: bool = False) -> None:
+        super().__init__(message)
+        self.cannot_host_yet = cannot_host_yet
 
 
 class HostTokenSource(Protocol):
@@ -141,10 +151,15 @@ class HostTokenSource(Protocol):
         """Register the callback that sends each new host token down the connection."""
         ...
 
-    def track_relay(self, connected: Optional[RelayConnected]) -> None:
-        """Register what says whether a host connection is up right now.
+    def track_relay(
+        self,
+        connected: Optional[RelayConnected],
+        people: Optional[ConnectedPeople] = None,
+    ) -> None:
+        """Register what says whether a host connection is up, and who is on it.
 
-        A lease renewal reports it as ``relay.connected``. ``None`` unregisters it.
+        A lease renewal reports *connected* as ``relay.connectionStatus`` and
+        *people* as ``connectedCount``. ``None`` unregisters each.
         """
         ...
 
@@ -153,43 +168,13 @@ class HostTokenSource(Protocol):
         ...
 
 
-class StaticHostTokenSource:
-    """One fixed credential, replaced only through :meth:`publish`."""
-
-    def __init__(self, credential: HostCredential) -> None:
-        self._credential = credential
-        self._callback: Optional[NewTokenCallback] = None
-        self.renewals: list[bool] = []
-
-    async def current(self) -> HostCredential:
-        return self._credential
-
-    async def renew(self, *, host_token_requested: bool) -> HostCredential:
-        self.renewals.append(host_token_requested)
-        return self._credential
-
-    def on_new_token(self, callback: Optional[NewTokenCallback]) -> None:
-        self._callback = callback
-
-    def track_relay(self, connected: Optional[RelayConnected]) -> None:
-        return None
-
-    async def aclose(self) -> None:
-        return None
-
-    async def publish(self, credential: HostCredential) -> None:
-        """Hold *credential* from now on, and hand it to the client as a new token."""
-        self._credential = credential
-        if self._callback is not None:
-            await self._callback(credential)
-
-
 class UnavailableHostTokenSource:
-    """The default source: no lease service is configured, so there is no host token."""
+    """The default source when an edition names the relay but brings no host token source."""
 
     MESSAGE = (
-        "Remote Control has no host token source: set tunnel.relay_lease_url and "
-        "tunnel.relay_lease_credential so the Crew can hold a lease"
+        "Remote Control has no host token source: set tunnel.relay_lease_credential "
+        "(and tunnel.relay_lease_url for a lease service other than the built-in one) "
+        "so the Crew can hold a lease"
     )
 
     async def current(self) -> HostCredential:
@@ -201,7 +186,11 @@ class UnavailableHostTokenSource:
     def on_new_token(self, callback: Optional[NewTokenCallback]) -> None:
         return None
 
-    def track_relay(self, connected: Optional[RelayConnected]) -> None:
+    def track_relay(
+        self,
+        connected: Optional[RelayConnected],
+        people: Optional[ConnectedPeople] = None,
+    ) -> None:
         return None
 
     async def aclose(self) -> None:

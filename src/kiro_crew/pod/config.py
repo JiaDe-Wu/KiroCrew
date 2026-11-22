@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from kiro_crew.config.paths import _default_home
+from kiro_crew.gateway_shutdown_budget import TOTAL_SHUTDOWN_BUDGET_SECS
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,25 @@ TERMINAL_BOOT_EXIT_CODES: tuple[int, ...] = (
     EXIT_LIVE_PORT_COLLISION,
     EXIT_REFUSED_UNRECOVERABLE,
 )
+
+#: The unit's ``TimeoutStopSec``: SIGTERM-to-SIGKILL for the pod's gateway. A pod
+#: runs the same gateway as the live service, so it gets the live unit's budget
+#: (``service/linux_unit.py``) instead of systemd's default of 90s.
+POD_STOP_TIMEOUT_SECS = TOTAL_SHUTDOWN_BUDGET_SECS
+
+#: How long ``systemctl --user stop`` is waited on. ``stop`` returns once the job
+#: ends, and systemd allows ``TimeoutStopSec`` for the SIGTERM and again for the
+#: SIGKILL that follows it, so the wait covers both plus a margin. Shorter than
+#: that, a pod that is still stopping reads as a failed stop.
+SYSTEMCTL_STOP_WAIT_SECS = 2 * POD_STOP_TIMEOUT_SECS + 5
+
+#: Default health-wait budget for `pod up`, in seconds. A first pod boot does
+#: real extra work beyond serving /api/health -- config migration, staging CLI
+#: files, minting a fresh .local_secret -- and on a loaded host a healthy
+#: gateway was measured needing well past the old 45s wall, so the default is
+#: twice that. Also the floor for how long the Windows supervisor waits for an
+#: in-app restart's successor to claim the pod: that successor is a full boot.
+POD_HEALTH_WAIT_SECS_DEFAULT = 90
 
 
 def _canonical_override(raw: str) -> Path:

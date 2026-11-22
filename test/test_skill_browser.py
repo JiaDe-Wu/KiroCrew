@@ -147,6 +147,19 @@ class TestListKiroSkills:
         # ~/.kiro/skills/ does not exist at all
         assert list_kiro_skills(None) == []
 
+    def test_bom_skill_keeps_its_description_and_always(self, fake_home, tmp_path):
+        """A SKILL.md saved as UTF-8 with a byte-order mark lists the same
+        description and always flag as the same file saved without one."""
+        proj = tmp_path / "proj"
+        skill = proj / ".kiro" / "skills" / "demo" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_bytes(
+            b"\xef\xbb\xbf---\nname: demo\ndescription: routes demo questions\n"
+            b"always: true\n---\nbody\n"
+        )
+        rows = [r for r in list_kiro_skills(proj) if r["source"] == "kiro-workspace"]
+        assert [(r["description"], r["always"]) for r in rows] == [("routes demo questions", True)]
+
 
 # ── _expand_resource_uri / _agent_loads_skill / _resolve_loaded_by_agents ──
 
@@ -831,6 +844,61 @@ class TestAgentMatchIndex:
 
         assert [_agents_loading_skill_indexed(row, index) for row in rows] == [[], [], []]
         assert seen.count(str(root)) == 1
+
+    def test_the_alias_rule_runs_once_per_glob_set_and_only_for_a_listed_leaf(
+        self, fake_home, monkeypatch
+    ):
+        """Agents made from one template share one alias check per row.
+
+        A host with many Bots carries many specs with the same ``skill://``
+        mappings, and the alias rule costs a path build and an ``lstat`` per
+        (row, agent). It runs once per distinct glob set, and not at all for a
+        row whose folder name no alias prefix holds.
+        """
+        import kiro_crew.skills as skills_module
+        from kiro_crew.skill_runtime import catalog as catalog_module
+
+        root = skills_module.skills_dir()
+        app_dir = root / "some-app"
+        # "twin" exists under the app too, but as a different skill: the alias
+        # rule must look, and must answer no.
+        _write_skill(app_dir, "twin")
+        rows = [_write_skill(root, "twin") / "SKILL.md", _write_skill(root, "plain") / "SKILL.md"]
+        agents_dir = fake_home / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True)
+        pattern = f"skill://{app_dir}/*/SKILL.md"
+        parsed = [
+            (f"a{j}", {"resources": [pattern]}, agents_dir / f"a{j}.json") for j in range(5)
+        ]
+        index = _build_agent_match_index(_expand_agent_globs(parsed))
+        calls: list[Path] = []
+        real_hit = catalog_module._alias_hit
+
+        def counted(path, candidates):
+            calls.append(path)
+            return real_hit(path, candidates)
+
+        monkeypatch.setattr(catalog_module, "_alias_hit", counted)
+
+        assert [_agents_loading_skill_indexed(row, index) for row in rows] == [[], []]
+        # One check for "twin" across the five agents, none for "plain": no
+        # entry of that name under some-app.
+        assert calls == [rows[0]]
+
+    def test_an_alias_prefix_no_path_can_name_does_not_break_the_index(self, fake_home):
+        """A spec resource with an embedded NUL lists no skill and raises nothing."""
+        import kiro_crew.skills as skills_module
+
+        root = skills_module.skills_dir()
+        row = _write_skill(root, "plain") / "SKILL.md"
+        agents_dir = fake_home / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True)
+        pattern = f"skill://{root}/bad\x00prefix/*/SKILL.md"
+        parsed = [("a", {"resources": [pattern]}, agents_dir / "a.json")]
+
+        index = _build_agent_match_index(_expand_agent_globs(parsed))
+
+        assert _agents_loading_skill_indexed(row, index) == []
 
 
 class TestProjectRelativeGlobAnchorsOnProjectDir:
@@ -1655,7 +1723,13 @@ class TestSessionScopedSkillResolution:
     async def test_app_projectless_slot_cannot_fall_back_to_foreign_project(
         self, fake_home, tmp_path, monkeypatch
     ):
-        """An owned slot without a project must not inherit another slot's project."""
+        """An owned slot without a project must not inherit another slot's project.
+
+        The catalog answers it with no project at all, which is how an app chat
+        (always projectless) reaches its own skills. The ``kiro-workspace/``
+        browse routes resolve through the shared-project fallback, so they keep
+        the uniform 404.
+        """
         from kiro_crew.dashboard.handlers import api_skill_detail, prompts
         from kiro_crew.skills import SkillsLoader
 
@@ -1673,6 +1747,13 @@ class TestSessionScopedSkillResolution:
         state._standalone_skills = SkillsLoader(install_builtins=False)
         audit = MagicMock()
         monkeypatch.setattr(prompts, "_sel", lambda: audit)
+        catalog_projects = []
+
+        def collect(_skills, _package, project_dir):
+            catalog_projects.append(project_dir)
+            return []
+
+        monkeypatch.setattr(prompts, "collect_skills_blocking", collect)
         app = _make_app(state)
         app.router.add_get("/api/skills/{name:.+}", api_skill_detail)
 
@@ -1683,14 +1764,17 @@ class TestSessionScopedSkillResolution:
 
         app.middlewares.insert(0, inject_app)
         headers = {"X-Session-Key": "owned-projectless"}
-        paths = (
-            "/api/skills",
+        browse_paths = (
             "/api/skills/kiro-workspace/foreign-skill/-/tree",
             "/api/skills/kiro-workspace/foreign-skill/-/file?path=SKILL.md",
             "/api/skills/kiro-workspace/foreign-skill",
         )
         async with TestClient(TestServer(app)) as client:
-            for path in paths:
+            response = await client.get("/api/skills", headers=headers)
+            assert response.status == 200
+            assert await response.json() == []
+            assert catalog_projects == [None]
+            for path in browse_paths:
                 response = await client.get(path, headers=headers)
                 assert response.status == 404, path
                 assert (await response.json())["code"] == "slot_not_found"
@@ -1700,5 +1784,20 @@ class TestSessionScopedSkillResolution:
             for call in audit.log_api_access.call_args_list
             if call.kwargs.get("outcome") == "denied"
         ]
-        assert len(denied) == len(paths)
+        assert len(denied) == len(browse_paths)
         assert all(call.kwargs["source"] == "app_isolation" for call in denied)
+        assert all(call.kwargs["error"] == "owned slot has no project" for call in denied)
+        allowed = [
+            call.kwargs
+            for call in audit.log_api_access.call_args_list
+            if call.kwargs.get("outcome") == "allowed"
+        ]
+        assert allowed == [
+            {
+                "caller": "app-A",
+                "operation": "skills_list",
+                "outcome": "allowed",
+                "source": "app_isolation",
+                "resources": "slot=owned-projectless",
+            }
+        ]

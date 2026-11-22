@@ -55,6 +55,10 @@ def _item(item_id: str, **over):
     return base
 
 
+#: The conductor's ask record: only a question it vetted is the person's.
+ASK = {"what": "pick one", "options": [], "written_at": "2026-11-01T05:59:00+00:00"}
+
+
 def _summary(items, *, closed=(), looping=()):
     return crew_work.summarize(
         items, closed=lambda k: k in closed, looping=lambda k: k in looping, now=NOW
@@ -65,8 +69,8 @@ def test_summary_counts_open_items_and_splits_out_the_person():
     summary = _summary(
         [
             _item("a"),
-            _item("b", status="question", reason="needs_human"),
-            _item("c", status="blocked", reason="approval"),
+            _item("b", status="question", reason="needs_human", ask=ASK),
+            _item("c", status="blocked", reason="approval", ask=ASK),
             _item("e", status="question"),
         ]
     )
@@ -86,8 +90,8 @@ def test_summary_counts_open_items_and_splits_out_the_person():
 
 
 def test_a_person_wait_with_no_local_worker_names_none():
-    remote = _item("r", status="blocked", reason="approval", worker_instance_id="peer-1")
-    unbound = _item("u", status="question", reason="needs_human", worker_session_key="")
+    remote = _item("r", status="blocked", reason="approval", worker_instance_id="peer-1", ask=ASK)
+    unbound = _item("u", status="question", reason="needs_human", worker_session_key="", ask=ASK)
     assert _summary([remote, unbound])["person_workers"] == ["", ""]
 
 
@@ -106,6 +110,18 @@ def test_a_quiet_item_is_stale_now_and_a_looping_worker_never():
     assert looped["stale_at_ms"] == 0
     # The row reads the loop itself, so a worker waiting on CI shows as running.
     assert looped["looping"] is True
+
+
+def test_a_worker_waiting_until_a_time_is_not_stalled_before_it():
+    """A ``progress`` report naming ``wake_at`` is a wait the worker declared,
+    so the row's stall clock starts when that wait ends, not at the report."""
+    wake = NOW + timedelta(hours=2)
+    waiting = _item("w", last_report_at=_stamp(40), wake_at=wake.isoformat())
+    (only,) = _summary([waiting])["items"]
+    assert only["stale_at_ms"] == int(wake.timestamp() * 1000) + WINDOW_MS
+    # A wait that already ended leaves the report's own window in force.
+    ended = _item("e", last_report_at=_stamp(40), wake_at=_stamp(30))
+    assert _summary([ended])["items"][0]["stale_at_ms"] == NOW_MS
 
 
 def test_a_looping_worker_whose_question_the_conductor_owes_is_not_shown_running():
@@ -304,6 +320,7 @@ def test_a_person_s_steer_after_the_ask_answers_it():
         "b",
         status="question",
         reason="needs_human",
+        ask=ASK,
         events=[{"ts": _stamp(1), "kind": "steer", "text": "use the blue one"}],
     )
     assert _summary([asked])["person"] == 0
@@ -341,7 +358,9 @@ def test_a_steer_before_a_new_question_in_the_same_second_does_not_answer_it():
         events=[
             {"ts": same, "kind": "steer", "text": "earlier"},
             {"ts": same, "kind": "report", "status": "question", "text": "which one?"},
+            {"ts": same, "kind": "ask", "text": ""},
         ],
+        ask=ASK,
     )
     assert _summary([asked])["person"] == 1
     answered = dict(asked, events=[*asked["events"], {"ts": same, "kind": "steer", "text": "blue"}])
@@ -423,3 +442,22 @@ def test_a_channel_conductor_s_loop_is_found_under_its_session_key(monkeypatch, 
     crew_work.remember("discord:agent:direct:1", {"items": [_item("a")]})
     summary = crew_work.summary_for_state("discord_agent_direct_1", SimpleNamespace(_slots={}))
     assert summary["conductor_looping"] is expected
+
+
+def test_a_question_the_conductor_has_not_vetted_is_not_the_person_s():
+    unvetted = _item("b", status="question", reason="needs_human")
+    assert _summary([unvetted])["person"] == 0
+    # A record a newer report superseded is not current either.
+    stale = _item(
+        "c",
+        status="question",
+        reason="needs_human",
+        ask=ASK,
+        events=[
+            {"ts": _stamp(3), "kind": "ask", "text": ""},
+            {"ts": _stamp(2), "kind": "report", "status": "question", "text": "and now?"},
+        ],
+    )
+    assert _summary([stale])["person"] == 0
+    vetted = dict(stale, events=[*stale["events"], {"ts": _stamp(1), "kind": "ask", "text": ""}])
+    assert _summary([vetted])["person"] == 1

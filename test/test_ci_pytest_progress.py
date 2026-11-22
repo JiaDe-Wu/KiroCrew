@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -127,6 +128,7 @@ class TestCIProgress(unittest.TestCase):
                 next(r["selected"] for r in records if r["event"] == "collection_end"), 2
             )
             self.assertGreaterEqual(records[1]["elapsed"], 0)
+            self.assertIs(records[-1]["channel_closed"], False)
         summaries = [
             line[line.index("CI_PROGRESS ") + 12 :]
             for line in result.stdout.splitlines()
@@ -224,6 +226,44 @@ class TestCIProgress(unittest.TestCase):
             )
         )
 
+    def test_worker_whose_channel_closed_records_it_at_session_end(self):
+        # Closing a worker's receive side mid-run is the transport event behind
+        # xdist's clean-finish INTERNALERROR: the worker ends with exit status 0
+        # while still assigned work, and its session_end says its channel closed.
+        # The "cut" group reaches the worker as ONE runtests command, so when
+        # test_close runs test_held[1] is in, or about to enter, its queue.
+        # Swapping in a queue that starts with the shutdown mark right after the
+        # close leaves test_held[1] assigned but never run, whatever the
+        # controller sends later. The worker's own "shutdown" command handler
+        # puts that mark, so the test names no xdist-private marker object; the
+        # worker module runs as execnet's __channelexec__, so its marker cannot
+        # be imported from xdist.remote either. Without the swap, a
+        # controller that sent nothing after the close finds no assigned work
+        # and raises "no active workers" instead.
+        (self.root / "test_cut.py").write_text(
+            "import pytest\n"
+            "@pytest.mark.xdist_group('cut')\n"
+            "def test_close(request):\n"
+            "    worker = next(p for p in request.config.pluginmanager.get_plugins()\n"
+            "                  if type(p).__name__ == 'WorkerInteractor')\n"
+            "    worker.channel.gateway._channelfactory._local_close(\n"
+            "        worker.channel.id, sendonly=True)\n"
+            "    worker.torun = worker._make_queue()\n"
+            "    worker.handle_command(('shutdown', {}))\n"
+            "@pytest.mark.xdist_group('cut')\n"
+            "@pytest.mark.parametrize('n', range(2))\n"
+            "def test_held(n): pass\n"
+            "@pytest.mark.parametrize('n', range(6))\n"
+            "def test_rest(n): pass\n",
+            encoding="utf-8",
+        )
+        result = self.run_pytest("-n1")
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertIn("assert not crashitem", result.stdout + result.stderr)
+        (rows,) = self.records().values()
+        self.assertEqual((rows[-1]["event"], rows[-1]["exitstatus"]), ("session_end", 0))
+        self.assertIs(rows[-1]["channel_closed"], True)
+
     def test_nested_runs_share_directory_without_overwriting(self):
         child = self.root / "nested"
         child.mkdir()
@@ -307,7 +347,7 @@ class TestCIProgress(unittest.TestCase):
         self.assertEqual(job["strategy"]["matrix"]["group"], list(range(1, count + 1)))
         command = next(s["run"] for s in job["steps"] if s.get("name", "").startswith("Run tests"))
         for flag in [
-            "-n auto",
+            '-n "$WORKERS"',
             "--timeout=180",
             "--no-cov",
             "--max-worker-restart=0",
@@ -315,6 +355,19 @@ class TestCIProgress(unittest.TestCase):
             "-p scripts.ci_file_shards",
         ]:
             self.assertIn(flag, command)
+        # The shard sizes its own workers rather than taking the xdist budget,
+        # and logs both the count and the host's peak memory.
+        self.assertNotIn("-n auto", command)
+        self.assertIn('echo "pytest workers: $WORKERS"', command)
+        # One worker per 2 GiB after 2 GiB for the host: 6 on the 16,111 MiB
+        # fleet runner. Still capped by the core count and never below 1.
+        self.assertIn("by_mem=$(( (mem_mib - 2048) / 2048 ))", command)
+        self.assertIn("WORKERS=$(( $(nproc) < by_mem ? $(nproc) : by_mem ))", command)
+        self.assertIn('[ "$WORKERS" -ge 1 ] || WORKERS=1', command)
+        peak = next(s for s in job["steps"] if s.get("name") == "Report peak memory")
+        self.assertEqual(peak["if"], "${{ always() }}")
+        self.assertIn('"$RUNNER_TEMP/mem-peak-mib"', command)
+        self.assertIn('"$RUNNER_TEMP/mem-peak-mib"', peak["run"])
         self.assertIn("-p scripts.ci_pytest_progress", command)
         self.assertTrue(
             all(
@@ -347,12 +400,25 @@ class TestCIProgress(unittest.TestCase):
         self.assertIn("--max-worker-restart=0", command)
         self.assertEqual(command.count('"${PROGRESS[@]}"'), 4)
         self.assertEqual(command.count("--timeout=120"), 4)
+        # A hang SIGALRM cannot end still dumps every thread's stack, after
+        # pytest-timeout had its chance; PROGRESS reaches all four invocations.
+        dump_after = re.search(
+            r"PROGRESS=\([^)]*-p scripts\.ci_faulthandler_budget --faulthandler-grace=(\d+)",
+            command,
+        )
+        self.assertIsNotNone(dump_after, "the Linux shards carry no faulthandler dump")
+        self.assertGreater(int(dump_after.group(1)), 0)
         self.assertEqual(command.count('-n "$WORKERS"'), 4)
         self.assertNotIn("-n auto", command)
         self.assertEqual(command.count("-p scripts.ci_file_shards"), 3)
         self.assertIn("--cov=kiro_crew --cov=sage_lib", command)
         self.assertIn("--cov=src/kiro_crew/apps/builtins/aws_control/crew/packaging", command)
         self.assertIn("--cov=src/kiro_crew/apps/builtins/code_review_sage/tests", command)
+        # The full-suite run writes its data file and prints no terminal table;
+        # the reduced and leaf runs carry --no-cov, so the flag appears once.
+        full = command.rsplit("exit 0", 1)[1]
+        self.assertIn("--cov-report=", full.split())
+        self.assertEqual(command.count("--cov-report"), 1)
         upload = next(s for s in job["steps"] if s.get("name") == "Upload Linux pytest progress")
         self.assertEqual(upload["if"], "${{ always() }}")
         self.assertEqual(upload["with"]["name"], "linux-pytest-progress-${{ matrix.group }}")

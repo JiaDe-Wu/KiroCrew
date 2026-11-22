@@ -2,7 +2,7 @@
  *  cards out (a content-sized CSS-columns masonry, the virtualized masonry, and
  *  the one-column list windowed against the page's own scroller), switched at
  *  `VIRTUALIZE_AT`. */
-import { useMemo } from 'react'
+import { useEffect, useId, useMemo, useRef } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { ExternalLink, X, Share2, Loader2, Star } from 'lucide-react'
 import { openPopout } from '../utils/artifactPopout'
@@ -12,17 +12,17 @@ import type { ItemContent } from '@virtuoso.dev/masonry'
 // virtualizer rather than a library: see `LibraryList` for the measured reason.
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
 import { api } from '../api/client'
-import { Badge } from '../components/ui'
-import { publishNoticeKey } from '../components/PublishHub'
+import { publicationBadgeLabel, usePublicationProviderName } from '../lib/publicationBadge'
 import { timeAgo as _timeAgo } from '../utils/timeAgo'
 import { DndDraggable } from '../components/dnd'
 import type { Artifact } from '../types'
-import { KIND_BADGE, isoToTs } from '../components/library/LibraryTable'
+import { KindPill, isoToTs } from '../components/library/LibraryTable'
 import type { LibraryDrag } from '../components/library/LibraryTable'
 import { WidgetThumb, ContentThumb, ImageThumb, WebAppThumb } from '../components/library/ArtifactThumbs'
 import { LiveSiteLink } from '../components/library/LiveSiteLink'
+import ErrorNotice from '../components/ErrorNotice'
+import Clickable from '../components/Clickable'
 import { i18nT } from '../i18n/t'
-import { uiLocation } from '../uiLocations/uiLocation'
 import { guidePick } from '../uiLocations/targetRegistry'
 
 // ── Masonry library ──────────────────────────────────────────────────────
@@ -43,6 +43,58 @@ type LibCtx = {
   pinningSlug: string | null
 }
 
+/** A shared or published artifact's mark beside its name. `relative z-10`
+ *  lifts it above the card's open button, which would otherwise take the hover
+ *  its tooltip needs; the lift also takes the click, so the mark is itself a
+ *  control that runs the same open. It is named like the open button and
+ *  described by the badge label. The masonry and the card grid both draw it. */
+export function PublicationMark({ a, onOpen }: { a: Artifact; onOpen: (slug: string) => void }) {
+  const providerName = usePublicationProviderName(a.publication)
+  const badgeId = useId()
+  if (!a.publication) return null
+  return (
+    <Clickable
+      onClick={() => onOpen(a.slug)}
+      aria-label={a.name}
+      aria-describedby={badgeId}
+      className="relative z-10 inline-flex shrink-0 rounded-sm focus-ring-accent"
+      data-testid="publication-badge"
+    >
+      <Share2
+        id={badgeId}
+        size={12}
+        className={a.publication.last_error ? 'text-danger shrink-0' : a.publication.notice ? 'text-warn shrink-0' : 'text-ok shrink-0'}
+        aria-label={publicationBadgeLabel(a.publication, providerName)}
+      >
+        <title>{publicationBadgeLabel(a.publication, providerName)}</title>
+      </Share2>
+    </Clickable>
+  )
+}
+
+/** A publication's last sync failure, inline under the card's name. Lifted
+ *  above the open button so the hand-off is reachable; its clicks stay here
+ *  instead of opening the card. */
+export function PublicationSyncError({ a }: { a: Artifact }) {
+  if (!a.publication?.last_error) return null
+  return (
+    <span role="presentation" className="relative z-10 block mt-1" onClick={(e) => e.stopPropagation()}>
+      {/* The hand-off is on: a library card holds no unsaved input. */}
+      <ErrorNotice
+        variant="inline"
+        className="whitespace-normal"
+        title={i18nT('pages.artifactsPage.published_sync_issue')}
+        // A card is narrow: the message takes its own line under the title
+        // instead of a column beside it.
+        messagePlacement="below"
+        message={a.publication.last_error}
+        askAgent
+        testId="publication-sync-error"
+      />
+    </span>
+  )
+}
+
 /** A single masonry card. Rendered by VirtuosoMasonry for each artifact. */
 function LocalCardBody({ a, context }: { a: Artifact; context: LibCtx }) {
   const { onOpen, onDelete, deletingSlug, onTogglePin, pinningSlug } = context
@@ -56,6 +108,15 @@ function LocalCardBody({ a, context }: { a: Artifact; context: LibCtx }) {
     enabled: !!a.slug,
   })
   const deleting = deletingSlug === a.slug
+  const pinning = pinningSlug === a.slug
+  // The star stays focusable while its save runs (see the button), so a second
+  // press must be refused here. `pinningSlug` only changes on a later render,
+  // so the press claims this ref first. Any change of the page's one pin save
+  // releases it unless that save is this card's: it ended, or another card's
+  // star replaced it. A save that lands changes `a.pinned`, which releases it
+  // too, even if no render ever showed it pending.
+  const pinClaim = useRef(false)
+  useEffect(() => { if (!pinning) pinClaim.current = false }, [pinningSlug, pinning, a.pinned])
   const hasPreview = a.kind === 'widget' || a.kind === 'html'
   const content = full?.content || ''
   // Author affordance: an imported artifact shows whose copy it came from; a
@@ -98,19 +159,14 @@ function LocalCardBody({ a, context }: { a: Artifact; context: LibCtx }) {
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-1.5">
               <span className="text-sm text-text-strong font-medium truncate">{a.name}</span>
-              {a.publication && (
-                <Share2
-                  size={12}
-                  className={a.publication.last_error ? 'text-danger shrink-0' : a.publication.notice ? 'text-warn shrink-0' : 'text-ok shrink-0'}
-                  aria-label={a.publication.last_error ? i18nT('pages.artifactsPage.published_sync_issue') : a.publication.notice ? i18nT(publishNoticeKey({ rolling_out: 'pages.artifactsPage.published_rolling_out', distribution_disabled: 'pages.artifactsPage.published_distribution_disabled', notice_generic: 'pages.artifactsPage.published_notice_generic' }, a.publication.notice_code)) : i18nT('pages.artifactsPage.published', { visibility: a.publication.visibility.toLowerCase() })}
-                />
-              )}
+              <PublicationMark a={a} onOpen={onOpen} />
             </div>
             <code className="text-[11px] text-muted">{a.slug}</code>
             {author && <span className="block text-[11px] text-muted mt-0.5">{i18nT('pages.artifactsPage.by_author', { author })}</span>}
             <LiveSiteLink slug={a.slug} />
+            <PublicationSyncError a={a} />
           </div>
-          <Badge variant={KIND_BADGE[a.kind]}>{a.kind}</Badge>
+          <KindPill kind={a.kind} />
         </div>
         {a.description && <div className="text-[12px] text-muted mt-1 line-clamp-2">{a.description}</div>}
         {a.tags && a.tags.length > 0 && (
@@ -130,16 +186,24 @@ function LocalCardBody({ a, context }: { a: Artifact; context: LibCtx }) {
               * pop-out / delete actions that follow. Not overlaid on the
               * thumbnail — that layer is pointer-events-none so clicks fall
               * through to the card's open button. */}
+            {/* `aria-disabled` while saving, not `disabled`: the press that
+              * started the save holds focus here, and a disabled button would
+              * drop it to <body>. */}
             <button
               type="button"
-              disabled={pinningSlug === a.slug}
-              onClick={() => onTogglePin(a)}
-              className={`p-1 rounded transition-colors cursor-pointer bg-transparent border-none disabled:cursor-default ${a.pinned ? 'text-accent' : 'text-muted hover:text-accent'}`}
+              aria-disabled={pinning}
+              aria-busy={pinning}
+              onClick={() => {
+                if (pinning || pinClaim.current) return
+                pinClaim.current = true
+                onTogglePin(a)
+              }}
+              className={`p-1 rounded transition-colors cursor-pointer bg-transparent border-none aria-disabled:cursor-default ${a.pinned ? 'text-accent' : 'text-muted hover:text-accent'}`}
               title={a.pinned ? i18nT('pages.artifactsPage.starred_click_to_unstar') : i18nT('pages.artifactsPage.star_artifact')}
               aria-label={a.pinned ? i18nT('pages.artifactsPage.remove_star_from_artifact') : i18nT('pages.artifactsPage.star_artifact')}
               aria-pressed={!!a.pinned}
             >
-              {pinningSlug === a.slug
+              {pinning
                 ? <Loader2 size={13} className="animate-spin" />
                 : <Star size={13} className={a.pinned ? 'fill-current' : ''} />}
             </button>
@@ -152,11 +216,21 @@ function LocalCardBody({ a, context }: { a: Artifact; context: LibCtx }) {
             >
               <ExternalLink size={13} />
             </button>
+            {/* `aria-disabled` while removing, not `disabled`: the press that
+              * started the removal holds focus here, and a disabled button would
+              * drop it to <body> when a failed removal leaves the card mounted.
+              * No press claim: onDelete opens a modal confirm and only then
+              * starts the removal, which flips `deleting` before the next
+              * discrete event, so `deleting` alone refuses a second press. */}
             <button
               type="button"
-              disabled={deleting}
-              onClick={() => onDelete(a)}
-              className="p-1 rounded text-muted hover:text-danger transition-colors cursor-pointer bg-transparent border-none disabled:opacity-60 disabled:cursor-default"
+              aria-disabled={deleting}
+              aria-busy={deleting}
+              onClick={() => {
+                if (deleting) return
+                onDelete(a)
+              }}
+              className="p-1 rounded text-muted hover:text-danger transition-colors cursor-pointer bg-transparent border-none aria-disabled:opacity-60 aria-disabled:cursor-default"
               title={i18nT('pages.artifactsPage.remove_from_library')}
               aria-label={i18nT('pages.artifactsPage.remove_from_artifacts_library')}
             >
@@ -338,8 +412,10 @@ export function LibraryMasonry({
   return (
     // -mr-3 offsets each card's own mr-3 so the trailing column's gutter
     // doesn't add page width; cards carry mr-3 (gutter) + mb-3 (row gap).
-    // The picker a guide's "choose the artifact" step points at (artifacts.list).
-    <div {...uiLocation('artifacts.list', widthRef)} aria-label={i18nT('pages.artifactsPage.your_artifacts')} data-testid="artifacts-gallery" className={masonryOwnsScroll
+    // The guide's "choose the artifact" picker (artifacts.list) is the page's
+    // list region around this, so every view (Home, the card grid, this
+    // masonry, the table) shares one target.
+    <div ref={widthRef} data-testid="artifacts-gallery" className={masonryOwnsScroll
       ? (fillPage ? '-mr-3 flex-1 min-h-0' : '-mr-3 h-[60vh]')
       : '-mr-3'}>
       {asList ? (

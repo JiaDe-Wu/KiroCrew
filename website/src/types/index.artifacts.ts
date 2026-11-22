@@ -28,9 +28,10 @@ export interface ArtifactPublication {
   notice: string
   /** Machine discriminator for `notice`, so the UI can pick the right copy
    *  instead of assuming every notice is "still rolling out". One of
-   *  `"rolling_out"` | `"distribution_disabled"` | `"unknown"`, or empty when
-   *  there is no notice. The frontend selects its string from this and falls
-   *  back to a generic (no time promise) line for an unrecognised value.
+   *  `"rolling_out"` | `"distribution_disabled"` | `"origin_mismatch"` |
+   *  `"unknown"`, or empty when there is no notice. The frontend selects its
+   *  string from this and falls back to a generic (no time promise) line for an
+   *  unrecognised value.
    *  Optional so an older gateway that omits it reads as "". */
   notice_code?: string
 }
@@ -64,6 +65,13 @@ export interface PublishProviderDescriptor {
     supports_expiration: boolean
     programmable: boolean
     out_of_band_url: string
+    /** Expiry periods in days a first publish may pick, ascending. Optional: older
+     *  gateways omit it, and an absent or empty list means no expiry choice. */
+    expiration_choices_days?: number[]
+    /** Whether "no expiry" may be picked alongside `expiration_choices_days`. */
+    allows_no_expiration?: boolean
+    /** The preselected period; `null` is "no expiry". */
+    default_expiration_days?: number | null
   }
   sync_model: { authority: string; concurrency: string; collab_mode: 'mirror' | 'live' }
   discovery_model: {
@@ -132,7 +140,7 @@ export interface Artifact {
    *  deliberately NOT in any picker: the backend keeps it out of
    *  `USER_SELECTABLE_KINDS` so nobody can mint one by hand, and a kind offered in
    *  the UI that the server refuses is a dead menu entry. */
-  kind: 'widget' | 'html' | 'markdown' | 'svg' | 'json' | 'text' | 'webapp' | 'image' | 'dashboard'
+  kind: 'widget' | 'html' | 'markdown' | 'svg' | 'json' | 'text' | 'webapp' | 'image' | 'dashboard' | 'canvas'
   /** Provenance/origin bucket. Carries either a legacy bucket
    * (chat|cron|subagent|manual|import) or the actual session origin
    * (dashboard|slack|cli|task-runner|unknown), so treated as an open string. */
@@ -151,6 +159,9 @@ export interface Artifact {
   /** Opaque optimistic-concurrency token for `content`; echo it back as
    * `expected_token` on a content save. Absent for live file-backed artifacts. */
   content_token?: string
+  /** The shown `content` had text masked (credentials, suspicious URLs), so it is
+   *  not the stored content; saving it back would write the placeholders. */
+  content_redacted?: boolean
   /** Original source path for file-backed artifacts (live pointer). */
   source_path?: string
   /** True when the live state differs from the latest numbered snapshot.
@@ -183,6 +194,11 @@ export interface Artifact {
    * "save permanently" action changes. Absent on older payloads — treat
    * undefined as false. */
   auto_registered?: boolean
+  /** List responses only: true when the auto-widget sweep could delete this
+   *  record (the server's own `_is_sweepable_auto_widget`). It is the Artifacts
+   *  home page's "Recent output" row; everything else is made or kept. Absent
+   *  on older payloads -- treat undefined as false. */
+  sweepable?: boolean
   /** True for a crewmate's weekly report or monthly review, set by the gateway
    * when `save_goal_report` files it (never through the artifact API). The
    * viewer opens such a page in the crewmate Dashboard page's sandbox

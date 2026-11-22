@@ -48,7 +48,7 @@ own repo.
 
 | Field | Rules |
 |-------|-------|
-| `name` | Required. Kebab-case, matched against `^[a-z0-9]+(?:-[a-z0-9]+)*$`, unique across all apps. This is the install id and the on-disk directory name. `system` is reserved (it would shadow the `system.*` notification-channel namespace), as are `library` (the dashboard serves `/apps/library` as a static page), `registry`, `registries`, `blob`, `install` and `register` (shared `/api/apps/<name>` routes registered ahead of the per-app catch-all), and the Windows device stems `con`, `prn`, `aux`, `nul`, `com1`–`com9` and `lpt1`–`lpt9` (the name becomes a directory, and Windows resolves those inside every directory). Names that merely resemble one — `console`, `com10`, `null-app` — are fine. All are refused on every platform, so an app that installs on Linux also installs on Windows. |
+| `name` | Required. Kebab-case, matched against `^[a-z0-9]+(?:-[a-z0-9]+)*$`, unique across all apps. This is the install id and the on-disk directory name. `system` is reserved (it would shadow the `system.*` notification-channel namespace), as are `library` (the dashboard serves `/apps/library` as a static page), `registry`, `registries`, `blob`, `install`, `register` and `market` (shared `/api/apps/<name>` routes registered ahead of the per-app catch-all), and the Windows device stems `con`, `prn`, `aux`, `nul`, `com1`–`com9` and `lpt1`–`lpt9` (the name becomes a directory, and Windows resolves those inside every directory). Names that merely resemble one — `console`, `com10`, `null-app` — are fine. All are refused on every platform, so an app that installs on Linux also installs on Windows. |
 | `version` | Required. Semver (`major.minor.patch`, optionally with a pre-release or build suffix). Bump on every release. |
 | `displayName` | Required. Rendered in a fixed-width row that truncates, so keep it short. |
 | `description` | Required. Plain text, no markdown. Discover's list row shows one truncated line; the feature cards clamp to two; the detail page shows it in full. Two or three sentences is the useful range. |
@@ -148,7 +148,11 @@ falls back to the name-seeded gradient). Keep art as plain committed files under
 the size caps: an art file over 8 MiB is never served, so its card falls back to
 the gradient, and an owner-tier row prewarms only the first 12 paths of each
 screenshots field. This limitation applies only to pre-install store art: the install
-and update paths are not masked and check out LFS content as usual.
+and update paths are not masked and check out LFS content as usual, from the host
+the app is cloned from only: every registry git command pins `lfs.url` to the
+endpoint Git LFS derives from the clone URL, so a committed `.lfsconfig` that sets
+`lfs.url` or `remote.<name>.lfsurl` is overridden. Keep LFS objects on the same
+forge as the repository.
 
 ## 5. Setup and lifecycle scripts
 
@@ -169,7 +173,7 @@ and update paths are not masked and check out LFS content as usual.
 |------|--------------|---------|
 | `onInstall` | After a **registry** install has cloned and built the source, before the files are copied into the data home | 300s |
 | `onUninstall` | Before app files are removed, and only after cron cleanup has succeeded | 120s |
-| `onEnable` | After resources are registered, the backend is started, and dependencies are resolved | 30s, or `onEnableTimeout` (1-300) |
+| `onEnable` | After resources are registered, the backend is started, and dependencies are resolved; and after every update of an enabled app, once it is re-registered and its backend started | 30s, or `onEnableTimeout` (1-300) |
 | `onDisable` | First step of disable, before hooks, backend stop, and deregistration | 30s, or `onDisableTimeout` (1-300) |
 
 Execution model:
@@ -199,9 +203,16 @@ Execution model:
 - Installing from a **local path** (`POST /api/apps/install`, `kirocrew app
   install <dir>`) copies and registers the app but does not run `onInstall`. Do
   any build step yourself while iterating locally.
+- An update of an enabled app re-runs `onEnable` once the new version is in
+  place. The update replaces the installed folder with a fresh copy that never
+  carries `node_modules` or `.venv`, so an `onEnable` that installs them (for
+  example `cd runtime && npm ci --omit=dev`) puts them back. Keep it idempotent.
+  If it fails, the app stays enabled on the new version and the user is told
+  why; the next enable or update runs it again.
 - `setup.onUpdate` parses and round-trips through the manifest, but no code path
-  executes it. Do not put work an update depends on there. Make `onInstall`
-  idempotent instead, since a registry update re-runs it.
+  executes it. Do not put work an update depends on there. Put it in `onEnable`,
+  or in an idempotent `onInstall` for a build step, since a registry update
+  re-runs it.
 
 Only declare `onUninstall` for state Kiro Crew cannot see: app binaries outside
 the data home, shell aliases, launchd plists. For `resources: "gateway"` apps the
@@ -293,7 +304,10 @@ unreachable on exactly the hosts that need it to explain how to get the desktop 
 
 ```bash
 # Build the UI bundle if the app has one
-cd my-app/ui && npm install && npm run build && cd ..
+cd my-app/ui
+npm install
+npm run build
+cd ..
 
 kirocrew app install /absolute/path/to/my-app
 kirocrew app enable my-app
@@ -371,10 +385,14 @@ edit gets the same revocation, but only once the liveness watch notices, and an
 app's shutdown hook can no longer load by then. See
 `docs/architecture/app-platform-trust-model.md` for the full contract.
 
-Non-executable resources (agents, skills, MCP server declarations, cron
-definitions, UI bundles) are unaffected. If your app needs any executable
-surface, say so in your README: a user who has not turned the setting on will see
-`app_execution_denied` rather than a working install.
+The gate covers the whole app, not only its executable surfaces. Until the app
+is trusted, either alone (`agent.apps_trusted`, which the App Store asks for at
+enable) or through that setting, `enable` refuses it and registration denies it,
+so none of its agents, skills, MCP server declarations or cron definitions is
+registered. That holds for an app that declares only a skill and a remote MCP
+server, too. Only the static files of an installed UI bundle are still served
+from `/apps/<name>/ui/`. Tell users in your README to trust the app when they enable it; a
+user who has not will see `app_execution_denied` rather than a working install.
 
 Repository layout:
 
@@ -490,6 +508,13 @@ credential-free by default: an anonymous environment plus a strict sandbox that
 hides `~/.ssh`. This is a confused-deputy defense, because an index the owner did
 not author could otherwise point at a private sibling repo on the owner's own
 trusted forge and have the gateway read it with ambient credentials.
+
+Such a clone also reads no ssh config, so an app repo on a host you reach only
+through `~/.ssh/config` (a `ProxyCommand`, `ProxyJump` or `Host` alias) cannot be
+cloned that way, and the install fails with `git_clone_failed_strict_ssh_route`.
+Clone the repo from your own shell and run `kirocrew app install <dir>`, or use
+the same-repo carve-out or an owner-tier registry below, which clone with your
+credentials.
 
 **The same-repo carve-out** relaxes that for the monorepo layout. When an index
 entry's effective clone URL is byte-identical to the registry repo URL the owner
@@ -610,6 +635,9 @@ POST /api/apps/register
 ```
 
 The call is idempotent: registering again with a newer version updates the entry.
+With `agent.apps_ui_protected_copy` on (off by default), the dashboard runs the UI
+scripts (`.js`, `.mjs`) that were in the app's folder at its last registration, so
+an app that changes its UI registers again to ship it.
 `resources` and `lifecycle` default to `app` when omitted; the gateway always
 records `origin` as `external` and ignores any `origin` in the body. Use this when the app has its own build or package system, needs
 runtime-dynamic agent configuration, or manages its own agent, skill, and MCP
@@ -629,15 +657,19 @@ installed one.
 
 - Patch for fixes, minor for features, major for breaking changes (agent config
   schema, MCP tool interface).
-- `minKiroCrewVersion` is checked on install and update; too-old gateways get a
-  clear error telling the user to update Kiro Crew first.
+- `minKiroCrewVersion` is checked on install and update, by the gateway that serves
+  the request; a too-old gateway refuses with its own version and says to update
+  Kiro Crew, then restart that gateway. `kirocrew app install` names the version
+  of the gateway that decided.
 - Users update from the store or via `POST /api/apps/{name}/update`. For a
   registry-sourced app the update runs its preflight, stops the backend and
   deregisters the app's resources, then re-clones, rebuilds, and re-runs
   `onInstall`. If that install fails, the old version is restored: an enabled app
   is re-registered and restarted, while a disabled app stays stopped and
   unregistered. `kirocrew app update <name> [--source <dir>]` runs the same
-  request from a terminal through a running gateway.
+  request from a terminal through a running gateway; it is not available on
+  native Windows, which has no dashboard Unix socket, so use the Update button
+  there.
 
 ## 14. Review checklist
 
@@ -667,8 +699,8 @@ useful to Kiro Crew users.
 | Stage | Command or action |
 |-------|-------------------|
 | Scaffold | `kirocrew app init my-app` |
-| Build UI | `cd ui && npm run build` |
-| Install locally | `POST /api/apps/install`, or `kirocrew app install <dir>` |
+| Build UI | `npm run build` in `ui/` |
+| Install locally | `POST /api/apps/install`, or `kirocrew app install <dir or git URL>` |
 | Enable | Trust the app first, then `POST /api/apps/{name}/enable`, or `kirocrew app enable <name>` |
 | Live reload | `kirocrew app dev <name>` |
 | Update local copy | `POST /api/apps/{name}/update`, or `kirocrew app update <name> [--source <dir>]` |

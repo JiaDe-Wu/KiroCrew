@@ -18,9 +18,17 @@ provider sentence was lost from the usage-limit row and the "temporarily
 unavailable" retry never matched. :func:`provider_data_text` returns the text
 those readers should treat as the provider field.
 
-Only this shape is read differently: a ``data`` mapping that names a string
-``errorType``, next to a ``message`` that is not the fixed ``Internal error``
-boilerplate. A string ``data``, an ``errorKind`` mapping (claude-agent-acp) and
+opencode does the same for a provider failure it relays, with its own key::
+
+    {"code": -32603,
+     "message": "Internal error: <provider text>",
+     "data": {"errorName": "APIError", "service": "session"}}
+
+so the many-image pixel cap, among others, reached the user as the raw frame.
+
+Only these shapes are read differently: a ``data`` mapping that names a string
+``errorType`` or ``errorName``, next to a ``message`` that is not the fixed
+``Internal error`` boilerplate. A string ``data``, an ``errorKind`` mapping (claude-agent-acp) and
 a frame with no ``data`` read exactly as before.
 
 Split out of ``transport_errors.py`` to keep that module under the file-line cap.
@@ -30,13 +38,21 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+#: The ``data`` of the error reply the runtime hands a session in place of a chat
+#: prompt reply it dropped as oversize. ``transport_errors`` shows that error's
+#: ``message`` as one plain sentence (the byte counts stay in the reader's log),
+#: still through its credential redaction, since a backend can send it too.
+OVERSIZE_REPLY_DATA = "kirocrew:oversize-reply-dropped"
+
 
 def structured_data_prose(error: object) -> str:
     """The provider sentence of a structured-``data`` frame, or "" for any other shape."""
     if not isinstance(error, dict):
         return ""
     data = error.get("data")
-    if not isinstance(data, Mapping) or not isinstance(data.get("errorType"), str):
+    if not isinstance(data, Mapping):
+        return ""
+    if not isinstance(data.get("errorType"), str) and not isinstance(data.get("errorName"), str):
         return ""
     message = error.get("message")
     if not isinstance(message, str):
@@ -59,3 +75,24 @@ def provider_data_text(error: object) -> str:
     data = str(error.get("data", "") or "") if isinstance(error, dict) else ""
     prose = structured_data_prose(error)
     return f"{prose} {data}" if prose else data
+
+
+def _error_kind_from_frame(error: object) -> str:
+    """Return the structured ``errorKind`` a raw ACP frame's ``data`` carries.
+
+    claude-agent-acp names some provider answers with a machine-readable kind
+    alongside the prose (``{"code": -32603, "message": "Internal error",
+    "data": {"errorKind": "cloud_credential_error"}}`` -- the same field the
+    ``{'errorKind': 'unknown'}`` wrapper note at ``transport_errors._RE_5XX_HINT``
+    describes). Only a ``data`` that IS a mapping is read: the formatter pastes a
+    non-mapping ``data`` verbatim into the user-visible message, so matching
+    the kind out of that string would be the prose path structured readers
+    exist to avoid. Returns "" when the frame names no kind.
+    """
+    if not isinstance(error, dict):
+        return ""
+    data_field = error.get("data")
+    if isinstance(data_field, dict):
+        kind = data_field.get("errorKind")
+        return kind if isinstance(kind, str) else ""
+    return ""

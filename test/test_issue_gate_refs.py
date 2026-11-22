@@ -382,6 +382,232 @@ class TestGateStepDecisions:
         assert "GATE_ENFORCED" in out
 
 
+def _retrigger_job() -> tuple[dict, dict]:
+    import yaml
+
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "issue-gate-retrigger.yml").read_text(encoding="utf-8")
+    )
+    (job,) = workflow["jobs"].values()
+    # PyYAML reads the bare key `on` as boolean True.
+    return workflow.get("on") or workflow[True], job
+
+
+# gh's `--jq` is built in, so the gh stub hands each filter to a `jq`. A host
+# without one gets this stand-in for the step's four filters (exit 2 on any
+# other) instead of a skip; a host with jq runs the step's real filters.
+_RETRIGGER_JQ = """\
+import json, os, sys
+flag, expr, path = sys.argv[1:]
+with open(path, encoding="utf-8") as f:
+    data = json.load(f)
+if flag == "-r" and expr.startswith(".data.repository.issue.timelineItems.nodes[].source"):
+    for node in data["data"]["repository"]["issue"]["timelineItems"]["nodes"]:
+        s = node["source"]
+        if s.get("number") is not None and s["state"] == "OPEN" \\
+                and s["repository"]["nameWithOwner"] == os.environ["REPO"]:
+            repo = s["headRepository"]["nameWithOwner"]
+            print(s["number"], s["headRefOid"], repo, s["headRefName"])
+elif flag == "-r" and expr.startswith("[.workflow_runs[]"):
+    runs = [r for r in data["workflow_runs"] if r["head_branch"] == os.environ["HEAD_REF"]
+            and r["head_repository"]["full_name"] == os.environ["HEAD_REPO"]]
+    if runs:
+        r = max(runs, key=lambda r: r["id"])
+        print(r["id"], r["status"], "null" if r["conclusion"] is None else r["conclusion"])
+elif flag == "-r" and expr.startswith(".check_runs[]"):
+    marker = "/" + os.environ["REPO"] + "/actions/runs/"
+    for row in data["check_runs"]:
+        url = row.get("details_url") or ""
+        if marker in url:
+            rid = url.split("/actions/runs/")[1].split("/")[0]
+            if rid.isdigit():
+                print(rid)
+elif flag == "-r" and expr.startswith("select(.path"):
+    r = data
+    if r["path"] == ".github/workflows/issue-gate.yml" and r["event"] == "pull_request" \\
+            and r["head_sha"] == os.environ["SHA"] \\
+            and r["head_repository"]["full_name"] == os.environ["HEAD_REPO"] \\
+            and r["head_branch"] == os.environ["HEAD_REF"]:
+        print(r["id"], r["status"], "null" if r["conclusion"] is None else r["conclusion"])
+else:
+    sys.exit(2)
+"""
+
+_NEEDS_BASH = pytest.mark.skipif(
+    shutil.which("bash") is None or os.name == "nt",
+    reason="the step runs under bash, as on the ubuntu runner",
+)
+
+
+class TestRetrigger:
+    """A label landing on the ISSUE is not a pull_request event, so a gate that
+    went red before triage would stay red after it. issue-gate-retrigger.yml
+    re-runs that failed job when a label the gate reads changes."""
+
+    def test_it_fires_on_exactly_the_labels_the_gate_reads(self):
+        on, job = _retrigger_job()
+        assert on == {"issues": {"types": ["labeled", "unlabeled"]}}
+        listed = json.loads(job["if"].split("fromJSON('", 1)[1].split("')", 1)[0])
+        env = _gate_step()["env"]
+        read = [*env["TIER_LABELS"].split(), env["PENDING_LABEL"], env["TRIAGED_LABEL"]]
+        assert sorted(listed) == sorted(read)
+
+    @staticmethod
+    def _pr(number, sha, state="OPEN", repo=REPO):
+        return {
+            "source": {
+                "number": number,
+                "state": state,
+                "headRefOid": sha,
+                "headRefName": f"b{number}",
+                "headRepository": {"nameWithOwner": repo},
+                "repository": {"nameWithOwner": repo},
+            }
+        }
+
+    @staticmethod
+    def _run(run_id, branch, status="completed", conclusion="failure", repo=REPO, **extra):
+        return {
+            "id": run_id,
+            "status": status,
+            "conclusion": conclusion,
+            "head_branch": branch,
+            "head_repository": {"full_name": repo},
+            **extra,
+        }
+
+    def _drive(self, tmp_path, nodes, runs, check_runs=None, named=None):
+        """Run the step against a gh stub. ``runs`` is each head's listing,
+        ``check_runs`` each head's check-run run ids (default: none; ``None``:
+        unreadable) and ``named`` the bare run reads by id (absent = the read
+        fails)."""
+        (step,) = _retrigger_job()[1]["steps"]
+        timeline = {"data": {"repository": {"issue": {"timelineItems": {"nodes": nodes}}}}}
+        (tmp_path / "timeline.json").write_text(json.dumps(timeline), encoding="utf-8")
+        for sha, listed in runs.items():
+            (tmp_path / f"runs-{sha}.json").write_text(
+                json.dumps({"workflow_runs": listed}), encoding="utf-8"
+            )
+            ids = (check_runs or {}).get(sha, [])
+            rows = [
+                {"details_url": f"https://github.com/{REPO}/actions/runs/{rid}/job/1"}
+                for rid in ids or []
+            ]
+            rows.append({"details_url": "https://example.com/report"})
+            # None: the head's check-runs cannot be read.
+            body = "not json" if ids is None else json.dumps({"check_runs": rows})
+            (tmp_path / f"checks-{sha}.json").write_text(body, encoding="utf-8")
+        for rid, body in (named or {}).items():
+            (tmp_path / f"run-{rid}.json").write_text(json.dumps(body), encoding="utf-8")
+        gh = tmp_path / "gh"
+        gh.write_text(
+            "#!/bin/sh\n"
+            'case "$1 $2" in\n'
+            "  'api graphql') file=timeline.json ;;\n"
+            "  'api repos/'*'/check-runs'*)\n"
+            '    sha="${2#*/commits/}"; file="checks-${sha%%/*}.json" ;;\n'
+            "  'api repos/'*'/actions/runs/'*) file=\"run-${2##*/}.json\" ;;\n"
+            '  \'api repos/\'*) sha="${2#*head_sha=}"; file="runs-${sha%%&*}.json" ;;\n'
+            '  \'run rerun\') echo "$3 $4" >> "$STUB_DIR/reruns"; exit 0 ;;\n'
+            '  *) echo "unexpected $*" >&2; exit 2 ;;\n'
+            "esac\n"
+            'while [ "$#" -gt 1 ] && [ "$1" != "--jq" ]; do shift; done\n'
+            'exec jq -r "$2" "$STUB_DIR/$file"\n',
+            encoding="utf-8",
+        )
+        gh.chmod(0o755)
+        if shutil.which("jq") is None:
+            jq = tmp_path / "jq"
+            jq.write_text(f"#!{sys.executable}\n{_RETRIGGER_JQ}", encoding="utf-8")
+            jq.chmod(0o755)
+        script = tmp_path / "step.sh"
+        script.write_bytes(step["run"].encode("utf-8"))
+        return subprocess.run(
+            ["bash", "-e", str(script)],
+            cwd=tmp_path,
+            env={
+                **os.environ,
+                **{k: str(v) for k, v in step["env"].items()},
+                "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+                "STUB_DIR": str(tmp_path),
+                "REPO": REPO,
+                "ISSUE": "7",
+            },
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+
+    @staticmethod
+    def _reruns(tmp_path):
+        path = tmp_path / "reruns"
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
+    @_NEEDS_BASH
+    def test_it_reruns_only_a_failed_gate(self, tmp_path):
+        # The stubs run the step's own `--jq` filters: an issue source, a closed
+        # PR and another repository's PR drop out, a repeated PR counts once, and
+        # of PRs 12-15 only 12's gate failed, under a newer green run of another
+        # PR that shares its head SHA. PR 15's head has no run and its
+        # check-runs name none, so it is left alone.
+        pr, run = self._pr, self._run
+        nodes = [pr(12, "aaa"), pr(13, "bbb"), pr(14, "ccc"), pr(15, "ddd"), pr(12, "aaa")]
+        nodes += [{"source": {}}, pr(16, "eee", state="CLOSED"), pr(17, "fff", repo="o/r")]
+        runs = {
+            "aaa": [run(109, "b18", conclusion="success"), run(101, "b12")],
+            "bbb": [run(102, "b13", conclusion="success")],
+            "ccc": [run(103, "b14", status="in_progress", conclusion=None)],
+            "ddd": [],
+            "eee": [run(105, "b16")],
+            "fff": [run(106, "b17", repo="o/r")],
+        }
+        proc = self._drive(tmp_path, nodes, runs)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert self._reruns(tmp_path) == "101 --failed\n"
+        assert "PR #15: no Issue Gate run on head ddd; left alone." in proc.stdout
+
+    @_NEEDS_BASH
+    def test_an_empty_listing_reruns_the_failed_gate_its_check_runs_name(self, tmp_path):
+        # The listing answers none, but the head's check-runs name PR 12's failed
+        # gate run, and newer runs that each fail one filter: a gate run of a
+        # push, a run of another workflow, a gate run of another branch on the head.
+        def named(rid, **extra):
+            fields = {"path": ".github/workflows/issue-gate.yml", "event": "pull_request"}
+            fields["head_sha"] = "aaa"
+            return self._run(rid, "b12", **{**fields, **extra})
+
+        reads = {
+            101: named(101),
+            140: named(140, event="push"),
+            120: named(120, path=".github/workflows/ci.yml"),
+            130: {**named(130, conclusion="success"), "head_branch": "b18"},
+        }
+        proc = self._drive(
+            tmp_path,
+            [self._pr(12, "aaa")],
+            {"aaa": []},
+            check_runs={"aaa": [101, 140, 120, 130, 101]},
+            named=reads,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert self._reruns(tmp_path) == "101 --failed\n"
+
+    @_NEEDS_BASH
+    @pytest.mark.parametrize("unreadable", ["run", "check-runs"])
+    def test_an_unreadable_named_run_is_never_no_run(self, tmp_path, unreadable):
+        # Run 101 has no answer, so its read fails; or the check-runs read fails.
+        ids = None if unreadable == "check-runs" else [101]
+        proc = self._drive(tmp_path, [self._pr(12, "aaa")], {"aaa": []}, check_runs={"aaa": ids})
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert self._reruns(tmp_path) == ""
+        assert (
+            "::warning::PR #12: could not read the Issue Gate runs its head's check-runs name."
+            in proc.stdout
+        )
+        assert "no Issue Gate run" not in proc.stdout
+
+
 class TestCommandLine:
     def _run(self, body: str, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

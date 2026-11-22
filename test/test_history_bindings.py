@@ -41,6 +41,8 @@ from kiro_crew.history import ConversationLog
 
 pytestmark = pytest.mark.xdist_group(name="tree_scan_history_bindings")
 
+SHARED_BINDINGS_CHECKS = ("the_class_only_scan_can_fail",)
+
 _PACKAGE = "kiro_crew"
 _REPO = Path(__file__).resolve().parents[1]
 
@@ -126,6 +128,7 @@ _MEMBERS: dict[str, tuple[str, str, str]] = {
     "chain_mid_rotation": ("function", "1eda252b53bd", "history"),
     "chained_keys": ("function", "349ed17a0181", "history"),
     "clear_closed": ("function", "fe163b1b1d09", "history"),
+    "clear_consolidation_environment_backoff": ("function", "1eda252b53bd", "history_marker"),
     "consolidated_offset": ("function", "028659ce42ac", "history_marker"),
     "consolidation_counts": ("function", "286ecf2c0fe3", "history_marker"),
     "consolidation_retry_state": ("function", "945c2956ab9c", "history_marker"),
@@ -137,6 +140,9 @@ _MEMBERS: dict[str, tuple[str, str, str]] = {
     "derive_messages": ("function", "d4d3f09b758c", "history_derivation"),
     "derive_messages_chained": ("function", "d4d3f09b758c", "history_derivation"),
     "derive_messages_chained_with_keys": ("function", "81471b1c6628", "history_derivation"),
+    "derive_messages_chained_full_with_keys": ("function", "81471b1c6628", "history_derivation"),
+    "_read_messages_with_rotated_head": ("function", "d4d3f09b758c", "history_derivation"),
+    "_derive_settled_chain_rows": ("function", "5b8db63436a5", "history_derivation"),
     "derive_recent": ("function", "cac529f460f5", "history_derivation"),
     "get_cached_intent_summary": ("function", "ffa13bebb6bc", "history_summaries"),
     "get_cached_summary": ("function", "4b576121a346", "history_summaries"),
@@ -147,11 +153,13 @@ _MEMBERS: dict[str, tuple[str, str, str]] = {
     "has_messages": ("function", "1eda252b53bd", "history"),
     "listing_has_messages": ("function", "1eda252b53bd", "history"),
     "indexed_has_messages": ("function", "5ccb54f56604", "history"),
+    "listing_identities": ("function", "08b8e6e8bbc9", "history"),
     "init": ("function", "b60c5fea256e", "history"),
     "invalidate_tab_id_cache": ("function", "b60c5fea256e", "history"),
     "last_message_info": ("function", "5ce93cd5cafb", "history"),
     "last_message_preview": ("function", "67642ad2d3e2", "history"),
     "last_row_ts": ("function", "4b576121a346", "history"),
+    "last_speech_row_ts": ("function", "4b576121a346", "history"),
     "last_speech_info": ("function", "5c2c36671674", "history"),
     "list_sessions": ("function", "32c901f96e6a", "history"),
     "list_sessions_indexed": ("function", "3b4687b0c546", "history"),
@@ -163,7 +171,7 @@ _MEMBERS: dict[str, tuple[str, str, str]] = {
     "newest_session_stems": ("function", "37c4401320a5", "history"),
     "note_tab_id": ("function", "d619a539dc08", "history"),
     "publication_hold": ("function", "71bd4ae68dce", "history_derivation"),
-    "read_file_change_messages": ("function", "d4d3f09b758c", "history"),
+    "read_file_change_messages": ("function", "8e98e41596fe", "history"),
     "read_intent_summary": ("function", "ed187f9bbc5a", "history_summaries"),
     "read_messages": ("function", "d4d3f09b758c", "history"),
     "read_messages_chained": ("function", "d4d3f09b758c", "history"),
@@ -181,18 +189,20 @@ _MEMBERS: dict[str, tuple[str, str, str]] = {
     "record_consolidation_failure": ("function", "fe8a2b418865", "history_marker"),
     "rewrite_session": ("function", "b67b482624a6", "history"),
     "rotation_generation": ("function", "028659ce42ac", "history_marker"),
-    "search_sessions": ("function", "cb218591aedd", "history"),
+    "search_sessions": ("function", "ee42f42a88f4", "history"),
     "session_mtime": ("function", "eed46331c744", "history"),
     "set_cached_intent_summary": ("function", "271ca4530d1f", "history_summaries"),
     "set_cached_summary": ("function", "1d6bdfb57c5e", "history_summaries"),
     "set_title": ("function", "e8c95d28974e", "history"),
     "sliding_window": ("function", "fa03f21e682f", "history"),
     "snapshot_for_consolidation": ("function", "3943122bc725", "history_marker"),
+    "store_ingested_images": ("function", "4fec4fb083b9", "history_append"),
     "thread_transcript_identity": ("function", "4b576121a346", "history_threads"),
     "threads_sidecar_path": ("function", "445450696709", "history_threads"),
     "unconsolidated_count": ("function", "028659ce42ac", "history_marker"),
     "update_metadata": ("function", "5e1ab1217b61", "history"),
     "update_metadata_if": ("function", "316452efe533", "history"),
+    "warm_listing_index": ("function", "a0bbc81108fa", "history"),
     "warm_search": ("function", "b60c5fea256e", "history"),
 }
 
@@ -335,15 +345,6 @@ def _class_only_constructs(fn: ast.FunctionDef) -> list[str]:
         if isinstance(spelled, str) and spelled.startswith("__") and not spelled.endswith("__"):
             found.append(spelled)
     return found
-
-
-def test_the_class_only_scan_can_fail() -> None:
-    tree = ast.parse("def f(self):\n    super().g()\n    return __class__, self.__hidden\n")
-    assert sorted(_class_only_constructs(tree.body[0])) == [  # type: ignore[arg-type]
-        "__class__",
-        "__hidden",
-        "super()",
-    ]
 
 
 @pytest.mark.parametrize("owner", history._OWNERS)

@@ -33,6 +33,7 @@ if TYPE_CHECKING:
         QueuedReadUnavailable,
         QueuedRun,
         QueuedRunListing,
+        _record_isolation_denial,
         _redact,
         _run_belongs_to_caller,
         _sel,
@@ -48,7 +49,6 @@ if TYPE_CHECKING:
         logger,
         read_state,
         record_panel_dismissal_outcome,
-        settles_at_release,
         spawn_parent_claim,
         subagent_event_slot,
         warm_project_agents_for_spawn,
@@ -155,6 +155,115 @@ def _queued_run_payload(queued: QueuedRun) -> dict[str, object]:
     return data
 
 
+def _app_token_caller(request: web.Request) -> str:
+    """The app an app-token request acts for, else ``""``.
+
+    ``""`` for the dashboard owner (an empty claim) and for an internal caller,
+    whose reach is its own session's (:func:`_spawn_scope_refusal`). An app token
+    is neither: it is not the owner, and it presents no session of its own.
+    """
+    if request.get("internal_auth") is True:
+        return ""
+    app = request.get("app")
+    return app if isinstance(app, str) else ""
+
+
+def _app_token_parent_refusal(
+    request: web.Request, parent_session: str, operation: str
+) -> web.Response | None:
+    """The answer for an app token naming a parent session that is not its own.
+
+    A run reports into its parent session and takes that session's trust, so an
+    app token names only a session the app owns, resolved in that key's namespace
+    (``token_auth_callers.app_owner_of_session_key``). No parent at all is allowed,
+    as the App Kit SDK starts its runs. The body is the one an internal caller
+    gets for a session it cannot vouch for.
+    """
+    app = _app_token_caller(request)
+    if not app or not parent_session:
+        return None
+    from kiro_crew.dashboard.token_auth_callers import app_owner_of_session_key
+
+    state = request.app["state"]
+    owner = app_owner_of_session_key(
+        getattr(state, "_slots", None),
+        parent_session,
+        getattr(getattr(state, "crons", None), "_jobs", None),
+        getattr(getattr(state, "subagents", None), "_agents", None),
+    )
+    if owner == app:
+        return None
+    _record_isolation_denial(
+        app, operation, "parent_session", "the parent session is not the app's"
+    )
+    return web.json_response(
+        {
+            "error": "The execution identity is unavailable; Global memory was not used.",
+            "code": "member_identity_unavailable",
+        },
+        status=409,
+    )
+
+
+def _app_token_batch_refusal(
+    request: web.Request,
+    parent_session: str,
+    *,
+    batch_id: str = "",
+    ids: list[Any] | None = None,
+    allow_new_batch: bool = False,
+    operation: str = "spawn.batch",
+) -> web.Response | None:
+    """An app joins or reconciles only a wave the gate admitted under its app and parent.
+
+    A batch is judged by the owner the gate recorded when it counted each of
+    the wave's submissions (``_batch_owner``), not by the members the registry
+    still holds: a queued member has no run yet, and a refused or evicted one
+    never will. The owner's batch, another app's, one whose members disagree,
+    and one the gate never counted are refused; a batch nobody has used yet is
+    the app's to start when the caller may start one (``allow_new_batch``).
+    """
+    app = _app_token_caller(request)
+    if not app:
+        return None
+    mgr = request.app["state"].subagents
+    runs: list[Any]
+    if batch_id and mgr is not None:
+        owners = getattr(mgr, "_batch_owner", None)
+        owner = owners.get(batch_id) if isinstance(owners, dict) else None
+        if owner == (app, parent_session):
+            return None
+        if (
+            allow_new_batch
+            and owner is None
+            and batch_id not in mgr._batch_submitted
+            and not any(run.batch_id == batch_id for run in mgr.all_agents)
+        ):
+            return None
+        runs = []
+    else:
+        runs = [
+            mgr.get(aid) if mgr is not None and isinstance(aid, str) else None
+            for aid in (ids or [])
+        ]
+    if runs and all(
+        getattr(run, "app", None) == app
+        and getattr(run, "parent_session_key", None) == parent_session
+        for run in runs
+    ):
+        return None
+    _record_isolation_denial(
+        app, operation, "batch_members", "the batch members are not verifiably the app's"
+    )
+    return web.json_response(
+        {
+            "error": "The execution identity is unavailable; Global memory was not used.",
+            "code": "member_identity_unavailable",
+        },
+        status=409,
+    )
+
+
 async def _spawn_scope_refusal(
     request: web.Request, *, claimed_session: str | None = None
 ) -> web.Response | None:
@@ -164,18 +273,22 @@ async def _spawn_scope_refusal(
     check, whatever memory store its identity resolved to and whether it resolved
     one at all: a verified Global-memory session is still only the owner of its
     own runs, and a caller that presented no ``X-Session-Key`` owns no run a
-    session started. Only the dashboard owner (cookie auth, no ``internal_auth``)
-    is admitted without it, because that surface IS the owner. Refusals answer
-    404 ``task_scope_denied`` so a run id is never confirmed to a caller that may
-    not see it; the identity-less refusal says why, since a wrong run id and a
-    missing identity are indistinguishable from the caller's side otherwise.
+    session started. Only the dashboard owner (cookie auth, no ``internal_auth``,
+    no app claim) is admitted without it, because that surface IS the owner. An
+    app token is not the owner: it reaches only a run recorded under its own app
+    (the run's ``app``, as the listing bounds it), whatever session started it.
+    Refusals answer 404 ``task_scope_denied`` so a run id is never confirmed to a
+    caller that may not see it; the identity-less refusal says why, since a wrong
+    run id and a missing identity are indistinguishable from the caller's side
+    otherwise.
     """
     scope, refusal = await internal_memory_scope(
         request, "spawn.access", claimed_session=claimed_session
     )
     if refusal is not None:
         return refusal
-    if request.get("internal_auth") is not True:
+    app_token = _app_token_caller(request)
+    if request.get("internal_auth") is not True and not app_token:
         return None  # the dashboard owner's own surface
     caller = request.headers.get("X-Session-Key", "")
     state = request.app["state"]
@@ -190,20 +303,27 @@ async def _spawn_scope_refusal(
         except QueuedReadUnavailable:
             return _queue_unreadable()
     parent: object
+    # The app the run is recorded under; ``None`` when nothing records one.
+    run_app: object = None
     # One order, stated once: the live run, then a spawn the gate is still
     # holding, then the persisted record, then a harness-native card.
     if info is not None:
         parent = info.parent_session_key
+        run_app = getattr(info, "app", "")
     elif queued is not None:
         # A spawn the gate is still holding has no run folder yet; its row's
         # session key is the originating session, the field the live branch
         # reads from ``info``.
         parent = queued.parent_session_key
+        run_app = queued.app
     elif (record := await asyncio.to_thread(read_state, run_id)) is not None:
         # The persisted record spells the field ``parent_session``
         # (``subagent_persistence.write_state``). A record that lacks it is an
         # unknown owner, not a parentless run: ``None`` stays ``None``.
         parent = record.get("parent_session")
+        from kiro_crew.subagent_persistence import _record_app
+
+        run_app = _record_app(record)
     else:
         # A harness-native child has no managed run and no persisted record; its
         # ownership is the dashboard slot that tracks its card. Anything else
@@ -213,6 +333,13 @@ async def _spawn_scope_refusal(
         # caller's identity is that slot's session key, ``dashboard:<slot>``.
         slot = card.get("slot") if isinstance(card, dict) else None
         parent = f"dashboard:{slot}" if isinstance(slot, str) and slot else None
+    if app_token:
+        if isinstance(run_app, str) and run_app == app_token:
+            return None
+        _record_isolation_denial(
+            app_token, "spawn.access", f"run={run_id}", "the run was not started by this app"
+        )
+        return web.json_response({"error": "not found", "code": "task_scope_denied"}, status=404)
     if _run_belongs_to_caller(caller, run_id, parent):
         return None
     _sel().log_api_access(
@@ -390,7 +517,7 @@ async def api_spawn_lost(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     not_object = body_not_object_error(body)
     if not_object is not None:
         return not_object
@@ -406,8 +533,17 @@ async def api_spawn_lost(request: web.Request) -> web.Response:
     _, refusal = await internal_memory_scope(
         request, "spawn.batch", claimed_session=spawn_parent_claim(request, parent_session)
     )
+    if refusal is None:
+        refusal = _app_token_parent_refusal(request, parent_session, "spawn.batch")
+    if refusal is None:
+        refusal = _app_token_batch_refusal(request, parent_session, batch_id=batch_id)
     if refusal is not None:
         return refusal
+    from kiro_crew.dashboard.card_send import card_turn_seen
+
+    # A card turn seen when this request arrived, even if stopped during the awaits.
+    if parent_session and card_turn_seen(request, parent_session):
+        return web.json_response({"status": "ignored_card_turn", "batch_id": batch_id})
     state.subagents.record_lost_submission(
         batch_id, batch_total, reason, parent_session_key=parent_session
     )
@@ -427,11 +563,10 @@ async def api_spawn_mark_collected(request: web.Request) -> web.Response:
     redundant LLM turn whose response shadows any [OPTIONS:] buttons the
     synthesis message rendered.
 
-    Only a dashboard-born parent's flagged children reach its slot here
-    (:func:`_settle_collected_on_slot`). Every other parent's mark is pending until
-    the turn that received it releases (``kiro_crew.parent_turns``), and only a
-    landed release settles its children on a tab that shows the parent
-    (``_settle_inline``).
+    Every parent's mark is pending until the turn that received it releases
+    (``kiro_crew.parent_turns``), and only a landed release settles its children
+    on a tab that shows the parent (``_settle_inline``, through
+    :func:`_settle_collected_on_slot`).
     """
     state: DashboardState = request.app["state"]
     try:
@@ -450,30 +585,21 @@ async def api_spawn_mark_collected(request: web.Request) -> web.Response:
     _, refusal = await internal_memory_scope(
         request, "spawn.batch", claimed_session=spawn_parent_claim(request, parent_session)
     )
+    if refusal is None:
+        refusal = _app_token_parent_refusal(request, parent_session, "spawn.batch")
+    if refusal is None:
+        refusal = _app_token_batch_refusal(request, parent_session, ids=ids)
     if refusal is not None:
         return refusal
     # Only a mark sent after its reply frame was written changes anything: a
     # caller that does not say so (a kirocrew-core from before this mark moved
     # behind the write) may have marked a reply the parent never received.
     written = body.get("written") is True
-    flagged = _flag_collected_inline(state, ids, parent_session) if written else set()
+    if written:
+        _flag_collected_inline(state, ids, parent_session)
     slot_name = dashboard_slot_key(parent_session)
-    if not slot_name:
+    if not slot_name or not state.get_slot(slot_name):
         return web.json_response({"status": "no_slot"})
-    slot = state.get_slot(slot_name)
-    if not slot:
-        return web.json_response({"status": "no_slot"})
-    if not written or settles_at_release(parent_session):
-        # A pending mark changes nothing on the slot: a completion queued there
-        # must still play if the turn that received the reply never lands.
-        return web.json_response({"status": "ok", "marked": len(ids)})
-    owed = _settle_collected_on_slot(slot, flagged, state.subagents)
-    if owed and state.subagents is not None:
-        try:
-            await state.subagents.settle_queued_delivery(owed)
-        except Exception:
-            logger.debug("Could not settle inline-collected deliveries", exc_info=True)
-    state.push_slots_update()
     return web.json_response({"status": "ok", "marked": len(ids)})
 
 
@@ -510,9 +636,8 @@ def _settle_collected_on_slot(slot: Any, ids: set[str], subagents: Any = None) -
     if subagents is not None:
         # A completion still queued was settled above. One already handed to
         # the parent and not queued (injected, or settled by an earlier
-        # mark whose reply the tool never saw) has passed every check that
-        # would discard its id, so it stays out of the set. That makes a
-        # repeated mark a no-op, which the tool relies on when it re-sends one.
+        # release) has passed every check that would discard its id, so it
+        # stays out of the set.
         wanted = {
             aid
             for aid in wanted
@@ -532,8 +657,7 @@ def _flag_collected_inline(state: DashboardState, ids: list[Any], parent_session
     so no caller can suppress a completion owed to a parent it is not. Bounded
     like the slot set: the first 200 ids, each at most ``_COLLECTED_ID_MAX_LEN``.
 
-    Every parent but a dashboard-born one (``settles_at_release``), a tab open on
-    it or not, gets only a pending mark (``kiro_crew.parent_turns``): it is held
+    Every parent gets only a pending mark (``kiro_crew.parent_turns``): it is held
     under the attempt now holding the parent's permit, and the end of that
     attempt confirms it if the turn landed and revokes it otherwise. It is held
     only when that attempt is the one that spawned the child (``_spawned_under``,
@@ -541,19 +665,17 @@ def _flag_collected_inline(state: DashboardState, ids: list[Any], parent_session
     (``_seen_done_under``, stamped by ``GET /api/spawn/{id}``): a mark processed
     after its attempt ended, while no turn or a later attempt holds the permit (an
     in-claim retry, the same task's next turn, another turn, an injection or a
-    compaction), flags nothing, so the completion is delivered. A dashboard-born
-    parent's tab route acknowledges on the mark.
+    compaction), flags nothing, so the completion is delivered.
     """
     flagged: set[str] = set()
     mgr = state.subagents
     if mgr is None or not parent_session:
         return flagged
-    held = settles_at_release(parent_session)
     ledger = ledger_of(state.sessions)
-    token = None
-    if held and ledger is not None:
-        token = state.sessions.turn_token(parent_session, open_attempt=False)
-    if held and token is None:
+    if ledger is None:
+        return flagged
+    token = state.sessions.turn_token(parent_session, open_attempt=False)
+    if token is None:
         return flagged
     foreign = 0
     for aid in ids[:200]:
@@ -565,7 +687,7 @@ def _flag_collected_inline(state: DashboardState, ids: list[Any], parent_session
         if getattr(record, "parent_session_key", None) != parent_session:
             foreign += 1
             continue
-        if token is not None and (
+        if (
             getattr(record, "_seen_done_under", None) != token
             or getattr(record, "_spawned_under", None) != token
         ):
@@ -573,13 +695,11 @@ def _flag_collected_inline(state: DashboardState, ids: list[Any], parent_session
             # is not the one holding the permit now: that attempt ended and the
             # reply reached no live turn.
             continue
-        if token is not None:
-            record._inline_state = "pending"
-            record._inline_token = token
+        record._inline_state = "pending"
+        record._inline_token = token
         record._collected_inline = True
         flagged.add(aid)
-    if token is not None and ledger is not None:
-        ledger.hold_marks(token, sorted(flagged))
+    ledger.hold_marks(token, sorted(flagged))
     if foreign:
         logger.warning(
             "mark-collected: ignored %d id(s) that are not children of the calling parent",
@@ -615,6 +735,31 @@ async def api_spawn_retry(request: web.Request) -> web.Response:
                 return _queued_not_started()
         except QueuedReadUnavailable:
             return _queue_unreadable()
+        # The pump can register the run while that lookup awaited; the
+        # registry then answers, not the folder.
+        old = state.subagents.get(agent_id)
+    if not old:
+        try:
+            recorded = await asyncio.to_thread(read_state, agent_id)
+        except (OSError, ValueError):
+            recorded = None
+        if recorded is not None:
+            # Its record left memory (a gateway restart, or past the failed-run
+            # bound). The folder holds only the redacted task and not the run's
+            # approval mode, so a retry from it would run a different
+            # experiment: refused, not replayed.
+            logger.info("Retry of %s refused: run record not in memory", agent_id)
+            return web.json_response(
+                {
+                    "error": (
+                        f"run {agent_id} has no record in memory, so it cannot be "
+                        "retried as it ran; use spawn_continue on it, or spawn its "
+                        "task again"
+                    ),
+                    "code": "retry_unavailable",
+                },
+                status=409,
+            )
         return web.json_response({"error": "not found"}, status=404)
     if not old.done:
         return web.json_response({"error": "agent is still running"}, status=409)
@@ -722,9 +867,10 @@ async def _retry_failed_run(
             app=execution.app,
             _memory_mode=execution.memory_mode,
             _execution_context=execution.to_record(),
-            # The replacement sits where the failed run sat in its tree, even when
+            # The replacement keeps its tree position and root chat's panel even when
             # the parent's record is gone and admission cannot read it.
             _depth=getattr(old, "depth", None),
+            _root_session_key=getattr(old, "root_session_key", None),
             **({"_preassigned_id": run_id} if run_id else {}),
         )
         import contextlib
@@ -886,12 +1032,38 @@ async def api_spawn_delete(request: web.Request) -> web.Response:
     """
     state: DashboardState = request.app["state"]
     agent_id = request.match_info["agent_id"]
-    # Handle native kiro-cli subagents (native:* IDs not in SubagentManager)
+    # Harness-native subagents (native:* IDs not in SubagentManager)
     if agent_id.startswith("native:") and hasattr(state, "_native_cards"):
         card_info = getattr(state, "_native_cards", {}).get(agent_id)
         if card_info:
-            # Can't actually kill the kiro-cli internal sub-agent, but we can
-            # close the Activity card so it stops showing "Starting..."
+            from kiro_crew.dashboard.native_child_stop import harness_stops_native_child
+
+            # A harness that can stop this one child is asked to, and the card
+            # closes on the end the harness then reports, drawn as stopped.
+            stopping = await harness_stops_native_child(state, card_info)
+            # User-initiated cancellation is an auditable action (parity with
+            # the managed path, which audits inside SubagentManager.cancel()).
+            try:
+                _sel().log_tool_invocation(
+                    session_key=card_info["slot"],
+                    source="subagent",
+                    tool_name="cancel_native_subagent",
+                    outcome="cancelled_by_user",
+                    metadata={
+                        "card_id": agent_id,
+                        **({"harness_cancel": True} if stopping else {}),
+                    },
+                )
+            except Exception:
+                logger.debug("SEL audit failed for native cancel %s", agent_id, exc_info=True)
+            if stopping:
+                return web.json_response({"ok": True, "cancelled": True, "stopping": True})
+            if agent_id not in state._native_cards:
+                # The child ended while the harness was being asked: its own end
+                # closed the card, and a second close would redraw it as stopped.
+                return web.json_response({"ok": True, "cancelled": True})
+            # Otherwise the child runs on inside its parent's process, out of reach,
+            # so only the Activity card is closed: it stops showing "Starting...".
             state._native_cards.pop(agent_id, None)
             # Persist the stop on the slot-owned tracker record so WS replay
             # (native_subagent_snapshots) reconstructs this card as STOPPED for
@@ -913,18 +1085,6 @@ async def api_spawn_delete(request: web.Request) -> web.Response:
                     _rec["result"] = "(cancelled)"
             except Exception:
                 logger.debug("native cancel: tracker update failed for %s", agent_id, exc_info=True)
-            # User-initiated cancellation is an auditable action (parity with
-            # the managed path, which audits inside SubagentManager.cancel()).
-            try:
-                _sel().log_tool_invocation(
-                    session_key=card_info["slot"],
-                    source="subagent",
-                    tool_name="cancel_native_subagent",
-                    outcome="cancelled_by_user",
-                    metadata={"card_id": agent_id},
-                )
-            except Exception:
-                logger.debug("SEL audit failed for native cancel %s", agent_id, exc_info=True)
             state.broadcast_ws(
                 "subagent_done",
                 {
@@ -939,7 +1099,42 @@ async def api_spawn_delete(request: web.Request) -> web.Response:
                 },
             )
             return web.json_response({"ok": True, "cancelled": True})
-        return web.json_response({"error": "not found"}, status=404)
+        # Every completion path unregisters a card from ``_native_cards``, but
+        # its slot still holds the record reconnect replay draws it from.
+        # Dismissing marks that record, so a finished card stays cleared instead
+        # of answering 404 and coming back on the next reconnect. As in the
+        # persisted-run dismissal below, only a dashboard session passes: an app
+        # token's claim names its app, and an internal caller's claim is absent
+        # or names its app.
+        request_app = request.get("app", "")
+        if "app" not in request or request_app:
+            _sel().log_api_access(
+                caller=request_app or "unknown",
+                operation="spawn.dismiss",
+                outcome="denied",
+                source="app_isolation",
+                resources="dashboard-only dismissal of a native subagent card",
+                error="app tokens cannot dismiss native subagent cards",
+            )
+            return app_token_refusal(
+                "dismiss a finished native subagent card",
+                "Dismiss the card from the dashboard instead.",
+            )
+        if not state.dismiss_native_subagent(agent_id):
+            return web.json_response({"error": "not found"}, status=404)
+        # The card is already cleared, so an audit failure must not turn the
+        # answer into an error the panel would report as a failed dismissal.
+        try:
+            _sel().log_api_access(
+                caller="dashboard",
+                operation="spawn.dismiss",
+                outcome="allowed",
+                source="subagent",
+                resources=f"native card {agent_id}",
+            )
+        except Exception:
+            logger.debug("SEL audit failed for native dismissal %s", agent_id, exc_info=True)
+        return web.json_response({"ok": True, "cancelled": False, "dismissed": True})
     manager = state.subagents
     info = manager.get(agent_id) if manager is not None else None
     if manager is not None and info is None:

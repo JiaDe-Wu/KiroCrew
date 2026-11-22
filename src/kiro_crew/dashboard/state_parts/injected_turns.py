@@ -14,10 +14,19 @@ import re
 
 from kiro_crew.constants import SUBAGENT_BATCH_COMPLETION_PREFIX, SUBAGENT_COMPLETION_PREFIX
 from kiro_crew.deny_guidance import remediation_for, rule_id_for
+from kiro_crew.deny_notice import POLICY_REROUTE_TEXT
+from kiro_crew.timed_out_call import TOOL_STALL_RECOVERY_PREFIX as _TOOL_STALL_RECOVERY_PREFIX
+from kiro_crew.timed_out_call import timed_out_call_body
 
 # Structured monitor wakeups are automation, not user speech. The controller
 # owns the complete envelope; every delivery surface passes it through unchanged.
 MONITOR_WAKE_PREFIX = "[Monitor wake]"
+
+# A wake for a subscription: an MCP resource subscription today
+# (rfc-mcp-resource-subscriptions.md §4.9.2), the webhook subscriptions'
+# ``session`` consumer once rfc-webhook-subscriptions PR 1 lands and reuses it.
+WEBHOOK_WAKE_PREFIX = "[Webhook wake]"
+WEBHOOK_WAKE_END = "[End of webhook wake]"
 
 
 # Cron notification wrapper format — used by handlers.py (create), chat.py (detect), transcriptRendering.tsx (render)
@@ -42,7 +51,7 @@ SUBAGENT_COMPLETION_PREFIXES = (
 
 
 # One-shot synthesis turn fired after ALL sub-agents in a fan-out complete and
-# each result has been processed in its own turn (see gateway._subagent_done arm
+# each result has been processed in its own turn (see subagent_wiring._subagent_done arm
 # + chat_runner drain/idle branch). Its visible reply is the consolidated,
 # user-facing summary. Rendered as an "inject" message (not a user bubble); the
 # prefix marks it as a synthetic continuation so it is NOT mirrored to linked
@@ -57,6 +66,19 @@ SUBAGENT_SYNTHESIS_PROMPT = (
     "findings across all of them (do not just repeat each result in turn), and (3) give concrete "
     "recommended next actions or decisions. This is the user-facing deliverable — keep it clear "
     "and actionable."
+)
+
+
+# Appended to the announce of a completion that arms the synthesis. The arm
+# reads only in-memory state, so a sibling queued in the task store can still
+# be out: the note is conditional and promises nothing about what follows. A
+# turn that takes it and ends on visible reply text lets the fire gate drop the
+# synthesis (`_drop_single_turn_synthesis`), but only once the gate's store
+# read answers clear.
+SUBAGENT_FINAL_COMPLETION_NOTE = (
+    "[SYSTEM] This may be the last sub-agent result of this batch. If no other "
+    "sub-agent of this batch is still queued or running, give the consolidated "
+    "report across all of its results in this reply."
 )
 
 
@@ -82,7 +104,7 @@ STALE_RECOVERY_PREFIX = "[Stalled turn — automatic recovery]"
 # task from scratch), this hands the model the stall context so it can check
 # partial results and continue. Rendered as an "inject" message (not a user
 # bubble) and never mirrored to a linked Slack thread as user input.
-TOOL_STALL_RECOVERY_PREFIX = "[Tool stall — automatic recovery]"
+TOOL_STALL_RECOVERY_PREFIX = _TOOL_STALL_RECOVERY_PREFIX
 
 
 # Prefix on the continuation injected after a reset recovers an interrupted
@@ -398,17 +420,17 @@ def build_refusal_recovery_prompt(
         (
             "Do NOT repeat, restate or re-derive what you already sent — the user "
             "has read it. If the task is NOT finished, continue from there: use an "
-            "allowed alternative (for a shell command, a read-only variant) or a "
-            "different tool, and say what it changed. Only if the task IS finished "
+            "allowed alternative that does not reach the same effect (for a shell "
+            "command, a read-only variant; for a publish, a branch and a pull "
+            "request), and say what it changed. Only if the task IS finished "
             "and the block left nothing missing, open with a one-line recap of the "
             "outcome of the work (the one restatement allowed here: this reply "
             "becomes the last message the user sees), then one short line noting "
             "the block, and stop."
             if answered
-            else "Decide how to proceed: use an allowed alternative (for a shell "
-            "command, a read-only variant), a different tool, or — if the block is "
-            "correct and you genuinely cannot proceed — say so and stop. Otherwise "
-            "continue the task where you left off."
+            else "Decide how to proceed: "
+            + POLICY_REROUTE_TEXT
+            + " Otherwise continue the task where you left off."
         ),
     ]
     # Per-class remediation, de-duplicated across the turn's refusals: several
@@ -495,6 +517,8 @@ def build_tool_stall_recovery_prompt(
     idle_secs: int,
     command: str = "",
     stuck_input: bool = False,
+    processes_terminated: int = 0,
+    timed_out: bool = False,
 ) -> str:
     """Body of the continuation injected after a watchdog tool-stall cancel.
 
@@ -505,7 +529,16 @@ def build_tool_stall_recovery_prompt(
     re-queuing the original user message verbatim (which restarted the entire
     task and re-ran the very command that stalled). The caller prepends
     :data:`TOOL_STALL_RECOVERY_PREFIX`.
+
+    ``timed_out`` is set when the call's own silence timer ran out
+    (``acp.tool_silence``): no result and no progress within its bound. The
+    nudge is then the one wording each surface that hands such a call back
+    sends (``kiro_crew.timed_out_call``), which gives it back to the model as a
+    timeout error it may retry, the way a harness returns a timed-out call's
+    error result.
     """
+    if timed_out:
+        return timed_out_call_body(tool_title, idle_secs)
     idle_mins = max(1, round(idle_secs / 60))
     tool_label = tool_title or "a tool call"
     lines = [
@@ -513,6 +546,16 @@ def build_tool_stall_recovery_prompt(
         f"~{idle_mins} minute(s) and the turn was ended by a Kiro Crew watchdog. "
         "This was NOT a user action — do not treat it as a cancellation or "
         "interruption by the user.",
+    ]
+    if processes_terminated > 0:
+        noun = "process" if processes_terminated == 1 else "processes"
+        lines += [
+            "",
+            f"The watchdog terminated {processes_terminated} {noun} from the "
+            "stalled shell command. Those old processes are no longer running; "
+            "still check for any related survivor before retrying.",
+        ]
+    lines += [
         "",
         "Before doing anything else, check whether the tool actually completed "
         "or left partial results — do NOT blindly re-run the whole task or "

@@ -277,6 +277,8 @@ _TURN_ONLY_BODY_KEYS = frozenset(
         "send_now",
         # A display label for this send's row; the slot keeps nothing.
         "banner",
+        # Read only on a person's send, for a conversation the send begins.
+        "embed_app",
     }
 )
 _SETTINGS_BODY_KEYS: dict[str, object] = {
@@ -668,7 +670,7 @@ async def test_app_send_refused_when_the_slot_closes_during_the_permission_read(
     reading = threading.Event()
     release = threading.Event()
 
-    def gated_grant(_app: str) -> bool:
+    def gated_grant(_app: str, **_kw: object) -> bool:
         reading.set()
         assert release.wait(5)
         return True
@@ -1014,6 +1016,23 @@ async def test_only_the_ending_turns_own_recovery_continues_its_turn(
     assert ((TURN_END_WIRE_CLS, "") in [(m["cls"], m["content"]) for m in slot.drain()]) is marked
 
 
+@pytest.mark.parametrize(("own", "recovery_id"), [(True, "turn-a"), (False, "turn-b")])
+@pytest.mark.asyncio
+async def test_an_own_retry_keeps_its_turns_lineage(state, own: bool, recovery_id: str) -> None:
+    """The ending turn's own retry is that turn again under a new generation; any
+    other dispatch starts a turn of its own."""
+    slot = _user_slot(state)
+    slot.queue_append("first", directive_user_origin=True)
+    await _drain_once(state, slot)
+    first = slot._turn_generation
+    assert slot._turn_lineage_generation() == first
+    meta = {TURN_ACTOR_META_KEY: "app", chat_runner._RECOVERY_TURN_META_KEY: recovery_id}
+    slot.queue_insert(0, "retry", kind=SYNTHETIC_RECOVERY_KIND, meta=meta)
+    await _drain_once(state, slot, predecessor_actor="app", predecessor_turn_id="turn-a")
+    assert slot._turn_generation == first + 1
+    assert slot._turn_lineage_generation() == (first if own else first + 1)
+
+
 def _held_note(slot, text: str) -> None:
     slot._deferred_notes.append(
         {"id": "n1", "content": text, "cls": "reconcile-note", "context": None, "session": None}
@@ -1156,6 +1175,28 @@ async def test_a_held_app_recovery_cannot_extend_a_later_apps_stream(state, monk
     assert any("later app reply" in content for _, content in pending[:boundary])
     assert any("older recovered reply" in content for _, content in pending[boundary:])
     assert all("older recovered reply" not in content for _, content in pending[:boundary])
+
+
+@pytest.mark.asyncio
+async def test_a_restored_turns_retry_keeps_its_restored_provenance(state, monkeypatch) -> None:
+    # The retry is stamped with the `user` fallback the restored turn ran under, so
+    # without its own mark it would drain as the person's turn.
+    _scripted_turns(state, monkeypatch, "")
+    slot = _user_slot(state)
+    slot._titled = True
+    with patch.object(chat_runner, "_start_next_queued_turn", new=AsyncMock(return_value=False)):
+        await chat_runner._run_chat(state, slot, "restored request", _turn_provenance_restored=True)
+    [retry] = slot._queue
+    assert retry["meta"][TURN_ACTOR_META_KEY] == "user"
+    run_chat = MagicMock()
+
+    with (
+        patch.object(chat_runner, "spawn_guarded_turn", side_effect=_spawn_closing_the_turn),
+        patch.object(chat_runner, "_run_chat", new=run_chat),
+    ):
+        assert await chat_runner._start_next_queued_turn(state, slot) is True
+
+    assert run_chat.call_args.kwargs.get("_turn_provenance_restored") is True
 
 
 @pytest.mark.asyncio

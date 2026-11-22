@@ -99,6 +99,11 @@ describe('UserMessage edit textarea — rule 1 textarea: claimEnter', () => {
 })
 
 describe('TagManagerList create input — rule 1 single-line input: isComposing only', () => {
+  // The file-level api mock is shared and never cleared, so drop the calls an earlier test recorded.
+  beforeEach(() => {
+    vi.mocked(api.createChatTag).mockClear()
+  })
+
   function renderList() {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     render(
@@ -214,10 +219,10 @@ describe('ProjectPicker path input — rule 2: gate the Enter path only', () => 
     expect(vi.mocked(api.browseDirs)).toHaveBeenCalledWith('/home/u/alpha')
   })
 
-  // The Escape || Tab branch closes the picker and returns focus to the
-  // trigger — the composition-abort harm on a composable free-text path
-  // field: an IME candidate-cycling Tab (or candidate-cancelling Escape)
-  // must not be adopted as "leave the picker".
+  // The Escape branch closes the picker and returns focus to the trigger —
+  // the composition-abort harm on a composable free-text path field: an IME
+  // candidate-cancelling Escape must not be adopted as "leave the picker".
+  // Tab never closes it: it moves through the Browse pane's buttons.
   async function openBrowseWithSpy() {
     const onOpenChange = vi.fn()
     renderWithProviders(
@@ -241,10 +246,16 @@ describe('ProjectPicker path input — rule 2: gate the Enter path only', () => 
     expect(onOpenChange).not.toHaveBeenCalled()
   })
 
-  it('closes the picker on a plain Tab (positive control)', async () => {
+  it('closes the picker on a plain Escape (positive control)', async () => {
+    const { input, onOpenChange } = await openBrowseWithSpy()
+    fireEvent.keyDown(input, { key: 'Escape' })
+    expect(onOpenChange).toHaveBeenCalledWith(false)
+  })
+
+  it('keeps the picker open on a plain Tab', async () => {
     const { input, onOpenChange } = await openBrowseWithSpy()
     fireEvent.keyDown(input, { key: 'Tab' })
-    expect(onOpenChange).toHaveBeenCalledWith(false)
+    expect(onOpenChange).not.toHaveBeenCalled()
   })
 })
 

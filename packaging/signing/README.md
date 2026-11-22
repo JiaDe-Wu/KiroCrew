@@ -39,8 +39,11 @@ warnings).
   Every request, parts and final, also lists the shell entries (helper apps,
   frameworks, their Helpers, ShipIt): each task ends with the service's app
   pass, which signs the frameworks and fails on one whose nested executables
-  are unsigned. `merge` copies a part's signed backend files out of the zip the
-  service returned into the local `.app`; the final request signs the shell.
+  are unsigned. A task takes as long as the tree it is given, so `stage` builds
+  each part its own input: the app without the backend files that part does not
+  list. `merge` copies a part's signed backend files out of the zip the
+  service returned into the local `.app`; the final request signs the shell
+  over the whole merged app.
   `test/test_signing_split.py` drills it and `sign.sh` against a fake service.
 - `sign-dmg.sh` — the second signing task: Developer-ID signs the rebuilt DMG
   through the signing service with a `type: dmg` manifest, so Gatekeeper accepts
@@ -73,7 +76,11 @@ warnings).
 
   The mounted-volume phase races Spotlight and XProtect, which start reading
   the freshly-copied app and can hold the volume against ejection ("Resource
-  busy") — the same transient class electron-builder retries on. The script
+  busy"). electron-builder's own dmgbuild step hits the same race, so
+  `run_electron_builder_with_retry` in `packaging/desktop-electron-builder.sh` treats an
+  hdiutil "Resource busy" as transient: it detaches the device dmgbuild left
+  attached through `hdiutil-detach.sh`, then retries within its three-attempt
+  budget. The script
   layers its defenses: `-nobrowse` keeps the volume out of Finder, and the
   eject gets bounded retries with a synced force fallback (see
   `hdiutil-detach.sh`). hdiutil calls run without `-quiet`, because

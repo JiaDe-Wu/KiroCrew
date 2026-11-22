@@ -21,6 +21,9 @@ export interface Lesson {
   /** Where the lesson came from (`user_explicit`, `consolidation`, ...), as the
    *  store recorded it. Absent or empty when the row carries no source. */
   source?: string
+  /** `false` when the shown `rule` is redacted, so editing it would store the
+   *  placeholder; absent when the row can be edited. */
+  rule_editable?: boolean
 }
 
 /** One row of `GET /api/memory/stores` — a declared memory store.
@@ -407,11 +410,22 @@ export interface McpTempRefusal {
   cause: 'sealed' | 'unclassifiable' | 'check-failed'
 }
 
+/** Why a KAS chat does not use the sign-in an MCP row holds or offers:
+ *  `chat`, the row's sign-in runs on kiro-cli, so the chat signs in itself;
+ *  `again`, the row's sign-in is saved for KAS chats, but the grant it holds now
+ *  is kiro-cli's only, so signing in again here is what reaches them. */
+export type McpKasChatSignIn = 'chat' | 'again'
+
 export interface McpServer {
   name: string; command: string; args?: string[]
   url?: string
   /** Header names are preserved, but read responses redact every value. */
   headers?: Record<string, string>
+  /** The public OAuth client id the entry's own `oauth` block names, if any. */
+  clientId?: string
+  /** The entry's own `oauth` block reaches no KAS engine: it names a client
+   *  secret, or keeps nothing Crew sends. Absent means false. */
+  oauthWithheld?: boolean
   status: string; error?: string; tools?: string[]
   source: string; enabled: boolean; disabledTools?: string[]
   /** How status/tools were established: "handshake" (real spawn + tools/list)
@@ -429,10 +443,28 @@ export interface McpServer {
    *  alongside `authChallenge`; absent is "unknown", which is why the sign-in
    *  wording is gated on an explicit `false`. */
   authGrantPresent?: boolean
+  /** Crew holds this server's sign-in (`dashboard.feature_previews.crew_oauth` on KAS):
+   *  `authGrantPresent` is Crew's, and KAS chats use it through Crew. */
+  authCrewHeld?: boolean
   /** The owner added this remote server from the dashboard, at this url, so the
    *  table may offer the in-place sign-in on it. Absent or false for a server
    *  an agent, a session or a hand edit added. */
   ownerSignIn?: boolean
+  /** This row is a Connections provider's server whose client the user may hold
+   *  themselves (Slack), and no OAuth Apps record exists for it yet. The card
+   *  leaves the row alone and the row keeps its own chat sign-in guidance. */
+  connectionUnconfigured?: boolean
+  /** On a `connectionUnconfigured` row whose chat sign-in cannot start: the entry
+   *  names no client of its own, or Crew's sign-in serves it and has no OAuth app.
+   *  The row names the missing OAuth app instead of sending the user to chat. */
+  connectionNeedsApp?: boolean
+  /** The provider's OAuth app is saved, but Crew's sign-in is unavailable.
+   *  The row links to setup instead of offering a sign-in that cannot work. */
+  connectionNeedsCrewSignIn?: boolean
+  /** Set by the gateway only while chats run on KAS, on a row that asked for
+   *  OAuth whose sign-in a KAS chat would not use (see `McpKasChatSignIn`).
+   *  Absent: no caveat. */
+  kasChatSignIn?: McpKasChatSignIn
   /** Spec-declared temp keys the probe refused (path already redacted); the
    *  probe ran with the managed temp instead. Absent when nothing was refused. */
   tempRefusals?: McpTempRefusal[]
@@ -442,6 +474,10 @@ export interface McpServer {
   /** True when the entry lives in Kiro Crew's own mcp.json — the scope the
    *  Edit JSON action reads and writes (consent-disabled rows included). */
   kirocrewManaged?: boolean
+  /** One of Kiro Crew's own servers (`kirocrew-core`, `kirocrew-cron`, ...).
+   *  The table locks its Kiro Crew switch on and offers no Uninstall, and the
+   *  backend refuses turning it off or removing it. */
+  builtin?: boolean
   /** Which config switched the row off, from the backend — never inferred from
    *  `enabled` + `kirocrewManaged`. `kirocrew`: a disable in Kiro Crew's own
    *  store, which the Kiro Crew scope badge + Apply lifts (the consent step).
@@ -489,4 +525,12 @@ export interface McpGlobalScope {
   id: string
   /** Human display label for the scope badge, e.g. "Claude". */
   label: string
+}
+
+/** An MCP config file the servers list skipped (`GET /api/mcp/unreadable`). */
+export interface McpUnreadableFile {
+  /** The file, with the home directory shown as `~`. */
+  file: string
+  /** The gateway's fixed repair reason, e.g. "it is saved as UTF-16; re-save it as UTF-8". */
+  reason: string
 }

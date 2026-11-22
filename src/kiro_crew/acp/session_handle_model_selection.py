@@ -11,12 +11,12 @@ and a patch of the method on the class or on an instance reaches every caller.
 Instance fields written: ``_advertised_models_changed``, ``_available_models``,
 ``_available_models_captured_at``,
 ``_available_models_probe_confirmed``, ``_available_models_read_probe_at``,
-``_config_options``, ``_kas_auto_fallback``, ``_mode_model_unjudged``, ``_model``,
-``_read_refresh_task``, ``_resolved_model_id``, ``active_agent``, ``model_pin_partial``,
-``model_pin_refused``.
+``_config_options``, ``_kas_auto_fallback``, ``_kas_served_ids``, ``_mode_model_unjudged``,
+``_model``, ``_read_refresh_task``, ``_resolved_model_id``, ``active_agent``,
+``inherited_model``, ``model_pin_partial``, ``model_pin_refused``.
 
 Instance fields read: ``_engine_fallback``, ``_runtime``, ``_session_id``,
-``last_prompt_stats``, ``request_vault_identity``.
+``kas_bundle_engine_version``, ``last_prompt_stats``, ``request_vault_identity``.
 """
 
 from __future__ import annotations
@@ -24,9 +24,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from kiro_crew import model_registry
+from kiro_crew.acp import harness_notices
 from kiro_crew.acp._dispatch import set_mode_params, set_model_params
 from kiro_crew.acp.client import (
     DEFAULT_MODEL,
@@ -40,6 +41,7 @@ from kiro_crew.acp.client import (
     advertised_model_ids,
     catalog_row_would_drop,
     pick_served_default,
+    resolve_pin_spelling,
     resolve_usable_model,
 )
 from kiro_crew.acp.session_handle_runtime_contract import AcpRequestTimeout, AcpRuntimeError
@@ -47,6 +49,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
+    ACP_BACKENDS_CONFIG_MODEL_SELECT_IS_CANONICAL,
     ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
@@ -206,6 +209,21 @@ def model_select_envelope(resp: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def select_lists_only_its_current_model(select: dict[str, Any]) -> bool:
+    """Whether a :func:`model_select_envelope` names one model, the one its session runs.
+
+    KAS answers ``session/load`` this way from kiro-cli 3.4 (measured on 3.4.1):
+    ``session/new`` lists every model the account is served, a reload of the same
+    session lists only its current one, and the engine still accepts a
+    ``session/set_config_option`` for a model outside it. Such a select says what
+    the session runs, not what the account is served, so it is neither the list a
+    pin is judged against nor the account's catalog. An ``auto``-only select is not
+    this shape: a ``session/new`` answers it too, and it keeps its own rules.
+    """
+    ids = [m.get("modelId") for m in select.get("availableModels", [])]
+    return len(ids) == 1 and ids[0] != DEFAULT_MODEL and ids[0] == select.get("currentModelId")
+
+
 def session_models_envelope(resp: dict[str, Any], backend: str) -> Any:
     """The ``models`` payload of a session response, with the select folded in.
 
@@ -217,7 +235,12 @@ def session_models_envelope(resp: dict[str, Any], backend: str) -> Any:
     stay exactly as they were.
     """
     models = resp.get("models") or resp.get("availableModels")
-    if models is None or models == {} or models == []:
+    if (
+        backend in ACP_BACKENDS_CONFIG_MODEL_SELECT_IS_CANONICAL
+        or models is None
+        or models == {}
+        or models == []
+    ):
         models = models_from_config_options(resp, backend) or models
     return models
 
@@ -308,8 +331,14 @@ def _kas_model_spelling(model_id: str, advertised: list[str]) -> str:
     return model_registry.acp_id_correction(model_id) or model_id
 
 
-async def set_model(self: AcpSessionHandle, model_id: str) -> None:
+async def set_model(self: AcpSessionHandle, model_id: str, *, inherit: bool = False) -> None:
     """Switch model via session/set_model.
+
+    ``inherit=True`` applies a model the session inherits rather than pins
+    (kiro-cli's ``chat.defaultModel`` on an unpinned KAS start): the switch
+    lands in ``_resolved_model_id`` and ``inherited_model`` only, and ``_model``
+    keeps its unpinned value, so every reader that asks "is this session
+    pinned?" still answers no. Any other call clears ``inherited_model``.
 
     This is the shared-runtime SUBSTITUTE path (background one-liners, tips,
     contradiction sweep, and any caller that did not pre-guard an explicit
@@ -333,8 +362,26 @@ async def set_model(self: AcpSessionHandle, model_id: str) -> None:
     # must not survive a later one, or a read-after-call reports a pick that
     # landed (or inherited the default) as refused.
     self.model_pin_refused = ""
+    self.inherited_model = ""
     if self._runtime.acp_backend == ACP_BACKEND_KAS:
         model_id = _kas_model_spelling(model_id, self._advertised_model_ids())
+        # KAS takes any id on ``set_config_option`` and fails every later prompt
+        # on one the account is not served, so judge the pin against the
+        # ``model`` select here. ``auto`` is left to ``ensure_served_default``.
+        # shortcut: a select that lists only ``auto`` is not trusted as the
+        # account's list; judge it too once an auto-only account is captured.
+        served = self._kas_served_ids
+        if model_id and model_id != DEFAULT_MODEL and any(m != DEFAULT_MODEL for m in served):
+            listed = resolve_pin_spelling(model_id, served)
+            if not listed:
+                logger.warning(
+                    "KAS model %s is not in this session's model select; "
+                    "staying on the session's current model",
+                    redact_log_via_context(str(model_id)),
+                )
+                self.model_pin_refused = model_id
+                return
+            model_id = listed
     # Backend-aware: on a ``<model>[<effort>]`` pair-id harness the advertised
     # list is the picker's vocabulary while the ``model`` config option's is
     # the BARE id, so a bare pin misses the list yet is exactly what the wire
@@ -408,7 +455,11 @@ async def set_model(self: AcpSessionHandle, model_id: str) -> None:
             )
             self.model_pin_refused = resolved
             return
-    self._model = resolved
+    if inherit:
+        # The applied spelling (after the KAS fold), never the raw setting.
+        self.inherited_model = resolved
+    else:
+        self._model = resolved
     self.model_pin_refused = ""
     if getattr(self, "_mode_model_unjudged", False):
         # The session runs this model now, not the one an earlier set_mode
@@ -624,9 +675,23 @@ def store_session_config(self: AcpSessionHandle, resp: dict[str, Any]) -> None:
     """
     modes = resp.get("modes")
     current_agent = modes.get("currentModeId") if isinstance(modes, dict) else None
+    # The mode names a mode-change notice reads (``acp.harness_notices``); a no-op
+    # on a backend outside ``ACP_BACKENDS_HARNESS_NOTICES``.
+    harness_notices.note_session_modes(cast(Any, self), resp)
     self.active_agent = (
         self._crew_agent_name(current_agent) if isinstance(current_agent, str) else ""
     )
+    store_config_options(self, resp)
+
+
+def store_config_options(self: AcpSessionHandle, resp: dict[str, Any]) -> None:
+    """Absorb a ``configOptions`` list and the model list it or *resp* carries.
+
+    The half of :func:`store_session_config` that does not read ``modes``, so a
+    KAS ``config_option_update`` can run it too: from engine 0.66.117 the
+    ``session/new`` answer carries no ``model`` select and the engine sends it
+    in a ``config_option_update`` about 0.3 s later.
+    """
     config_options = resp.get("configOptions")
     if isinstance(config_options, list):
         self._config_options = config_options
@@ -643,6 +708,15 @@ def store_session_config(self: AcpSessionHandle, resp: dict[str, Any]) -> None:
         self._kas_auto_fallback = (
             pick_served_default("auto", ids) if select.get("currentModelId") == "auto" else ""
         )
+        # A response without a select (some ``session/load`` answers), or with one
+        # naming only the session's current model (a KAS ``session/load``), keeps
+        # the list an earlier response gave.
+        if (
+            self._runtime.acp_backend == ACP_BACKEND_KAS
+            and ids
+            and not select_lists_only_its_current_model(select)
+        ):
+            self._kas_served_ids = ids
         # KAS sends no ``models`` object, so the select's ``currentValue`` is
         # the only place it says which model the session runs (``auto`` on a
         # new session). Without it ``served_model`` stays ``""`` and every turn
@@ -668,9 +742,8 @@ def store_session_config(self: AcpSessionHandle, resp: dict[str, Any]) -> None:
     # (``session_models_envelope``): a host in
     # ``ACP_BACKENDS_ADVERTISED_MODEL_SELECTION`` advertises no ``models`` object
     # and puts the list in a ``configOptions`` ``model`` select, and a reader that
-    # knows about one shape and not the other is how the entitlement probe came to
-    # answer ``[]`` for codex while this path answered correctly. Absent stays
-    # absent, so the shape branches below are untaken exactly as before.
+    # knows about one shape and not the other answers ``[]`` for such a host.
+    # Absent stays absent, so the shape branches below are then untaken.
     models = session_models_envelope(resp, self._runtime.acp_backend)
     if isinstance(models, dict):
         # Record the resolved model id (kiro-cli's currentModelId) so
@@ -710,6 +783,62 @@ def store_session_config(self: AcpSessionHandle, resp: dict[str, Any]) -> None:
         self._mark_available_models_captured()
 
 
+#: How long a new KAS session waits for its ``model`` select after ``session/new``.
+#: Measured about 0.3 s on engine 0.66.117 and 0.66.119.
+#: shortcut: a fixed bound; raise it if a slow model service makes the select later.
+_KAS_SELECT_WAIT_SECS = 2.0
+#: Quiet window per drain round while waiting for that select.
+_KAS_SELECT_POLL_SECS = 0.1
+
+
+async def settle_kas_model_select(self: AcpSessionHandle) -> None:
+    """Read a KAS select that came after the session answer, then judge the default.
+
+    From engine 0.66.117 ``session/new`` answers without its ``model`` select
+    and the engine sends it in a ``config_option_update`` about 0.3 s later.
+    The KAS start path (``_wait_managed_mcp``) calls this after its notification
+    drain. On an engine known to send the select late (the bundle route, whose
+    version Crew pins) the start-path check found no select, so: while the select
+    is still missing, the queue is drained (through ``drain_init``, so every
+    frame gets the same handling) until it is in or the bound runs out, and the
+    served-default check then runs on it, whether the drain or this wait read
+    it. A no-op on other backends and on an engine that answers with the select.
+    """
+    if not self._runtime.acp_backend == ACP_BACKEND_KAS:
+        return
+    from kiro_crew.acp.kas_engine_features import engine_sends_model_select_late
+
+    if not engine_sends_model_select_late(self.kas_bundle_engine_version):
+        return
+    # Counted in rounds rather than read off a clock, so the bound holds
+    # whatever the drain's own timing does.
+    for _ in range(int(_KAS_SELECT_WAIT_SECS / _KAS_SELECT_POLL_SECS)):
+        if self._kas_served_ids or not self._runtime.is_alive():
+            break
+        await self.drain_init(
+            duration=_KAS_SELECT_POLL_SECS,
+            idle_exit=_KAS_SELECT_POLL_SECS,
+            no_report_ceiling=0.0,
+        )
+    if self._kas_served_ids:
+        await self.ensure_served_default()
+
+
+def absorb_config_options(self: AcpSessionHandle, config_options: list[Any]) -> None:
+    """Take the ``configOptions`` a ``config_option_update`` pushed.
+
+    One reader for the live update path and the start-up drain. On KAS it is
+    :func:`store_config_options`, since from engine 0.66.117 the ``model``
+    select arrives here rather than in ``session/new``; other backends only
+    replace the options and resync effort.
+    """
+    if self._runtime.acp_backend == ACP_BACKEND_KAS:
+        store_config_options(self, {"configOptions": config_options})
+    else:
+        self._config_options = config_options
+        self._sync_effort_levels()
+
+
 def _feed_advertised_model_cache(self: AcpSessionHandle) -> None:
     """Record this session's advertised ids in the cross-session model cache.
 
@@ -741,7 +870,7 @@ def _feed_advertised_model_cache(self: AcpSessionHandle) -> None:
     if not ids:
         return
     if model_registry.refresh_advertised_models(
-        model_registry_namespace(backend), ids, rows=self._available_models
+        model_registry_namespace(backend), ids, rows=self._available_models, confirm_shrink=True
     ):
         self._advertised_models_changed = True
 
@@ -849,6 +978,40 @@ async def ensure_served_default(self: AcpSessionHandle, *, activated_model: str 
             )
         finally:
             self._model = intent
+    elif getattr(getattr(self._runtime, "_harness", None), "reasserts_reported_model", False):
+        # An inheriting session is sent the model its adapter reports, as the
+        # per-chat claude client does (``_reassert_adapter_resolved_model``):
+        # claude-agent-acp reports the settings model verbatim without passing it
+        # on, so a resumed session can run Claude Code's built-in default instead.
+        # Nothing is sent for a pinned session, for the head of the advertised list
+        # (the adapter's ``default``), or for an id the list does not carry. The
+        # write is inherited, not a pin: ``_model`` still reads "inherit". Best
+        # effort: a refused write leaves the adapter's own model.
+        advertised = self._advertised_model_ids()
+        reported = self._resolved_model_id or ""
+        if (
+            self._model not in ("", DEFAULT_MODEL)
+            or not advertised
+            or reported not in advertised
+            or reported == advertised[0]
+        ):
+            return
+        _reported_log = redact_log_via_context(reported)
+        try:
+            sent = await self._push_model_config_option(reported, strict=False)
+        except (AcpError, AcpRuntimeError) as exc:
+            logger.warning(
+                "ACP model %s reported by the backend could not be re-applied: %s",
+                _reported_log,
+                redact_log_via_context(str(exc)),
+            )
+            return
+        if sent:
+            self._resolved_model_id = sent
+            self.inherited_model = sent
+            logger.info(
+                "ACP model: re-applied %s, resolved by the backend's settings", _reported_log
+            )
 
 
 def _normalize_models(advertised: list[Any]) -> list[dict[str, str]]:

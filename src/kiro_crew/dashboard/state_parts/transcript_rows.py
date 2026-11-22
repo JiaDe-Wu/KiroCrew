@@ -12,7 +12,8 @@ import logging
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.dashboard.system_notices import is_system_notice
+from kiro_crew.dashboard.system_notices import is_harness_advisory_row, is_system_notice
+from kiro_crew.history_schema import transcript_sort_key
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 if TYPE_CHECKING:
@@ -149,13 +150,14 @@ def is_quiet_end_row(m: dict) -> bool:
     return tool in (None, "", QUIET_END_TOOL) and server in (None, "", QUIET_END_SERVER)
 
 
-def chat_message_note(slot_key: str, msg: dict, *, workspace: str | None) -> dict[str, Any]:
+def chat_message_note(slot_key: str, msg: dict, *, workspace: str | None = None) -> dict[str, Any]:
     """Build the ``chat_message`` broadcast note for an appended row.
 
     The ONE builder shared by the append door (``_broadcast_chat_message``) and
     the reader-suppressed frame in ``append_and_surface``, so a row leaves the
     backend in one form whichever door delivers it. *workspace* scopes the
-    allowed-link hosts, as in ``_prepare_messages``.
+    allowed link hosts of the row's blocked-link records, as in
+    ``_prepare_messages``.
     """
     role = msg.get("role", "")
     content = msg.get("content", "")
@@ -174,25 +176,10 @@ def chat_message_note(slot_key: str, msg: dict, *, workspace: str | None) -> dic
     from kiro_crew.dashboard.chat_utils import (
         redact_display_content,
         serialize_wire_content,
-        with_allowed_links_restored,
     )
 
-    restored_meta: dict | None = None
     if role != "user" and content:
-        # The same allowed-host scope as _prepare_messages, so the live
-        # frame and the history agree on an allowed link: its placeholder
-        # becomes the address again, then the display pass runs.
-        from kiro_crew.security.exfil import allowed_host_audit_epoch, scoped_exempt_hosts
-        from kiro_crew.security.redaction_allow import allowed_hosts_for, normalize_workspace
-
-        epoch = allowed_host_audit_epoch()
-        hosts = allowed_hosts_for(workspace)
-        with scoped_exempt_hosts(hosts, normalize_workspace(workspace), epoch):
-            if isinstance(content, str) and isinstance(msg.get("meta"), dict):
-                shown = with_allowed_links_restored({"content": content, "meta": msg["meta"]})
-                content = shown["content"]
-                restored_meta = shown["meta"]
-            content = redact_display_content(content)
+        content = redact_display_content(content)
     else:
         # The wire-string invariant covers EVERY row: a structured user
         # row or a falsy container serializes to text without redaction.
@@ -238,9 +225,31 @@ def chat_message_note(slot_key: str, msg: dict, *, workspace: str | None) -> dic
     # test_rehydrate_does_not_broadcast_replayed_messages and
     # test_restore_recent_sessions_does_not_broadcast_either. Do not relax
     # it further without re-checking that meta is still absent.
-    direct_meta = restored_meta if restored_meta is not None else msg.get("meta")
+    direct_meta = msg.get("meta")
     if direct_meta and isinstance(direct_meta, dict):
         payload["meta"] = {**(payload.get("meta") or {}), **direct_meta}
+    # The blocked-link records of the text this frame sends, under the same
+    # allowed-host scope as _prepare_messages, so the live frame and the history
+    # agree on which links render as a Blocked link card. A value the row's meta
+    # carries under the key is dropped either way (with_blocked_links).
+    from kiro_crew.dashboard.chat_utils import allowed_hosts_for, with_blocked_links
+    from kiro_crew.security.blocked_links import allowed_host_audit_epoch, allowed_link_hosts
+    from kiro_crew.security.redaction_allow import normalize_workspace
+
+    held = payload.get("meta")
+    base = held if isinstance(held, dict) else {}
+    from kiro_crew.dashboard.chat_utils_display import _renders_links
+
+    if _renders_links(role, content):
+        epoch = allowed_host_audit_epoch()
+        with allowed_link_hosts(
+            allowed_hosts_for(workspace), normalize_workspace(workspace), epoch
+        ):
+            shown = with_blocked_links(base, content)
+    else:
+        shown = with_blocked_links(base, None)
+    if shown is not base:
+        payload["meta"] = shown
     if role == "mcp_oauth" and isinstance(payload.get("meta"), dict):
         # An `mcp_oauth` row's meta carries the Authorize link the client draws.
         # A replayed transcript line (refresh_channel_window broadcasts the
@@ -309,7 +318,17 @@ def is_stop_event_row(m: dict) -> bool:
 #: turn; here the question is whether a dispatch happened that got no reply,
 #: and a recovery or replay dispatch that died is exactly such a turn.
 _TURN_INJECT_KINDS: frozenset[str] = frozenset(
-    {"cron", "mcp_app", "recovery", "user_replay", "synthesis", "automation_notice"}
+    {
+        "cron",
+        "mcp_app",
+        "resource",
+        "recovery",
+        "user_replay",
+        "synthesis",
+        "automation_notice",
+        "workflow",
+        "heartbeat",
+    }
 )
 
 
@@ -325,6 +344,31 @@ TURN_OPENING_INJECT_KINDS: frozenset[str] = _TURN_INJECT_KINDS - _TURN_CONTINUIN
 def _is_turn_inject(meta: object) -> bool:
     """Whether an ``inject`` row's meta says it dispatched a turn."""
     return isinstance(meta, dict) and meta.get("injectKind") in _TURN_INJECT_KINDS
+
+
+#: ``chat_utils.MODEL_UNAVAILABLE_KIND``, spelled here because ``chat_utils``
+#: imports this module (``test_model_unavailable_settles_turn.py`` pins the two
+#: equal, and ``MODEL_UNAVAILABLE_KIND`` in ``website/src/lib/modelUnavailable.ts``
+#: is the frontend twin).
+_MODEL_UNAVAILABLE_KIND = "model_unavailable"
+
+
+def is_model_unavailable_row(m: dict) -> bool:
+    """True when *m* is the terminal card a spent ladder leaves on a refused model.
+
+    The row a capacity or rollout refusal ends on once the retry ladder and the
+    ``agent.fallback_model`` chain are spent. It SETTLES the turn rather than
+    interrupting it: the backend has already refused the same turn on the same
+    model several times, so Resume would only repeat it, and the fix is the
+    model picker the card offers. Read from ``meta.kind`` (every row appended
+    with ``meta=``) or a top-level ``kind`` (a rebuilt row), never from prose.
+    """
+    if m.get("role") != "error":
+        return False
+    if m.get("kind") == _MODEL_UNAVAILABLE_KIND:
+        return True
+    meta = m.get("meta")
+    return isinstance(meta, dict) and meta.get("kind") == _MODEL_UNAVAILABLE_KIND
 
 
 def is_turn_interrupted(messages: list[dict]) -> bool:
@@ -352,6 +396,10 @@ def is_turn_interrupted(messages: list[dict]) -> bool:
     deliberately BOTH halves -- the tag alone cannot decide, because an
     automatic compaction can write the same tagged row inside an ordinary turn
     whose real reply never arrived, and that tail is a genuine interruption.
+    A third shape settles the turn the same way: the terminal card a spent ladder
+    leaves when the backend refused the selected model for capacity or a rollout
+    (:func:`is_model_unavailable_row`). Resume would send the same turn to the
+    same refused model, so the card offers the model picker instead.
 
     Selects the wording injected for the model (``_MANUAL_RESUME_MSG`` vs
     ``_MANUAL_CONTINUE_MSG``), gates whether the composer offers the Resume
@@ -378,6 +426,12 @@ def is_turn_interrupted(messages: list[dict]) -> bool:
     # act and must not close it -- a gateway that died in that later work
     # would otherwise hide behind it.
     saw_later_tool = False
+    # A drained sub-agent completion (role ``subagent``) opens a turn of its own,
+    # so a refused-model card older than it settles only its own turn.
+    saw_later_opener = False
+    # A harness's advisory of the newest turn answers it as an assistant row does,
+    # whichever side of an error row the runner landed it on.
+    saw_advisory = False
     for m in reversed(messages):
         role = m.get("role")
         meta = m.get("meta") or {}
@@ -417,13 +471,18 @@ def is_turn_interrupted(messages: list[dict]) -> bool:
                 saw_compaction_result = True
             continue
         if role == "inject" and m.get("content") and _is_turn_inject(meta):
-            return True
+            return saw_trailing_error if saw_advisory else True
+        if role == "subagent":
+            saw_later_opener = True
         # A monitor loop's cycle row always dispatches a turn; unanswered, it
         # is the same shape as an unanswered user row.
         if role == "nudge" and m.get("content"):
-            return True
+            return saw_trailing_error if saw_advisory else True
+        if is_harness_advisory_row(m) and m.get("content"):
+            saw_advisory = True
+            continue
         if role in ("user", "assistant") and m.get("content"):
-            if role != "user":
+            if role != "user" or saw_advisory:
                 return saw_trailing_error
             # A ``/compact`` answered by its compaction notice is a FINISHED
             # turn -- unless an error row trails the notice, which is the same
@@ -439,6 +498,12 @@ def is_turn_interrupted(messages: list[dict]) -> bool:
                 return saw_trailing_error
             return True
         if role == "error":
+            # The card a refused model's spent ladder ends on settles the turn,
+            # like a Stop: Resume would send it to the same refused model again.
+            # Only reached as the newest turn's terminator, because a later
+            # user, inject or assistant row returns above first.
+            if is_model_unavailable_row(m) and not saw_later_opener:
+                return False
             saw_trailing_error = True
     # The walk ran off the start of the window without meeting a conversational
     # row: a long turn can push its own opener and reply into the frozen prefix,
@@ -446,6 +511,59 @@ def is_turn_interrupted(messages: list[dict]) -> bool:
     # the assistant branch above honors -- the turn ended in it and nothing
     # newer proves completion -- so it decides the same way.
     return saw_trailing_error
+
+
+#: How long an interrupted turn stays on offer to the bulk Resume: a week, the
+#: same window an ``[OPTIONS:]`` ending keeps its session in Waiting. A
+#: transcript is restored with its tail on every boot, so a turn cut short once
+#: would otherwise be offered for as long as the session exists.
+INTERRUPTED_BULK_RESUME_MAX_AGE_SECS = 7 * 24 * 3600
+
+
+def is_interruption_stale(messages: list[dict], now: float) -> bool:
+    """True when the newest durable row is older than the bulk-Resume window.
+
+    Only the bulk Resume (the sidebar's "Resume N sessions" row and
+    ``POST /api/chat/slots/resume-all``) reads this. The session still counts as
+    interrupted everywhere else, so its own composer keeps offering Resume.
+
+    The newest durable row is the same row the sidebar sorts by (``last_ts``):
+    a session someone touched since the turn was cut short is not stale. An
+    unreadable stamp is never stale, so the session stays on offer as before.
+    """
+    for m in reversed(messages):
+        if m.get("role") in _TRANSIENT_ROLES:
+            continue
+        bucket, at = transcript_sort_key(m.get("ts") or "")
+        return bucket == 0 and now - at > INTERRUPTED_BULK_RESUME_MAX_AGE_SECS
+    return False
+
+
+#: ``chat_utils.AUTH_REQUIRED_KIND``, spelled here for the reason
+#: ``_MODEL_UNAVAILABLE_KIND`` is (``test_newest_error_is_sign_in.py`` pins the two equal).
+_AUTH_REQUIRED_KIND = "auth_required"
+
+
+def newest_error_is_sign_in(messages: list[dict]) -> bool:
+    """True when the newest error row is a sign-in error and no reply or new turn follows it.
+
+    The sidebar's twin of ``authRequiredIsNewest`` in
+    ``website/src/pages/chat/transcriptRenderers.tsx``, so an interrupted
+    session's row names the sign-in first, as the composer's hint does.
+    ``test/fixtures/sign_in_newest_rows.json`` holds both to the same answers.
+    """
+    for m in reversed(messages):
+        role = m.get("role")
+        meta = m.get("meta")
+        if not isinstance(meta, dict):
+            meta = {}
+        if role == "error":
+            return _AUTH_REQUIRED_KIND in (m.get("kind"), meta.get("kind"))
+        if role in ("assistant", "nudge", "subagent") or (role == "user" and not meta.get("steer")):
+            return False
+        if role == "inject" and meta.get("injectKind") in TURN_OPENING_INJECT_KINDS:
+            return False
+    return False
 
 
 def _mark_permission_resolved(

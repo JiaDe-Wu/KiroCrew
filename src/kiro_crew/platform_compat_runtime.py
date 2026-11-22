@@ -29,6 +29,7 @@ from typing import Callable, Optional, Sequence
 
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.platform_compat_native import IS_POSIX, IS_WINDOWS
+from kiro_crew.platform_compat_proctable import _proc_children, darwin_child_pids
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 if IS_POSIX:
@@ -155,6 +156,43 @@ def _rearm_process_alarm_after_failed_exec(previous: tuple[float, float] | None)
     signal.setitimer(signal.ITIMER_REAL, value, interval)
 
 
+#: Comma-separated pids of the children an exec'd predecessor left behind;
+#: ``reexec_children.adopt_inherited_children`` collects them at gateway boot.
+REEXEC_CHILDREN_ENV = "KIROCREW_REEXEC_CHILD_PIDS"
+
+
+def _publish_children_for_successor(
+    children: Callable[[], list[int] | None] | None = None,
+) -> None:
+    """Name this image's direct children for its exec successor to reap.
+
+    ``execv`` keeps the pid, so they stay the successor's children with nothing
+    left to wait on them. Clears the variable when there are none or they cannot
+    be listed, so a stale list is never passed on. No-op off POSIX, where
+    ``execv`` starts a new process. Never raises: a restart must not fail here.
+    """
+    if not IS_POSIX:
+        return
+    try:
+        if children is not None:
+            pids = children()
+        elif sys.platform == "darwin":
+            pids = darwin_child_pids(os.getpid())
+        else:
+            pids = _proc_children(os.getpid())
+    except Exception:  # noqa: BLE001 - a restart must never fail over this list
+        pids = None
+    if pids:
+        os.environ[REEXEC_CHILDREN_ENV] = ",".join(str(pid) for pid in pids)
+    else:
+        os.environ.pop(REEXEC_CHILDREN_ENV, None)
+
+
+def _withdraw_children_for_successor() -> None:
+    """Drop the list again after an exec that failed, so no child inherits it."""
+    os.environ.pop(REEXEC_CHILDREN_ENV, None)
+
+
 def reexec_launcher(launcher: str, args: Sequence[str]) -> None:
     """Re-enter a validated stable launcher, preserving its dispatch pathname.
 
@@ -171,9 +209,11 @@ def reexec_launcher(launcher: str, args: Sequence[str]) -> None:
         argv = [subprocess.list2cmdline([arg]) for arg in argv]
     cancel_wheel_applies_in_flight("exec")
     previous_alarm = _disarm_process_alarm_before_exec()
+    _publish_children_for_successor()
     try:
         os.execv(launcher, argv)
     except OSError:
+        _withdraw_children_for_successor()
         _rearm_process_alarm_after_failed_exec(previous_alarm)
         raise
 
@@ -210,9 +250,11 @@ def reexec_python_module(module: str, args: Sequence[str], executable: str | Non
     argv[0] = argv0
     cancel_wheel_applies_in_flight("exec")
     previous_alarm = _disarm_process_alarm_before_exec()
+    _publish_children_for_successor()
     try:
         os.execv(resolved, argv)
     except OSError:
+        _withdraw_children_for_successor()
         _rearm_process_alarm_after_failed_exec(previous_alarm)
         raise
 
@@ -445,6 +487,33 @@ def isolated_python_argv(
     return [resolved, "-s", *args]
 
 
+def _soften_non_unicode_posix_streams() -> None:
+    """Replace, not raise on, glyphs an ASCII-only POSIX stdout/stderr cannot encode.
+
+    The encoding is kept: the terminal really is ASCII, so writing UTF-8 bytes
+    would show mojibake. Only a strict stream that cannot encode the probe changes.
+    """
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        encoding = getattr(stream, "encoding", None)
+        # LANG=C gives surrogateescape, which still raises on a real glyph.
+        if stream is None or not encoding:
+            continue
+        if getattr(stream, "errors", None) not in ("strict", "surrogateescape"):
+            continue
+        try:
+            "\u2705".encode(encoding)
+            continue
+        except UnicodeEncodeError:
+            pass
+        except LookupError:
+            continue
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def ensure_utf8_console() -> None:
     """Keep Kiro Crew's process tree UTF-8 and repair current Windows streams.
 
@@ -458,10 +527,13 @@ def ensure_utf8_console() -> None:
     ``PYTHONIOENCODING`` can otherwise override POSIX UTF-8 defaults too.  On
     Windows, best-effort reconfigure (Python 3.7+) the current streams to UTF-8
     with backslashreplace so a stray un-encodable char degrades to an escape
-    instead of crashing. Idempotent and safe to call once at startup.
+    instead of crashing. On POSIX, an ASCII-only stream (``LANG=C`` with UTF-8
+    mode off) keeps its encoding but replaces un-encodable glyphs with ``?``.
+    Idempotent and safe to call once at startup.
     """
     _ensure_utf8_process_environment()
     if not IS_WINDOWS:
+        _soften_non_unicode_posix_streams()
         return
     # Repair the current streams below, and separately make the invariant
     # inheritable by MCP/session children and any later re-exec.  Environment

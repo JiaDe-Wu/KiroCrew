@@ -3,10 +3,10 @@ title: Fold advances push deltas, not whole values -- the work board ships chang
 status: draft
 author: kirocrew agent session
 created: 2026-10-26
-last-audited: 2026-10-26
-audited-at: 908099fc26
+last-audited: 2026-11-20
+audited-at: 0c5d8bd5f3
 doc-pr: null
-implementation-prs: []
+implementation-prs: [24749, 25218]
 tracking-issues: []
 supersedes: []
 superseded-by: []
@@ -14,7 +14,14 @@ superseded-by: []
 
 # RFC: Fold advances push deltas, not whole values
 
-Status: draft. Nothing built. Every code reference below was read at `908099fc26`.
+Status: draft. No maintainer acceptance is recorded, but most of section 4's
+plan is on main: PR (c+d) in [#24749](https://github.com/kirodotdev/KiroCrew/pull/24749)
+(`crew_log/fold_delta.py`, `base_revision` and `delta` on `FoldAdvanced`) and
+the value-less `work` advance of PR (e) in
+[#25218](https://github.com/kirodotdev/KiroCrew/pull/25218), with the
+`fold_watch` routing in `dashboard/handlers/crew_log.py`. The change-mark delta
+base (section 2.1) is not built. Checked at `cdb601611f`. Every code reference
+below was read at `908099fc26`.
 Paths are relative to `src/kiro_crew/` unless they start with `website/`.
 
 Each time the crew log's eager folder advances a fold, it renders the WHOLE fold
@@ -394,7 +401,7 @@ writing, open PR #24275 also changes `crew_log/bus.py`, `crew_log/eager.py` and
 | (a) | Stop sending values the browser drops: `_push_fold` omits `value` for every slot fold but `work`. | `dashboard/handlers/crew_log.py` | No. Can start now. |
 | (b) | Per-tab watch and skip render of unwatched folds: `fold_delta.1` capability, `fold_hello`, `fold_watch`, per-socket watch sets, keyed exporter subscriptions, a bus "has a matching subscriber" check that eager consults before it reads a slot fold. | `dashboard/ws.py`, `dashboard/websocket_hub.py`, `dashboard/handlers/crew_log.py`, `crew_log/bus.py`, `crew_log/eager.py`, browser `useWebSocket.ts`, `websocket/connection.ts` | Yes: `dashboard/ws.py`. Waits. |
 | (c+d) | Shipped together in #24749. Delta for `work` with a RENDER-DIFF base: the publisher holds the last published render per board and diffs the new render against it item by item (`diff_work`), so the fold step and the memo cell are untouched. `base_revision`, `kind`, `delta` on `FoldAdvanced` (value still carried), `snapshot_needed` when no base is held or the revision does not rise, `published_revision` on the REST read (`read_labelled` folds outside `_published_lock`, then checks the label under it), the shared apply in `crew_log/fold_delta.py` and its TypeScript twin. Receivers switched: the bus (per-subscriber base, relabel to `snapshot_needed` on a gap), `conductor_wake` (restamps only the changed items of a delta), the WS exporter (`slot_fold` to tabs that declare `fold_delta.2` and watch the board), the browser (`websocket/workDelta.ts`), and REST. | `crew_log/bus.py`, `crew_log/eager.py`, `crew_log/fold_delta.py` (new), `conductor_wake.py`, `dashboard/handlers/crew_log.py`, `dashboard/websocket_hub.py`, `dashboard/ws.py`, `dashboard/state_parts/*`; browser `useWebSocket.ts`, `websocket/connection.ts`, `websocket/workDelta.ts` (new), `pages/chat/command-center/useCommandCenter.ts` | Landed after the hotfix. |
-| (e) | Moved here from (c) and (d): the change-mark delta base (section 2.1: marks in the `work` fold step and the memo cell, replacing the held render and its diff); the `DashboardFeed` delta apply; value-less self-reads (`conductor_wake` reads its own board through `_read_board_items`, and receivers rebuild the value with `fold_delta.value_after`). Then remove the whole-value path: `FoldAdvanced` carries no `value` for `work`; legacy sockets get the recorded render for that revision (`eager.published_value`), serialized only when one is a target. The change-mark base is not built: eager still renders the board once per publish to diff it. | `crew_log/projection_work.py`, `crew_log/projection_slot_memo.py`, `crew_log/bus.py`, `crew_log/eager.py`, `crew_log/fold_delta.py`, `dashboard/handlers/crew_log.py`, `conductor_wake.py`, `dashboard_feed.py` | Yes: `projection_work.py`, `projection_slot_memo.py`. Ships one release after (c+d). |
+| (e) | Moved here from (c) and (d): the change-mark delta base (section 2.1: marks in the `work` fold step and the memo cell, replacing the held render and its diff); the `DashboardFeed` delta apply; value-less self-reads (`conductor_wake` reads its own board through `_read_board`, and receivers rebuild the value with `fold_delta.value_after`). Then remove the whole-value path: `FoldAdvanced` carries no `value` for `work`; legacy sockets get the recorded render for that revision (`eager.published_value`), serialized only when one is a target. The change-mark base is not built: eager still renders the board once per publish to diff it. | `crew_log/projection_work.py`, `crew_log/projection_slot_memo.py`, `crew_log/bus.py`, `crew_log/eager.py`, `crew_log/fold_delta.py`, `dashboard/handlers/crew_log.py`, `conductor_wake.py`, `dashboard_feed.py` | Yes: `projection_work.py`, `projection_slot_memo.py`. Ships one release after (c+d). |
 
 PR (a) is the only one that can start before the hotfix. It saves the 168 KB
 `workstreams` value and every other non-work value on every advance, per tab.

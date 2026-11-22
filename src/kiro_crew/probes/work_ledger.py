@@ -15,9 +15,12 @@ itself, which is the only part that needs a disk.
 
 Three facts this probe cannot read for itself and takes as values instead:
 
-* ``worker_running`` -- whether a worker's slot has a turn in flight. That lives
-  in the dashboard's in-process slot table, which a probe running on a worker
-  thread has no handle on, so the driver injects a resolver.
+* ``worker_running`` -- whether the worker's session owns proven current or
+  queued work: a turn, or work that outlives it such as a running or queued
+  sub-agent, a workflow, synthesis, preparation or compaction (the gateway binds
+  ``session_activity.session_work_pending``). That lives in the dashboard's
+  in-process state, which a probe running on a worker thread has no handle on, so
+  the driver injects a resolver.
 * ``worker_closed`` -- whether that slot is GONE. Same table, same reason, and a
   separate question: "not running" is true of a worker thinking between turns as
   well as of one that ended, which is why ``is_stale`` makes the first wait out a
@@ -39,18 +42,27 @@ a stall, and a worker that is gone is judged as a quiet one (see
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
+import threading
+import time
+from collections import OrderedDict
 from typing import Callable
 
 from kiro_crew import irq, ledger_wake, work_ledger, work_preview
+from kiro_crew.session_ledger_layout import ledger_key
 from kiro_crew.work_vocab import (
     WORK_BLOCKED_REASONS,
     WORK_REASON_STATUSES,
     WORK_REMOTE_DISPATCH_STATUSES,
+    ask_is_current,
 )
 
 logger = logging.getLogger(__name__)
+
+#: Events read per item to date its ask record: the Board's own tail size.
+_ASK_TAIL = 20
 
 #: This probe's subject kind. ``probes/__init__`` imports this module only inside
 #: ``build``, which keeps the ledger store off the gateway boot path, so it spells the
@@ -72,6 +84,13 @@ _REPORT_KEY = "report"
 #: Prefix for a silence wake's dedupe key.
 _STALL_KEY = "stall"
 
+#: Prefix for a host posture-change wake's dedupe key (rfc-host-memory-guard.md §5.2).
+_POSTURE_KEY = "posture"
+
+#: Prefixes for a same-level worsening wake and a worker growth wake (same budget).
+_WORSE_KEY = "worse"
+_GROWTH_KEY = "growth"
+
 #: Prefix for an undelivered-report wake's dedupe key
 #: (:mod:`kiro_crew.work_ledger_undelivered`).
 _UNDELIVERED_KEY = "undelivered"
@@ -83,19 +102,17 @@ _UNDELIVERED_KEY = "undelivered"
 #: there would otherwise make every finished ledger read as a failure in silence.
 ACCEPTED_STATE = "accepted"
 
-#: Dedupe key for "the whole goal is finished, and every item's bar was met". One
-#: per subject, since a watch that ends has nothing further to say. PUBLIC because a
-#: driver records success or failure from a probe's own terminal keys, so this kind's
-#: key has to be nameable from outside: read through the pull-request vocabulary
-#: instead, a conductor whose every item is closed reads as not-merged and is
-#: persisted as blocked.
+#: Key prefix of the one wake for "every item is closed, and every item's bar was
+#: met". The rest of the key is a digest of the closed board.
 ACCEPTED_KEY = "all-accepted"
 
-#: Dedupe key for "the whole goal is finished, and at least one item was NOT
-#: accepted". Equally terminal -- a rejected goal leaves nothing to watch either --
-#: and deliberately NOT a success key, so a ledger whose items were all rejected or
-#: abandoned is not persisted as an outcome its conductor never reached.
+#: Key prefix of the one wake for "every item is closed, and at least one was NOT
+#: accepted" (rejected or abandoned).
 CLOSED_KEY = "all-closed"
+
+#: The rate-file entry the "every item is closed" wake is charged to. Not an item
+#: id (those start ``it_``), so it shares no budget or seen set with a real item.
+_ALL_CLOSED_ENTRY = "_all_closed"
 
 #: :attr:`WorkLedgerProbe.revision` for a ledger that was read but holds no worker
 #: report yet. Not empty, because empty means "not known" to the gate.
@@ -138,13 +155,15 @@ class WorkLedgerProbe(irq.Probe):
     """Watch one conductor's work ledger.
 
     Args:
-        worker_running: ``session_key -> has a turn in flight``. Defaults to
-            :func:`_always_idle`.
+        worker_running: ``session_key -> owns proven current or queued session
+            work`` (a turn is one kind). Defaults to :func:`_always_idle`.
         worker_closed: ``session_key -> its slot is gone``. Defaults to
             :func:`_always_open`, so a build with no resolver never skips the
             staleness window.
         worker_looping: ``session_key -> its session holds an active loop``.
             Defaults to :func:`_never_looping`, which never suppresses a flag.
+        worker_loop_held: ``session_key -> its session holds an active loop that
+            cannot fire``, which voids a ``wake_at``. Defaults to never.
     """
 
     def __init__(
@@ -153,10 +172,12 @@ class WorkLedgerProbe(irq.Probe):
         worker_running: Callable[[str], bool] | None = None,
         worker_closed: Callable[[str], bool] | None = None,
         worker_looping: Callable[[str], bool] | None = None,
+        worker_loop_held: Callable[[str], bool] | None = None,
     ) -> None:
         self._worker_running = worker_running or _always_idle
         self._worker_closed = worker_closed or _always_open
         self._worker_looping = worker_looping or _never_looping
+        self._worker_loop_held = worker_loop_held or _never_looping
         self._conductor = ""
         #: The polling driver's identity, read off the ctx each tick. The seen set
         #: is kept per driver; see ``ledger_wake._MAX_WATCHERS_PER_ITEM``.
@@ -212,70 +233,19 @@ class WorkLedgerProbe(irq.Probe):
         """
         key = self._conductor or _conductor_key(getattr(ctx, "message", ""))
         self._watcher = str(getattr(getattr(ctx, "job", None), "id", "") or "")
-        record = work_ledger.read_conductor(key)
-        if record is None:
+        read = _read_board(key)
+        if read is None:
             # No ledger, or one that could not be read. Deliberately NOT the same
             # answer as "a ledger with no items": a conductor that has not opened
             # one yet is indistinguishable from a torn read at this layer, and the
             # cheap failure is to keep firing on the existing timer.
             return irq.Tick(fetch_ok=False, detail="work ledger unreadable")
-
-        items = work_ledger.list_work_items(key)
-        # How many item files EXIST, against how many were readable. ``list_work_items``
-        # skips a torn file so one bad item cannot hide the rest, which is right for a
-        # board and wrong for a terminal decision: if the only OPEN item is the
-        # unreadable one, every item this tick can see is closed and the watch would
-        # deactivate while its work is still live. A watch that ends early is silent
-        # about the thing it was armed for, so doubt here must keep the watch alive.
-        try:
-            stored = sum(1 for _ in work_ledger.items_dir(key).glob("it_*.json"))
-        except OSError:
-            stored = len(items)
-        all_readable = stored <= len(items)
-        newest: dict[str, str] = {}
-        tails: dict[str, list[work_ledger.WorkEvent]] = {}
-        for item in items:
-            events = work_ledger.read_events(key, item.item_id, limit=_EVENT_TAIL)
-            tails[item.item_id] = events
-            if events:
-                newest[item.item_id] = events[-1].id
+        items, all_readable, tails = read.items, read.all_readable, read.tails
+        # Open items only: a closed item never wakes again, and every observation
+        # this probe raises is ``ResetsOn.NEVER``, which an epoch reset keeps.
+        newest = {item_id: events[-1].id for item_id, events in tails.items() if events}
         epoch = ledger_wake.revision(newest)
         self.revision = worker_report_revision(items)
-
-        if items and all_readable and all(item.is_terminal for item in items):
-            # Every item closed means the goal this ledger serves is finished, so
-            # the watch has nothing left to observe. Requires at least one item on
-            # purpose: "all of nothing" is vacuously true, and a watch armed
-            # BEFORE the conductor mints its first item would otherwise deactivate
-            # itself on its very first tick.
-            #
-            # WHICH terminal key is not cosmetic. A closed item ended accepted,
-            # rejected or abandoned, and only the first means its bar was met, so a
-            # ledger is a success only when every item ended accepted. Reporting one
-            # key for all three would persist a goal whose every item was REJECTED
-            # as a succeeded watch -- the same conflation, in the other direction, as
-            # reading this kind through the pull-request vocabulary.
-            accepted = sum(1 for item in items if item.state == ACCEPTED_STATE)
-            finished_well = accepted == len(items)
-            detail = (
-                f"[work-ledger wake] every item is closed and accepted ({len(items)} total)"
-                if finished_well
-                else (
-                    f"[work-ledger wake] every item is closed, {accepted} accepted "
-                    f"of {len(items)}"
-                )
-            )
-            return irq.Tick(
-                epoch=epoch,
-                observations=[
-                    irq.Observation(
-                        ACCEPTED_KEY if finished_well else CLOSED_KEY,
-                        irq.Severity.TERMINAL,
-                        detail,
-                        irq.ResetsOn.NEVER,
-                    )
-                ],
-            )
 
         # A closed item never wakes again, so its seen set has nothing left to
         # suppress. Dropping it here is what keeps that set bounded by the item's
@@ -284,7 +254,19 @@ class WorkLedgerProbe(irq.Probe):
         if closed:
             ledger_wake.forget_items(key, closed)
 
-        observations: list[irq.Observation] = []
+        if items and all_readable and len(closed) == len(items):
+            # Every item closed is NOT the end of the goal: a lead closes item N
+            # and waits for item N+1, a conductor closes a round and opens the
+            # next. So it is one wake that says so, and the watch stays armed;
+            # only a stop or the loop's own bounds end it. Requires at least one
+            # item, so an empty ledger (a watch armed before the first item) says
+            # nothing.
+            return irq.Tick(
+                epoch=epoch,
+                observations=self._all_closed(key, items) + self._posture_observations(key, items),
+            )
+
+        observations: list[irq.Observation] = self._posture_observations(key, items)
         for item in items:
             if item.is_terminal:
                 continue
@@ -303,6 +285,113 @@ class WorkLedgerProbe(irq.Probe):
         )
 
     # -- internals --------------------------------------------------------
+
+    def _all_closed(
+        self, conductor_key: str, items: list[work_ledger.WorkItem]
+    ) -> list[irq.Observation]:
+        """The one wake for a board whose every item is closed, or nothing.
+
+        The token is a digest of the items' ids and states, so the same closed
+        board wakes once, and a different one (a new item that has since closed)
+        wakes once more. It is charged to its own entry in the rate file, so it
+        never spends a real item's budget.
+
+        A closed item ended accepted, rejected or abandoned, and only the first
+        met its bar, so the text says how many were accepted.
+        """
+        token = ledger_wake.revision({item.item_id: item.state for item in items})
+        accepted = sum(1 for item in items if item.state == ACCEPTED_STATE)
+        finished_well = accepted == len(items)
+        prefix = ACCEPTED_KEY if finished_well else CLOSED_KEY
+        if not self._spend(
+            conductor_key, _ALL_CLOSED_ENTRY, f"{prefix}:{token}", replaces=f"{prefix}:"
+        ):
+            return []
+        detail = (
+            f"[work-ledger wake] every item is closed and accepted ({len(items)} total)"
+            if finished_well
+            else f"[work-ledger wake] every item is closed, {accepted} accepted of {len(items)}"
+        )
+        return [
+            irq.Observation(
+                f"{prefix}:{token}",
+                irq.Severity.WAKE,
+                detail + ". The watch stays armed: create the next item, or call autonudge_stop "
+                "if the goal is done.",
+                irq.ResetsOn.NEVER,
+            )
+        ]
+
+    def _posture_observations(
+        self, conductor_key: str, items: list[work_ledger.WorkItem]
+    ) -> list[irq.Observation]:
+        """Host wakes: a posture change, a further fall at the same level, a worker's growth.
+
+        rfc-host-memory-guard.md §5.2. The posture is read live from the gateway's
+        notifier, never from a record file. The seen set keeps one ``posture:<level>``
+        token per watcher (``replaces``), so a repeat of the level wakes nobody and a
+        new level wakes once. With no level seen yet, ``ample`` is the baseline and
+        wakes nobody. A same-level step of decline (``worsened``, rfc-resource-control.md
+        §4.2) wakes once per token and is charged to the posture rate entry like a
+        level change, so a flapping value is bounded by its hourly budget. A growth
+        step of one open item's worker tree (``worker_growth``, §4.3) wakes once per
+        step and is charged to THAT item's budget.
+        """
+        from kiro_crew.conductor_wake import POSTURE_ITEM
+        from kiro_crew.notifications import resource_pressure
+
+        current = resource_pressure.current_posture()
+        if current is None:
+            return []
+        level, reading = current
+        found: list[irq.Observation] = []
+
+        def wake(token: str, replaces: str, brief: str, entry: str = POSTURE_ITEM) -> None:
+            if self._spend(conductor_key, entry, token, replaces=replaces):
+                # Unique per wake: the kernel masks a key for ``realert_secs``, and
+                # tight -> ample -> tight inside that window is two changes.
+                found.append(
+                    irq.Observation(
+                        # The entry too: two workers' growth in one tick share a stamp.
+                        f"{entry}:{token}:{time.time():.3f}",
+                        irq.Severity.WAKE,
+                        f"[work-ledger wake] {brief}",
+                        irq.ResetsOn.NEVER,
+                    )
+                )
+
+        if level != "ample" or any(
+            ledger_wake.already_woke(
+                conductor_key, POSTURE_ITEM, f"{_POSTURE_KEY}:{other}", watcher=self._watcher
+            )
+            for other in ("tight", "critical")
+        ):
+            wake(
+                f"{_POSTURE_KEY}:{level}",
+                f"{_POSTURE_KEY}:",
+                f"host posture is {level} ({reading})",
+            )
+        worse = resource_pressure.worsened()
+        if worse is not None and level != "ample":
+            wake(f"{_WORSE_KEY}:{worse[0]}", f"{_WORSE_KEY}:", worse[1])
+        growth = resource_pressure.worker_growth()
+        for item in items:
+            step = growth.get(ledger_key(item.worker_session_key or ""))
+            # A remote worker's key names a peer's session, never a local tree.
+            if item.is_terminal or not item.worker_session_key or item.worker_instance_id:
+                continue
+            if step is None:
+                continue
+            stamp, size_mb, share, grown_mb = step
+            if grown_mb > 0:
+                text = (
+                    f"worker {item.item_id} grew to {size_mb / 1024:.1f} GB ({share:.0f}% of "
+                    f"RAM; +{grown_mb / 1024:.1f} GB since the last wake)"
+                )
+            else:
+                text = f"worker {item.item_id} holds {size_mb / 1024:.1f} GB ({share:.0f}% of RAM)"
+            wake(f"{_GROWTH_KEY}:{stamp}", f"{_GROWTH_KEY}:", text, entry=item.item_id)
+        return found
 
     def _item_observations(
         self,
@@ -323,7 +412,39 @@ class WorkLedgerProbe(irq.Probe):
         """
         found: list[irq.Observation] = []
         remote_dispatch: bool | None = None
-        for event in events:
+        # A tail longer than ``_EVENT_TAIL`` carries one extra, oldest event that is
+        # only the next one's predecessor, never a wake of its own.
+        first = 1 if len(events) > _EVENT_TAIL else 0
+        newest_report = max(
+            (i for i, e in enumerate(events) if (e.kind or "").strip() == "report"), default=-1
+        )
+        for index in range(first, len(events)):
+            event = events[index]
+            previous = events[index - 1] if index else None
+            prior = ledger_wake.previous_report(events, index)
+            cause = ""
+            if prior is not None and ledger_wake.repeats_wait(
+                prior.status, prior.text, event.status, event.text
+            ):
+                # The same wait as the worker's report before it, even with the
+                # conductor's own decide between them. Only the newest report's
+                # reason is known (the item's), so it alone is checked against the
+                # cause last delivered: a new reason is news.
+                if index != newest_report or ledger_wake.already_woke(
+                    conductor_key,
+                    item.item_id,
+                    ledger_wake.cause_token(event.status, item.reason),
+                    watcher=self._watcher,
+                ):
+                    continue
+            elif previous is not None and ledger_wake.repeats_status(
+                previous.kind, previous.status, event.status
+            ):
+                # Same status as the report just before: the conductor already woke
+                # on that one (``ledger_wake.repeats_status``).
+                continue
+            if index == newest_report and (event.status or "").strip() in ("blocked", "question"):
+                cause = ledger_wake.cause_token(event.status, item.reason)
             if remote_dispatch is None and (event.status or "").strip() in (
                 WORK_REMOTE_DISPATCH_STATUSES
             ):
@@ -337,7 +458,7 @@ class WorkLedgerProbe(irq.Probe):
             # reset on a revision: the key already cannot recur, and clearing it
             # when some OTHER item reports would re-fire a wake this one already
             # delivered.
-            if not self._spend(conductor_key, item.item_id, event.id):
+            if not self._spend(conductor_key, item.item_id, event.id, cause=cause):
                 continue
             found.append(
                 irq.Observation(
@@ -370,26 +491,45 @@ class WorkLedgerProbe(irq.Probe):
                     )
                 )
 
-        running, closed, looping = work_ledger.item_liveness(
+        running, closed, looping, held = work_ledger.item_liveness(
             conductor_key,
             item,
             running=self._worker_running,
             closed=self._worker_closed,
             looping=self._worker_looping,
+            held=self._worker_loop_held,
         )
-        if work_ledger.is_stale(
-            item, worker_running=running, worker_closed=closed, worker_looping=looping
+        # An open ``ask`` record says the conductor is waiting on a person for this
+        # item, so its silence is not the worker's to explain. The board's own
+        # ``stale`` flag is left alone, and a closed worker session still raises.
+        waits_on_person = bool(item.ask) and not closed
+        if not waits_on_person and work_ledger.is_stale(
+            item,
+            worker_running=running,
+            worker_closed=closed,
+            worker_looping=looping,
+            worker_loop_held=held,
         ):
             # The whole liveness conjunction is ``is_stale``'s, not this module's:
             # quiet past the window -- or the worker's session gone, which needs no
             # window -- AND the worker not running AND its last word still leaving the
             # move with it. Restating any part of it here would be a second copy of a
-            # shipped rule.
-            token = f"{_STALL_KEY}:{item.last_report_at or 'none'}"
+            # shipped rule. The token is the stall's episode
+            # (``ledger_wake.stall_episode``), not the last report's stamp: a
+            # ``progress`` that keeps the status is not a second stall.
+            episode = ledger_wake.stall_episode(
+                item,
+                events,
+                closed=closed,
+                handed_back=work_ledger._decided_after_report(item),
+            )
+            token = f"{_STALL_KEY}:{episode}"
             if self._spend(conductor_key, item.item_id, token, replaces=f"{_STALL_KEY}:"):
                 found.append(
                     irq.Observation(
-                        f"{_STALL_KEY}:{item.item_id}:{item.last_report_at or 'none'}",
+                        # The episode, not the report stamp: the kernel masks a key
+                        # for ``realert_secs``, so a re-armed stall needs a new one.
+                        f"{_STALL_KEY}:{item.item_id}:{episode}",
                         irq.Severity.WAKE,
                         ledger_wake.stall_brief(
                             item_id=item.item_id,
@@ -400,7 +540,15 @@ class WorkLedgerProbe(irq.Probe):
                 )
         return found
 
-    def _spend(self, conductor_key: str, item_id: str, token: str, *, replaces: str = "") -> bool:
+    def _spend(
+        self,
+        conductor_key: str,
+        item_id: str,
+        token: str,
+        *,
+        replaces: str = "",
+        cause: str = "",
+    ) -> bool:
         """Whether this item may wake now, charging the budget if it does.
 
         A *token* that already woke the conductor never wakes it again while the item
@@ -427,7 +575,12 @@ class WorkLedgerProbe(irq.Probe):
             )
             return False
         if not ledger_wake.note_wake(
-            conductor_key, item_id, token=token, replaces=replaces, watcher=self._watcher
+            conductor_key,
+            item_id,
+            token=token,
+            replaces=replaces,
+            watcher=self._watcher,
+            cause=cause,
         ):
             logger.warning(
                 "work-ledger probe: item %s's wake could not be charged; folding "
@@ -438,15 +591,129 @@ class WorkLedgerProbe(irq.Probe):
         return True
 
 
+#: How long an unchanged board read may be served again without reading the store.
+#: Only a backstop: a store write in this process moves ``change_mark``, and one in
+#: another process renames a file into the directory and moves its mtime. This bounds
+#: an edit that does neither (a file rewritten in place by hand). Six patrol ticks.
+_REUSE_MAX_AGE_SECS = 1800.0
+
+#: A read is kept for reuse only when the store's directories last changed at least
+#: this long before it started. A write in the same mtime tick as the stat would
+#: otherwise leave the mtime unmoved and be missed (git's "racy" rule).
+_RACY_SECS = 2.0
+
+#: Boards whose last read is kept, oldest read dropped first, and the items
+#: all kept reads may hold together. The same budgets as the store's listing memo
+#: (``work_ledger_store._LISTING_MEMO_BOARDS`` / ``_LISTING_MEMO_ITEMS``): a board too
+#: big for that memo is not kept here either.
+_KEPT_BOARDS = 256
+_KEPT_ITEMS = 10_000
+
+
+@dataclasses.dataclass(frozen=True)
+class _BoardRead:
+    """One read of a board. Shared between ticks: callers must not mutate it."""
+
+    items: list[work_ledger.WorkItem]
+    all_readable: bool
+    #: Each OPEN item's event tail, by item id.
+    tails: dict[str, list[work_ledger.WorkEvent]]
+    mark: int
+    signature: tuple[int, int]
+    read_at: float
+
+
+_BOARD_READS: OrderedDict[str, _BoardRead] = OrderedDict()
+_BOARD_READS_LOCK = threading.Lock()
+
+
+def _read_board(key: str) -> _BoardRead | None:
+    """*key*'s items and each open item's event tail, or ``None`` for no readable ledger.
+
+    Serves the last read again while nothing could have written the store since:
+    the same ``change_mark`` (every write here), the same directory mtimes (a file
+    renamed in by another process), and younger than :data:`_REUSE_MAX_AGE_SECS`.
+    Liveness, undelivered reports and staleness are not part of it; the caller
+    still judges those every tick.
+    """
+    started = time.time()
+    mark = work_ledger.change_mark(key)
+    signature: tuple[int, int] | None
+    try:
+        items_dir = work_ledger.items_dir(key)
+        signature = (items_dir.parent.stat().st_mtime_ns, items_dir.stat().st_mtime_ns)
+    except OSError:
+        items_dir, signature = None, None
+    slot = str(items_dir) if items_dir is not None else ""
+    with _BOARD_READS_LOCK:
+        kept = _BOARD_READS.get(slot)
+    if (
+        kept is not None
+        and kept.mark == mark
+        and kept.signature == signature
+        and 0 <= started - kept.read_at < _REUSE_MAX_AGE_SECS
+    ):
+        return kept
+
+    # After the stat, not before: a listing that joins a walk begun earlier gets that
+    # walk's result, which can predate a write by another process the stat already
+    # saw. With no walk in flight now, any walk this read leads or joins began after
+    # the stat. ``work_ledger_store.list_work_items`` keys its walks the same way.
+    with work_ledger._LISTINGS_LOCK:
+        fresh_walk = slot not in work_ledger._LISTINGS
+    if work_ledger.read_conductor(key) is None:
+        with _BOARD_READS_LOCK:
+            _BOARD_READS.pop(slot, None)
+        return None
+    items = work_ledger.list_work_items(key)
+    # How many item files EXIST, against how many were readable. ``list_work_items``
+    # skips a torn file so one bad item cannot hide the rest, which is right for a
+    # board and wrong for the "every item is closed" wake: if the only OPEN item
+    # is the unreadable one, every item this tick can see is closed, and the
+    # wake would tell the conductor its board is done while work is still live.
+    try:
+        stored = sum(1 for _ in (items_dir or work_ledger.items_dir(key)).glob("it_*.json"))
+    except OSError:
+        stored = len(items)
+    tails = {
+        # One event past the tail, read only as the oldest event's predecessor:
+        # without it a repeat rolling into the oldest slot reads as news.
+        item.item_id: work_ledger.read_events(key, item.item_id, limit=_EVENT_TAIL + 1)
+        for item in items
+        if not item.is_terminal
+    }
+    read = _BoardRead(items, stored <= len(items), tails, mark, signature or (0, 0), started)
+    # An item file the listing could not read once is retried next tick rather than
+    # kept missing, and so is an empty tail: every item's log starts with its ``create`` event, so an empty
+    # one is a read that failed (``read_events`` answers ``[]`` for an I/O error).
+    # An empty listing is not kept either: it is also what a failed scan returns,
+    # and an empty board costs little to read again.
+    keep = (
+        fresh_walk
+        and bool(items)
+        and read.all_readable
+        and all(tails.values())
+        and signature is not None
+        and started - max(signature) / 1e9 >= _RACY_SECS
+    )
+    with _BOARD_READS_LOCK:
+        _BOARD_READS.pop(slot, None)
+        if keep and len(items) <= _KEPT_ITEMS:
+            _BOARD_READS[slot] = read
+            kept_items = sum(len(r.items) for r in _BOARD_READS.values())
+            while len(_BOARD_READS) > _KEPT_BOARDS or kept_items > _KEPT_ITEMS:
+                kept_items -= len(_BOARD_READS.popitem(last=False)[1].items)
+    return read
+
+
 def has_open_items(conductor_key: str) -> bool:
     """Whether *conductor_key*'s ledger holds at least one non-terminal item.
 
     What the AutoNudge timer asks before it lets a spent cycle cap or runtime
     budget end a work-ledger watch. Positive evidence only: an unreadable ledger,
     or a torn item file ``list_work_items`` skips, answers False, so doubt leaves
-    the loop's own bound in force rather than lifting it -- the opposite of the
-    tick's terminal rule above, because there doubt must keep a watch ALIVE and
-    here it must not keep one running past its bound. Read-only; blocking file
+    the loop's own bound in force rather than lifting it, because doubt must not
+    keep a watch running past its bound. Read-only; blocking file
     reads, so call it off the event loop.
     """
     try:
@@ -525,13 +792,13 @@ def person_wait_fingerprint(
             work_preview.remote_dispatch()
             and all(work_ledger.remote_pull_fresh(conductor_key, item) for item in remote)
         ):
-            # A remote worker's reports reach this board through the hub's
-            # background puller (``remote_puller``), every
-            # ``REMOTE_PULL_INTERVAL_SECS``. While its last pull is fresh the fields
-            # here stand for the peer's and a new report moves the fingerprint like
-            # a local one. A stale, failed or missing pull, or the switch off (no
-            # puller), could hold the patrol past the report that moves the item,
-            # so the patrol runs instead: the liveness fallback.
+            # A remote worker's reports reach this board through the pull the
+            # patrol tick runs before this read (``remote_puller.pull_on_patrol``).
+            # While its last pull is fresh the fields here stand for the peer's and
+            # a new report moves the fingerprint like a local one. A stale, failed
+            # or missing pull, or the switch off (no pull), could hold the patrol
+            # past the report that moves the item, so the patrol runs instead: the
+            # liveness fallback.
             return None
         closed = worker_closed or _always_open
         if any(_worker_gone(conductor_key, item, closed) for item in open_items):
@@ -546,9 +813,26 @@ def person_wait_fingerprint(
             if lost is not None:
                 undelivered[item.item_id] = lost["at"]
         revision = worker_report_revision(items)
-        if not undelivered:
+        if undelivered:
+            revision = f"{revision}|undelivered:{ledger_wake.revision(undelivered)}"
+        # The host posture is news no report carries either (rfc-host-memory-guard.md
+        # §5.2): a level change, a further fall at the level, or an open item's
+        # worker growth step releases the hold for the tick that wakes on it.
+        from kiro_crew.notifications import resource_pressure
+
+        posture = resource_pressure.current_posture()
+        if posture is None:
             return revision
-        return f"{revision}|undelivered:{ledger_wake.revision(undelivered)}"
+        growth = resource_pressure.worker_growth()
+        steps = {
+            item.item_id: growth[key][0]
+            for item in open_items
+            if not item.worker_instance_id
+            and (key := ledger_key(item.worker_session_key or "")) in growth
+        }
+        worse = resource_pressure.worsened()
+        revision = f"{revision}|posture:{posture[0]}:{worse[0] if worse else ''}"
+        return f"{revision}|growth:{ledger_wake.revision(steps)}" if steps else revision
     except Exception:  # noqa: BLE001 - a read fault must never hold a patrol
         logger.debug("work-ledger probe: person-wait read failed for %s", conductor_key)
         return None
@@ -579,3 +863,39 @@ def _conductor_key(raw: object) -> str:
     if not key:
         raise ValueError("work-ledger watch config needs a 'conductor' session key")
     return key
+
+
+def person_wait_asked(conductor_key: str) -> bool:
+    """Whether the conductor relayed every open item's question with a current ``ask``.
+
+    The person-wait hold's second half. The Board lists a person wait only with a
+    current ``ask`` record (``work_vocab.ask_is_current``: no report after the newest
+    ``ask`` event), so the hold does too: a question the conductor has not relayed,
+    or one a newer report superseded, is still the conductor's, and holding its
+    patrol would stall the crew while the Board says nothing needs the person.
+
+    Kept apart from :func:`person_wait_fingerprint` on purpose: the fingerprint
+    covers worker-owned fields only, so the conductor's own ``work_ask_record`` write
+    in the relay turn does not move it, and the next tick can hold at once.
+    Positive evidence only: a read that raises answers False, so doubt never holds.
+    Blocking file reads; call it off-loop.
+    """
+    try:
+        open_items = [
+            item for item in work_ledger.list_work_items(conductor_key) if not item.is_terminal
+        ]
+        return bool(open_items) and all(
+            item.ask
+            and ask_is_current(
+                [
+                    event.to_dict()
+                    for event in work_ledger.read_events(
+                        conductor_key, item.item_id, limit=_ASK_TAIL
+                    )
+                ]
+            )
+            for item in open_items
+        )
+    except Exception:  # noqa: BLE001 - a read fault must not hold the patrol
+        logger.debug("work-ledger probe: ask read failed for %s", conductor_key)
+        return False

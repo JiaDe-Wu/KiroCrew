@@ -11,7 +11,7 @@ on the one class.
 
 Instance fields written: ``_chained_far_end``, ``_chained_hop_identity``,
 ``_chained_hop_port``, ``_chained_ttl``, ``_connect_timeout``, ``_last_error``,
-``_max_recovery``, ``_mint_timeout``, ``_peer_sessions``, ``_probe_fails``,
+``_last_error_code``, ``_max_recovery``, ``_mint_timeout``, ``_peer_sessions``, ``_probe_fails``,
 ``_reconfiguring``, ``_recover_attempts``, ``_recover_since``, ``_recover_backoff_max``,
 ``_ssh_compression``, ``_tokens``, ``_tunnel_epoch``, ``_tunnels``.
 
@@ -35,6 +35,7 @@ from kiro_crew.instances.registry import (
     _UNALLOCATED_PORT,
     Instance,
     InstanceDisabledError,
+    InstanceStoppedError,
     ancestor_ids,
     descendant_ids,
     is_headless_provisioner,
@@ -169,7 +170,9 @@ async def connect(
     the browser could.
 
     A disabled crew raises :class:`InstanceDisabledError` and spawns nothing,
-    and so does a chained crew with a disabled crew anywhere up its chain.
+    and so does a chained crew with a disabled crew anywhere up its chain. A
+    crew whose cloud machine was stopped raises its subclass,
+    :class:`InstanceStoppedError`.
     The check reads the record under the same lock the disabling write is
     made under (see :meth:`reconfigure`), so a connect racing a disable either
     finishes first and is torn down by it, or starts after and is refused.
@@ -206,6 +209,8 @@ async def connect(
             )
         if inst.disabled:
             raise InstanceDisabledError(f"crew {instance_id!r} is disabled")
+        if inst.cloud_stopped:
+            raise InstanceStoppedError(f"crew {instance_id!r} is stopped")
         if inst.via_instance_id:
             # A chained crew's forward dials its parent's host, so a disabled
             # crew anywhere up the chain keeps this one closed as well.
@@ -247,8 +252,8 @@ async def connect(
             # terminated and the local forward freed before we spawn a
             # replacement. Otherwise the old child orphans (dropped from
             # _tunnels below, never killed) and keeps the port — every
-            # replacement then hits ExitOnForwardFailure while _port_reachable
-            # is still satisfied by the orphan -> tight respawn loop.
+            # replacement then loses its bind while _port_reachable is still
+            # satisfied by the orphan -> tight respawn loop.
             with contextlib.suppress(Exception):
                 await existing.stop()
 
@@ -310,7 +315,9 @@ async def connect(
             if not await asyncio.to_thread(cloud_ssm.session_manager_plugin_installed):
                 return self._error_status(
                     inst,
-                    await asyncio.to_thread(cloud_ssm.session_manager_plugin_unavailable_message),
+                    await asyncio.to_thread(
+                        cloud_ssm.session_manager_plugin_unavailable_message, "connect again"
+                    ),
                 )
 
         # Reclaim our own forwarder if a prior gateway hard-kill leaked it
@@ -384,13 +391,11 @@ async def connect(
         # rather than on there being a freed port to add back.
         #
         # Everything here runs off the event loop: ``_reserved_ports`` reads
-        # the registry from disk under its own lock, and the port probe binds
-        # a socket. Under the mirror neither happened on this path -- the port
-        # was a fixed field read and one probe -- whereas this reads a file
-        # and can walk upward past every occupied candidate, all inside the
-        # manager lock on the gateway's loop, where a synchronous scan would
-        # stall unrelated requests and heartbeats. This matches how the rest
-        # of the module already reaches the registry (``asyncio.to_thread``).
+        # the registry from disk under its own lock, the port probe binds a
+        # socket, and the scan can walk past every occupied candidate, all
+        # inside the manager lock. On the gateway's loop that would stall
+        # unrelated requests and heartbeats. The rest of the module reaches
+        # the registry the same way (``asyncio.to_thread``).
         reserved = await asyncio.to_thread(self._reserved_ports)
         # Prefer this crew's own recorded port for origin stability (above),
         # but not on a rebuild, which wants a fresh port. ``_reserved_ports``
@@ -445,7 +450,7 @@ async def connect(
         # The probe above is advisory — there is an inherent TOCTOU window
         # between probing and ssh actually binding — so re-check immediately
         # before spawning and fail with an actionable message rather than
-        # letting the child exit on ExitOnForwardFailure.
+        # letting the child fail its bind.
         if not await asyncio.to_thread(_is_port_free, local_port):
             return self._error_status(
                 inst,
@@ -475,6 +480,11 @@ async def connect(
         ok = await tunnel.start()
         if not ok:
             self._last_error[instance_id] = tunnel.status.error or "tunnel failed to start"
+            if tunnel.status.error_code:
+                self._last_error_code[instance_id] = (
+                    self._last_error[instance_id],
+                    tunnel.status.error_code,
+                )
             # Drop the failed tunnel (matching the mint-failure path below) so
             # status() returns None and _status_for surfaces the error via the
             # last_error() fallback, rather than leaving a stale ERROR tunnel
@@ -601,6 +611,7 @@ async def connect(
         # Connected cleanly — drop any retained failure reason from a prior
         # attempt so status() does not report a stale error.
         self._last_error.pop(instance_id, None)
+        self._last_error_code.pop(instance_id, None)
         return tunnel.status
 
 
@@ -699,6 +710,7 @@ async def _teardown_locked(self: SshTunnelManager, instance_id: str, *, keep_int
     self._recover_attempts.pop(instance_id, None)
     self._recover_since.pop(instance_id, None)
     self._last_error.pop(instance_id, None)
+    self._last_error_code.pop(instance_id, None)
     # A teardown ends the generation: a slow unlocked mint or rebuild in
     # flight captured the pre-teardown stamp, and this bump is what lets
     # the epoch compares at their store/record sites refuse the result —
@@ -744,7 +756,12 @@ async def _teardown_locked(self: SshTunnelManager, instance_id: str, *, keep_int
     return tunnel is not None
 
 
-async def reconfigure(self: SshTunnelManager, instance_id: str, apply: Callable[[], _T]) -> _T:
+async def reconfigure(
+    self: SshTunnelManager,
+    instance_id: str,
+    apply: Callable[[], _T],
+    needs_teardown: Callable[[], bool] | None = None,
+) -> _T:
     """Tear the tunnel down and rewrite its coordinates as ONE operation.
 
     Editing the host/port/transport of a live instance is two steps that must
@@ -758,8 +775,18 @@ async def reconfigure(self: SshTunnelManager, instance_id: str, apply: Callable[
     ``apply`` performs the persistence and returns whatever the caller needs;
     it runs on a worker thread because the registry write is blocking, so the
     event loop is not held while the lock is.
+
+    ``needs_teardown``, when given, runs the same way under the lock first,
+    because whether an edit moves the tunnel depends on the record as it is
+    then. False writes in that same hold of the lock and touches nothing else,
+    so a tunnel the edit does not move keeps its self-heal; True goes on to the
+    barrier and the teardown below.
     """
-    # The barrier goes up FIRST, with no await before it, so no recovery can
+    if needs_teardown is not None:
+        async with self._lock:
+            if not await asyncio.to_thread(needs_teardown):
+                return await _write_out(apply)
+    # The barrier goes up before the cancellation's first await, so no recovery can
     # be scheduled for this instance from here on (see `_reconfiguring`).
     # Cancellation then runs OUTSIDE the lock, because a recovery task may
     # itself be waiting for that lock and awaiting it while holding the lock
@@ -801,18 +828,25 @@ async def _reconfigure_locked(
         # the tunnel stays tracked (see _teardown_locked), and the caller is
         # told to disconnect and retry.
         await self._teardown_locked(instance_id, keep_intent=True)
-        # The write is shielded: if this request's task is cancelled (the
-        # client hung up), the worker thread keeps going regardless, and an
-        # unshielded await would unwind the `async with` and release the lock
-        # while that write was still in flight — letting a concurrent connect
-        # read the pre-edit coordinates. Awaiting it out under the lock keeps
-        # the critical section honest, then the cancellation propagates.
-        write = asyncio.ensure_future(asyncio.to_thread(apply))
-        try:
-            return await asyncio.shield(write)
-        except asyncio.CancelledError:
-            await asyncio.wait({write})
-            raise
+        return await _write_out(apply)
+
+
+async def _write_out(apply: Callable[[], _T]) -> _T:
+    """Run the record write *apply* on a worker thread, under the caller's lock.
+
+    The write is shielded: if this request's task is cancelled (the client hung
+    up), the worker thread keeps going regardless, and an unshielded await would
+    unwind the caller's `async with` and release the lock while that write was
+    still in flight — letting a concurrent connect read the pre-edit
+    coordinates. Awaiting it out keeps the critical section honest, then the
+    cancellation propagates.
+    """
+    write = asyncio.ensure_future(asyncio.to_thread(apply))
+    try:
+        return await asyncio.shield(write)
+    except asyncio.CancelledError:
+        await asyncio.wait({write})
+        raise
 
 
 async def shutdown(self: SshTunnelManager) -> None:
@@ -838,13 +872,16 @@ async def shutdown(self: SshTunnelManager) -> None:
             self._cancel_token_refresh(instance_id)
         ids = list(self._tunnels)
         for instance_id in ids:
-            tunnel = self._tunnels.pop(instance_id, None)
+            tunnel = self._tunnels.get(instance_id)
             self._tokens.pop(instance_id, None)
             self._peer_sessions.pop(instance_id, None)
             self._chained_far_end.pop(instance_id, None)
             if tunnel is not None:
                 with contextlib.suppress(Exception):
                     await tunnel.stop()
+            # Only once the stop has returned: a shutdown cut mid-stop leaves the
+            # tunnel here, so the next shutdown (the gateway's exit path) stops it.
+            self._tunnels.pop(instance_id, None)
         # Every lent hop port goes with the process, so nothing stays bound by a
         # guard whose gateway is gone. The LEASE survives this, and
         # `sync_hop_holds` at the next startup is what re-takes the ports.
@@ -872,6 +909,17 @@ def last_error(self: SshTunnelManager, instance_id: str) -> str | None:
     even though there is no live tunnel object to query.
     """
     return self._last_error.get(instance_id)
+
+
+def last_error_code(self: SshTunnelManager, instance_id: str) -> str:
+    """The ``TunnelStatus.error_code`` of the retained failure, or ``""``.
+
+    Only while :meth:`last_error` still answers the reason it came with.
+    """
+    entry = self._last_error_code.get(instance_id)
+    if entry is None or entry[0] != self._last_error.get(instance_id):
+        return ""
+    return entry[1]
 
 
 def status_all(self: SshTunnelManager) -> dict[str, TunnelStatus]:

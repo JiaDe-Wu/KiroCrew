@@ -113,8 +113,9 @@ docker run -d --name kirocrew \
   ghcr.io/kirodotdev/kirocrew:stable
 ```
 
-See the [Docker guide](docs/guides/docker.md) for first-run login, channel tags, and
-the container security model.
+See the [Docker guide](docs/guides/docker.md) for first-run login, channel tags,
+[upgrades](docs/guides/docker.md#state-and-upgrades), and the container security
+model.
 
 ### Build from source
 
@@ -221,8 +222,9 @@ use [SECURITY.md](SECURITY.md) for private vulnerability reporting.
 
 The [install guide](docs/guides/install.md) owns every install path, first-run
 step, optional dependency, upgrade, uninstall, and recovery procedure. User data
-lives under `~/.kiro/crew` by default and moves with `KIROCREW_HOME`; configuration
-keys and precedence are canonical in the
+lives under `~/.kiro/crew` by default and moves with `KIROCREW_HOME`, except some
+[folders that stay under `~/.kiro`](docs/guides/install.md#folders-beside-the-data-home);
+configuration keys and precedence are canonical in the
 [config spec](docs/system-specs/modules/config.md).
 
 For a new source or wheel install:
@@ -253,28 +255,50 @@ Use `kirocrew config get`, `kirocrew config set <key> <value>`, and
 [troubleshooting guide](src/kiro_crew/docs/troubleshooting.md) for log sources,
 levels, diagnostics bundles, and recovery steps.
 
+### Stopping or removing Kiro Crew
+
+```bash
+kirocrew stop                # stop a running Gateway
+kirocrew service uninstall   # remove the service
+```
+
+A service installed with `kirocrew service install` starts again at the next
+boot or login after `kirocrew stop`, until `kirocrew service uninstall` removes
+it. On Linux the service is a system unit, so both commands ask for sudo there.
+The desktop app runs its own Gateway: quit the app (Quit in its tray icon menu,
+or Cmd+Q / Ctrl+Q) to stop it, because closing its window keeps it running. A
+Docker install stops with `docker stop kirocrew`. To remove the program, follow
+[Uninstalling](docs/guides/install.md#uninstalling) for your install method;
+your data stays in place until you follow
+[Removing user data](docs/guides/install.md#removing-user-data).
+
 ## Anonymous usage telemetry
 
 Kiro Crew sends **one anonymous heartbeat per day** so maintainers can see how
 many copies are actively running and which releases, Python minors, and install
 paths still need support. After a successful install or update from the official
 app catalog, it also sends one anonymous per-app receipt. Both signals are
-enabled by default, but first egress waits until the first-run privacy disclosure
-has been shown; they use the same controls below.
+enabled by default and use the same controls below.
 
-To turn it off, flip **Settings → Privacy → Send anonymous usage heartbeat** in
-the dashboard (the same switch appears on the last step of first-run
-onboarding). Or from a terminal:
+To turn it off, flip **Settings > Privacy > Send anonymous usage heartbeat** in
+the dashboard. Or from a terminal:
 
 ```bash
-kirocrew telemetry disable        # persists to config.json
-export KIROCREW_TELEMETRY_DISABLED=1   # or per-shell / per-container
-kirocrew telemetry status         # print exactly what would be sent
+kirocrew telemetry disable        # local metrics and the heartbeat; persists to config.json
+export KIROCREW_TELEMETRY_DISABLED=1   # heartbeat only, per-shell / per-container
+export DO_NOT_TRACK=1             # everything: local metrics and the heartbeat
+kirocrew telemetry status         # print both switches and exactly what would be sent
 ```
 
-The toggle and `kirocrew telemetry disable` write the same setting, so either
-one sticks across restarts and upgrades. `KIROCREW_TELEMETRY_DISABLED` overrides
-both — when it is set, the dashboard toggle is disabled and says so.
+The Settings switches and `kirocrew telemetry disable` write the same settings,
+so either one sticks across restarts and upgrades. `KIROCREW_TELEMETRY_DISABLED` and
+`DO_NOT_TRACK` override them: when one is set, the dashboard toggle is disabled
+and says so. An existing install that turned the heartbeat off, wrote
+`telemetry.enabled: false`, or sets `DO_NOT_TRACK` keeps local recording off
+after an upgrade and is not asked again. That includes the written
+`telemetry.enabled: false` that builds before recording was on by default put
+into every new config: it stays off until you turn recording on in Settings >
+Privacy or with `kirocrew telemetry enable`.
 
 **Exactly these five fields are sent, at most once per day, and nothing else:**
 
@@ -301,11 +325,10 @@ entries. Apps from user-configured registries, local-directory installs, and
 self-registered apps emit nothing, so private app names never leave the machine.
 If the receipt-only secret cannot be persisted, the receipt is skipped.
 
-This list used to be nine fields. Release channel, OS, CPU architecture and
-governance posture were **removed** — each was coarse on its own, but the
-instance id is stable, so those attributes all describe the *same* copy and
-together they narrowed the group any one install blends into far more than any
-single field suggests.
+Release channel, OS, CPU architecture and governance posture are **not sent**.
+Each is coarse on its own, but the instance id is stable, so those attributes
+would all describe the *same* copy and together narrow the group any one install
+blends into far more than any single field suggests.
 
 We report this as **Daily Active Crews** rather than "users": Kiro Crew has
 no account system of its own, and the Kiro sign-in that `kiro-cli` uses for
@@ -333,9 +356,19 @@ would not take effect:
 
 See [docs/system-specs/modules/governance.md](docs/system-specs/modules/governance.md).
 
-This is separate from `telemetry.enabled`, which controls **local-only**
-performance metrics that never leave your machine. See
-[docs/system-specs/modules/metrics.md](docs/system-specs/modules/metrics.md).
+This is separate from `telemetry.enabled`, which controls performance metrics.
+They are on by default, are recorded on your machine, are capped at 30 days and
+100 MB, and turn off with the Settings > Privacy switch, `kirocrew telemetry disable`,
+`KIROCREW_TELEMETRY=0` or `DO_NOT_TRACK=1`. The first `kirocrew gateway`,
+`kirocrew run` or `kirocrew chat` start prints a one-line notice about them to
+stderr, once per install and notice version; it waits for no answer.
+
+While they are on, the public build also sends the reviewed product usage metrics
+(which features are used and how long things take; no prompts, files, paths or
+credentials) to Kiro telemetry, labelled with a hashed install ID. It is not sent
+from an enterprise (LTS) build or a CI runner, and every off switch above stops it. See
+[docs/guides/telemetry-otlp-export.md](docs/guides/telemetry-otlp-export.md#the-kiro-telemetry-destination)
+and [docs/system-specs/modules/metrics.md](docs/system-specs/modules/metrics.md).
 
 ## Docs and contributing
 
@@ -1153,6 +1186,7 @@ make this tool possible:
 <a href="https://github.com/rjullien" title="Rene Jullien"><img src="https://github.com/rjullien.png?size=64" width="64" height="64" alt="Rene Jullien" /></a>
 <a href="https://github.com/rkeely" title="Rkee"><img src="https://github.com/rkeely.png?size=64" width="64" height="64" alt="Rkee" /></a>
 <a href="https://github.com/rlunar" title="Roberto Luna-Rojas"><img src="https://github.com/rlunar.png?size=64" width="64" height="64" alt="Roberto Luna-Rojas" /></a>
+<a href="https://github.com/rmartin" title="Roy Martin"><img src="https://github.com/rmartin.png?size=64" width="64" height="64" alt="Roy Martin" /></a>
 <a href="https://github.com/rmkumari0704" title="rmkumari0704"><img src="https://github.com/rmkumari0704.png?size=64" width="64" height="64" alt="rmkumari0704" /></a>
 <a href="https://github.com/rnoack1" title="Robert Noack"><img src="https://github.com/rnoack1.png?size=64" width="64" height="64" alt="Robert Noack" /></a>
 <a href="https://github.com/robchahin" title="robchahin"><img src="https://github.com/robchahin.png?size=64" width="64" height="64" alt="robchahin" /></a>

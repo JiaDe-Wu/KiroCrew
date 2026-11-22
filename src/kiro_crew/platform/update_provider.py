@@ -26,7 +26,7 @@ import platform
 import sys
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
-from typing import Any, Coroutine, Protocol, runtime_checkable
+from typing import Any, Awaitable, Callable, Coroutine, Protocol, runtime_checkable
 
 from kiro_crew import platform_compat, update_ownership
 from kiro_crew.edition_locks import locked_off
@@ -118,19 +118,21 @@ _APPLY_TIMEOUT_SECS = 600
 INSTALLER_TIMEOUT_TERM_GRACE_SECS = 60.0
 
 
-async def _stop_installer(
-    proc: asyncio.subprocess.Process, *, grace: float = UPDATE_INSTALLER_TERM_GRACE_SECS
-) -> None:
+async def _stop_installer(proc: asyncio.subprocess.Process, *, grace: float | None = None) -> None:
     """Stop an in-flight update installer so its own rollback can run.
 
     An installer that replaces the install in place moves the old tree aside
     first and restores it from a TERM trap if it is interrupted. SIGKILL skips
     that trap and leaves no install at all, so the group gets SIGTERM and
     *grace* seconds to finish, then SIGKILL. The cancellation (shutdown) arm of
-    every apply route uses the default; the timeout arm passes
+    every apply route uses the default, :data:`UPDATE_INSTALLER_TERM_GRACE_SECS`
+    read at call time (as :func:`_start_installer` reads it), so this module's
+    binding is the one seam for it; the timeout arm passes
     :data:`INSTALLER_TIMEOUT_TERM_GRACE_SECS`. The check command keeps
     :func:`_kill_and_reap`, since it changes nothing.
     """
+    if grace is None:
+        grace = UPDATE_INSTALLER_TERM_GRACE_SECS
     await platform_compat.terminate_and_reap(
         proc, grace=grace, reap_timeout=UPDATE_INSTALLER_KILL_REAP_SECS
     )
@@ -138,7 +140,14 @@ async def _stop_installer(
 
 async def _start_installer(
     spawn: Coroutine[Any, Any, asyncio.subprocess.Process],
+    *,
+    stop: Callable[[asyncio.subprocess.Process], Awaitable[None]] | None = None,
 ) -> asyncio.subprocess.Process:
+    """Start an update child so a cancel that lands during the start still stops it.
+
+    The stop is :func:`_stop_installer`'s graceful TERM, or *stop* for a child with
+    no TERM trap to honour.
+    """
     start = asyncio.ensure_future(spawn)
     try:
         return await asyncio.shield(start)
@@ -151,9 +160,7 @@ async def _start_installer(
         remaining = deadline - loop.time()
         if remaining <= 0:
             start.cancel()
-            logger.warning(
-                "CommandProvider.apply: cancelled while the update child was still starting"
-            )
+            logger.warning("Update: cancelled while the update child was still starting")
             raise asyncio.CancelledError
         try:
             await asyncio.wait({start}, timeout=remaining)
@@ -163,9 +170,10 @@ async def _start_installer(
         raise asyncio.CancelledError
     error = start.exception()
     if error is not None:
-        logger.warning(
-            "CommandProvider.apply: cancelled; the update child failed to start: %s", error
-        )
+        logger.warning("Update: cancelled; the update child failed to start: %s", error)
+        raise asyncio.CancelledError
+    if stop is not None:
+        await stop(start.result())
         raise asyncio.CancelledError
     grace = max(0.0, deadline - loop.time())
     if grace == 0.0:
@@ -619,8 +627,8 @@ def resolve_provider() -> CommandProvider | None:
     :class:`CommandProvider` is returned; otherwise ``None`` — the ungoverned
     default, where the gateway keeps its built-in update behaviour.
 
-    Always ``None`` in an enterprise build: managed update commands are off there
-    whatever the policy pins (RFC enterprise edition, Red "Managed update
+    Always ``None`` in an LTS build: managed update commands are off there
+    whatever the policy pins (RFC LTS edition, Red "Managed update
     commands").
     """
     if locked_off():

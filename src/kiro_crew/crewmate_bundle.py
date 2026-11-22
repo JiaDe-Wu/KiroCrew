@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import json
 import re
 import stat
 import zipfile
@@ -29,6 +28,8 @@ from typing import Any
 
 from kiro_crew import change_card_catalog as catalog
 from kiro_crew import crewmate_carried
+from kiro_crew.bounded_read import bounded_read
+from kiro_crew.user_json import loads_user_json
 
 #: The format an export writes. Its manifest entry is :data:`MANIFEST_ENTRY`.
 CREWMATE_FORMAT = "kirocrew.kirobot"
@@ -149,7 +150,7 @@ def _read_entry(zf: zipfile.ZipFile, info: zipfile.ZipInfo, cap: int) -> bytes:
         raise _refuse("invalid_bundle", f"'{info.filename[:64]}' uses an unsupported compression")
     try:
         with zf.open(info) as fh:
-            blob = fh.read(cap + 1)
+            blob = bounded_read(fh, cap + 1)
     except (zipfile.BadZipFile, zlib.error, ValueError, OSError, NotImplementedError, EOFError):
         # A bad CRC, a header that disagrees with the directory, an unknown method.
         raise _refuse("invalid_bundle", f"'{info.filename[:64]}' cannot be read") from None
@@ -160,7 +161,8 @@ def _read_entry(zf: zipfile.ZipFile, info: zipfile.ZipInfo, cap: int) -> bytes:
 
 def _json_part(name: str, blob: bytes) -> Any:
     try:
-        return json.loads(blob.decode("utf-8"))
+        # A Windows editor saves UTF-8 with a byte-order mark; it is not content.
+        return loads_user_json(blob.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, RecursionError):
         # RecursionError: JSON nested deeper than the parser's stack.
         raise _refuse("invalid_bundle", f"'{name}' is not UTF-8 JSON") from None
@@ -432,7 +434,9 @@ def crewmate_import_params(bundle: Any, files: CrewmateFile | None = None) -> di
         # The model hint has its own row (shown, not applied); only an effort
         # hint with no model row is named as left out.
         "model": not params.get("model_hint") and params.get("reasoning_effort_hint"),
-        "dashboardTemplate": template,
+        # A built-in page this build ships is applied by the card's own step;
+        # only one it lacks is left out.
+        "dashboardTemplate": template and not _ships_builtin(template),
     }
     left_out = [code for code, part in left_out_parts.items() if part]
     if left_out:
@@ -442,6 +446,17 @@ def crewmate_import_params(bundle: Any, files: CrewmateFile | None = None) -> di
         if carried:
             params["carried"] = carried
     return catalog.validate_params(catalog.KIND_CREWMATE_IMPORT, params)
+
+
+def _ships_builtin(template: str) -> bool:
+    """Whether ``builtin:<id>`` names a page the shipped catalog of this build holds."""
+    from kiro_crew.dashboard_templates import catalog as templates
+
+    try:
+        entry = templates.load_one(template.removeprefix("builtin:"))
+    except Exception:  # unknown id, or a catalog that cannot be read: leave it out
+        return False
+    return entry.origin == templates.BUILTIN_SOURCE
 
 
 def _rules_max() -> int:

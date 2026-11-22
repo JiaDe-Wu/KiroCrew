@@ -31,8 +31,10 @@ import { useCrewMode } from './usePreviewFlag'
  *   `dashboard.crewmates_in_agent_picker` config is `true` (read from the shared
  *   `['kirocrewConfig']` query, like `useCrewmateThreadsFlag`), a member row is
  *   withheld when a listed template reaches the same binding (see
- *   `withoutCoveredCrewmates`: the member has no memory of its own and runs a
- *   listed template); a crewmate no template covers stays pickable. Being the
+ *   `withoutCoveredCrewmates`: the member has no memory of its own, runs a
+ *   listed template and has no workspace, pin, label, triggers or description
+ *   of its own, and the server reports no other setup of its own); a crewmate
+ *   no template covers stays pickable. Being the
  *   default agent earns a member no exemption: a covered default member is
  *   withheld like any other. Conductor templates (the catalog's
  *   `conductor_agents`) are always left out: a chat reaches a conductor
@@ -69,6 +71,32 @@ import { useCrewMode } from './usePreviewFlag'
  *  array, so emptying an already empty roster is not a state change. */
 const NO_CHOICES: KiroCrewAgent[] = []
 
+/** The workspace a template pick runs on until the config names another. */
+const DEFAULT_WORKSPACE = 'default'
+
+/** The catalog reads started in this task, by session key. Every pane's picker and the
+ *  page's own roster read the catalog on one refresh, each from its own effect, and
+ *  effects of one commit run in one task: a second reader of the same chat in that
+ *  task takes the first one's answer instead of sending the same request again. A read
+ *  started in a later task is a new read, so no change is ever answered from before it. */
+const readsThisTask = new Map<string, ReturnType<typeof api.agentCatalog>>()
+
+/** Test seam: forget the reads of the task a test ran in. */
+export function __resetCatalogReadsForTests(): void {
+  readsThisTask.clear()
+}
+
+function readCatalog(sessionKey?: string): ReturnType<typeof api.agentCatalog> {
+  const key = sessionKey ?? ''
+  let read = readsThisTask.get(key)
+  if (!read) {
+    read = api.agentCatalog(sessionKey)
+    readsThisTask.set(key, read)
+    setTimeout(() => readsThisTask.delete(key), 0)
+  }
+  return read
+}
+
 /** `next` unless it is structurally equal to `prev`, in which case `prev`. */
 function keepIfEqual(prev: KiroCrewAgent[], next: KiroCrewAgent[]): KiroCrewAgent[] {
   return jsonEqual(prev, next) ? prev : next
@@ -100,6 +128,14 @@ export function useAgents(refreshTrigger: number, sessionKey?: string, projectDi
     select: (c) => c?.dashboard?.crewmates_in_agent_picker === true,
   })
   const memberChoices = memberChoicesQuery.data === true
+  // The workspace a template pick runs on, from the same shared query: a
+  // crewmate bound anywhere else is a different binding, so no template covers it.
+  const defaultWorkspaceQuery = useQuery<{ default_workspace?: unknown }, Error, string>({
+    queryKey: ['kirocrewConfig'],
+    queryFn: () => api.kirocrewConfig(),
+    select: (c) => (typeof c?.default_workspace === 'string' && c.default_workspace) || DEFAULT_WORKSPACE,
+  })
+  const defaultWorkspace = defaultWorkspaceQuery.data ?? DEFAULT_WORKSPACE
   const [error, setError] = useState(false)
   const [reloading, setReloading] = useState(false)
   const [reloadTick, setReloadTick] = useState(0)
@@ -109,7 +145,7 @@ export function useAgents(refreshTrigger: number, sessionKey?: string, projectDi
   // unchanged, so without this a new `agent.crew_mode_agent` left the picker
   // hiding the old conductor and offering the new one.
   const [crewCatalogKey, setCrewCatalogKey] = useState('')
-  // The Crew Mode preview decides whether a conductor is hidden from the picker.
+  // Whether this build offers conductor mode decides whether a conductor is hidden from the picker.
   const crewMode = useCrewMode()
   const reload = useCallback(() => {
     setReloading(true)
@@ -120,6 +156,11 @@ export function useAgents(refreshTrigger: number, sessionKey?: string, projectDi
   // a scope boundary.
   const lastKey = useRef<string | undefined>(undefined)
   const lastProject = useRef<string | undefined>(undefined)
+  // What the last effect run read on, so a run caused by the refresh counter alone can
+  // be told from a scope switch or a `reload`, and whether any read has landed yet.
+  const lastTrigger = useRef(refreshTrigger)
+  const lastReloadTick = useRef(reloadTick)
+  const loadedOnce = useRef(false)
 
   useEffect(() => {
     let cancelled = false
@@ -130,15 +171,23 @@ export function useAgents(refreshTrigger: number, sessionKey?: string, projectDi
     // to avoid flicker. The scope is (slot, project) because re-pointing one
     // slot at another project makes the old project's agents just as stale as a
     // slot switch does.
-    if (lastKey.current !== sessionKey || lastProject.current !== projectDir) {
+    const scopeChanged = lastKey.current !== sessionKey || lastProject.current !== projectDir
+    // A refresh frame re-reads the catalog; nobody sees the answer while the tab is
+    // hidden, so the read waits for the tab to be shown (below). A scope switch, a
+    // `reload` and the first read of this tab never wait.
+    const counterOnly = !scopeChanged && refreshTrigger !== lastTrigger.current && reloadTick === lastReloadTick.current
+    lastTrigger.current = refreshTrigger
+    lastReloadTick.current = reloadTick
+    if (scopeChanged) {
       lastKey.current = sessionKey
       lastProject.current = projectDir
       setChoices(NO_CHOICES)
       // The previous scope's verdict says nothing about this one.
       setError(false)
     }
-    api.agentCatalog(sessionKey).then(d => {
+    const load = () => readCatalog(sessionKey).then(d => {
       if (cancelled) return
+      loadedOnce.current = true
       // Stamped here, once, so every picker that renders these rows shows the
       // same "Kiro Agent only" pill: the catalog was asked for THIS chat, so its
       // `session_backend` is the harness this chat runs.
@@ -146,7 +195,7 @@ export function useAgents(refreshTrigger: number, sessionKey?: string, projectDi
       // Recorded before the state update below re-renders, so every reader of
       // lib/crewMode (the Crew Mode switch, the picker filter) sees this catalog's
       // conductor on the same render as its rows.
-      setCrewModeCatalog(d.crew_mode_agent, d.conductor_agents)
+      setCrewModeCatalog(d.crew_mode_agent, d.conductor_agents, d.default_agent)
       setCrewCatalogKey(crewCatalogIdentity(d.crew_mode_agent, d.conductor_agents))
       // Every `refresh` frame and every session switch refetches the catalog,
       // and the reply is almost always the roster already held. Keeping the
@@ -168,6 +217,16 @@ export function useAgents(refreshTrigger: number, sessionKey?: string, projectDi
       // resolves visibly instead of leaving the caller pinned in "trying".
       setReloading(false)
     })
+    if (counterOnly && loadedOnce.current && typeof document !== 'undefined' && document.hidden) {
+      const onShown = () => {
+        if (document.hidden) return
+        document.removeEventListener('visibilitychange', onShown)
+        void load()
+      }
+      document.addEventListener('visibilitychange', onShown)
+      return () => { cancelled = true; document.removeEventListener('visibilitychange', onShown) }
+    }
+    void load()
     return () => { cancelled = true }
   }, [refreshTrigger, sessionKey, projectDir, reloadTick])
 
@@ -177,16 +236,16 @@ export function useAgents(refreshTrigger: number, sessionKey?: string, projectDi
   // which row a bare name resolves to for the name-only consumers.
   // Conductor templates never reach a chat's picker: Crew Mode is the way in.
   const pickerChoices = useMemo(
-    () => withoutConductors(memberChoices ? choices : withoutCoveredCrewmates(choices)),
+    () => withoutConductors(memberChoices ? choices : withoutCoveredCrewmates(choices, defaultWorkspace)),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- crewCatalogKey stands for the conductor set withoutConductors reads from lib/crewMode
-    [choices, memberChoices, crewCatalogKey, crewMode],
+    [choices, memberChoices, defaultWorkspace, crewCatalogKey, crewMode],
   )
   // The picker's rows as of the last successful load, for display-only labels
   // that must agree with the picker on when a same-name pair exists (#19472).
   const displayPickerChoices = useMemo(
-    () => withoutConductors(memberChoices ? displayChoices : withoutCoveredCrewmates(displayChoices)),
+    () => withoutConductors(memberChoices ? displayChoices : withoutCoveredCrewmates(displayChoices, defaultWorkspace)),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- same conductor-set dependency as pickerChoices
-    [displayChoices, memberChoices, crewCatalogKey, crewMode],
+    [displayChoices, memberChoices, defaultWorkspace, crewCatalogKey, crewMode],
   )
 
   return { agents, displayAgents, choices: pickerChoices, displayChoices: displayPickerChoices, defaultAgent, error, reload, reloading }
@@ -195,8 +254,9 @@ export function useAgents(refreshTrigger: number, sessionKey?: string, projectDi
 /**
  * The pop-up's rows while `dashboard.crewmates_in_agent_picker` is off (the
  * default). A crewmate is withheld only when a listed template already reaches
- * the same thing: it has no memory of its own (`memory_store === 'default'`) and
- * runs a listed template, so picking that template is the identical binding (the
+ * the same thing: it has no memory of its own (`memory_store === 'default'`),
+ * runs a listed template, and has nothing else of its own (see
+ * `hasOwnSetup`), so picking that template is the identical binding (the
  * built-in `default` crew is this case).
  *
  * A shared name is not enough. A template pick binds the shared `default` store,
@@ -206,24 +266,60 @@ export function useAgents(refreshTrigger: number, sessionKey?: string, projectDi
  * stays, as does one whose agent is its own private copy (the catalog never
  * lists a private copy as a template).
  *
+ * Shared memory on a listed template is not enough either. A template pick runs
+ * on `defaultWorkspace` with no crewmate identity or permanent rules, so a
+ * crewmate set up for its own work on that store (its own workspace, its own
+ * description, its own rules or briefing) is not reached by the template row,
+ * and withholding one leaves it unreachable from any chat.
+ *
  * No crewmate is exempt for being "the default": a session created without a
  * crewmate runs the default TEMPLATE, which the catalog lists as its own row and
  * the badge marks, so the way back from any switch is that template row. The
- * stock `default` crewmate (shared memory, the `kirocrew` template) is therefore
- * withheld like any covered crewmate; the search reaches a crewmate only on the
- * Crewmates page.
+ * stock `default` crewmate (shared memory, the `kirocrew` template, nothing else)
+ * is therefore withheld like any covered crewmate; the search reaches a crewmate
+ * only on the Crewmates page.
  */
-export function withoutCoveredCrewmates(choices: KiroCrewAgent[]): KiroCrewAgent[] {
-  const templates = new Set(
-    choices.filter(c => c.selection_kind === 'template').map(c => c.name),
+export function withoutCoveredCrewmates(choices: KiroCrewAgent[], defaultWorkspace = DEFAULT_WORKSPACE): KiroCrewAgent[] {
+  const templates = new Map(
+    choices.filter(c => c.selection_kind === 'template').map(c => [c.name, c] as const),
   )
-  const covered = (c: KiroCrewAgent) =>
-    c.memory_store === 'default' && templates.has(c.kiro_agent)
+  const covered = (c: KiroCrewAgent) => {
+    const template = templates.get(c.kiro_agent)
+    return c.memory_store === 'default' && template !== undefined && !hasOwnSetup(c, template, defaultWorkspace)
+  }
   return choices.filter(c => c.selection_kind !== 'member' || !covered(c))
 }
 
+/** A row's text field, trimmed; a missing or non-string value reads as empty. */
+function trimmedText(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+/**
+ * Whether a crewmate row carries setup a pick of `template` does not bring: a
+ * workspace other than the one a template pick runs on (an empty one resolves
+ * to it on the backend), a model pin (`auto` pins nothing, as the backend reads
+ * it), a reasoning-effort pin, a label, triggers, or a description of its own.
+ * A description equal to the template's is the template's, which is what a
+ * template enrolled as a member through `POST /api/agents/sync` carries, so it
+ * does not count. Setup the row does not carry (permanent rules, goals, a
+ * briefing, a harness, worker, approval or dynamic-capabilities choice) is the
+ * server's `own_setup` verdict.
+ */
+function hasOwnSetup(member: KiroCrewAgent, template: KiroCrewAgent, defaultWorkspace: string): boolean {
+  const model = trimmedText(member.model)
+  const description = trimmedText(member.description)
+  return member.own_setup === true
+    || (trimmedText(member.workspace) || defaultWorkspace) !== defaultWorkspace
+    || (model !== '' && model !== 'auto')
+    || trimmedText(member.reasoning_effort) !== ''
+    || trimmedText(member.display_name) !== ''
+    || trimmedText(member.triggers) !== ''
+    || (description !== '' && description !== trimmedText(template.description))
+}
+
 /** One row per name, member first — see `agents` in the hook's docs. */
-function foldByName(choices: KiroCrewAgent[]): KiroCrewAgent[] {
+export function foldByName(choices: KiroCrewAgent[]): KiroCrewAgent[] {
   const byName = new Map<string, KiroCrewAgent>()
   for (const row of choices) {
     const held = byName.get(row.name)

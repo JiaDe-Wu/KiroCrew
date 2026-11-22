@@ -124,13 +124,16 @@ def _overlay_stt_provider() -> object:
     loop and opening a FIFO there would block it.
     """
     # Imported at call time: the loader imports this module.
-    from kiro_crew.config.loader import config_local_path, read_config_text
+    from kiro_crew.config.loader import config_local_path, read_endorsed_config_text
 
     try:
         local_path = config_local_path()
-        if not local_path.is_file():
+        # A name that exists but is not a regular file (a FIFO) is never opened. A
+        # MISSING one is still read: its endorsed copy, if any, is what the load
+        # merges, and the reader opens nothing at the name then.
+        if local_path.exists() and not local_path.is_file():
             return _ABSENT
-        raw = json.loads(read_config_text(local_path))
+        raw = json.loads(read_endorsed_config_text(local_path))
     except (OSError, ValueError):
         # ValueError covers malformed JSON and invalid UTF-8 alike.
         return _ABSENT
@@ -138,6 +141,19 @@ def _overlay_stt_provider() -> object:
     if isinstance(stt, dict) and "provider" in stt:
         return stt["provider"]
     return _ABSENT
+
+
+#: Rows a load could not judge because the edition had not been installed yet.
+#: Boot reloads the config once it is, so the row is judged then
+#: (``bootstrap._refresh_stt_for_edition``).
+_DEFERRED_ROWS: set[str] = set()
+
+
+def take_deferred_rows() -> set[str]:
+    """Return and forget the rows a pre-boot load left unjudged."""
+    rows = set(_DEFERRED_ROWS)
+    _DEFERRED_ROWS.clear()
+    return rows
 
 
 def _stt_resolves_auto_locally(base_data: dict) -> bool:
@@ -155,13 +171,33 @@ def _stt_resolves_auto_locally(base_data: dict) -> bool:
     """
     # Imported at call time: config.sections is the whole schema and its
     # dependencies, and this module is otherwise import-light.
+    from kiro_crew import speech_providers
     from kiro_crew.config.sections import STT_PROVIDER_LOCAL, stt_provider_resolution
 
     provider = _overlay_stt_provider()
     if provider is _ABSENT:
         stt = base_data.get("stt")
         provider = stt.get("provider") if isinstance(stt, dict) else None
+    if provider is None and speech_providers.registry_pending():
+        # No provider stored, so the edition default picks it, and the edition is
+        # not installed yet: the CLI loads config once before boot. Judging now
+        # against the built-in default warns about a value the post-boot answer
+        # ('kirocrew config defaults') calls fine. Boot reloads and judges it.
+        _DEFERRED_ROWS.add("stt.language_code")
+        return False
     return stt_provider_resolution(provider) == STT_PROVIDER_LOCAL
+
+
+def _small_memory_host_applies(_base_data: dict) -> bool:
+    """Whether ``"auto"`` differs from a stored 3600 here: only on a small machine.
+
+    Elsewhere ``"auto"`` resolves to 3600 (``embeddings_settings``), so a stored
+    3600 already behaves like the default and is not drift.
+    """
+    # Imported at call time: keeps the embedding runtime out of the loader's import.
+    from kiro_crew.embeddings_settings import small_memory_host
+
+    return small_memory_host()
 
 
 def _stale_unsandboxed_exec_false_applies(_base_data: dict) -> bool:
@@ -196,6 +232,15 @@ _TOOL_STALL_PAIR_NOTE = (
 # known cost of an explicit list. It is accepted because the alternative -- deriving
 # "was this value chosen or merely materialized" automatically -- is exactly the
 # provenance the config layer does not have.
+# Both metrics disk caps carry the same caveat: 0 is a real setting, and adopting
+# deletes the shards past the new cap.
+_METRICS_CAP_NOTE = (
+    "0 means no limit and is a supported setting; it only matters while local "
+    "metric recording is on, and adopting the new cap deletes the metric shards "
+    "past it."
+)
+
+
 SUPERSEDED_DEFAULTS: tuple[SupersededDefault, ...] = (
     # False costs env-declaring servers their pooling, so the default is True.
     #
@@ -257,8 +302,8 @@ SUPERSEDED_DEFAULTS: tuple[SupersededDefault, ...] = (
         changed_in="#6651",
         new_default_display="unset (automatic: 25s desktop / 90s managed service)",
     ),
-    # 0 means as many panes as crews registered. A stored 5 evicts the 6th crew,
-    # which at the pane looks like a connection flapping on tab switch.
+    # 0 means automatic, which now also resolves to 5 (the five most recently
+    # opened Crews, SSH and relay together), so a stored 5 behaves the same.
     #
     # REPORT-ONLY: plausible values are about 1..10, so an operator with five crews
     # who types 5 stores exactly the old default.
@@ -267,7 +312,7 @@ SUPERSEDED_DEFAULTS: tuple[SupersededDefault, ...] = (
         old_default=5,
         new_default=0,
         changed_in="#7248",
-        new_default_display="0 (automatic: as many as are registered)",
+        new_default_display="0 (automatic: the 5 most recently opened)",
     ),
     # A stored False withdraws session control from every ordinary agent. Crew
     # members and the owner-tab Conductor keep a creator-fenced dispatch bypass
@@ -479,6 +524,59 @@ SUPERSEDED_DEFAULTS: tuple[SupersededDefault, ...] = (
             "on every save, and on Windows it blocks every agent session"
         ),
         applies=_stale_unsandboxed_exec_false_applies,
+    ),
+    # The local metrics disk caps went from 0 (no limit) to 30 days and 100 MB
+    # when local recording became on by default. Older builds' first-boot save
+    # wrote the whole telemetry section, so most upgraded installs store 0 / 0
+    # without having chosen it.
+    #
+    # REPORT-ONLY: 0 is the documented way to turn each cap off, so a stored 0
+    # may be a choice, and adopting a cap prunes shards past it, which cannot be
+    # undone. The report says so and the user decides.
+    SupersededDefault(
+        dotted_key="telemetry.retention_days",
+        old_default=0,
+        new_default=30,
+        changed_in="#22397",
+        note=_METRICS_CAP_NOTE,
+    ),
+    SupersededDefault(
+        dotted_key="telemetry.max_total_mb",
+        old_default=0,
+        new_default=100,
+        changed_in="#22397",
+        note=_METRICS_CAP_NOTE,
+    ),
+    # A machine with 16 GiB or less now releases the embedding model after ten idle
+    # minutes ("auto"); see docs/request-for-change/rfc-small-machine-embedding-release.md.
+    #
+    # REPORT-ONLY: an hour is a value an operator sets on purpose, and a stored
+    # number is always kept, so the report tells the owner and the owner decides.
+    SupersededDefault(
+        dotted_key="memory.embedding_idle_evict_secs",
+        old_default=3600,
+        new_default="auto",
+        changed_in="#36969",
+        new_default_display='"auto" (600 on a machine with 16 GiB or less)',
+        note="a stored number, 3600 included, is kept as your choice; auto picks by memory size",
+        applies=_small_memory_host_applies,
+    ),
+    # Remote Crew went from off to on by default. Old full saves wrote false on
+    # every install, so most upgraded installs still store it without having chosen it.
+    #
+    # REPORT-ONLY: false is also the owner's way to keep this gateway from opening
+    # SSH or SSM tunnels to other hosts, and adopting would start doing that without
+    # consent. The report says how to turn it on; the owner decides.
+    SupersededDefault(
+        dotted_key="instances.enabled",
+        old_default=False,
+        new_default=True,
+        changed_in="#39300",
+        note=(
+            "this setting lets this gateway connect to remote crews over SSH or SSM; "
+            "to turn it on, run `kirocrew config set instances.enabled true`, then "
+            "restart the gateway"
+        ),
     ),
 )
 

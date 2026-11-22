@@ -1256,6 +1256,26 @@ class TestSyncFileLock:
         with mcp_mod._get_mcp_lock_sync():
             pass
 
+    @pytest.mark.asyncio
+    async def test_async_lock_opens_its_file_off_the_event_loop(
+        self, sandbox: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The lock file is opened in a worker thread, so a slow mount cannot stall the loop."""
+        loop_thread = threading.get_ident()
+        opened_on: list[int] = []
+        real_open = open
+
+        def recording_open(path: Any, *args: Any, **kwargs: Any) -> Any:
+            if Path(path) == mcp_mod._MCP_LOCK_PATH:
+                opened_on.append(threading.get_ident())
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_mod, "open", recording_open, raising=False)
+        async with mcp_mod._get_mcp_lock():
+            pass
+        assert len(opened_on) == 1
+        assert opened_on[0] != loop_thread
+
 
 # ── the set-stub eligibility rule ───────────────────────────────────────
 
@@ -1640,7 +1660,7 @@ class TestShareabilityRefusesAProbeFromBeforeAnEdit:
         routed_allowlist([])
         monkeypatch.setattr(mcp_mod, "_collect_server_rows", lambda: {"a-mcp": dict(self._ROW)})
         monkeypatch.setattr(mcp_mod, "_load_shareability_state", lambda: ({}, {}))
-        monkeypatch.setattr(mcp_mod, "_probe_currency", lambda: {"a-mcp": False})
+        monkeypatch.setattr(mcp_mod, "_probe_view", lambda: ({"a-mcp": False}, frozenset()))
         seen: dict[str, Any] = {}
         real = mcp_mod._assess_server
 
@@ -1715,3 +1735,84 @@ class TestShareabilityRefusesAProbeFromBeforeAnEdit:
             assert mcp_mod._probe_currency() == {"edited": False, "same": True}
         finally:
             disc._probe_cache.clear()
+
+
+# ── what the Measure button counts ──────────────────────────────────────
+
+
+class TestMeasureDue:
+    """``measure_due`` marks exactly the rows a measure pass can still change.
+
+    Counting every unmeasured row keeps the button offering, after every pass,
+    servers the pass never probes.
+    """
+
+    @staticmethod
+    def _row(launches: int = 1) -> dict[str, Any]:
+        return {
+            "agents": {"alpha"},
+            "transport": "stdio",
+            "entry_poolable": False,
+            "env_names": set(),
+            "launch_ids": {f"l{i}" for i in range(launches)},
+        }
+
+    @pytest.mark.asyncio
+    async def test_counts_only_the_rows_a_pass_can_fill(
+        self, monkeypatch: pytest.MonkeyPatch, routed_allowlist
+    ) -> None:
+        import kiro_crew.mcp_discovery as disc
+
+        routed_allowlist([])
+        rows = {
+            # Never probed. Only "unprobed" is a server the pass probes: the
+            # others are declared by another agent only, switched off, left out
+            # after repeated failures, or refused for a secret:// env value.
+            "unprobed": self._row(),
+            "other-agent": self._row(),
+            "off": self._row(),
+            "held": self._row(),
+            "vault": self._row(),
+            # Probed: a pre-flight can still raise it, unless one is stored or
+            # the row merges two launches. A divergent pre-flight is re-run.
+            "preflight-due": self._row(),
+            "no-declaration": self._row(),
+            "preflight-stored": self._row(),
+            "two-launches": self._row(launches=2),
+            "diverged": self._row(),
+        }
+        probed = ("preflight-due", "no-declaration", "preflight-stored", "two-launches", "diverged")
+        listed = [McpServerInfo(name=n, command="bin") for n in ("unprobed", "held", *probed)] + [
+            McpServerInfo(name="off", command="bin", disabled=True),
+            McpServerInfo(name="vault", command="bin", env={"TOKEN": "secret://token"}),
+        ]
+        monkeypatch.setattr(disc, "list_servers", lambda *a, **k: list(listed))
+        monkeypatch.setattr(disc, "_spawn_excluded", lambda: {"held"})
+        monkeypatch.setattr(mcp_mod, "_collect_server_rows", lambda: rows)
+        monkeypatch.setattr(
+            mcp_mod,
+            "_load_shareability_state",
+            lambda: ({}, {"preflight-stored": (True, False), "diverged": (True, True)}),
+        )
+        _seed_probe(monkeypatch, *probed)
+        declaring = mcp_mod.probe_metadata
+        plain = SimpleNamespace(**{**vars(declaring("diverged")), "capabilities": {}})
+        monkeypatch.setattr(
+            mcp_mod, "probe_metadata", lambda n: plain if n == "no-declaration" else declaring(n)
+        )
+
+        resp = await mcp_mod.api_mcp_gateway_servers(_request())
+
+        due = {r["name"]: r.get("measure_due") for r in _payload(resp)["servers"]}
+        assert due == {
+            "unprobed": True,
+            "other-agent": False,
+            "off": False,
+            "held": False,
+            "vault": False,
+            "preflight-due": True,
+            "no-declaration": True,
+            "preflight-stored": False,
+            "two-launches": False,
+            "diverged": True,
+        }

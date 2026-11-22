@@ -54,6 +54,7 @@ from kiro_crew.constants import (
     STEER_NOTICE_BOUND_SECS,
     TOOL_APPROVAL_TIMEOUT,
 )
+from kiro_crew.dashboard import chat_utils
 from kiro_crew.dashboard import turn_dispatch as td
 from kiro_crew.dashboard.state import REFUSAL_RECOVERY_PREFIX
 from kiro_crew.hook_runtime.script_hooks import ScriptHookResult
@@ -436,6 +437,8 @@ _DONE = AcpEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN)
 #: earlier default is adopted back to the current one), short enough that a
 #: prompt arming late in it has less than the configured window left.
 _CEILING = 3600
+#: ``chat_utils.HOST_DECLINE_CAUSE_META_KEY``'s value, pinned below.
+HOST_DECLINE_CAUSE_KEY = "host_decline_cause"
 
 
 def _prompt_turn(*before: Any, answers: dict[str, str] | None = None) -> TurnScript:
@@ -560,6 +563,35 @@ class TestTheRunnersApprovalWindow:
         [steer] = _steers(record)
         assert "the turn had no budget left to host its approval prompt" in steer
 
+    def test_the_decline_cause_key_is_the_wire_literal_the_dashboard_reads(self) -> None:
+        # turnPolicyBlock.ts mirrors this literal; read off the module so the
+        # behaviour tests below fail on their assertions, not at import.
+        assert getattr(chat_utils, "HOST_DECLINE_CAUSE_META_KEY", None) == HOST_DECLINE_CAUSE_KEY
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("before", "cause"),
+        [((), DENY_CAUSE_APPROVAL_TIMEOUT), ((Wait(_CEILING - 5),), DENY_CAUSE_APPROVAL_NO_BUDGET)],
+        ids=["timeout", "no-budget"],
+    )
+    async def test_the_decline_card_carries_the_hosts_cause(
+        self, before: tuple[Any, ...], cause: str
+    ) -> None:
+        # The dashboard reads this to keep the reply's "Steered" chip off a turn
+        # the person did not steer: the host's own notice was steered into it.
+        record = await run_turn(
+            _prompt_turn(*before), config={"agent": {"chat_turn_timeout_secs": _CEILING}}
+        )
+        [card] = record.rows("error")
+        assert (card.get("meta") or {}).get(HOST_DECLINE_CAUSE_KEY) == cause
+
+    @pytest.mark.asyncio
+    async def test_an_answered_prompt_leaves_no_decline_cause(self) -> None:
+        record = await run_turn(_prompt_turn(answers={"req-1": APPROVED}))
+        assert not [
+            row for row in record.history_rows if HOST_DECLINE_CAUSE_KEY in (row.get("meta") or {})
+        ]
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("slot", "window"),
@@ -625,6 +657,73 @@ class TestTheRunnersApprovalWindow:
         )
         assert _cards(record) == [td.format_approval_no_budget_card()]
         assert _expiry_notes(record) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("script", "bridged"),
+        [
+            (lambda: _prompt_turn(), 1),
+            (lambda: _prompt_turn(Wait(_CEILING - 5)), 0),
+        ],
+        ids=["waits", "no-budget"],
+    )
+    async def test_only_a_prompt_that_waits_is_handed_to_the_bridge(
+        self, monkeypatch, script, bridged: int
+    ) -> None:
+        # A no-budget decline never resolves its future, so the hand-off must not
+        # start for it: the chat app would hear "waiting" for a refused tool.
+        handed: list[str] = []
+        monkeypatch.setattr(
+            "kiro_crew.notifications.bridge_approval_note.schedule_pending_approval",
+            lambda state, fut, **kw: handed.append(kw["request_id"]),
+        )
+        await run_turn(script(), config={"agent": {"chat_turn_timeout_secs": _CEILING}})
+        assert handed == ["req-1"] * bridged
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("slot", "window"),
+        [(SlotSpec(key="chat-1"), 600), (SlotSpec(key="worker-1", app="issue-radar"), 180)],
+        ids=["attended", "unattended"],
+    )
+    async def test_the_bridged_answer_dies_with_the_prompts_own_window(
+        self, monkeypatch, slot: SlotSpec, window: int
+    ) -> None:
+        # A chat app's Approve must not outlive the wait it answers, so the
+        # binding's deadline is the window this prompt really waits.
+        handed: list[dict] = []
+        monkeypatch.setattr(
+            "kiro_crew.notifications.bridge_approval_note.schedule_pending_approval",
+            lambda state, fut, **kw: handed.append(kw),
+        )
+        await run_turn(_prompt_turn(), slot=slot)
+        [kw] = handed
+        assert kw["ttl_s"] == window
+        assert kw["crew_log_session"] and isinstance(kw["turn"], int)
+        # A plain prompt is answerable, and the buttons sit beside what it runs.
+        assert kw["answerable"] is True
+        assert kw["approval_detail"]
+
+    @pytest.mark.asyncio
+    async def test_an_unverified_child_request_gets_no_chat_app_buttons(self, monkeypatch) -> None:
+        # Its card text is agent-authored and the dashboard row warns so; a chat
+        # app's Approve beside that text alone would drop the warning.
+        handed: list[dict] = []
+        monkeypatch.setattr(
+            "kiro_crew.notifications.bridge_approval_note.schedule_pending_approval",
+            lambda state, fut, **kw: handed.append(kw),
+        )
+        child = AcpEvent(
+            kind=EVENT_PERMISSION_REQUEST,
+            request_id="req-1",
+            title="fs_write",
+            tool_kind="edit",
+            sub_session_id="child-1",
+        )
+        assert child.child_low_fidelity
+        await run_turn(TurnScript(events=[child, _AFTER, _DONE]))
+        [kw] = handed
+        assert kw["answerable"] is False
 
     @pytest.mark.asyncio
     async def test_a_muted_session_still_leaves_the_bell_note(self) -> None:
@@ -759,8 +858,12 @@ class TestAnswerReleasesTheApprovalHold:
 
     @staticmethod
     def _releases(record: TurnRecord) -> list[str]:
+        # Only the answer's release: every turn's start also releases (unarmed).
         return [
-            call.args[0] for call in record.autonudge_calls if call.name == "release_approval_hold"
+            call.args[0]
+            for call in record.autonudge_calls
+            if call.name == "release_approval_hold"
+            and call.kwargs.get("why") == "an approval was answered"
         ]
 
     @pytest.mark.asyncio
@@ -776,3 +879,16 @@ class TestAnswerReleasesTheApprovalHold:
         record = await run_turn(_prompt_turn(), slot=slot)
         assert self._releases(record) == []
         assert record.notify_approval_stalled == [("chat-1", 600)]
+
+    @pytest.mark.asyncio
+    async def test_a_new_turn_releases_the_hold_unarmed_whoever_sent_it(self) -> None:
+        """A turn's start ends a hold left by an earlier turn; its own end re-arms."""
+        slot = SlotSpec(key="chat-1", autonudge=True)
+        record = await run_turn(_prompt_turn(answers={"req-1": APPROVED}), slot=slot)
+        releases = [
+            (call.args[0], call.kwargs.get("arm"))
+            for call in record.autonudge_calls
+            if call.name == "release_approval_hold"
+            and call.kwargs.get("why") == "a new turn started in the session"
+        ]
+        assert releases == [("chat-1", False)]

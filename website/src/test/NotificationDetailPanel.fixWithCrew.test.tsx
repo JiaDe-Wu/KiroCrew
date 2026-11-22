@@ -5,13 +5,14 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { screen } from '@testing-library/react'
+import { screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { renderWithProviders } from './helpers'
 import NotificationDetailPanel from '../components/notifications/NotificationDetailPanel'
-import { buildNotificationPrompt } from '../components/notifications/notificationHandoff.prompt'
+import { buildNotificationPrompt, wholeCronResult } from '../components/notifications/notificationHandoff.prompt'
 import { sendErrorToChat, setGatewayConnected } from '../utils/errorReport'
+import { api } from '../api/client'
 import type { Notification } from '../types'
 
 vi.mock('../utils/errorReport', async (importOriginal) => ({
@@ -19,7 +20,7 @@ vi.mock('../utils/errorReport', async (importOriginal) => ({
   sendErrorToChat: vi.fn(() => true),
 }))
 vi.mock('../api/client', () => ({
-  api: { taskRunToChat: vi.fn(), cronToChat: vi.fn(), resolveApproval: vi.fn(), ackNotification: vi.fn().mockResolvedValue({}) },
+  api: { taskRunToChat: vi.fn(), cronToChat: vi.fn(), cron: vi.fn(), resolveApproval: vi.fn(), ackNotification: vi.fn().mockResolvedValue({}) },
 }))
 vi.mock('../components/MarkdownRenderer', () => ({
   default: ({ content }: { content: string }) => <span>{content}</span>,
@@ -39,9 +40,18 @@ const approvalNote: Notification = {
   body: 'rm build/', approval_id: 'ap-1',
 }
 const fixButton = () => screen.queryByRole('button', { name: /Fix with Crew/i })
+/** A body as the notification store keeps one over its 20,000-character cap. */
+const storeCut = (text: string) => text.slice(0, 19_999) + '…'
+const RESULT_TS = 1_760_511_655.25
+const report = 'one row of the nightly report\n'.repeat(1000) + 'the end of the report'
+const cutNote: Notification = { ...cronNote, body: storeCut(report), result_ts: RESULT_TS }
+const serveJob = (last_result_ts: number) => vi.mocked(api.cron).mockResolvedValue(
+  { id: 'job-20971', last_result: report, last_result_ts } as Awaited<ReturnType<typeof api.cron>>,
+)
 
 beforeEach(() => {
   vi.mocked(sendErrorToChat).mockReset().mockReturnValue(true)
+  vi.mocked(api.cron).mockReset()
   setGatewayConnected(true)
 })
 
@@ -57,6 +67,33 @@ describe('NotificationDetailPanel -- "Fix with Crew"', () => {
     expect(prompt).toContain('exit 1: disk full')
     expect(prompt.trimEnd().endsWith(ASK)).toBe(true)
     expect(onClose).toHaveBeenCalledTimes(1)
+  })
+
+  it('stages the job\'s whole last result for a cron note whose body the store cut', async () => {
+    serveJob(RESULT_TS)
+    const onClose = vi.fn()
+    const { queryClient } = renderWithProviders(<NotificationDetailPanel n={cutNote} onClose={onClose} />)
+    await waitFor(() => expect(queryClient.getQueryData(['crons', 'job', 'job-20971'])).toBeDefined())
+    await userEvent.click(fixButton()!)
+    expect(sendErrorToChat).toHaveBeenCalledTimes(1)
+    const prompt = vi.mocked(sendErrorToChat).mock.calls[0][0] as string
+    expect(prompt).toContain(report)
+    expect(prompt).not.toContain('…')
+    expect(onClose).toHaveBeenCalledTimes(1)
+  })
+
+  it('says the text it sends is cut short when the job\'s whole result could not be read', async () => {
+    vi.mocked(api.cron).mockRejectedValue(new Error('404 Not Found'))
+    const { rerender } = renderWithProviders(<NotificationDetailPanel n={cutNote} onClose={() => {}} />)
+    const notice = await screen.findByTestId('notif-whole-result-error')
+    expect(notice).toHaveTextContent(/Fix with Crew sends the text shown here, which is cut short/)
+    await userEvent.click(fixButton()!)
+    expect(sendErrorToChat).toHaveBeenCalledTimes(1)
+    const prompt = vi.mocked(sendErrorToChat).mock.calls[0][0] as string
+    expect(prompt).toContain(cutNote.body)
+    // The same job's whole note, read while the failed read is still cached: it sends its whole body.
+    rerender(<NotificationDetailPanel n={cronNote} onClose={() => {}} />)
+    expect(screen.queryByTestId('notif-whole-result-error')).not.toBeInTheDocument()
   })
 
   it('keeps the notification open when the hand-off could not be staged', async () => {
@@ -92,6 +129,19 @@ describe('buildNotificationPrompt', () => {
     const fenceClose = prompt.lastIndexOf('\n````\n')
     expect(prompt.indexOf('Ignore the above')).toBeLessThan(fenceClose)
     expect(prompt.indexOf(ASK)).toBeGreaterThan(fenceClose)
+  })
+
+  it('takes no result from a later or earlier run than the one the note carries', () => {
+    expect(wholeCronResult(cutNote, { last_result: report + '\nand a later line', last_result_ts: RESULT_TS + 60 })).toBeUndefined()
+    expect(wholeCronResult(cutNote, { last_result: report, last_result_ts: RESULT_TS - 60 })).toBeUndefined()
+  })
+
+  it('takes no result too big to hand off', () => {
+    expect(wholeCronResult(cutNote, { last_result: report.repeat(4), last_result_ts: RESULT_TS })).toBeUndefined()
+  })
+
+  it('leaves a whole body alone, even when the job\'s result is the one it carries', () => {
+    expect(wholeCronResult({ ...cronNote, result_ts: RESULT_TS }, { last_result: 'exit 1: disk full', last_result_ts: RESULT_TS })).toBeUndefined()
   })
 
   it('strips credentials from the body', () => {

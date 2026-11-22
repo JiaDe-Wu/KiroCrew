@@ -24,6 +24,15 @@ from kiro_crew.crew_log.session_tree import TreeNode
 from kiro_crew.dashboard.handlers import crew_workers
 
 
+def _yielding(serialize):
+    """The state's ``serialize_slots_yielding`` over a stub's synchronous rows."""
+
+    async def serialize_slots_yielding(**kwargs):
+        return serialize(**kwargs)
+
+    return serialize_slots_yielding
+
+
 class _Tree:
     """A seeded session tree whose ``nodes()`` object is replaced when it changes."""
 
@@ -97,15 +106,21 @@ class _World:
 
         return SimpleNamespace(
             serialize_slots=serialize_slots,
+            serialize_slots_yielding=_yielding(serialize_slots),
             get_slot=lambda key: None,
             conversation_log=self.log,
         )
 
-    async def read(self) -> dict[str, dict[str, Any]]:
+    async def respond(self, headers: dict[str, str] | None = None) -> web.Response:
         app = web.Application()
         app["state"] = self._state()
-        req = make_mocked_request("GET", "/x", app=app, match_info={"slot": "root"})
-        resp = await crew_workers.api_crew_workers(req)
+        req = make_mocked_request(
+            "GET", "/x", headers=headers, app=app, match_info={"slot": "root"}
+        )
+        return await crew_workers.api_crew_workers(req)
+
+    async def read(self) -> dict[str, dict[str, Any]]:
+        resp = await self.respond()
         assert resp.status == 200, resp.text
         return {w["key"]: w for w in json.loads(resp.text)["workers"]}
 
@@ -195,12 +210,84 @@ async def test_a_worker_seen_live_reads_its_title_again_once_closed(world: _Worl
 async def test_a_kept_answer_older_than_the_bound_is_read_again(
     world: _World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    wl.ensure_conductor("root")
     await world.read()
     world.reset_counts()
     # A negative bound makes every kept answer already too old: no clock is waited on.
     monkeypatch.setattr(crew_workers, "CACHE_MAX_AGE_SECS", -1.0)  # flake-ok: no clock wait
     await world.read()
-    assert world.walks == 1 and world.log.reads and world.ledger_reads
+    # Only the root owns a store; a member without one costs a stat (next test).
+    assert world.walks == 1 and world.log.reads and world.ledger_reads == ["root"]
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """The handler's monotonic clock, moved by hand: no test waits on a real one."""
+    now = [1000.0]
+    monkeypatch.setattr(crew_workers, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    return now
+
+
+def _bind(board: str, item_id: str, title: str, worker: str) -> None:
+    wl.ensure_conductor(board)
+    wl.create_bound_item(
+        board, item_id, title=title, acceptance={}, decision="", worker_session_key=worker
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_aged_member_without_a_store_is_checked_by_one_stat_not_read(
+    world: _World, monkeypatch: pytest.MonkeyPatch, clock: list[float]
+) -> None:
+    first = await world.read()
+    stats: list[str] = []
+    present = crew_workers._store_present
+
+    def counted(ledger: str) -> bool:
+        stats.append(ledger)
+        return present(ledger)
+
+    monkeypatch.setattr(crew_workers, "_store_present", counted)
+    world.reset_counts()
+    clock[0] += crew_workers.CACHE_MAX_AGE_SECS + 1
+    assert await world.read() == first
+    assert world.ledger_reads == []
+    assert sorted(stats) == ["c1", "c2", "root", "w1"]
+
+
+@pytest.mark.asyncio
+async def test_a_member_store_another_process_creates_shows_once_the_bound_passes(
+    world: _World, monkeypatch: pytest.MonkeyPatch, clock: list[float]
+) -> None:
+    assert (await world.read())["c2"]["summary"] == ""
+    with monkeypatch.context() as elsewhere:
+        # Another process's write moves no change mark here.
+        elsewhere.setattr(wl, "_mark_changed", lambda _key: None)
+        _bind("c1", "it_0000c004", "Check the links", "c2")
+    clock[0] += crew_workers.CACHE_MAX_AGE_SECS - 1
+    assert (await world.read())["c2"]["summary"] == ""
+    clock[0] += 2
+    assert (await world.read())["c2"]["summary"] == "Check the links"
+
+
+@pytest.mark.asyncio
+async def test_a_store_another_process_writes_shows_within_the_bound_of_its_own_read(
+    world: _World, monkeypatch: pytest.MonkeyPatch, clock: list[float]
+) -> None:
+    _bind("c1", "it_0000c005", "Check the links", "c2")
+    await world.read()
+    clock[0] += 250
+    wl.apply_worker_report("c1", "it_0000c005", status="progress", summary="Half the links")
+    assert (await world.read())["c2"]["summary"] == "Half the links"
+    with monkeypatch.context() as elsewhere:
+        elsewhere.setattr(wl, "_mark_changed", lambda _key: None)
+        wl.apply_worker_report("c1", "it_0000c005", status="progress", summary="All the links")
+    # The root's entry ages out here, but c1 was read 51 s ago and is kept.
+    clock[0] += 51
+    assert (await world.read())["c2"]["summary"] == "Half the links"
+    # 301 s after c1's own read: shown, though the replacing entry is only 250 s old.
+    clock[0] += 250
+    assert (await world.read())["c2"]["summary"] == "All the links"
 
 
 def test_every_lock_hold_moves_its_stores_change_mark() -> None:
@@ -284,3 +371,63 @@ async def test_a_store_that_left_the_crew_is_not_kept(world: _World) -> None:
     out = await world.read()
     assert "c2" not in out
     assert "c2" not in entry.boards and "c2" not in entry.titles
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_poll_is_a_304_and_any_shown_change_is_not(world: _World) -> None:
+    first = await world.respond()
+    tag = first.headers["ETag"]
+    assert first.headers["Cache-Control"] == "private, no-cache"
+    assert first.headers["Vary"] == "Accept-Encoding"
+    same = await world.respond({"If-None-Match": tag})
+    assert same.status == 304 and same.body is None and same.headers["ETag"] == tag
+    assert same.headers["Vary"] == "Accept-Encoding"
+    for field, value in (("title", "Renamed"), ("running", True)):
+        world.rows[1][field] = value
+        changed = await world.respond({"If-None-Match": tag})
+        assert changed.status == 200 and changed.headers["ETag"] != tag
+        tag = changed.headers["ETag"]
+    world.log.titles["c1"] = "Closed one, renamed"
+    world.tree.set({"root": None, "w1": "root", "c1": "root", "c2": "c1", "c3": "w1"})
+    assert (await world.respond({"If-None-Match": tag})).status == 200
+
+
+@pytest.mark.asyncio
+async def test_a_3000_closed_worker_list_is_gzipped_only_when_asked(world: _World) -> None:
+    import gzip
+
+    edges: dict[str, str | None] = {"root": None, "w1": "root"}
+    edges.update({f"c{i}": "root" for i in range(3000)})
+    world.tree.set(edges)
+    world.log.titles.update({f"c{i}": f"Closed worker number {i}" for i in range(3000)})
+    plain = await world.respond()
+    assert plain.status == 200 and "Content-Encoding" not in plain.headers
+    zipped = await world.respond({"Accept-Encoding": "gzip, br"})
+    assert zipped.headers["Content-Encoding"] == "gzip"
+    assert zipped.headers["ETag"] == plain.headers["ETag"]
+    assert len(zipped.body) < 100_000 < len(plain.body)
+    assert json.loads(gzip.decompress(zipped.body)) == json.loads(plain.body)
+    refused = await world.respond({"Accept-Encoding": "gzip;q=0"})
+    assert "Content-Encoding" not in refused.headers
+
+
+@pytest.mark.parametrize(
+    ("accept", "gzipped"),
+    [
+        ("*;q=1, gzip;q=0", False),
+        ("gzip;q=0, *;q=1", False),
+        ("*", True),
+        ("gzip;q=0.5", True),
+        ("identity", False),
+        ("gzip;q=0.000", False),
+        ("gzip;q=abc", False),
+        ("gzip;q=", False),
+        ("x-gzip", True),
+        ("", False),
+    ],
+)
+def test_accept_encoding_gzip_follows_the_explicit_weight(accept: str, gzipped: bool) -> None:
+    from kiro_crew.dashboard.conditional_get import _accepts_gzip
+
+    req = make_mocked_request("GET", "/x", headers={"Accept-Encoding": accept})
+    assert _accepts_gzip(req) is gzipped

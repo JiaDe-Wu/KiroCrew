@@ -43,7 +43,8 @@ surface, and nothing else needs a call site.
 The start times live in ONE process-global registry keyed by ``toolCallId``, and
 a finish POPS its entry: a call with no recorded start emits nothing. So if a
 frame is ever seen by both layers, the first finish records it and the second is
-a no-op -- the layering cannot double-count.
+a no-op -- the layering cannot double-count. The same pop feeds the
+``tool_calls`` count in ``Stats``, which ``kirocrew status`` prints.
 
 **Why not reuse the watchdog's existing dispatch clock.**
 ``acp/liveness_tool_state.py::ToolCallState`` already stamps ``dispatch_ts`` on a tool call,
@@ -65,6 +66,9 @@ from __future__ import annotations
 import logging
 import threading
 import time
+
+from kiro_crew.stats import Stats
+from kiro_crew.tracing import turns as _trace_turns
 
 logger = logging.getLogger(__name__)
 
@@ -166,11 +170,14 @@ def note_tool_call_started(
     kind: str | None = None,
     mcp_server_name: str | None = None,
     scope: str = "",
+    tool_name: str = "",
 ) -> None:
     """Record when *tool_call_id* started, with its normalised kind.
 
     *scope* is the emitting session's cache scope -- see :func:`_registry_key`
     for why a process-global registry cannot key on the raw backend id.
+    *tool_name* is the harness-authored name, used only by the tool's trace
+    span (``tracing/turns.py``), which opens here too.
 
     Idempotent per scoped id: an id already open keeps its ORIGINAL start time,
     so the ``tool_call_update`` refinements that follow a call (and the second
@@ -181,6 +188,9 @@ def note_tool_call_started(
         return
     try:
         resolved = classify_tool_kind(kind, mcp_server_name=mcp_server_name)
+        _trace_turns.tool_started(
+            scope, tool_call_id, kind=resolved, mcp_server_name=mcp_server_name, tool_name=tool_name
+        )
         key = _registry_key(tool_call_id, scope)
         with _lock:
             if key in _open_calls:
@@ -205,10 +215,12 @@ def record_tool_call_finished(
     if not tool_call_id or not status or status not in _TERMINAL_STATUSES:
         return
     try:
+        _trace_turns.tool_finished(scope, tool_call_id, status=status)
         with _lock:
             started = _open_calls.pop(_registry_key(tool_call_id, scope), None)
         if started is None:
             return
+        Stats().inc_tool_call()
         started_at, resolved_kind = started
         # ``perf_counter``, not ``monotonic``: on Windows the latter advances in
         # ~15.6ms ticks, so a call that completes inside one tick measures exactly

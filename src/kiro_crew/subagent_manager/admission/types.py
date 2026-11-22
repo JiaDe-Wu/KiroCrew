@@ -5,6 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Mapping
 
+# The tombstone writer owns the parent-end cause, because a restart tombstone written
+# over a parent-end one keeps it; the admission readers import it from here.
+from kiro_crew.subagent_persistence import PARENT_END_TOMBSTONE_CAUSE  # noqa: F401
+
 if TYPE_CHECKING:
     from kiro_crew import taskq as _taskq
     from kiro_crew.subagent import SubagentInfo
@@ -17,9 +21,16 @@ TASK_STORE_UNAVAILABLE_CODE = "task_store_unavailable"
 #: The ``cause`` of the tombstone a persisted spawn refused BEFORE its row was
 #: claimed writes (``write_refusal_tombstone``). It is distinct from every cause
 #: a run that started can leave behind, so the boot reconcile's queued pass can
-#: settle a ``queued`` row on it and on nothing else: a ``queued`` row may be one
-#: an earlier attempt already ran, and that attempt's ending is not this row's.
+#: settle a ``queued`` row on it (and on the queued-stop marker below) and on
+#: nothing else: a ``queued`` row may be one an earlier attempt already ran, and
+#: that attempt's ending is not this row's.
 REFUSAL_TOMBSTONE_CAUSE = "refused"
+
+#: The ``cause`` of the tombstone a queued stop writes when its store cancel did
+#: not land (``write_queued_stop_tombstone``). Like the refusal marker it is
+#: distinct from every cause a run that started can leave behind, so the boot
+#: reconcile settles a ``queued`` or ``admitted`` row on it, ``cancelled``.
+QUEUED_STOP_TOMBSTONE_CAUSE = "queued_stop"
 
 #: The shortest delay an admission re-check timer whose delay derives from
 #: ``admit_wait_secs`` or a row's wake is armed with: the pump's waiting-row
@@ -101,7 +112,7 @@ def tombstone_terminal_state(cause: str, outcome: str = "") -> str | None:
     live settle decided it (:func:`outcome_task_state`); the coarser ``cause``
     answers for a tombstone that recorded none. ``gateway_restart`` proves
     nothing by itself, and is the one cause missing here
-    (``test_every_tombstone_cause_has_a_terminal_state`` pins that).
+    (``test_a_gateway_restart_tombstone_proves_no_terminal_state`` pins that).
     """
     from kiro_crew import taskq
     from kiro_crew.subagent import _NEUTRAL_REAP_REASONS
@@ -125,6 +136,8 @@ def tombstone_terminal_state(cause: str, outcome: str = "") -> str | None:
         # A spawn refused before its row was claimed: ``failed`` to every
         # reader; the boot reconcile's probe answers it as ``REFUSED`` first.
         REFUSAL_TOMBSTONE_CAUSE: taskq.FAILED,
+        # A queued run stopped before it started; the probe answers ``STOPPED`` first.
+        QUEUED_STOP_TOMBSTONE_CAUSE: taskq.CANCELLED,
         "timeout": taskq.FAILED,
         "turn_limit": taskq.FAILED,
         "child_escalation_limit": taskq.FAILED,

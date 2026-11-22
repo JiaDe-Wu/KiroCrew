@@ -21,9 +21,10 @@ from pathlib import Path
 
 from aiohttp import web
 
-from kiro_crew import platform_compat
+from kiro_crew import edition, platform_compat
 from kiro_crew.dashboard.handlers._shared import _get_skills
 from kiro_crew.discovery_featured import featured_entries
+from kiro_crew.extension_governance import extensions_off, skill_package_denied
 from kiro_crew.external_text import redact_external_text as _redact_external
 from kiro_crew.frontmatter import SKILL_LOADER, parse_frontmatter
 from kiro_crew.security import redact, redact_credentials, redact_exfiltration_urls
@@ -37,7 +38,9 @@ from kiro_crew.skill_providers.base import (
     provider_available,
 )
 from kiro_crew.skill_providers.skillsh import SkillsShConfig, SkillsShProvider
+from kiro_crew.skills import SkillsLoader
 from kiro_crew.skills import skills_dir as _skills_dir
+from kiro_crew.skills_body_reads import _decode_skill_text
 
 from .prompts import _deny_non_owner_skill_operation, api_skills
 
@@ -363,6 +366,60 @@ async def api_skills_discover(request: web.Request) -> web.Response:
     )
 
 
+class _InstallRefused(Exception):
+    """A governance refusal raised from inside the bundle write, before the publish."""
+
+
+def _skill_name(raw: bytes, catalog_key: str) -> str:
+    """One skill's name as the loader reads it: frontmatter ``name``, else its
+    catalog key (``<provider>/<slug>[/<folder>...]``, ``listing.py``)."""
+    meta = SkillsLoader._parse_frontmatter_text(_decode_skill_text(raw, strict=False))
+    return str(meta.get("name") or "").strip() or catalog_key
+
+
+def _staged_skill_names(stage: Path, key: str) -> list[str]:
+    """The skill names a staged bundle holds, read from what was written.
+
+    Read from the staged tree, not the bundle's own paths, so the names are the ones
+    the publish would install: ``./AGENTS.md`` or ``SKILL.md/`` land as plain files,
+    and an ``AGENTS.md`` copied to ``SKILL.md`` is read as that copy. Every file
+    named ``SKILL.md`` in any case, at any depth, is one skill, named as the loader
+    reads it; the top-level one is published as catalog key *key*, a nested one
+    under it. Symlinks are skipped (the writer
+    writes none). Empty when none is readable.
+    """
+    names: list[str] = []
+    for path in sorted(stage.rglob("*")):
+        if path.name.lower() != "skill.md" or path.is_symlink() or not path.is_file():
+            continue
+        rel = path.relative_to(stage)
+        catalog_key = "/".join((key, *rel.parts[:-1]))
+        try:
+            names.append(_skill_name(path.read_bytes(), catalog_key))
+        except OSError:
+            names.append("")  # unreadable: skill_package_denied refuses it
+    return names
+
+
+def _install_blocked(request: web.Request, provider_name: str, reason: str) -> web.Response:
+    """The 403 a governance refusal of a Discover install answers (LTS only)."""
+    _sel().log_tool_invocation(
+        session_key=request.get("session_key", "dashboard"),
+        tool_name="install_skill_from_provider",
+        tool_kind="skill_provider_install",
+        outcome="denied",
+        downstream_service=provider_name,
+        error="blocked_by_policy",
+    )
+    return web.json_response(
+        {
+            "error": _redact_external(f"Blocked by governance policy: {reason}"),
+            "code": "blocked_by_policy",
+        },
+        status=403,
+    )
+
+
 async def api_skills_discover_install(request: web.Request) -> web.Response:
     """POST /api/skills/-/discover/install — install a skill from a provider.
 
@@ -466,6 +523,12 @@ async def api_skills_discover_install(request: web.Request) -> web.Response:
             },
             status=404,
         )
+
+    if edition.is_lts():
+        # Install off (no rule names it) refuses before anything is fetched.
+        refusal = await asyncio.to_thread(extensions_off, "install_skill")
+        if refusal:
+            return _install_blocked(request, provider_name, refusal)
 
     # Determine the local slug for the installed skill. An explicit user-supplied
     # name still wins: the provider names the DEFAULT key, not the user's choice.
@@ -589,6 +652,18 @@ async def api_skills_discover_install(request: web.Request) -> web.Response:
             {"error": "Skill content exceeds size limit", "code": "skill_too_large"}, status=413
         )
 
+    # RFC D13, LTS only: each skill the package holds is checked against the
+    # policy's ``skill`` term before it is installed. A bundle is judged on its
+    # staged copy, before the publish (``_write_bundle``); one file, here.
+    package = f"{provider_name}:{_safe_skill_id}"
+    lts = edition.is_lts()
+    if lts and not bundle:
+        refusal = await asyncio.to_thread(
+            skill_package_denied, package, [_skill_name((content or "").encode("utf-8"), key)]
+        )
+        if refusal:
+            return _install_blocked(request, provider_name, refusal)
+
     # Write to local skills directory.
     file_count = 0
     if bundle:
@@ -611,7 +686,11 @@ async def api_skills_discover_install(request: web.Request) -> web.Response:
                 candidate.relative_to(skills_root)
             except ValueError:
                 logger.warning("Refusing bundle install outside skills root: %s", skill_dir)
-                return 0
+                # Raised, not returned: the caller turns an OSError into a failed
+                # install, and a plain return would report success with nothing written.
+                raise PermissionError(
+                    errno.EPERM, "the install path is outside the skills folder", key
+                ) from None
             # Link defense: if the skill dir itself is a link, every containment
             # check below resolves against the link TARGET, so a pre-planted one
             # would redirect the whole bundle write outside the skills root
@@ -628,9 +707,12 @@ async def api_skills_discover_install(request: web.Request) -> web.Response:
             # `unlink_link_or_junction` detaches a junction with `rmdir`, so the
             # target's contents are left alone exactly as `unlink` leaves a
             # symlink's.
-            if platform_compat.is_link_or_junction(skill_dir):
-                logger.warning("Replacing linked skill dir: %s", skill_dir)
-                platform_compat.unlink_link_or_junction(skill_dir)
+            #
+            # The link is moved aside only once the new bundle has verified (below,
+            # just before the swap): the bundle is built in a sibling stage that
+            # never passes through it, and an install that fails, at the bundle or
+            # at the publish, must leave the existing install in place, linked or
+            # not. Only after the publish is the old link itself detached.
             # Build the new bundle in a dot-prefixed sibling (the loader skips
             # dot dirs); the old install is only swapped out once it verifies.
             skill_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -638,6 +720,7 @@ async def api_skills_discover_install(request: web.Request) -> web.Response:
             stage = skill_dir.with_name(f".{skill_dir.name}.{secrets.token_hex(6)}")
             stage.mkdir()
             aside: Path | None = None
+            aside_is_link = False
             try:
                 resolved_root = stage.resolve()
                 # Belt-and-suspenders: the staging dir must itself land under
@@ -646,8 +729,9 @@ async def api_skills_discover_install(request: web.Request) -> web.Response:
                     resolved_root.relative_to(skills_root)
                 except ValueError:
                     logger.warning("Refusing bundle write outside skills root: %s", skill_dir)
-                    stage.rmdir()
-                    return 0
+                    raise PermissionError(
+                        errno.EPERM, "the install path is outside the skills folder", key
+                    ) from None
                 written = 0
                 for rel_path, file_content in bundle:
                     if ".." in rel_path or rel_path.startswith("/") or rel_path.startswith("./.."):
@@ -675,11 +759,24 @@ async def api_skills_discover_install(request: web.Request) -> web.Response:
                     with (stage / "AGENTS.md").open("r", encoding="utf-8", newline="") as src:
                         agents_content = src.read()
                     (stage / "SKILL.md").write_text(agents_content, encoding="utf-8", newline="")
+                if lts:
+                    # Judged on what the publish would install; the stage is a dot
+                    # dir the loader skips, removed below on a refusal.
+                    refusal = skill_package_denied(package, _staged_skill_names(stage, key))
+                    if refusal:
+                        raise _InstallRefused(refusal)
                 if not (stage / "SKILL.md").is_file():
                     raise FileNotFoundError(errno.ENOENT, "bundle has no SKILL.md", "SKILL.md")
+                old = stage.with_name(stage.name + ".old")
+                aside_is_link = platform_compat.is_link_or_junction(skill_dir)
+                if aside_is_link:
+                    # Moved aside, never followed: os.rename renames the link
+                    # itself, so a failed publish below puts it back unchanged.
+                    logger.warning("Replacing linked skill dir: %s", skill_dir)
+                    os.rename(skill_dir, old)
+                    aside = old
                 # No-replace publish: without consent an existing install (even empty) stays.
-                if overwrite and skill_dir.exists():
-                    old = stage.with_name(stage.name + ".old")
+                elif overwrite and skill_dir.exists():
                     os.rename(skill_dir, old)
                     aside = old
                 platform_compat.publish_dir_noreplace(stage, skill_dir)
@@ -694,11 +791,20 @@ async def api_skills_discover_install(request: web.Request) -> web.Response:
                     shutil.rmtree(stage, ignore_errors=True)
                 raise
             if aside is not None:
-                shutil.rmtree(aside, ignore_errors=True)
+                if aside_is_link:
+                    # Detach the old link only; its target is the user's own folder.
+                    try:
+                        platform_compat.unlink_link_or_junction(aside)
+                    except OSError:
+                        logger.warning("Could not remove the old link for %s", key)
+                else:
+                    shutil.rmtree(aside, ignore_errors=True)
             return written
 
         try:
             file_count = await asyncio.to_thread(_write_bundle)
+        except _InstallRefused as refused:
+            return _install_blocked(request, provider_name, str(refused))
         except OSError as exc:
             from kiro_crew.platform import redact_log_via_context  # deferred, as above
 

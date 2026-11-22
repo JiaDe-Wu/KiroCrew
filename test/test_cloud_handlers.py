@@ -17,6 +17,7 @@ from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
 from kiro_crew.cloud import launch_job as lj
+from kiro_crew.cloud.aws import AWSError
 from kiro_crew.dashboard import handlers_cloud as hc
 
 
@@ -417,10 +418,10 @@ class TestPluginInstallCommand:
         assert "mktemp -d" in cmd
         assert "/tmp/session-manager-plugin" not in cmd
 
-    def test_rpm_family_installs_straight_from_the_url(self, monkeypatch):
+    def test_rpm_family_installs_the_checked_file_not_the_url(self, monkeypatch):
         cmd = self._cmd(monkeypatch, "Linux", "arm64", {"rpm", "dnf"})
         assert "linux_arm64/session-manager-plugin.rpm" in cmd
-        assert cmd.startswith("sudo dnf install -y")
+        assert '| sha256sum -c && sudo dnf install -y "$p"' in cmd
 
     def test_an_unsupported_platform_returns_nothing_rather_than_a_wrong_command(self, monkeypatch):
         assert self._cmd(monkeypatch, "Windows", "x86_64", set()) == ""
@@ -449,8 +450,13 @@ class TestLaunch:
         lst = await hc.api_cloud_launch_list(_req("GET", "/api/cloud/launch", state=state))
         assert any(x["id"] == job_id for x in _body(lst)["jobs"])
 
-    async def test_create_passes_the_subnet_to_the_job_and_engine(self, tmp_path):
+    async def test_create_passes_the_subnet_to_the_job_and_engine(self, tmp_path, monkeypatch):
         seen: dict = {}
+        monkeypatch.setattr(
+            hc.ec2,
+            "resolve_explicit_subnet",
+            lambda subnet_id, profile, region, instance_type="": ("vpc-1", subnet_id, "igw"),
+        )
 
         class SubnetEngine(FakeEngine):
             def provision(self, *, tag, size_key, profile, region, subnet_id=""):
@@ -476,6 +482,34 @@ class TestLaunch:
         )
         assert resp.status == 400
         assert _body(resp)["code"] == "invalid_subnet"
+        assert state.cloud_launch_store.list() == []
+
+    @pytest.mark.parametrize(
+        "stderr, status, code",
+        [
+            ("", 400, "invalid_subnet"),  # the check's own refusal
+            ("An error occurred (InvalidSubnetID.NotFound) when calling", 400, "invalid_subnet"),
+            ("An error occurred (ExpiredToken) when calling", 502, "aws_call_failed"),
+        ],
+    )
+    async def test_create_answers_the_subnet_check_before_any_job(
+        self, tmp_path, monkeypatch, stderr, status, code
+    ):
+        # The launch's own subnet check runs before any job exists; only a refusal of the
+        # subnet itself is invalid_subnet, an account or network failure is not.
+        message = "subnet subnet-0123abcd has no verified internet egress route (NAT or gateway)"
+
+        def _refuse(subnet_id, profile, region, instance_type=""):
+            raise AWSError(message, action="ec2:DescribeRouteTables", stderr=stderr)
+
+        monkeypatch.setattr(hc.ec2, "resolve_explicit_subnet", _refuse)
+        state = _state(tmp_path)
+        body = {"region": "us-east-1", "size_key": "balanced", "subnet_id": "subnet-0123abcd"}
+        resp = await hc.api_cloud_launch_create(
+            _req("POST", "/api/cloud/launch", state=state, body=body)
+        )
+        got = (resp.status, _body(resp).get("code"), _body(resp).get("error"))
+        assert got == (status, code, message)
         assert state.cloud_launch_store.list() == []
 
     async def test_create_persists_off_the_event_loop(self, tmp_path):

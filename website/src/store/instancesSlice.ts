@@ -22,11 +22,16 @@ import { createSlice, type PayloadAction } from '@reduxjs/toolkit'
 
 // The shapes live in a neutral module, so the store does not depend on a page.
 import type { InstanceDraft, InstanceFormValues } from '../types/instanceForm'
+import type { RemoteCrewAddLink } from '../lib/remoteCrewAddLink'
+import type { PaneRelayCrew } from '../lib/paneRelayCrews'
 
 export interface WarmConn {
   port: number
   token: string
 }
+
+/** `staleToken`: the dead pane the link's own reconnect replaces; its readiness does not count. */
+export interface PendingPaneSlot { id: string; key: string; staleToken?: string }
 
 /** One switcher tab as relayed to an embedded pane (parent → frame). */
 export interface HostTab {
@@ -54,6 +59,9 @@ export interface HostTab {
    *  connected and merely unreachable itself, so naming it would be false. Absent
    *  when the chain is healthy, and absent from an older parent's model. */
   brokenAt?: string
+  /** How the parent reaches this crew, for the row's "Private · <source>" line.
+   *  Absent from an older parent's model, whose rows then show the host alone. */
+  transport?: 'ssh' | 'ssm' | 'fargate'
 }
 
 /** The embedded pane's OWN tunnel status, used by its readout capsule (item 1). */
@@ -77,6 +85,10 @@ export interface HostModel {
    *  embedded header must inset its RIGHT side clear of the native caption
    *  buttons (the transparent titleBarOverlay's min/max/close cluster). */
   winInset: boolean
+  /** True when the parent is a frameless Linux Electron window, so the
+   *  embedded header must inset its RIGHT side clear of the caption buttons
+   *  the shell injects there (#electron-linux-controls). */
+  linuxInset: boolean
   /** The host window's live, zoom-aware caption reserve (e.g. `178px`), read
    *  from the `--mc-win-caption-reserve` the main process sets on the HOST
    *  <html>. The pane is a separate document, so it never inherits that value,
@@ -105,6 +117,12 @@ export interface HostModel {
    *  `mc-set-crew-pin` back up so the set stays one shared value across every
    *  pane. A plain array because postMessage cannot carry a Set. */
   pinnedCrews: string[]
+  /** The parent's Remote Crews rows (lib/paneRelayCrews.ts), so the pane's own
+   *  switcher lists them too; empty from an older host or with the relay viewer off. */
+  relayCrews?: PaneRelayCrew[]
+  /** The parent's latest Remote Crews read failed; `relayCrews` are the last rows it
+   *  loaded, none on a first read. False from an older host. */
+  relayCrewsFailed?: boolean
   /** The parent's "keep tab order fixed" preference, relayed so the embedded bar
    *  applies the same ordering as the local bar instead of always reshuffling on
    *  switch (its own cross-origin-iframe localStorage the parent can never
@@ -117,6 +135,12 @@ export interface HostModel {
    *  to `false` would leave the pane offering a toggle the host can never honor,
    *  so `null` orders by the pre-relay default AND hides the control instead. */
   stableOrder: boolean | null
+  /** The parent's "a background chat finished" toast opt-in (Settings ›
+   *  Notifications). Relayed because the pane's own cross-origin-iframe
+   *  localStorage is one the parent's toggle never writes; the pane follows it
+   *  unless that storage holds an explicit choice (`loadChatCompleteNotify`).
+   *  An older parent sends none, read as `false`. */
+  chatCompleteNotify: boolean
 }
 
 /**
@@ -157,6 +181,17 @@ interface CrewFormState {
    * preload partial slices.
    */
   launch?: CrewLaunchDraft | null
+  /**
+   * The desktop app's `kirocrew://remote-crew/add` link the add form's values
+   * started from, or `null`. While it is set the form starts from it when `add`
+   * holds nothing, and says the values came from a link. Dropping the add values
+   * drops it too, so a successful add or a cleared form never brings the link's
+   * values back. Optional because tests preload partial slices.
+   */
+  addLink?: RemoteCrewAddLink | null
+  /** Bumped by every add link: Remote Crew's React key, so a panel already on
+   *  screen remounts with the newest link's values on its first tab. */
+  addLinkSeq?: number
 }
 
 /** The launch form's sign-in choice: Builder ID, or an Identity Center portal. */
@@ -170,11 +205,18 @@ export interface CrewLaunchDraft {
   subnet_id: string
   /** `null` until the reader picks one: the inherited preselection is not kept. */
   identity: CrewLaunchIdentity | null
+  /** Absent means sign in; only the choice to skip needs to be kept. */
+  signinOnLaunch?: boolean
+  /** A custom EC2 instance type picked instead of a size tier. Optional: a
+   *  draft held before the field existed reads as none. */
+  instance_type?: string
 }
 
 const sameLaunchDraft = (a: CrewLaunchDraft | null, b: CrewLaunchDraft | null): boolean =>
   a === b
   || (!!a && !!b && a.subnet_id === b.subnet_id
+    && (a.signinOnLaunch ?? true) === (b.signinOnLaunch ?? true)
+    && (a.instance_type ?? '') === (b.instance_type ?? '')
     && (a.identity === b.identity
       || (!!a.identity && !!b.identity
         && a.identity.mode === b.identity.mode
@@ -190,8 +232,54 @@ interface InstancesState {
    *  src (port+token). Cleared whenever the src changes (a reload is coming),
    *  so the viewport can tell a live pane from one still loading / dead. */
   ready: Record<string, boolean>
+  /** Why the last connect for each crew was rejected, whichever path sent it
+   *  (tab click, auto-connect, auto-warm, Retry), so the in-pane panel can say
+   *  why. Cleared when a connect warms the crew, the user leaves it, or its
+   *  warm entry is dropped.
+   *  Optional because tests preload partial slices. */
+  connectError?: Record<string, string>
+  /** A `kirocrew://chat?crew=` link waiting for that crew's pane to be ready
+   *  (see lib/crewDeepLink.ts). One in total: a newer link replaces
+   *  it, and any switch to another pane drops it. */
+  pendingPaneSlot: PendingPaneSlot | null
   host: HostModel | null
   crewForms: CrewFormState
+  /** Relay Crew tabs in opening order, after the SSH tabs. Optional because tests preload partial slices. */
+  relayTabs?: RelayTab[]
+  /** Relay Crews with a pane open, most recent first: the same Crews as relayTabs. */
+  relayLive?: string[]
+  /** The relay Crew filling <main>, or null. */
+  relayActive?: string | null
+  /** Bumped by every choice of what fills <main> (Local, an SSH Crew, a relay tab, the start of
+   *  a relay open). A relay open's answer makes its Crew active only while this still holds the
+   *  value its start returned, so a late answer never overrides a newer choice. */
+  pickSeq?: number
+  /** A relay Crew whose open is waiting for its answer, with the `pickSeq` its start left:
+   *  the window shows it as connecting while no newer choice was made. */
+  relayOpening?: (RelayTab & { gen: number }) | null
+}
+
+/** A relay Crew tab: its endpoint ID and the name it was opened under. */
+export interface RelayTab { id: string; name: string }
+
+/** Whether a remote Crew, SSH or relay, covers the local one: `setActiveId(null)` brings it forward. */
+export const localCovered = (s: { instances?: Pick<InstancesState, 'activeId' | 'relayActive'> }) =>
+  s.instances?.activeId != null || s.instances?.relayActive != null
+
+// Switch the page body to instance `id`, or to the local dashboard for null.
+function activate(state: InstancesState, id: string | null) {
+  // Leaving a crew drops its connect failure: coming back shows what
+  // happens next, not the old refusal.
+  if (state.activeId && state.activeId !== id && state.connectError) {
+    delete state.connectError[state.activeId]
+  }
+  state.activeId = id
+  if (state.pendingPaneSlot && state.pendingPaneSlot.id !== id) state.pendingPaneSlot = null
+  if (id) {
+    state.mru = [id, ...state.mru.filter(x => x !== id)]
+    // Selecting an instance clears its unread badge.
+    if (state.unread[id]) state.unread[id] = 0
+  }
 }
 
 const initialState: InstancesState = {
@@ -200,6 +288,7 @@ const initialState: InstancesState = {
   mru: [],
   unread: {},
   ready: {},
+  pendingPaneSlot: null,
   host: null,
   crewForms: { add: null, edit: null },
 }
@@ -232,16 +321,54 @@ const instancesSlice = createSlice({
       if (!prev || prev.port !== conn.port || prev.token !== conn.token) {
         delete state.ready[id]
       }
+      if (state.connectError) delete state.connectError[id]
       state.warm[id] = conn
       state.mru = [id, ...state.mru.filter(x => x !== id)]
     },
+    setConnectError(state, action: PayloadAction<{ id: string; error: string }>) {
+      if (!state.connectError) state.connectError = {}
+      state.connectError[action.payload.id] = action.payload.error
+    },
     setActiveId(state, action: PayloadAction<string | null>) {
-      state.activeId = action.payload
-      if (action.payload) {
-        state.mru = [action.payload, ...state.mru.filter(x => x !== action.payload)]
-        // Selecting an instance clears its unread badge.
-        if (state.unread[action.payload]) state.unread[action.payload] = 0
+      activate(state, action.payload)
+      state.relayActive = null
+      state.pickSeq = (state.pickSeq ?? 0) + 1
+    },
+    /** A relay open was asked for: a choice, so it retires every open still waiting. Its
+     *  answer carries the value this leaves in `pickSeq`. */
+    relayOpenStarted(state, action: PayloadAction<RelayTab | undefined>) {
+      state.pickSeq = (state.pickSeq ?? 0) + 1
+      state.relayOpening = action.payload ? { ...action.payload, gen: state.pickSeq } : null
+    },
+    /** The open started at `gen` was refused, or shown in a window of its own. */
+    relayOpenEnded(state, action: PayloadAction<number>) {
+      if (state.relayOpening?.gen === action.payload) state.relayOpening = null
+    },
+    /** A relay Crew's pane opened, or came forward from another tab: it fills <main> under
+     *  the local top bar, so no instance is active. With `gen` (an open's answer) it does so
+     *  only while no newer choice was made; otherwise the pane stays a hidden tab, least
+     *  recent, and nothing on screen changes. */
+    relayPaneOpened(state, action: PayloadAction<RelayTab & { gen?: number }>) {
+      const { id, name, gen } = action.payload
+      if (state.relayOpening?.id === id) state.relayOpening = null
+      const tabs = state.relayTabs ?? []
+      if (!tabs.some(t => t.id === id)) state.relayTabs = [...tabs, { id, name }]
+      const live = (state.relayLive ?? []).filter(x => x !== id)
+      if (gen !== undefined && gen !== (state.pickSeq ?? 0) && state.relayActive !== id) {
+        if (!(state.relayLive ?? []).includes(id)) state.relayLive = [...live, id]
+        return
       }
+      state.relayLive = [id, ...live]
+      activate(state, null)
+      state.relayActive = id
+      if (gen === undefined) state.pickSeq = (state.pickSeq ?? 0) + 1
+    },
+    /** A pane closed, by main, its tab's close or the warm cap: its tab goes with it. */
+    relayPaneClosed(state, action: PayloadAction<string>) {
+      const id = action.payload
+      state.relayLive = (state.relayLive ?? []).filter(x => x !== id)
+      state.relayTabs = (state.relayTabs ?? []).filter(t => t.id !== id)
+      if (state.relayActive === id) state.relayActive = null
     },
     /** Pure client-state teardown for one connection (no API call). */
     removeWarm(state, action: PayloadAction<string>) {
@@ -249,8 +376,13 @@ const instancesSlice = createSlice({
       delete state.warm[id]
       delete state.unread[id]
       if (state.ready) delete state.ready[id]
+      if (state.connectError) delete state.connectError[id]
       state.mru = state.mru.filter(x => x !== id)
       if (state.activeId === id) state.activeId = null
+      if (state.pendingPaneSlot?.id === id) state.pendingPaneSlot = null
+    },
+    setPendingPaneSlot(state, action: PayloadAction<PendingPaneSlot | null>) {
+      state.pendingPaneSlot = action.payload
     },
     /** The pane's embedded SPA mounted and announced `mc-embedded-ready`. */
     setPaneReady(state, action: PayloadAction<string>) {
@@ -285,6 +417,18 @@ const instancesSlice = createSlice({
       // Tests preload partial slices, so tolerate a missing container.
       if (!state.crewForms) state.crewForms = { add: null, edit: null }
       state.crewForms.add = action.payload
+      if (action.payload === null && state.crewForms.addLink) state.crewForms.addLink = null
+    },
+    /**
+     * A `kirocrew://remote-crew/add` link: the add form starts from these values
+     * the next time it mounts, in place of whatever it held, so the newest link
+     * wins. Form state only: nothing is saved and nothing connects.
+     */
+    prefillCrewAddForm(state, action: PayloadAction<RemoteCrewAddLink>) {
+      if (!state.crewForms) state.crewForms = { add: null, edit: null }
+      state.crewForms.add = null
+      state.crewForms.addLink = action.payload
+      state.crewForms.addLinkSeq = (state.crewForms.addLinkSeq ?? 0) + 1
     },
     /** Hold (or drop, with `null`) the unsaved edit of one crew, with the record
      *  it was opened on. */
@@ -315,13 +459,20 @@ const instancesSlice = createSlice({
 
 export const {
   setWarm,
+  setConnectError,
   setActiveId,
+  relayOpenStarted,
+  relayOpenEnded,
+  relayPaneOpened,
+  relayPaneClosed,
   removeWarm,
+  setPendingPaneSlot,
   setPaneReady,
   clearPaneReady,
   setUnread,
   setHostModel,
   setCrewAddForm,
+  prefillCrewAddForm,
   setCrewEditForm,
   setCrewLaunchDraft,
   dropLaunchedCrewDraft,

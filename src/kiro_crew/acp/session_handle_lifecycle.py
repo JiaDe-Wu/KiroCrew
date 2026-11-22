@@ -9,7 +9,8 @@ and a patch of the method on the class or on an instance reaches every caller.
 
 Instance fields written: ``_abandoned_steering``, ``_awaited_responses``,
 ``_cancel_grace_secs``, ``_cancel_ts``, ``_cancelled``, ``_ingress_seq``,
-``_release_task``, ``_session_key``, ``_stale_probe``, ``_steering_answers``.
+``_own_ingress_seq``, ``_release_task``, ``_session_key``, ``_stale_probe``,
+``_steering_answers``.
 
 Instance fields read: ``_pending_elicitations``, ``_prompt_or_tool_seen``, ``_queue``,
 ``_runtime``, ``_session_id``, ``_steering_settled``, ``delete_delay_secs``,
@@ -19,8 +20,10 @@ Instance fields read: ``_pending_elicitations``, ``_prompt_or_tool_seen``, ``_qu
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import time
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew import mediated_request_capability, released_sessions, sandbox_launch_mark
@@ -34,7 +37,14 @@ from kiro_crew.acp.client import (
     registration_rate_limited_error,
     registration_throttle_line,
 )
-from kiro_crew.acp.types import METHOD_CANCEL, METHOD_COMMANDS_EXECUTE, JsonRpcMessage
+from kiro_crew.acp.command_refused import AcpCommandRefused
+from kiro_crew.acp.session_handle_runtime_contract import host_checks_sessions
+from kiro_crew.acp.types import (
+    METHOD_CANCEL,
+    METHOD_COMMANDS_EXECUTE,
+    METHOD_KAS_SESSION_DELETE,
+    JsonRpcMessage,
+)
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.dashboard.chat_utils_awaits import drained_to_thread
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -144,7 +154,8 @@ async def send_command(
 ) -> str:
     """Execute a kiro slash command (e.g. '/compact', '/effort').
 
-    Returns the response text (if any). Mirrors AcpClient.send_command.
+    Returns the response text (if any); raises AcpCommandRefused on a
+    ``success: false`` answer. Mirrors AcpClient.send_command.
     """
     if args:
         cmd_name = command.strip().split(None, 1)[0].lstrip("/")
@@ -168,6 +179,9 @@ async def send_command(
         text = str(raw)
         text, _ = redact_exfiltration_urls(text)
         text, _ = redact_credentials(text)
+        if isinstance(result, dict) and result.get("success") is False:
+            # kiro-cli refuses an /effort level this way, with no JSON-RPC error.
+            raise AcpCommandRefused(text or f"{command} refused")
         return text
     except AcpTimeoutError:
         return ""
@@ -378,8 +392,101 @@ def _cleanup_transcript(self: AcpSessionHandle) -> None:
     guard therefore protects nothing on KAS — that backend's session record is
     removed by the same verb that freed the session or, for a released session,
     by the later ``released_sessions`` sweep.
+
+    A host whose teardown verb keeps the record names Crew's own delete in
+    ``TeardownPolicy.delete_disposable_record``. On codex that is the thread's
+    rollout under the ``CODEX_HOME`` the runtime's child ran with, so the delete
+    gets the runtime's ``extra_env``, and only an incognito or temporary session's
+    rollout is deleted. This is the path for a subagent of such a chat on the
+    shared runtime, for ``new_conversation`` and for a late-start teardown, none of
+    which reach ``AcpProvider.cleanup_session``. A persistent session's rollout
+    stays, because ``session/load`` replays it.
     """
+    delete_record = _disposable_record_delete(self._runtime.acp_backend)
+    if delete_record is not None:
+        if self.memory_mode != "persistent":
+            delete_record(self._session_id, getattr(self._runtime, "_extra_env", None))
+        return
     self.cleanup_transcript_files(self._session_id)
+
+
+def _disposable_record_delete(
+    backend: object,
+) -> Callable[[str, Mapping[str, str] | None], bool] | None:
+    """The harness's ``delete_disposable_record`` for *backend*, else ``None``.
+
+    ``None`` too for a backend with no harness, which keeps the kiro-cli sweep.
+    Imported at call time: the harness package imports this layer.
+    """
+    from kiro_crew.acp.harness import harness_for
+
+    if not isinstance(backend, str):
+        return None
+    try:
+        return harness_for(backend).teardown.delete_disposable_record
+    except ValueError:
+        return None
+
+
+def _teardown_deletes_record(backend: object) -> bool:
+    """Whether *backend*'s teardown verb is the one that deletes the stored record.
+
+    True on KAS, whose ``_kiro/session/delete`` removes the record from the
+    engine's own store; nothing on disk that Crew could unlink holds it.
+    """
+    from kiro_crew.acp.harness import harness_for
+
+    if not isinstance(backend, str):
+        return False
+    try:
+        return harness_for(backend).teardown.method == METHOD_KAS_SESSION_DELETE
+    except ValueError:
+        return False
+
+
+async def delete_native_record(runtime: Any, session_id: str) -> None:
+    """Delete *session_id*'s native record from the store of the host it ran on.
+
+    The body of ``AcpSessionProvider.cleanup_session``: a caller asks for it
+    after the session is done, so the record goes whatever the memory mode.
+
+    - A host whose verb keeps the record and that names Crew's own delete
+      (``TeardownPolicy.delete_disposable_record``; codex's rollout) gets that
+      delete, with the ``extra_env`` the runtime's child ran with.
+    - KAS gets ``_kiro/session/delete`` on this runtime. When the runtime cannot
+      send it (it is dead, as after an owning provider's shutdown), the delete is
+      scheduled due now in ``released_sessions``, whose sweep sends it on the
+      background runtime. An engine answers success for an id it does not hold,
+      so a record the teardown already deleted costs one round trip.
+    - Every other host keeps the kiro-cli transcript unlink.
+    """
+    if not session_id:
+        return
+    backend = getattr(runtime, "acp_backend", None)
+    delete_record = _disposable_record_delete(backend)
+    if delete_record is not None:
+        await drained_to_thread(delete_record, session_id, getattr(runtime, "_extra_env", None))
+        return
+    if _teardown_deletes_record(backend):
+        if await runtime.delete_session_record(session_id):
+            return
+        if sandbox_launch_mark.launched_in_sandbox():
+            # ``released-sessions/`` is masked in a sandboxed process: an entry
+            # written there is lost with the sandbox (``_release_ending``).
+            logger.warning("cleanup: could not delete the record of %s", session_id)
+            return
+        try:
+            await drained_to_thread(
+                functools.partial(
+                    released_sessions.schedule, session_id, backend=str(backend), delay_secs=0.0
+                )
+            )
+        except (OSError, ValueError):
+            logger.warning(
+                "cleanup: could not schedule the delete of %s", session_id, exc_info=True
+            )
+        return
+    await drained_to_thread(cleanup_transcript_files, session_id)
 
 
 def cleanup_transcript_files(sid: str) -> None:
@@ -416,6 +523,7 @@ async def _wait_for_response(
     """
     deadline = time.monotonic() + timeout
     buffered: list[JsonRpcMessage] = []
+    hold_end: asyncio.Event | None = None
     self._awaited_responses.add(req_id)
     try:
         while time.monotonic() < deadline:
@@ -475,9 +583,25 @@ async def _wait_for_response(
             # completion was sitting in this buffer. A spurious bump only
             # defers one watchdog tick, so over-counting is fail-safe.
             self._ingress_seq += 1
+            if not msg.fanout_no_owner:
+                # A frame routed to this session (a response, or a
+                # notification that names it) is this session's own
+                # progress, so the guard may move the tool-idle clock for
+                # it. A co-tenant's fanned-out frame only voids one tick.
+                self._own_ingress_seq += 1
+            if msg is self._agent_turn_start:
+                # The turn opened for it waits until this wait has put it back
+                # (``stream_unsolicited``), instead of reading an empty queue.
+                hold_end = self._agent_turn_hold_end = asyncio.Event()
             buffered.append(msg)
         raise AcpTimeoutError(f"Timeout waiting for response to request {req_id}")
     finally:
         self._awaited_responses.discard(req_id)
         for _m in buffered:
             self._queue.put_nowait(_m)
+        if not self._awaited_responses and host_checks_sessions(self._runtime):
+            # Frames that arrived after this response, while it was awaited, were
+            # shown to no agent-turn hook; look at them again now nothing waits.
+            self._rearm_agent_turn()
+        if hold_end is not None:
+            hold_end.set()

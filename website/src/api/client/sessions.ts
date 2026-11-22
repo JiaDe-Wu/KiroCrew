@@ -19,6 +19,42 @@ export interface ArchiveEntry {
   mtime: number
 }
 
+/** The filters `GET /api/sessions/search/messages` reads. */
+export interface MessageSearchParams {
+  q: string
+  agent?: string
+  role?: '' | 'user' | 'assistant'
+  /** Epoch seconds: keep chats last modified at or after this. */
+  since?: number
+}
+
+/** One matching message; `ts` and `mid` are what the chat's deep-link jump resolves. */
+export interface MessageSearchHit {
+  index: number
+  role: 'user' | 'assistant'
+  ts?: string
+  mid?: string
+  snippet: string
+}
+
+export interface MessageSearchResult {
+  key: string
+  title?: string
+  agent?: string
+  modified?: number
+  open?: boolean
+  hits: MessageSearchHit[]
+  hit_count: number
+}
+
+export interface MessageSearchResponse {
+  results: MessageSearchResult[]
+  /** Bots of every chat the ranking matched, before the filters cut the list. */
+  agents?: string[]
+  /** Present when the scan window left older chats out. */
+  scan?: { searched: number; total: number }
+}
+
 export function createSessionsEndpoints({ get, post, del, j, jfetch: fetch, sendResponseAuthRecovery, jCrewBoard }: ClientTransport) {
   const runtimes = {
     restartSessions: () =>
@@ -63,6 +99,8 @@ export function createSessionsEndpoints({ get, post, del, j, jfetch: fetch, send
         session_key?: string
         rss_mb: number; peak_rss_mb: number; cpu_cores: number
         procs: number | null; mcp: number | null
+        /** Credits the live run has burned so far; null while none. Absent from an older gateway. */
+        credits?: number | null
         started_at: number; shared: boolean; pid: number | null; sampled: boolean
       }[]
       totals: {
@@ -77,6 +115,28 @@ export function createSessionsEndpoints({ get, post, del, j, jfetch: fetch, send
          */
         lineage_over_cap: boolean
         lineage_cap: number
+        /**
+         * Everything the product runs on this host, by part, so the page's total
+         * is comparable with the OS's own figure for the app. `rss_mb` above
+         * stays the sessions' own total. Null when the breakdown could not be
+         * taken; absent from an older gateway.
+         */
+        breakdown?: {
+          total_mb: number
+          host_pct: number | null
+          /** True when some part could not be measured, so the total leaves it out. */
+          partial: boolean
+          categories: {
+            /** `sessions`, `warm_pool`, `other_agents`, `mcp_gateway`, `gateway`, `gateway_helpers`, `desktop`. */
+            id: string
+            /** null when this part cannot be measured on this host. */
+            mb: number | null
+            /** null when processes cannot be counted on this host. */
+            procs: number | null
+            /** The largest executables in this part, by base name. */
+            top: { name: string; procs: number; mb: number }[]
+          }[]
+        } | null
       }
       history: { t: number; mb: number }[]
     }>,
@@ -92,6 +152,16 @@ export function createSessionsEndpoints({ get, post, del, j, jfetch: fetch, send
     // Both off by default: every other caller wants the full inventory.
     sessions: (limit = 30, offset = 0, preview = false, excludeOpen = false, userOnly = false) => fetch('/api/sessions?limit=' + limit + '&offset=' + offset + (preview ? '&preview=1' : '') + (excludeOpen ? '&exclude_open=1' : '') + (userOnly ? '&user_only=1' : '')).then(j),
     sessionsSearch: (q: string, limit = 50) => fetch('/api/sessions/search?q=' + encodeURIComponent(q) + '&limit=' + limit).then(j),
+    // Search all chats: every matching message, grouped by chat, with optional
+    // bot, speaker and date filters (`GET /api/sessions/search/messages`).
+    sessionsSearchMessages: (params: MessageSearchParams, signal?: AbortSignal) => {
+      const qs = new URLSearchParams({ q: params.q })
+      if (params.agent) qs.set('agent', params.agent)
+      if (params.role) qs.set('role', params.role)
+      if (params.since !== undefined) qs.set('since', String(params.since))
+      return fetch('/api/sessions/search/messages?' + qs, signal ? { signal } : undefined)
+        .then(j) as Promise<MessageSearchResponse>
+    },
     // Every transcript, open or closed, minted under one short name (`chat-7`),
     // oldest first. A slot number is reused across gateway generations, so one
     // name can match several.

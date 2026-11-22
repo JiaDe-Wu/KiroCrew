@@ -11,8 +11,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import stat
+import tempfile
 import threading
 from dataclasses import replace
 from types import SimpleNamespace
@@ -20,6 +22,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from kiro_crew.config.loader import ACTIVATION_ALWAYS, KiroCrewConfig, MessagingConfig
 from kiro_crew.messaging.outbound_files import ExtractLimits, OutboundFile, Rejection
@@ -39,6 +42,7 @@ from kiro_crew.slack.format import SLACK_MSG_LIMIT, TRUNCATION_NOTICE
 from kiro_crew.slack.handler import _THINKING
 from kiro_crew.slack.renderer import SlackRenderer
 from kiro_crew.slack.transport import SLACK_CAPABILITIES
+from kiro_crew.testing.wait import await_until, default_timeout
 
 #: A one-pixel PNG: real leading bytes, so the extractor's magic-byte allowlist
 #: accepts it the way it would accept a chart the agent rendered.
@@ -222,6 +226,63 @@ class TestOutboundUploads:
         assert not os.path.exists(staged), "the staged bytes outlived the upload"
         if os.name == "posix":
             assert slack.uploads[0]["dir_mode"] == 0o700
+
+    @pytest.mark.asyncio
+    async def test_cancels_during_the_staging_mkdtemp_still_remove_the_dir(
+        self, monkeypatch
+    ) -> None:
+        """Two cancels land while the mkdtemp thread is held, and the thread makes the
+        dir only after both were delivered. Each step is queued on the loop behind
+        the one before it, so the order is fixed rather than raced against a timer."""
+        loop = asyncio.get_running_loop()
+        ceiling = default_timeout()
+        entered = asyncio.Event()
+        finished = asyncio.Event()
+        release = threading.Event()
+        made: list[str] = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def _held_mkdtemp(*args, **kwargs):
+            if kwargs.get("prefix") != "kirocrew-slack-upload-":
+                return real_mkdtemp(*args, **kwargs)
+            try:
+                loop.call_soon_threadsafe(entered.set)
+                assert release.wait(timeout=ceiling), "never released"
+                path = real_mkdtemp(*args, **kwargs)
+                made.append(path)
+                return path
+            finally:
+                loop.call_soon_threadsafe(finished.set)
+
+        monkeypatch.setattr(tempfile, "mkdtemp", _held_mkdtemp)
+
+        def _second_cancel_then_release() -> None:
+            # Runs after the first cancel was delivered; the release is queued
+            # behind the second one, so the thread returns only after both.
+            task.cancel()
+            loop.call_soon(release.set)
+
+        file = OutboundFile(path="/tmp/chart.png", data=PNG, alt="", mime="image/png")
+        task = asyncio.ensure_future(upload_outbound_files(_FakeSlack(), "C1", "t1", [file]))
+        try:
+            try:
+                await await_until(entered, what="the staging mkdtemp thread")
+            finally:
+                task.cancel()
+                loop.call_soon(_second_cancel_then_release)
+            with pytest.raises(asyncio.CancelledError):
+                await await_until(task, what="the cancelled upload")
+            # Without the settle the thread outlives the task; wait for it to return.
+            await await_until(finished, what="the staging mkdtemp thread's return")
+
+            assert made, "the mkdtemp thread never made the staging dir"
+            leaked = [p for p in made if os.path.exists(p)]
+            assert not leaked, f"a cancel during mkdtemp leaked the staging dir: {leaked}"
+        finally:
+            release.set()
+            for path in made:
+                with contextlib.suppress(OSError):
+                    os.rmdir(path)
 
     @pytest.mark.asyncio
     async def test_the_filename_comes_from_the_sniffed_type(self, tmp_path) -> None:
@@ -475,11 +536,11 @@ class TestFenceSafeSplitting:
         await _turn(renderer, "short and sweet")
 
         updates = [kw["text"] for m, kw in slack.calls if m == "update_message"]
-        posts = [kw["text"] for m, kw in slack.calls if m == "post_message"]
+        posts = [kw["text"] for m, kw in slack.calls if m in ("post_message", "post_blocks")]
         assert updates[-1] == "short and sweet"
-        # Only the fallback's own placeholder: an answer that fits gains no
-        # continuation replies.
-        assert posts == [_THINKING]
+        # Only the fallback's own placeholder (and the timing footer): an answer
+        # that fits gains no continuation replies.
+        assert [p for p in posts if not p.startswith("Finished")] == [_THINKING]
 
     @pytest.mark.asyncio
     async def test_the_splitter_runs_off_the_event_loop(self) -> None:
@@ -513,8 +574,8 @@ class TestFenceSafeSplitting:
 
         posts = [kw["text"] for m, kw in slack.calls if m == "post_message"]
         thinking = [t for t in posts if "reasoning step." in t]
-        assert len(thinking) > 1, "an over-limit 💭 reply is rejected whole by Slack"
-        assert thinking[0].startswith("💭")
+        assert len(thinking) > 1, "an over-limit Thinking reply is rejected whole by Slack"
+        assert thinking[0].startswith("*Thinking*")
         for text in thinking:
             assert len(text) <= SLACK_MSG_LIMIT, len(text)
 
@@ -770,6 +831,10 @@ class TestVoiceMemoRejections:
         transcribe_call.assert_not_awaited()
 
 
+#: A synthetic GitHub token with a valid checksum, which the credential plan redacts.
+_TOKEN = github_classic(seed=42)
+
+
 class TestReleasedTailIsRedacted:
     """Cutting image markup rejoins the text around it, so the JOIN is an egress.
 
@@ -778,11 +843,11 @@ class TestReleasedTailIsRedacted:
     """
 
     #: Split so NEITHER half is a credential on its own: the leading half is a
-    #: bare `AKIA` and the trailing half is the remaining body. Only removing the
-    #: markup between them spells the key, which is what makes this a join
+    #: bare token prefix and the trailing half is the remaining body. Only removing
+    #: the markup between them spells the key, which is what makes this a join
     #: hazard rather than a chunk the rolling redactor should already have caught.
-    _HEAD = "AKIA"
-    _TAIL = "IOSFODNN7EXAMPLE"
+    _HEAD = _TOKEN[:8]
+    _TAIL = _TOKEN[8:]
 
     @pytest.mark.asyncio
     async def test_a_credential_spelled_by_the_cut_is_not_appended(self, tmp_path) -> None:
@@ -827,25 +892,28 @@ class TestReleasedTailIsRedacted:
 
     @pytest.mark.asyncio
     async def test_an_exfiltration_url_in_shown_text_is_redacted_too(self) -> None:
-        """Both outbound redactors, in the seal's order -- URLs then credentials."""
+        """A credential value inside a URL is masked in shown text; the URL stays."""
         slack = _FakeSlack(streaming=True)
         renderer = _renderer(slack)
 
-        shown = await renderer._shown("see https://evil.example.com/?q=AKIAIOSFODNN7EXAMPLE now")
+        shown = await renderer._shown(
+            "see https://evil.example.com/?access_token=opaque-value-1234 now"
+        )
 
-        assert "AKIAIOSFODNN7EXAMPLE" not in shown
+        assert "opaque-value-1234" not in shown
+        assert "evil.example.com/?access_token=" in shown
 
 
 class TestEveryRendererEgressMeetsTheDisplayFloor:
     """One floor at every sink in this renderer, not one scan per reviewed line.
 
-    Neither `AKIA**<rest>**` nor `[AKIA](https://x)<rest>` matches as written, yet Slack
+    Neither `ghp_**<rest>**` nor `[ghp_](https://x)<rest>` matches as written, yet Slack
     renders an intact key, so every sink scans the displayed form too.
     """
 
     #: Emphasis markers Slack renders away; the literal string is not a credential.
-    _COLLAPSING = "AKIA**IOSFODNN7EXAMPLE**"
-    _KEY = "AKIAIOSFODNN7EXAMPLE"
+    _COLLAPSING = _TOKEN[:4] + "**" + _TOKEN[4:] + "**"
+    _KEY = _TOKEN
 
     def _leaked(self, slack: _FakeSlack) -> bool:
         """True if any string this client was shown carries the key once rendered."""
@@ -864,7 +932,7 @@ class TestEveryRendererEgressMeetsTheDisplayFloor:
         renderer = _renderer(slack)
         renderer._show_thinking = True
         await renderer.on_thinking(f"thinking about {self._COLLAPSING}")
-        await renderer._maybe_post_thinking()
+        await renderer._settle_thinking()
         assert slack.texts(), "premise: the thinking block was posted"
         assert not self._leaked(slack), slack.calls
 

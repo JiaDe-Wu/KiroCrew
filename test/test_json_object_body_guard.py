@@ -173,6 +173,9 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
     # A thread reply is one text field (capped at 32 KiB by the handler) plus a
     # slot key, so the shared default ceiling is the right one.
     "chat_threads.py::api_chat_thread_reply": ("<default>", _BOUNDED_BY_DEFAULT),
+    # A merge-back is one summary (capped at 4000 characters by the handler) and
+    # one message id, so the shared default ceiling is the right one.
+    "chat_merge_back.py::api_chat_slot_merge_back": ("<default>", _BOUNDED_BY_DEFAULT),
     # Voice config is a flat set of short scalars (provider name, voice name,
     # rate, paths) and voice synthesis takes one reply's text, which the panel
     # already truncates well below the shared default. Neither has a legitimate
@@ -188,6 +191,8 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
     "handlers/redaction.py::api_redaction_allow_host": ("_MAX_BODY", _BOUNDED_BY_DEFAULT),
     # A control click is one short closed name, so 256 bytes is far above any
     # legitimate body.
+    # One app view: a short app name and three closed fields.
+    "handlers/telemetry_app_view.py::api_app_view": ("_MAX_BODY_BYTES", _BOUNDED_BY_DEFAULT),
     "handlers/telemetry_ui_control.py::api_ui_control_clicked": (
         "_MAX_BODY_BYTES",
         _BOUNDED_BY_DEFAULT,
@@ -212,6 +217,11 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
         "<default>",
         _BOUNDED_BY_DEFAULT,
     ),
+    # An app's own-note ack: an app name and one note id.
+    "handlers/notifications_push.py::api_own_notification_ack": (
+        "<default>",
+        _BOUNDED_CONTROL_FIELDS,
+    ),
     "handlers/messaging.py::api_teams_activity": (
         "TEAMS_MAX_ACTIVITY_BYTES",
         _BOUNDED_EXPLICIT,
@@ -220,6 +230,9 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
     # event, reopen, close): small fixed-shape bodies, so the route keeps a 4 KiB
     # cap of its own, well under the shared default.
     "handlers/browser_live.py::_run": ("_MAX_BODY_BYTES", _BOUNDED_EXPLICIT),
+    # An app page's media button: a session key, an action and one number, so the
+    # route caps the body at 1 KiB, well under the shared default.
+    "handlers/browser_media.py::api_browser_media": ("_MAX_BODY_BYTES", _BOUNDED_EXPLICIT),
     # A quick-ask answer: an id, an action and at most a few values of 1 KiB each,
     # so the route caps the body at 8 KiB, well under the shared default.
     "handlers/browser_ask.py::api_browser_ask_answer": (
@@ -279,6 +292,31 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
         _CONTROL_FIELDS_CAP_PENDING,
     ),
     # memory.py tranche.
+    # Memory provider control routes: a mode and an id, a move's two ids and its
+    # options, or a provider id, so the shared 64 KB ceiling is far above any
+    # legitimate body.
+    "handlers/memory_provider.py::api_memory_provider_put": ("<default>", _BOUNDED_CONTROL_FIELDS),
+    "handlers/memory_provider_migrations.py::api_memory_provider_migrations": (
+        "<default>",
+        _BOUNDED_CONTROL_FIELDS,
+    ),
+    "handlers/memory_provider.py::api_memory_provider_conformance": (
+        "<default>",
+        _BOUNDED_CONTROL_FIELDS,
+    ),
+    # A benchmark run or eval-set request: suite and provider ids, cut-offs, budgets
+    # and an acknowledgement per provider, far under the shared 64 KB ceiling.
+    "handlers/memory_provider_bench.py::_body": ("<default>", _BOUNDED_CONTROL_FIELDS),
+    # One item: a ``document`` carries up to 64,000 characters, which escaping can
+    # grow to 768 KB, so the handler owns a 1 MiB cap beside the contract caps.
+    "handlers/memory_provider.py::api_memory_provider_item": (
+        "MAX_ITEM_BODY_BYTES",
+        _BOUNDED_EXPLICIT,
+    ),
+    "handlers/memory_provider.py::api_memory_provider_items_create": (
+        "MAX_ITEM_BODY_BYTES",
+        _BOUNDED_EXPLICIT,
+    ),
     "handlers/memory.py::api_memory_preferences": ("None", _UNBOUNDED_USER_CONTENT),
     "handlers/memory.py::api_memory_projects": ("None", _UNBOUNDED_USER_CONTENT),
     "handlers/memory.py::api_memory_history": ("None", _UNBOUNDED_USER_CONTENT),
@@ -319,7 +357,7 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
     # ---- tranche 2 ----
     # taskrunner.py: the control-field endpoints TAKE the cap rather than
     # deferring it, which is what tranche 1 could not do without rewriting its
-    # handlers' mocked-json test harness. Its own harness is updated in this PR.
+    # handlers' mocked-json test harness. Its own harness is updated to match.
     "handlers/taskrunner.py::api_taskrunner_cancel": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "handlers/taskrunner.py::api_taskrunner_rename": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "handlers/taskrunner.py::api_taskrunner_retry": ("<default>", _BOUNDED_CONTROL_FIELDS),
@@ -352,6 +390,10 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
     "chat_tags.py::api_chat_tag_column_update": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_tags.py::api_chat_tag_columns_reorder": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_tags.py::api_chat_slot_drop": ("<default>", _BOUNDED_CONTROL_FIELDS),
+    "handlers/chat_steering.py::api_chat_slot_steering_switch": (
+        "<default>",
+        _BOUNDED_CONTROL_FIELDS,
+    ),
     # chat_folders_routes.py: the reorder endpoint carries a bounded list of folder
     # ids and integer orders, capped at the folder ceiling, so it takes a
     # per-route byte ceiling sized from that entry budget rather than the
@@ -387,6 +429,12 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
         "<default>",
         _BOUNDED_CONTROL_FIELDS,
     ),
+    # A hub's batch read: at most 32 items, each a slot key, 16 event ids, a stamp
+    # and a digest, all capped by the route itself, well under the default.
+    "handlers/remote_work_items_pull.py::api_chat_work_items_pull": (
+        "<default>",
+        _BOUNDED_CONTROL_FIELDS,
+    ),
     "chat_api/continue_turn.py::api_chat_slot_end_wait": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_api/turn_stop.py::api_chat_slot_interrupt": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_api/prompt_queue.py::api_chat_slot_queue_edit": ("None", _UNBOUNDED_USER_CONTENT),
@@ -411,6 +459,8 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
         "<default>",
         _BOUNDED_CONTROL_FIELDS,
     ),
+    # The ultracode and Fast mode routes share one writer, which reads the body.
+    "chat_api/slot_effort.py::_write_session_switch": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_api/session_relaunch.py::api_chat_slot_workspace": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_api/session_relaunch.py::api_chat_slot_project": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_api/slot_settings.py::api_chat_slot_turn_timeout": ("<default>", _BOUNDED_CONTROL_FIELDS),
@@ -466,11 +516,13 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
     "handlers/cron_runs.py::api_cron_ack": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "handlers/cron_lessons.py::api_lessons_create": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "handlers/cron_lessons.py::api_lessons_delete": ("<default>", _BOUNDED_CONTROL_FIELDS),
+    "handlers/cron_lessons.py::api_lessons_update": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "handlers/agent_spec_pins.py::api_agent_spec_pin_write": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "handlers/cron_board.py::api_cron_folders_create": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "handlers/cron_board.py::api_cron_folders_update": ("<default>", _BOUNDED_CONTROL_FIELDS),
     # handlers/workflows.py: workflow bodies carry a script source or a
-    # free-form intent/input, so only promote (fixed metadata) takes the cap.
+    # free-form intent/input, so only promote (fixed metadata) and update from a
+    # run (a definition ref, a revision and the previewed digest) take the cap.
     "handlers/workflows.py::api_workflow_definitions_create": (
         "None",
         _UNBOUNDED_USER_CONTENT,
@@ -484,6 +536,10 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
     "handlers/workflows.py::api_workflow_run": ("None", _UNBOUNDED_USER_CONTENT),
     "handlers/workflows.py::api_workflow_run_intent": ("None", _UNBOUNDED_USER_CONTENT),
     "handlers/workflows.py::api_workflow_run_promote": ("<default>", _BOUNDED_CONTROL_FIELDS),
+    "handlers/workflows.py::api_workflow_run_update_definition": (
+        "<default>",
+        _BOUNDED_CONTROL_FIELDS,
+    ),
     "handlers/workflows.py::api_workflow_run_rerun": ("None", _UNBOUNDED_USER_CONTENT),
     # handlers/files.py and its file_api owners: bodies name paths and routing
     # fields -- the file bytes travel in api_file_write's body, which is the one
@@ -500,6 +556,8 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
     # a capped list of paths, each a FILE_READ_SCHEMA path
     "file_api/pinned_io.py::api_file_kinds": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "file_api/dashboard_config.py::api_dashboard_config": ("<default>", _BOUNDED_CONTROL_FIELDS),
+    # a parent directory and one folder name
+    "file_api/browse.py::api_browse_create_dir": ("<default>", _BOUNDED_CONTROL_FIELDS),
     # The four module-local body guards, which read through the helper.
     # A channel message carries user prose and these routes never had a cap below
     # client_max_size; adding one would be a new limit, not this convergence.

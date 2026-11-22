@@ -120,6 +120,11 @@ if [ "$1" = "api" ]; then
     esac
   fi
   case "$*" in
+    *"/actions/runs?event=pull_request_target"*)
+      # Sensitive Change Review's own runs on the head. Matched ahead of the
+      # `event=pull_request` glob, which would answer it too.
+      [ -f "$FIXTURES/fail_pt_runs" ] && { echo 'gh: Server Error (HTTP 500)' >&2; exit 1; }
+      cat "$FIXTURES/pt_runs.json"; exit 0 ;;
     *"/actions/runs?event=pull_request"*)
       [ -f "$FIXTURES/fail_runs" ] && { echo 'gh: Server Error (HTTP 500)' >&2; exit 1; }
       cat "$FIXTURES/runs.json"; exit 0 ;;
@@ -141,6 +146,14 @@ if [ "$1" = "api" ]; then
       fi
       cat "$FIXTURES/fork_checks.json"; exit 0 ;;
     *"/actions/runs/"[0-9]*)
+      # One run by id, read when a head_sha listing came back empty and the
+      # head's check-runs name the run: run_<id>.json is that run object.
+      rid="$*"
+      rid="${rid##*/actions/runs/}"
+      rid="${rid%%[/? ]*}"
+      if [ -f "$FIXTURES/run_$rid.json" ]; then
+        cat "$FIXTURES/run_$rid.json"; exit 0
+      fi
       # The triggering lane's run, read by the hold step. `--jq .status` is
       # applied by gh itself, so the stub emits the final value.
       [ -f "$FIXTURES/fail_lane_run" ] && { echo 'gh: Server Error (HTTP 500)' >&2; exit 1; }
@@ -152,6 +165,15 @@ if [ "$1" = "api" ]; then
 fi
 echo "gh stub: unhandled: $*" >&2
 exit 90
+"""
+
+# ``sleep`` stub on the same PATH as the ``gh`` stub. The retry helper's backoff
+# is a real shell ``sleep``, so each retry-exhausting read would cost 2+4 s of
+# wall clock. Recording the requested seconds instead keeps the backoff
+# schedule assertable (``Result.backoff``) without waiting it out.
+SLEEP_STUB = r"""#!/usr/bin/env bash
+printf '%s\n' "$1" >> "$FIXTURES/sleeps"
+exit 0
 """
 
 
@@ -216,6 +238,12 @@ class Result:
         path = self._fixtures / "calls.txt"
         return path.read_text().splitlines() if path.exists() else []
 
+    @property
+    def backoff(self) -> list[int]:
+        """Seconds the retry helper asked to sleep, in order."""
+        path = self._fixtures / "sleeps"
+        return [int(line) for line in path.read_text().split()] if path.exists() else []
+
 
 class Runner:
     """Executes one readiness step against one fixture repository state."""
@@ -228,9 +256,10 @@ class Runner:
         bindir = root / "bin"
         for d in (self.fixtures, self.work, self.tmp, bindir):
             d.mkdir(parents=True)
-        stub = bindir / "gh"
-        stub.write_text(GH_STUB)
-        stub.chmod(0o755)
+        for name, body in (("gh", GH_STUB), ("sleep", SLEEP_STUB)):
+            stub = bindir / name
+            stub.write_text(body)
+            stub.chmod(0o755)
         (self.tmp / "pr-readiness-summary.md").write_text("## summary\n")
         self.summary = root / "step-summary.md"
         self.summary.write_text("")
@@ -290,7 +319,7 @@ class Runner:
             if on:
                 flag.write_text("1")
         (self.fixtures / "status_post_attempts.txt").unlink(missing_ok=True)
-        for stale in ("calls.txt", "deleted.txt", "added.txt", "published_status.json"):
+        for stale in ("calls.txt", "deleted.txt", "added.txt", "published_status.json", "sleeps"):
             (self.fixtures / stale).unlink(missing_ok=True)
 
         proc = subprocess.run(  # noqa: S603 - fixed argv, test-local stub
@@ -362,6 +391,7 @@ def test_an_unreadable_base_publishes_a_stamped_pending(runner: Runner) -> None:
     assert result.published["state"] == "pending"
     assert result.published["description"].startswith(READ_FAILURE_TOKEN)
     assert "readiness: checking" in result.added
+    assert result.backoff == [2, 4]
 
 
 # ── Losing a label race must not withhold the verdict ────────────────────────
@@ -498,11 +528,9 @@ def _recheck_runner(
     fast_gate_attempt: int = 1,
     ci_cancelled_twin: bool = False,
     fail_fork_checks: bool = False,
-    renamed_rows: str = "current",
-    legacy_status: str = "completed",
-    legacy_conclusion: str | None = "success",
-    current_conclusion: str = "success",
     codeql_pr_runs: tuple[dict[str, object], ...] = (),
+    sensitive_status: str = "completed",
+    sensitive_conclusion: str = "success",
 ) -> Runner:
     spec = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
     job_env = spec["jobs"]["readiness"]["env"]
@@ -512,7 +540,6 @@ def _recheck_runner(
             "HEAD_REPO": "octo/KiroCrew" if fork else "kirodotdev/KiroCrew",
             "HEAD_REF": "feat/x",
             "MONITORED_LANES": job_env["MONITORED_LANES"],
-            "LEGACY_LANE_NAMES": job_env["LEGACY_LANE_NAMES"],
         }
     )
     head_repo = "octo/KiroCrew" if fork else "kirodotdev/KiroCrew"
@@ -563,6 +590,20 @@ def _recheck_runner(
     # same pull_request runs page.
     workflow_runs.extend(codeql_pr_runs)
     (runner.fixtures / "runs.json").write_text(json.dumps({"workflow_runs": workflow_runs}))
+    # Sensitive Change Review is read from its own `pull_request_target` run on
+    # the head, green by default.
+    sensitive_run = {
+        "id": 8,
+        "name": "Sensitive Change Review",
+        "event": "pull_request_target",
+        "path": ".github/workflows/sensitive-change-review.yml",
+        "status": sensitive_status,
+        "conclusion": sensitive_conclusion if sensitive_status == "completed" else None,
+        "run_started_at": "2026-08-07T19:00:20Z",
+        "head_repository": {"full_name": head_repo},
+        "head_branch": "feat/x",
+    }
+    (runner.fixtures / "pt_runs.json").write_text(json.dumps({"workflow_runs": [sensitive_run]}))
     # CodeQL is a `dynamic` run and its security verdict is a separate exact-SHA
     # check-run, so both pages back the publish re-check. Green by default, so a
     # test that says nothing about CodeQL keeps its own subject.
@@ -606,12 +647,6 @@ def _recheck_runner(
         ("First Principles Review", "first-principles-pr-"),
         ("Security Scope Review", "scope-pr-"),
     )
-    # `renamed_rows` reshapes the two renamed lanes: "current" posts them
-    # under today's names only, "legacy" only under the names a pre-rename head
-    # carries, and "both" posts each under both names, the legacy row NEWER (a
-    # higher check-run id) so that "the newest row wins" and "the current name
-    # wins" give different answers.
-    legacy = {new: old for old, new in json.loads(job_env["LEGACY_LANE_NAMES"]).items()}
     fork_checks: list[dict[str, object]] = []
     for offset, (name, prefix) in enumerate(fork_lanes):
         status, verdict = "completed", "success"
@@ -619,20 +654,6 @@ def _recheck_runner(
             status = fork_lane_status
             verdict = fork_lane_conclusion if fork_lane_status == "completed" else None
         external_id = f"{prefix}2064-77-{fork_rows_attempt}"
-        if name in legacy:
-            verdict = current_conclusion
-            if renamed_rows != "current":
-                fork_checks.append(
-                    {
-                        "id": 70 + offset,
-                        "name": legacy[name],
-                        "external_id": external_id,
-                        "status": legacy_status,
-                        "conclusion": legacy_conclusion if legacy_status == "completed" else None,
-                    }
-                )
-            if renamed_rows == "legacy":
-                continue
         fork_checks.append(
             {
                 "id": 40 + offset,
@@ -682,6 +703,100 @@ def test_a_success_with_every_lane_done_still_publishes_success(runner: Runner) 
     result = _recheck_runner(runner, "completed").run()
     assert result.published is not None
     assert result.published["state"] == "success"
+
+
+@pytest.mark.parametrize(
+    ("status", "conclusion", "state", "label"),
+    [
+        ("completed", "failure", "failure", "readiness: action required"),
+        ("in_progress", "success", "pending", "readiness: checking"),
+    ],
+)
+def test_a_sensitive_review_re_run_since_the_evaluation_holds_the_success(
+    runner: Runner, status: str, conclusion: str, state: str, label: str
+) -> None:
+    """Sensitive Change Review is a `pull_request_target` run, so the
+    `pull_request` page cannot see a re-run of it. A green `pull_request` run of
+    the same path (a PR's own copy) on that page does not mask its verdict."""
+    _recheck_runner(runner, "completed", sensitive_status=status, sensitive_conclusion=conclusion)
+    page = json.loads((runner.fixtures / "runs.json").read_text())
+    page["workflow_runs"].append(
+        {
+            "id": 99,
+            "name": "Sensitive Change Review",
+            "event": "pull_request",
+            "path": ".github/workflows/sensitive-change-review.yml",
+            "status": "completed",
+            "conclusion": "success",
+            "run_started_at": "2026-08-07T19:00:30Z",
+            "head_repository": {"full_name": "kirodotdev/KiroCrew"},
+            "head_branch": "feat/x",
+        }
+    )
+    (runner.fixtures / "runs.json").write_text(json.dumps(page))
+    result = runner.run(pr_labels=("readiness: passed",))
+    assert result.published is not None
+    assert result.published["state"] == state
+    assert "Sensitive Change Review" in result.published["description"]
+    assert label in result.added
+
+
+def _listing_empty_but_check_runs_name(runner: Runner, run: dict[str, object]) -> None:
+    """The head_sha listing answers no runs while the head's own check-runs name
+    ``run`` through an Actions job's ``details_url``."""
+    (runner.fixtures / "runs.json").write_text(json.dumps({"workflow_runs": []}))
+    checks = json.loads((runner.fixtures / "fork_checks.json").read_text())
+    checks["check_runs"].append(
+        {
+            "id": 900,
+            "name": "test",
+            "status": "in_progress",
+            "conclusion": None,
+            "details_url": (
+                f"https://github.com/kirodotdev/KiroCrew/actions/runs/{run['id']}/job/901"
+            ),
+        }
+    )
+    (runner.fixtures / "fork_checks.json").write_text(json.dumps(checks))
+    (runner.fixtures / f"run_{run['id']}.json").write_text(json.dumps(run))
+
+
+def test_a_lane_restarted_behind_an_empty_listing_still_holds_the_success(
+    runner: Runner,
+) -> None:
+    """An empty head_sha listing is not proof no lane is running: the run its
+    check-runs name answers for it, so the restarted lane holds the publish."""
+    _recheck_runner(runner, "completed")
+    _listing_empty_but_check_runs_name(
+        runner,
+        {
+            "id": 5,
+            "name": "CI",
+            "event": "pull_request",
+            "head_sha": SHA,
+            "path": ".github/workflows/ci.yml",
+            "status": "in_progress",
+            "conclusion": None,
+            "run_started_at": "2026-08-07T19:00:10Z",
+            "head_repository": {"full_name": "kirodotdev/KiroCrew"},
+            "head_branch": "feat/x",
+        },
+    )
+    result = runner.run()
+    assert result.published is not None
+    assert result.published["state"] == "pending"
+    assert "CI" in result.published["description"]
+
+
+def test_a_named_run_that_cannot_be_read_does_not_publish_success(runner: Runner) -> None:
+    _recheck_runner(runner, "completed")
+    _listing_empty_but_check_runs_name(runner, {"id": 5})
+    (runner.fixtures / "run_5.json").unlink()
+    (runner.fixtures / "fail_lane_run").touch()
+    result = runner.run()
+    assert result.published is not None
+    assert result.published["state"] == "pending"
+    assert result.backoff == [2, 4]
 
 
 # ── The fork re-check ────────────────────────────────────────────────────────
@@ -794,79 +909,12 @@ def test_a_cancelled_max_id_twin_on_a_fork_head_does_not_red_a_green_lane(runner
     assert result.published["state"] == "success"
 
 
-# A fork head reviewed under the old lane names `Opus 5 Review` / `GPT 5.6 Review`
-# carries those verdicts under the old names, bound to the same external_id. The
-# re-check binds by name too, so the alias table is what lets those rows answer
-# for their lanes instead of reading as "(not started)" and holding at pending.
-
-
-def test_a_pre_rename_fork_head_with_green_legacy_rows_publishes_success(runner: Runner) -> None:
-    result = _recheck_runner(runner, "completed", fork=True, renamed_rows="legacy").run()
-    assert result.published is not None
-    assert result.published["state"] == "success"
-
-
-def test_a_red_legacy_row_publishes_failure_under_the_current_lane_name(runner: Runner) -> None:
-    result = _recheck_runner(
-        runner, "completed", fork=True, renamed_rows="legacy", legacy_conclusion="failure"
-    ).run()
-    assert result.published is not None
-    assert result.published["state"] == "failure"
-    assert "Opus 5.5 Review" in result.published["description"]
-    assert "GPT 6.1 Review" in result.published["description"]
-
-
-def test_a_legacy_row_still_running_holds_the_publish(runner: Runner) -> None:
-    result = _recheck_runner(
-        runner, "completed", fork=True, renamed_rows="legacy", legacy_status="in_progress"
-    ).run()
-    assert result.published is not None
-    assert result.published["state"] == "pending"
-    # Held because the bound row is running, not because no row was found.
-    assert "Opus 5.5 Review" in result.published["description"]
-    assert "(not started)" not in result.published["description"]
-
-
-def test_a_legacy_row_from_a_previous_fast_gate_attempt_is_still_not_current(
-    runner: Runner,
-) -> None:
-    """The alias relaxes the NAME only; the external_id binding to this pull
-    request and to Fast Gate's newest attempt still decides which row is current."""
-    result = _recheck_runner(
-        runner,
-        "completed",
-        fork=True,
-        renamed_rows="legacy",
-        fork_rows_attempt=1,
-        fast_gate_attempt=2,
-    ).run()
-    assert result.published is not None
-    assert result.published["state"] == "pending"
-    assert "Opus 5.5 Review (not started)" in result.published["description"]
-
-
-def test_a_current_name_row_wins_over_a_newer_legacy_row(runner: Runner) -> None:
-    """When the head has a bound row under the current name, only that row
-    answers -- even against a newer, green legacy row."""
-    result = _recheck_runner(
-        runner, "completed", fork=True, renamed_rows="both", current_conclusion="failure"
-    ).run()
-    assert result.published is not None
-    assert result.published["state"] == "failure"
-    assert "Opus 5.5 Review" in result.published["description"]
-
-    result = _recheck_runner(
-        runner, "completed", fork=True, renamed_rows="both", legacy_conclusion="failure"
-    ).run()
-    assert result.published is not None
-    assert result.published["state"] == "success"
-
-
 def test_an_unreadable_fork_check_list_publishes_a_stamped_pending(runner: Runner) -> None:
     result = _recheck_runner(runner, "completed", fork=True, fail_fork_checks=True).run()
     assert result.published is not None
     assert result.published["state"] == "pending"
     assert result.published["description"].startswith(READ_FAILURE_TOKEN)
+    assert result.backoff == [2, 4]
 
 
 def test_a_same_repo_success_never_reads_the_fork_check_list(runner: Runner) -> None:
@@ -998,6 +1046,7 @@ def test_an_unreadable_lane_run_holds_anyway_and_stamps_the_read_failure(
     assert result.published["state"] == "pending"
     assert result.published["description"].startswith(READ_FAILURE_TOKEN + " ")
     assert _held(runner)
+    assert result.backoff == [2, 4]
 
 
 def test_a_failed_hold_fails_the_run_loud_and_does_not_retry(
@@ -1048,6 +1097,7 @@ def test_an_unreadable_re_check_publishes_a_stamped_pending(runner: Runner) -> N
     assert result.published is not None
     assert result.published["state"] == "pending"
     assert result.published["description"].startswith("[read-failed]")
+    assert result.backoff == [2, 4]
 
 
 def test_a_codeql_rerun_in_flight_holds_the_success(runner: Runner) -> None:
@@ -1117,6 +1167,28 @@ def test_no_dynamic_codeql_run_holds_nothing(runner: Runner) -> None:
     result = _recheck_runner(runner, "completed", codeql_runs_present=False).run()
     assert result.published is not None
     assert result.published["state"] == "success"
+
+
+def test_no_dynamic_run_does_not_refetch_the_runs_page_in_hand(runner: Runner) -> None:
+    """The head's check-runs name its CI run, already on the pull_request page
+    the re-check holds. With no dynamic run, that known run is not read again;
+    only a run the page does not hold is."""
+    _recheck_runner(runner, "completed", codeql_runs_present=False)
+    checks = json.loads((runner.fixtures / "fork_checks.json").read_text())
+    checks["check_runs"].append(
+        {
+            "id": 901,
+            "name": "test",
+            "status": "completed",
+            "conclusion": "success",
+            "details_url": "https://github.com/kirodotdev/KiroCrew/actions/runs/5/job/902",
+        }
+    )
+    (runner.fixtures / "fork_checks.json").write_text(json.dumps(checks))
+    result = runner.run()
+    assert result.published is not None
+    assert result.published["state"] == "success"
+    assert not [c for c in result.calls if "/actions/runs/5" in c], result.calls
 
 
 def _checked_in_codeql(
@@ -1209,6 +1281,7 @@ def test_an_unreadable_codeql_page_publishes_a_stamped_pending(runner: Runner) -
     assert result.published is not None
     assert result.published["state"] == "pending"
     assert result.published["description"].startswith("[read-failed]")
+    assert result.backoff == [2, 4]
 
 
 def test_an_unreadable_codeql_check_publishes_a_stamped_pending(runner: Runner) -> None:
@@ -1216,6 +1289,7 @@ def test_an_unreadable_codeql_check_publishes_a_stamped_pending(runner: Runner) 
     assert result.published is not None
     assert result.published["state"] == "pending"
     assert result.published["description"].startswith("[read-failed]")
+    assert result.backoff == [2, 4]
 
 
 def test_the_codeql_re_check_is_skipped_once_a_lane_already_downgraded(runner: Runner) -> None:

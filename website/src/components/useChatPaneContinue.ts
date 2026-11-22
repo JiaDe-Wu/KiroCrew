@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect, useMemo } from 'react'
 import { useAppSelector } from '../store'
-import { selectContinuable, selectTurnInterrupted } from '../store/chatSlice'
-import { newestErrorOwnsRecovery } from '../pages/chat/transcriptRenderers'
+import { selectContinuable, selectResumeInterrupted } from '../store/chatSlice'
+import { authRequiredIsNewest, newestErrorOwnsRecovery } from '../pages/chat/transcriptRenderers'
 import { useContinuePress } from '../hooks/useContinuePress'
 import type { ChatMessage } from '../types'
 
@@ -36,12 +36,14 @@ export function useChatPaneContinue({ slotKey, messages, turnRunning, sendPendin
 }) {
   const storeContinuable = useAppSelector((s) => selectContinuable(s, slotKey))
   const continuable = storeContinuable && !sendPending
-  const interrupted = useAppSelector((s) => selectTurnInterrupted(s, slotKey))
+  const interrupted = useAppSelector((s) => selectResumeInterrupted(s, slotKey))
   // The newest error row has a remedy of its own and has withheld Resume, since
   // a retry replays the rejection. The composer must not urge the press beneath
   // that card; typing still works. The rule is ChatPage's own, one predicate.
   // Memoised: the pane re-renders per keystroke.
   const cardOwnsRecovery = useMemo(() => newestErrorOwnsRecovery(messages), [messages])
+  // A sign-in error keeps Resume; the composer's hint names the sign-in first.
+  const resumeAfterSignIn = useMemo(() => authRequiredIsNewest(messages), [messages])
   const [continueError, setContinueError] = useState('')
   const { continuing, press } = useContinuePress({
     slot: slotKey,
@@ -63,6 +65,7 @@ export function useChatPaneContinue({ slotKey, messages, turnRunning, sendPendin
     continuable,
     interrupted,
     composerResume: continuable && interrupted && !cardOwnsRecovery,
+    resumeAfterSignIn,
     continuing,
     onContinue,
     continueError,

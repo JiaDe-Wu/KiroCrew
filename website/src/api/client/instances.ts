@@ -14,6 +14,9 @@ export interface InstanceTunnelStatus {
   local_port?: number
   remote_port?: number
   error?: string
+  /** The gateway's name for the cause of `error`, when it has one; `error` is
+   *  then the raw detail (see `remoteCrewTunnelError.tsx`). */
+  error_code?: string
   connected_at?: number
   token_ttl_remaining?: number
   /** Seconds the CURRENT token was issued for -- what `token_ttl_remaining`
@@ -29,7 +32,13 @@ export interface InstanceTunnelStatus {
       | 'ok'
       | 'not_connected'
       | 'ssh_unreachable'
+      | 'ssh_client_missing'
       | 'ssm_unreachable'
+      | 'ssm_target_missing'
+      | 'ssm_access_denied'
+      | 'ssm_user_unknown'
+      | 'remote_wrong_port'
+      | 'remote_not_installed'
       | 'remote_down'
       | 'tunnel_down'
       | 'unknown'
@@ -79,6 +88,9 @@ export interface InstanceView {
   was_connected: boolean
   /** The owner turned this crew off: no tunnel is opened for it until enabled. */
   disabled?: boolean
+  /** The owner stopped this crew's EC2 instance from the panel: no tunnel is
+   *  opened for it until the panel's Start clears this. */
+  cloud_stopped?: boolean
   status: InstanceTunnelStatus
 }
 
@@ -141,7 +153,28 @@ export function crewPeerUrl(instanceId: string, path: string): string {
   return '/api/instances/' + encodeURIComponent(instanceId) + '/proxy/' + path
 }
 
-export function createInstancesEndpoints({ get, post, del, patch, j, jfetch: fetch, jInstancesDisabled, sessionKeyHeader: _sk }: ClientTransport) {
+/** One remote Crew the person can open through the Kiro relay. Never carries a token. */
+export interface RelayCrewEntry {
+  endpointId: string
+  name: string
+  crewType: string
+  presence: string
+  relayConnectionStatus: string
+  crewUrl: string
+  /** The Crew's last lease renewal in epoch seconds, or null when the control plane gave none. */
+  lastSeenAt?: number | null
+  /** A team Crew announced to this person that they have not opened or seen listed yet. */
+  unseen?: boolean
+}
+
+/** The kind of Kiro account the crews list was read for, only when the gateway proved it
+ *  unchanged across the read. `startUrl` is the Identity Center portal. No e-mail. */
+export interface RelayViewerAccount {
+  accountType: string
+  startUrl?: string
+}
+
+export function createInstancesEndpoints({ get, post, del, patch, j, jfetch: fetch, jInstancesDisabled, jRelayViewer, sessionKeyHeader: _sk }: ClientTransport) {
   const registryAndTransfer = {
     // Instances (multi-instance management) — owner-only, gated by instances.enabled.
     // listInstances throws ApiError(403) when the feature is disabled; callers
@@ -157,6 +190,16 @@ export function createInstancesEndpoints({ get, post, del, patch, j, jfetch: fet
     // endpoint's other 403s (a non-owner caller, a Slack-origin request) still
     // journal — they are real authorization failures and a reader needs them.
     listInstances: () => get('/api/instances').then(jInstancesDisabled) as Promise<{ active: boolean; instances: InstanceView[]; warm_set_cap: number; default_destination?: string; sso: SsoStatus }>,
+    // Remote Crews reachable through the Kiro relay. Its routine refusals (signed out,
+    // remote access off, a build that keeps it off) throw but are not journaled.
+    // `offDomain`: how many listed Crews the dev relay domain setting alone left out.
+    relayViewerCrews: () => get('/api/relay-viewer/crews').then(jRelayViewer) as Promise<{ crews: RelayCrewEntry[]; account?: RelayViewerAccount; offDomain?: number }>,
+    // A browser tab's open: the gateway keeps the grant and answers only the tab's URL.
+    relayViewerBrowserOpen: (endpointId: string) =>
+      post('/api/relay-viewer/browser-open', { endpointId }).then(j) as Promise<{ url: string }>,
+    // Clears the dot of each named Crew; an ID the gateway does not hold is ignored.
+    relayViewerCrewsSeen: (endpointIds: string[]) =>
+      post('/api/relay-viewer/crews/seen', { endpointIds }).then(j) as Promise<{ ok: boolean }>,
     addInstance: (body: AddInstanceBody) => post('/api/instances', body).then(j) as Promise<InstanceView>,
     updateInstance: (id: string, body: Partial<AddInstanceBody>, opts?: { signal?: AbortSignal }) =>
       patch('/api/instances/' + encodeURIComponent(id), body, undefined, opts?.signal).then(j) as Promise<InstanceView>,
@@ -174,6 +217,14 @@ export function createInstancesEndpoints({ get, post, del, patch, j, jfetch: fet
       post('/api/instances/' + encodeURIComponent(id) + '/refresh-token').then(j) as Promise<
         InstanceTunnelStatus & { token?: string }
       >,
+    /** A token for the crew's pane naming `embedParentPort`, the port THIS page is
+     *  served on, with the gateway's forward it pairs with. Stores nothing on the
+     *  gateway; `own_page` says the page is the gateway's own (lib/paneCredential). */
+    embedInstanceToken: (id: string, embedParentPort: number) =>
+      post('/api/instances/' + encodeURIComponent(id) + '/embed-token', {
+        embed_parent_port: embedParentPort,
+        own_page: true,
+      }).then(j) as Promise<{ token: string; port: number; ttl: string }>,
     disconnectInstance: (id: string) =>
       post('/api/instances/' + encodeURIComponent(id) + '/disconnect').then(j) as Promise<{
         disconnected: string

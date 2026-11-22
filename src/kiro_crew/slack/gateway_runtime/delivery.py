@@ -32,8 +32,10 @@ if TYPE_CHECKING:
         CronJob,
         GatewayOrchestrator,
         PostedOptions,
+        _send_to_channel_target,
         asyncio,
         channel_namespace_of,
+        derive_caller_app,
         logger,
         open_dm_with_retry,
         parse_session_key,
@@ -55,6 +57,23 @@ async def _open_dm_with_retry(
         context=f"Cron '{job_name}'",
         max_attempts=max_attempts,
     )
+
+
+def _cron_dm_user(self: GatewayOrchestrator, job: CronJob) -> str:
+    """The Slack user a channel-less cron's result or failure alert is DM'd to.
+
+    ``created_by`` is the Slack user id of whoever scheduled the job from Slack.
+    A job an app registers for itself carries ``app:<name>`` there instead
+    (``CronSDK``), and an imported one ``import:<source>``: owner TAGS, which no
+    Slack user id ever looks like. Handing one to ``conversations.open`` fails
+    with ``user_not_found`` on every run, so the result reaches nobody. A tagged
+    or empty ``created_by`` therefore falls back to the install's owner, who is
+    the person an app's or an import's jobs run for.
+    """
+    created_by = job.created_by or ""
+    if not created_by or ":" in created_by:
+        return self._owner_id
+    return created_by
 
 
 def _record_cron_delivery(self: GatewayOrchestrator, job: CronJob, result_hash: str) -> None:
@@ -216,8 +235,38 @@ def _cron_origin_key(self: GatewayOrchestrator, parent_key: str) -> str:
     return origin if isinstance(origin, str) else ""
 
 
+def _cron_channel_pin(
+    self: GatewayOrchestrator, parent_key: str, *, pin: tuple[str, str] | None = None
+) -> tuple[str, str, str] | None:
+    """The ``(channel_type, target_id, app)`` of the pin on the job behind *parent_key*.
+
+    ``app`` is the app that created the job (``""`` for the person), read by the
+    same rule that names a ``cron:`` caller's app on a request, so the send asks
+    that app's own messaging grant as every proactive leg does. ``None`` for a
+    job with no pin, a non-cron key or an unknown job.
+
+    A caller holding the job passes its ``(channel_type, target_id)`` as *pin* (a
+    script run, the pair it launched with); the stored pair is read only when no
+    *pin* is given. A pin whose job is gone resolves to None.
+    """
+    if not parent_key.startswith("cron:") or self.cron_svc is None:
+        return None
+    job = self.cron_svc.get_job(parent_key.split(":", 2)[1])
+    if job is None:
+        return None
+    channel_type, target_id = pin if pin is not None else (job.channel_type, job.target_id)
+    if not (channel_type and target_id):
+        return None
+    return channel_type, target_id, derive_caller_app(None, parent_key, [job])
+
+
 async def _deliver_cron_to_channel(
-    self: GatewayOrchestrator, origin_key: str, text: str, *, actor_key: str
+    self: GatewayOrchestrator,
+    origin_key: str,
+    text: str,
+    *,
+    actor_key: str,
+    pin: tuple[str, str] | None = None,
 ) -> bool:
     """Deliver cron output to the non-Slack channel that owns *origin_key*.
 
@@ -243,8 +292,35 @@ async def _deliver_cron_to_channel(
     callers stand their Slack leg down, because one run notifying one operator
     twice is how notifications become noise. An explicit ``job.channel`` is a
     destination the user pinned and takes precedence over both.
+
+    So is the job's ``channel_type``/``target_id`` pin, and it replaces the origin
+    conversation here: it is sent through ``send_message``'s explicit-target leg,
+    whose gates (transport, proactive send, the creating app's messaging grant,
+    ``channels`` governance, the transport's allow-list) are re-run under
+    *actor_key*, the job's own key. A script run passes the pair it launched with
+    as *pin*, so its output goes where its grant fingerprint bound it. A pin whose
+    job is gone delivers nothing, never to the origin.
     """
-    if not origin_key or not text.strip():
+    if not text.strip():
+        return False
+    pinned = self._cron_channel_pin(actor_key, pin=pin)
+    if pinned is None and pin is not None and all(pin):
+        # Deleted mid-run: never its origin, and its creating app is unknown.
+        return False
+    if pinned is not None:
+        if self.dashboard_state is None:
+            return False
+        channel_type, target_id, app = pinned
+        sent = await _send_to_channel_target(
+            self.dashboard_state,
+            channel_type,
+            target_id,
+            text,
+            caller_session=actor_key,
+            request_app=app,
+        )
+        return sent.status == 200
+    if not origin_key:
         return False
     resolved = self._channel_reply_link(origin_key)
     if resolved is None:
@@ -292,11 +368,11 @@ def _cron_job_is_silent(self: GatewayOrchestrator, parent_key: str) -> bool:
 
     ``_deliver_cron_response`` routes a cron
     session's post-subagent-completion turn to its channel and to Slack,
-    gated on ``info.silent``, the *sub-agent's* flag. That flag is never set from
-    the parent cron's ``silent`` setting (``spawn`` defaults it False and
-    the spawn queue tuple doesn't carry it), so a silent cron's subagent
-    completions still reached Slack. The cron job's own ``silent`` flag is
-    the source of truth, so resolve it here. ``parent_key`` is
+    gated on ``info.silent``, the *sub-agent's* flag. Admission resolves that
+    flag from the parent cron's own ``silent`` setting
+    (``messaging_api/spawn.py::_parent_run_is_silent``); this live read stays
+    beside it for a run admitted before the job turned silent and for a run
+    whose row predates the admission rule. ``parent_key`` is
     ``cron:{job_id}`` or ``cron:{job_id}:{run_id}``.
     """
     if not parent_key.startswith("cron:") or self.cron_svc is None:

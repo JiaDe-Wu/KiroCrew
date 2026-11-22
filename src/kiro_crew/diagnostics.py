@@ -25,7 +25,6 @@ import logging
 import os
 import platform
 import re
-import socket
 import stat as stat_module
 import subprocess
 import sys
@@ -37,7 +36,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlencode
 
-from kiro_crew import __version__, agent_scratch, platform_compat, release_channel
+from kiro_crew import (
+    __version__,
+    agent_scratch,
+    diagnostics_host_name,
+    platform_compat,
+    release_channel,
+)
 from kiro_crew.cli_log_files import boot_log_paths
 from kiro_crew.config.loader import config_dir
 from kiro_crew.dashboard import crash_dump_store
@@ -281,12 +286,6 @@ def _home_prefixes() -> list[str]:
 # delimiter such as a PATH-list colon, a trailing comma, a closing paren or a
 # sentence-final dot.
 _PREFIX_BOUNDARY = r"(?![\w-]|\.\w)"
-#: The end of a host-name match: only a name character continues it, so
-#: ``jane-laptop2`` is another machine while ``jane-laptop.lan`` still matches.
-_HOST_BOUNDARY = r"(?![A-Za-z0-9_-])"
-#: A host name this long is replaced anywhere it appears; a shorter one only as a
-#: whole word, so a generic short name does not rewrite ordinary words.
-_HOST_ANYWHERE_MIN = 6
 
 
 def _collapse_home_prefixes(text: str) -> tuple[str, int]:
@@ -308,56 +307,16 @@ def _collapse_home_prefixes(text: str) -> tuple[str, int]:
     """
     count = 0
     for prefix in _home_prefixes():
-        pattern = re.compile(re.escape(prefix) + _PREFIX_BOUNDARY, re.IGNORECASE)
+        # Between segments any run of separators matches, so every escaping depth
+        # collapses. A leading root stays one separator: a run there would swallow
+        # ``file://`` and rescan every position of a long run.
+        first, *rest = re.split(r"[\\/]+", prefix.rstrip("\\/"))
+        body = r"[\\/]+".join(re.escape(s) for s in rest)
+        lead = (re.escape(first) + r"[\\/]+" if rest else re.escape(first)) if first else r"[\\/]"
+        pattern = re.compile(lead + body + _PREFIX_BOUNDARY, re.IGNORECASE)
         text, n = pattern.subn("~", text)
         count += n
     return text, count
-
-
-def _replace_host_name(text: str) -> tuple[str, int]:
-    """Replace this machine's host names in *text* with ``<host>``.
-
-    Crash-dump headers and the ``last-healthy-boot`` marker record a PID domain
-    that starts with the host name, and a work machine's name often carries its
-    user's name or an asset tag. That domain is cached at boot, so both it and the
-    live name are replaced, each in full and in its short form before the first
-    ``.``: a name of ``_HOST_ANYWHERE_MIN`` characters or more wherever it appears,
-    a shorter one only as a whole segment. A name an earlier gateway process had
-    is out of scope and survives.
-    """
-    own = crash_dump_store.current_process_identity()[0].partition("/")[0]
-    names = {
-        name
-        for full in (socket.gethostname(), own)
-        for name in (full, full.partition(".")[0])
-        if name
-    }
-    # A name of _HOST_ANYWHERE_MIN characters or more is specific enough to go
-    # wherever it sits, whatever precedes it (an escape, a control sequence, a
-    # percent-encoded byte, a word a stripped control byte joined it onto). A
-    # shorter one would rewrite ordinary words, so it stays a whole segment:
-    # it starts after a non-name character other than `\` (so the `t` of `\t` is
-    # never taken for the name), a serialized escape (`\n`, `\x1b`,
-    # `\u001b`) or an ANSI control sequence (`[32m`, `[?25h`). Longest first,
-    # so a full name wins over its short form.
-    by_length = sorted(names, key=len, reverse=True)
-    long_names = [n for n in by_length if len(n) >= _HOST_ANYWHERE_MIN]
-    short_names = [n for n in by_length if len(n) < _HOST_ANYWHERE_MIN]
-    total = 0
-    if long_names:
-        anywhere = re.compile(
-            rf"(?:{'|'.join(map(re.escape, long_names))}){_HOST_BOUNDARY}", re.IGNORECASE
-        )
-        text, total = anywhere.subn("<host>", text)
-    if short_names:
-        whole = re.compile(
-            rf"(^|[^A-Za-z0-9_\\-]|\\(?:x[0-9A-Fa-f]{{2}}|u[0-9A-Fa-f]{{4}}|[A-Za-z])|\[[0-9;?]*[A-Za-z])"
-            rf"(?:{'|'.join(map(re.escape, short_names))}){_HOST_BOUNDARY}",
-            re.IGNORECASE,
-        )
-        text, n = whole.subn(r"\1<host>", text)
-        total += n
-    return text, total
 
 
 def _scrub_bundle(text: str) -> tuple[str, int, int]:
@@ -383,13 +342,14 @@ def _scrub_bundle(text: str) -> tuple[str, int, int]:
     """
     # The host pass runs only AFTER the credential scrub and the home collapse:
     # replaced first, a host name that is also a word a credential rule keys on
-    # would hide that credential from the rule. A long name is matched anywhere, so a control
-    # byte the scrub strips cannot hide it; a short name joined onto a word that
-    # way is a known gap (shortcut: whole-word only for names under
-    # _HOST_ANYWHERE_MIN, upgrade if a short-name leak is reported).
+    # would hide that credential from the rule. The scrub strips hidden
+    # characters, which can join a short name onto the word in front of it, so
+    # those joins are read from the text before the scrub.
+    names = diagnostics_host_name.host_names()
+    joined = diagnostics_host_name.find_joined_host_words(text, names)
     text, secrets = _scrub(text)
     text, collapses = _collapse_home_prefixes(text)
-    text, replaced = _replace_host_name(text)
+    text, replaced = diagnostics_host_name.replace_host_names(text, names, joined)
     return text, secrets, collapses + replaced
 
 
@@ -404,14 +364,18 @@ def _kiro_log_dirs() -> list[Path]:
     guessing which one is authoritative per platform, try every candidate and
     take the first that actually exists; ``KIRO_CHAT_LOG_FILE`` overrides all of
     them for anyone running a non-default layout. Windows sets ``TEMP``/``TMP``
-    and usually leaves ``TMPDIR`` unset, so those follow ``TMPDIR``.
+    and usually leaves ``TMPDIR`` unset, so those follow ``TMPDIR``. The fixed
+    ``/tmp`` candidate is POSIX-only: on Windows it names ``\\tmp`` at the root
+    of the current drive, which kiro-cli does not use and any local account can
+    create.
     """
     out: list[Path] = []
     for env in ("XDG_RUNTIME_DIR", "TMPDIR", "TEMP", "TMP"):
         value = os.environ.get(env)
         if value:
             out.append(Path(value) / "kiro-log")
-    out.append(Path("/tmp") / "kiro-log")
+    if not platform_compat.IS_WINDOWS:
+        out.append(Path("/tmp") / "kiro-log")
     # Preserve order while dropping duplicates (TMPDIR is often /tmp), and drop
     # symlinked candidates: a symlinked `kiro-log` would resolve to off-tree
     # files that are not themselves symlinks, so the per-file guard would pass
@@ -1229,7 +1193,18 @@ _INSTALL_OPTIONS = {
 _CHANNEL_OPTIONS = release_channel.CHANNEL_FORM_OPTIONS
 
 
-def _versions_text(note: str, identity: release_channel.Provenance) -> str:
+#: ``versions.txt``'s ``version_alignment:`` in a bundle the gateway collects: its own
+#: files are not the selected package of a side-by-side install (a promoted update
+#: whose restart was put off, a desktop update), so comparing them would read aligned.
+_ALIGNMENT_NOT_CHECKED = (
+    "not checked (collected inside the gateway, which cannot read a side-by-side"
+    " install's selected package; `kirocrew doctor --bundle` compares them)"
+)
+
+
+def _versions_text(
+    note: str, identity: release_channel.Provenance, version_alignment: str | None = None
+) -> str:
     # Private, so it keeps everything the public report may not: the raw stamp
     # (a repackager's build id), the distribution metadata it was weighed
     # against, and the channel record -- the evidence behind `channel:`.
@@ -1241,6 +1216,7 @@ def _versions_text(note: str, identity: release_channel.Provenance) -> str:
         f"distribution_version: {identity.distribution or 'unavailable'}",
         f"channel: {identity.channel or 'unknown'}",
         f"channel_record: {identity.recorded or 'absent'}",
+        f"version_alignment: {version_alignment or _ALIGNMENT_NOT_CHECKED}",
         f"kiro_cli_version: {_kiro_cli_version()}",
         f"kas_engine: {_kas_engine_version()}",
         f"python: {platform.python_version()}",
@@ -1401,8 +1377,8 @@ def terminal_issue_url(result: BundleResult, note: str = "") -> str:
     The dashboard renders `BundleResult.github_issue_url` out of a JSON response
     that no redactor scans, so it keeps the full pre-filled body. A link PRINTED
     to stdout has no such guarantee — it gets selected into chat, captured from a
-    shell tool, or relayed by an agent, and on those paths the pre-filled variant
-    is replaced wholesale by ``[REDACTED: suspicious URL to github.com]``. This
+    shell tool, or relayed by an agent, and on those paths a long pre-filled query
+    reads as data carried out (``security.exfil.scan_exfiltration_urls``). This
     variant trades the pre-filled body for a link that arrives intact. An edition
     tracker gets the same ``prefill=False`` signal and owns keeping its query short.
     """
@@ -1431,6 +1407,7 @@ def collect_bundle(
     note: str = "",
     include_logs: bool = True,
     output_dir: Path | None = None,
+    version_alignment: str | None = None,
 ) -> BundleResult:
     """Collect, redact, and zip a diagnostics bundle.
 
@@ -1440,6 +1417,9 @@ def collect_bundle(
         include_logs: when False, only versions + crash reports are bundled
             (no full gateway / chat logs) for a lighter, lower-sensitivity zip.
         output_dir: where to write the zip. Defaults to ``<data_home>/diagnostics``.
+        version_alignment: the running gateway's version against the selected
+            package's, as ``kirocrew doctor --bundle`` reads it. None, the
+            dashboard's collector, records it as not checked.
 
     Returns:
         :class:`BundleResult` with the zip path and a pre-filled issue URL.
@@ -1503,9 +1483,22 @@ def collect_bundle(
     text_sources.append(("crash.log", home / "logs" / "crash.log", False))
     dumps_dir = home / "logs" / "crash-dumps"
     if _usable_dir(dumps_dir):
+        # The sweep keeps an unexplained exit's header on purpose, and a clean-exit
+        # marker is empty: neither may push a stall's stacks out of the bundle, so
+        # markers stay out and those headers only fill the slots left over.
+        try:
+            unexplained = set(crash_dump_store.unexplained_exits(dumps_dir))
+        except OSError:
+            unexplained = set()  # an ordering hint only; the bundle goes on without it
         dumps = sorted(
-            (p for p in dumps_dir.glob("*") if p.is_file() and not p.is_symlink()),
-            key=lambda p: p.stat().st_mtime,
+            (
+                p
+                for p in dumps_dir.glob("*")
+                if p.is_file()
+                and not p.is_symlink()
+                and not p.name.endswith(crash_dump_store.CLEAN_EXIT_SUFFIX)
+            ),
+            key=lambda p: (p not in unexplained, p.stat().st_mtime),
             reverse=True,
         )[:_MAX_CRASH_DUMPS]
         for d in dumps:
@@ -1529,7 +1522,7 @@ def collect_bundle(
     )
     with os.fdopen(_fd, "wb") as _raw, zipfile.ZipFile(_raw, "w", zipfile.ZIP_DEFLATED) as zf:
         # Generated members first.
-        versions = _versions_text(note, identity)
+        versions = _versions_text(note, identity, version_alignment)
         # ``versions.txt`` carries the absolute ``data_home`` path
         # unconditionally, which embeds the OS login. Run it through the bundle
         # scrub stack so the archive does not ship a local path in a file whose

@@ -24,6 +24,8 @@ import { describe, it, expect, vi, beforeEach, beforeAll } from 'vitest'
 vi.mock('@radix-ui/react-dropdown-menu', async () => await import('./__mocks__/@radix-ui/react-dropdown-menu'))
 
 import { screen, waitFor, fireEvent, act, within } from '@testing-library/react'
+import { i18nT } from '../i18n/t'
+import { confirmAction } from './confirmAction'
 import userEvent from '@testing-library/user-event'
 import ChannelPage from '../pages/ChannelPage'
 import { renderWithProviders } from './helpers'
@@ -317,6 +319,24 @@ describe('ChannelPage — message list', () => {
     mockApi([channelOf({ messages: [message({ reply_count: 2 })] })])
     await renderPage()
     expect(screen.getByRole('button', { name: '2 replies' })).toBeInTheDocument()
+  })
+
+  it('counts a thread reply that arrives live on its parent, once', async () => {
+    mockApi([channelOf({ messages: [message({ id: 'p1', content: 'Root finding' })] })])
+    await renderPage()
+    // Let the channel's own read land first, so it cannot overwrite the live reply.
+    await waitFor(() => expect(vi.mocked(api).channelGet).toHaveBeenCalledWith('ch1'))
+    await act(async () => { await vi.mocked(api).channelGet.mock.results[0].value })
+    expect(screen.queryByRole('button', { name: /repl(y|ies)$/ })).not.toBeInTheDocument()
+
+    const reply = message({ id: 'r1', thread_id: 'p1', content: 'Follow-up detail' })
+    wsEvent('channel_message', { channel_id: 'ch1', message: reply })
+    expect(await screen.findByRole('button', { name: '1 reply' })).toBeInTheDocument()
+
+    // The same event again (a channel read that already held it) adds nothing.
+    wsEvent('channel_message', { channel_id: 'ch1', message: reply })
+    wsEvent('channel_message', { channel_id: 'ch1', message: message({ id: 'r2', thread_id: 'p1', content: 'More' }) })
+    expect(await screen.findByRole('button', { name: '2 replies' })).toBeInTheDocument()
   })
 })
 
@@ -762,20 +782,116 @@ describe('ChannelPage — New Channel dialog', () => {
 
 describe('ChannelPage — close channel', () => {
   it('closes the channel on confirm and clears the selection', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     await renderPage()
     await userEvent.click(screen.getByTitle('Close channel'))
+    const dialog = await screen.findByRole('dialog', { name: 'Close channel' })
+    expect(within(dialog).getByText(i18nT('pages.channelPage.close_this_channel_all_agents_will_be_dismissed'), { selector: 'p' })).toBeInTheDocument()
+    await confirmAction('Close')
     await waitFor(() => expect(vi.mocked(api).channelClose).toHaveBeenCalledWith('ch1'))
     await waitFor(() => expect(screen.getByText('Create a channel to get started')).toBeInTheDocument())
+  })
+
+  it('returns to the narrow channel list after confirming the selected channel close', async () => {
+    const originalMatchMedia = window.matchMedia.bind(window)
+    const media = vi.spyOn(window, 'matchMedia').mockImplementation(query => query === '(max-width: 767px)'
+      ? { matches: true, media: query, addEventListener: vi.fn(), removeEventListener: vi.fn() } as unknown as MediaQueryList
+      : originalMatchMedia(query))
+    try {
+      await renderPage()
+      const list = screen.getByText('+ New').parentElement!.parentElement!
+      fireEvent.click(screen.getAllByText('Gamma rollout').find(node => node.tagName !== 'H2')!)
+      expect(list).toHaveClass('hidden')
+      await userEvent.click(screen.getByTitle('Close channel'))
+      await confirmAction('Close')
+      await waitFor(() => expect(vi.mocked(api).channelClose).toHaveBeenCalledWith('ch1'))
+      await waitFor(() => expect(list).not.toHaveClass('hidden'))
+      expect(screen.getByText('+ New')).toBeInTheDocument()
+      expect(screen.getByText('No channels yet')).toBeInTheDocument()
+    } finally {
+      media.mockRestore()
+    }
+  })
+
+  it('returns to the narrow list when channel_closed arrives before the close response', async () => {
+    const originalMatchMedia = window.matchMedia.bind(window)
+    const media = vi.spyOn(window, 'matchMedia').mockImplementation(query => query === '(max-width: 767px)'
+      ? { matches: true, media: query, addEventListener: vi.fn(), removeEventListener: vi.fn() } as unknown as MediaQueryList
+      : originalMatchMedia(query))
+    let finishClose: () => void = () => {}
+    vi.mocked(api).channelClose = vi.fn().mockReturnValue(new Promise<void>(resolve => { finishClose = resolve }))
+    try {
+      await renderPage()
+      const list = screen.getByText('+ New').parentElement!.parentElement!
+      fireEvent.click(screen.getAllByText('Gamma rollout').find(node => node.tagName !== 'H2')!)
+      expect(list).toHaveClass('hidden')
+      await userEvent.click(screen.getByTitle('Close channel'))
+      await confirmAction('Close')
+      await waitFor(() => expect(vi.mocked(api).channelClose).toHaveBeenCalledWith('ch1'))
+      wsEvent('channel_closed', { channel_id: 'ch1' })
+      await screen.findByText('No channels yet')
+      expect(list).toHaveClass('hidden')
+      await act(async () => { finishClose() })
+      await waitFor(() => expect(list).not.toHaveClass('hidden'))
+    } finally {
+      media.mockRestore()
+    }
+  })
+
+  it('returns to the narrow list, not to a fallback channel, when channel_closed beats the close response', async () => {
+    mockApi([channelOf(), channelOf({ id: 'ch2', topic: 'Other rollout' })])
+    const originalMatchMedia = window.matchMedia.bind(window)
+    const media = vi.spyOn(window, 'matchMedia').mockImplementation(query => query === '(max-width: 767px)'
+      ? { matches: true, media: query, addEventListener: vi.fn(), removeEventListener: vi.fn() } as unknown as MediaQueryList
+      : originalMatchMedia(query))
+    let finishClose: () => void = () => {}
+    vi.mocked(api).channelClose = vi.fn().mockReturnValue(new Promise<void>(resolve => { finishClose = resolve }))
+    try {
+      await renderPage()
+      const list = screen.getByText('+ New').parentElement!.parentElement!
+      fireEvent.click(screen.getAllByText('Gamma rollout').find(node => node.tagName !== 'H2')!)
+      expect(list).toHaveClass('hidden')
+      await userEvent.click(screen.getByTitle('Close channel'))
+      await confirmAction('Close')
+      await waitFor(() => expect(vi.mocked(api).channelClose).toHaveBeenCalledWith('ch1'))
+      wsEvent('channel_closed', { channel_id: 'ch1' })
+      await screen.findByRole('heading', { name: 'Other rollout' })
+      await act(async () => { finishClose() })
+      await waitFor(() => expect(list).not.toHaveClass('hidden'))
+    } finally {
+      media.mockRestore()
+    }
+  })
+
+  it('returns to the narrow list when the closed channel was a fallback shown after the selected one was closed elsewhere', async () => {
+    mockApi([channelOf(), channelOf({ id: 'ch2', topic: 'Other rollout' })])
+    const originalMatchMedia = window.matchMedia.bind(window)
+    const media = vi.spyOn(window, 'matchMedia').mockImplementation(query => query === '(max-width: 767px)'
+      ? { matches: true, media: query, addEventListener: vi.fn(), removeEventListener: vi.fn() } as unknown as MediaQueryList
+      : originalMatchMedia(query))
+    try {
+      await renderPage()
+      const list = screen.getByText('+ New').parentElement!.parentElement!
+      fireEvent.click(screen.getAllByText('Gamma rollout').find(node => node.tagName !== 'H2')!)
+      wsEvent('channel_closed', { channel_id: 'ch1' })
+      await screen.findByRole('heading', { name: 'Other rollout' })
+      expect(list).toHaveClass('hidden')
+      await userEvent.click(screen.getByTitle('Close channel'))
+      await confirmAction('Close')
+      await waitFor(() => expect(vi.mocked(api).channelClose).toHaveBeenCalledWith('ch2'))
+      await waitFor(() => expect(list).not.toHaveClass('hidden'))
+      expect(screen.getByText('No channels yet')).toBeInTheDocument()
+    } finally {
+      media.mockRestore()
+    }
   })
 
   it('keeps the channel and reports it when the close request fails', async () => {
     // Removing the channel under a "Failed to close channel" notice would show
     // the action as done; a refused close leaves the list as it was.
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     vi.mocked(api).channelClose = vi.fn().mockRejectedValue(new Error('already gone'))
     await renderPage()
     await userEvent.click(screen.getByTitle('Close channel'))
+    await confirmAction('Close')
     const notice = await screen.findByTestId('channel-error')
     expect(notice).toHaveTextContent('Failed to close channel')
     expect(notice).toHaveTextContent('already gone')
@@ -783,10 +899,23 @@ describe('ChannelPage — close channel', () => {
     expect(screen.queryByText('No channels yet')).not.toBeInTheDocument()
   })
 
-  it('does nothing when the confirm is cancelled', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(false)
+  it('closes the channel the dialog was raised for and keeps showing the channel opened while the dialog was up', async () => {
+    mockApi([channelOf(), channelOf({ id: 'ch2', topic: 'Other rollout' }), channelOf({ id: 'ch3', topic: 'Third rollout' })])
     await renderPage()
     await userEvent.click(screen.getByTitle('Close channel'))
+    await screen.findByRole('dialog')
+    fireEvent.click(screen.getByText('Third rollout'))
+    await screen.findByRole('heading', { name: 'Third rollout' })
+    await confirmAction('Close')
+    await waitFor(() => expect(vi.mocked(api).channelClose).toHaveBeenCalledWith('ch1'))
+    expect(screen.getByRole('heading', { name: 'Third rollout' })).toBeInTheDocument()
+  })
+
+  it('does nothing when the confirm is cancelled', async () => {
+    await renderPage()
+    await userEvent.click(screen.getByTitle('Close channel'))
+    const dialog = await screen.findByRole('dialog')
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
     expect(vi.mocked(api).channelClose).not.toHaveBeenCalled()
     expect(screen.getByRole('heading', { name: 'Gamma rollout' })).toBeInTheDocument()
   })

@@ -9,10 +9,17 @@ channel TOP-LEVEL (a code channel is one session, never a thread).
 
 **What the session starts with** (:func:`resolve_session_spec`): the order
 :func:`kiro_crew.slack.features.resolve_code_channel_session` applies --
-agent from the explicit default, else the default folder's ``default_agent``,
-else Slack's default agent; model and effort explicit or the agent's own; the
+agent: the conductor mode agent while "Always use conductor mode" is on (where
+conductor mode is offered), else the explicit default, else the default folder's
+``default_agent``, else Slack's default agent; model and effort explicit or the agent's own; the
 default folder when it exists; project from the folder chain, else the origin
-thread's ``!project``, else the dashboard default.
+thread's ``!project``, else the dashboard default; approval mode explicit, else
+``ask``. A ``trust_reads`` / ``trust`` mode is put on the new slot through
+:func:`kiro_crew.dashboard.slot_approval_seed.seed_slot_approval` -- the same
+per-slot flags and ``mode_change:<mode>`` SEL record the dashboard picker
+writes -- once the session is bound, so the channel's first turn already runs
+in it. The user can change it on the session afterwards; like every slot's
+trust it is in-memory, so a gateway restart returns the session to asking.
 
 **How Slack reaches it.** The session's Slack link is recorded against the ts
 of the kickoff message this gateway posts when it binds the channel (the
@@ -70,6 +77,12 @@ class SessionSpec:
     reasoning_effort: str = ""
     folder_id: str = ""
     project_dir: str = ""
+    #: ``ask`` / ``trust_reads`` / ``trust``.
+    approval_mode: str = features.CODE_CHANNEL_APPROVAL_ASK
+
+
+#: The SEL caller a code channel's approval seed is recorded under.
+APPROVAL_SEED_CALLER = "slack:code_channel"
 
 
 class BindingUnavailable(Exception):
@@ -79,6 +92,21 @@ class BindingUnavailable(Exception):
 def _slack_default_agent(cfg: Any) -> str:
     agent = getattr(getattr(cfg, "agent", None), "default_agent", "")
     return agent.strip() if isinstance(agent, str) else ""
+
+
+def resolved_default_agent(cfg: Any) -> str:
+    """``agent.default_agent`` as a new dashboard chat resolves it, or ``""`` when unset.
+
+    Through :func:`~kiro_crew.config.loader.default_template` (a removed spec falls
+    back to the managed default) and :func:`dispatch_kiro_agent` (a file stem
+    becomes the declared name), the stamp ``_default_template_stamp`` writes.
+    Filesystem-backed: run it through ``asyncio.to_thread``.
+    """
+    if not _slack_default_agent(cfg):
+        return ""
+    from kiro_crew.config.loader import default_template, dispatch_kiro_agent
+
+    return dispatch_kiro_agent(default_template(cfg))
 
 
 def _origin_project(origin_thread_ts: str) -> str:
@@ -108,15 +136,29 @@ async def resolve_session_spec(state: Any, cfg: Any, *, origin_thread_ts: str = 
         folders = await _read_folders(state)
     origin_project = _origin_project(origin_thread_ts)
     defaults = features.code_channel_defaults(cfg)
+    # The ``agent`` section from the live config watcher: the gateway's own config
+    # object (*cfg*, ``slack_cfg``) takes only the Slack fields on a reload, so its
+    # ``agent.crew_mode_agent`` and ``agent.default_agent`` are the boot values.
+    # *cfg* stands in until the watcher has a snapshot.
+    from kiro_crew.config import live
+
+    agent_cfg = live.snapshot() or cfg
+    conductor_agent = features.code_channel_conductor_agent(cfg, agent_cfg=agent_cfg)
+    if conductor_agent:
+        from kiro_crew.dashboard.slack_code_settings import conductor_overlay_unreadable
+
+        if await asyncio.to_thread(conductor_overlay_unreadable):
+            # config.local.json cannot be read, so whether it turns the switch off
+            # is unknown: off, read now (the live config may keep an older copy).
+            logger.info("code channel: config.local.json unreadable; conductor mode off")
+            conductor_agent = None
+    default_agent = await asyncio.to_thread(resolved_default_agent, agent_cfg)
     if not defaults.folder and state is not None and hasattr(state, "read_folders"):
         # Zero-config: file into the "Code channels" folder, created on first
-        # use (and again if the user deleted it) with the conductor as its
-        # default agent. The resolution order is unchanged -- an explicit
-        # default agent still wins over the folder's.
+        # use (and again if the user deleted it) with no default agent, so the
+        # session runs the owner's default agent unless something names another.
         try:
-            auto_id = await ensure_folder_path(
-                state, AUTO_FOLDER_PATH, default_agent=AUTO_FOLDER_AGENT
-            )
+            auto_id = await ensure_folder_path(state, AUTO_FOLDER_PATH)
         except BindingUnavailable as exc:
             # Two folders of that name: the settings page says so; the session
             # goes unfiled (the resolver's own rule).
@@ -129,21 +171,25 @@ async def resolve_session_spec(state: Any, cfg: Any, *, origin_thread_ts: str = 
     resolved = features.resolve_code_channel_session(
         defaults,
         folders,
-        slack_agent=_slack_default_agent(cfg),
+        slack_agent=default_agent,
         origin_project_dir=origin_project,
+        conductor_agent=conductor_agent,
     )
     if resolved.folder_missing:
         logger.info("code channel default folder does not exist; filing at top level")
     from kiro_crew.dashboard.slack_code_settings import default_agent_available
 
-    if await default_agent_available(defaults.agent, resolved.project_dir) is False:
+    if (
+        resolved.agent_source != "conductor"
+        and await default_agent_available(defaults.agent, resolved.project_dir) is False
+    ):
         # A saved default that is gone (its spec removed) is skipped, as the
         # settings preview shows: the folder's agent, then Slack's, runs instead.
         logger.info("code channel default agent %r no longer exists; inheriting", defaults.agent)
         resolved = features.resolve_code_channel_session(
             defaults,
             folders,
-            slack_agent=_slack_default_agent(cfg),
+            slack_agent=default_agent,
             origin_project_dir=origin_project,
             default_agent_available=False,
         )
@@ -159,12 +205,17 @@ async def resolve_session_spec(state: Any, cfg: Any, *, origin_thread_ts: str = 
     return SessionSpec(
         agent=resolved.agent or "",
         # The defaults picker offers templates only: a same-named crewmate must
-        # not take that pick. Folder and Slack defaults resolve as they do elsewhere.
-        agent_kind="template" if resolved.agent_source == "default" else "",
+        # not take that pick, nor the conductor mode agent (a template, as the
+        # dashboard's conductor mode switch picks it), nor ``agent.default_agent``
+        # (the default template, never a crewmate: ``default_template``). Now the
+        # zero-config path, it must not resolve to a Bot keyed by the same name.
+        # Only a folder's agent resolves its namespace as it does elsewhere.
+        agent_kind="template" if resolved.agent_source in ("default", "conductor", "slack") else "",
         model=resolved.model or "",
         reasoning_effort=resolved.reasoning_effort or "",
         folder_id=folder_id,
         project_dir=project,
+        approval_mode=resolved.approval_mode,
     )
 
 
@@ -204,6 +255,7 @@ async def create_bound_session(
         effective_session_key,
         slot_history_key,
     )
+    from kiro_crew.dashboard.slot_approval_seed import seed_slot_approval
     from kiro_crew.dashboard.slot_persistence import metadata_codec
     from kiro_crew.effort import is_valid_effort
 
@@ -334,6 +386,22 @@ async def create_bound_session(
         except BaseException:
             _retract(state, slot, anchor_ts, _sync_dashboard_slots)
             raise
+        # Bound and recorded: only now put the slot on its configured posture, so
+        # a retracted newborn never leaves a SEL record for a session that does
+        # not exist, and the published slot is already in it. ``ask`` is the
+        # starting posture and changes nothing. A channel the policy refuses
+        # (narrowed during the awaits above) gets no raised posture.
+        from kiro_crew.slack.code_channels import surface
+
+        if (
+            spec.approval_mode != features.CODE_CHANNEL_APPROVAL_ASK
+            and surface.channel_policy_refusal(
+                channel_id, operation="slack.code_channel.write", caller=APPROVAL_SEED_CALLER
+            )
+        ):
+            logger.info("code channel %s: approval mode not seeded (channel policy)", channel_id)
+        elif seed_slot_approval(state, slot, spec.approval_mode, caller=APPROVAL_SEED_CALLER):
+            logger.info("code channel %s: session starts in %s", channel_id, spec.approval_mode)
         state.push_slots_update()
     return slot
 
@@ -379,10 +447,9 @@ def _usable_project_dir(configured: str) -> str:
     return ""
 
 
-#: The sidebar folder zero-config code channels file into, and its agent: the
-#: resolver's own constants, so creation and resolution name the same folder.
+#: The sidebar folder zero-config code channels file into: the resolver's own
+#: constant, so creation and resolution name the same folder.
 AUTO_FOLDER_PATH = features.AUTO_FOLDER_NAME
-AUTO_FOLDER_AGENT = features.AUTO_FOLDER_AGENT
 
 
 async def _read_folders(state: Any) -> list[dict[str, Any]]:
@@ -469,6 +536,28 @@ def bound_slot(state: Any, binding: Binding) -> Any | None:
     if state is None or not hasattr(state, "get_linked_slot"):
         return None
     return state.get_linked_slot(binding.anchor_ts)
+
+
+def channel_session(state: Any, binding: Binding) -> Any | None:
+    """:func:`bound_slot`, only while it is still the session *binding* recorded.
+
+    The binding store is the gateway's own record; the slot's routing is read
+    back from its transcript, which an agent can rewrite. A change of the
+    channel's agent or approval mode acts on the slot only while its key is the
+    binding's ``session_key`` and its turns run on that same session: a code
+    channel's session is never linked to another, so a ``linked_session_key``
+    read back onto it names some other session and the change is refused.
+    """
+    from kiro_crew.dashboard.chat_utils import effective_session_key, session_key_for
+
+    slot = bound_slot(state, binding)
+    if slot is None or str(getattr(slot, "key", "") or "") != binding.session_key:
+        return None
+    if getattr(slot, "linked_session_key", ""):
+        return None
+    if effective_session_key(slot) != session_key_for(binding.session_key):
+        return None
+    return slot
 
 
 def active_binding(channel_id: str | None, thread_ts: str | None = None) -> Binding | None:
@@ -607,6 +696,20 @@ def check_anchor_handoff(thread_ts: str | None, slot_key: str) -> None:
         raise AnchorHandoffRefused(thread_ts or "")
 
 
+def no_reactions(channel_id: str | None) -> bool:
+    """Whether *channel_id* is a live code channel, which shows no per-message reactions.
+
+    A code channel's progress lives in Slack's own session status and the work
+    board, so the eyes / thinking / coding / done ladder is not added there. Every
+    other channel, DM and thread keeps it. Never raises (a store not loaded yet
+    reads as "not a code channel").
+    """
+    try:
+        return active_binding(channel_id) is not None
+    except Exception:
+        return False
+
+
 def mirror_post_thread(channel_id: str | None, thread_ts: str | None) -> str | None:
     """The ``thread_ts`` a dashboard-to-Slack mirror post uses.
 
@@ -653,6 +756,7 @@ async def notify_turn_start(
     *,
     source: str,
     on_bound: Callable[[], None] | None = None,
+    prompt: str = "",
 ) -> bool:
     """Fire turn-start hooks for a bound channel; True when it is one.
 
@@ -661,13 +765,16 @@ async def notify_turn_start(
     when the turn is cancelled part way through the start subscribers.
     """
     binding = active_binding(channel_id, thread_ts)
-    if binding is None:
+    if binding is None or binding.archived_at:
+        # An archived channel takes no turns: its session is a plain chat now.
         return False
     if on_bound is not None:
         on_bound()
     from kiro_crew.slack.code_channels.hooks import TurnEvent, fire_turn_start
 
-    await fire_turn_start(binding, TurnEvent(binding.channel_id, session_key, source=source))
+    await fire_turn_start(
+        binding, TurnEvent(binding.channel_id, session_key, source=source, prompt=prompt)
+    )
     return True
 
 

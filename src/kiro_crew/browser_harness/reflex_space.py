@@ -31,8 +31,8 @@ _TARGETED_LABELS = {
     "type": "Replace the text in one of the editable fields with one of the given values.",
     "select": "Pick one of the offered values in a dropdown.",
 }
-#: Elements offered to one target head; the walker sends at most 250.
-TARGET_CAP = 200
+#: Options per target head, each dropdown option counting as one (see decide.MAX_OPTIONS).
+TARGET_CAP = 100
 
 
 @dataclass
@@ -144,8 +144,6 @@ def build(
     for op in targeted:
         cands: dict[str, Move] = {}
         for row in rows or []:
-            if len(cands) >= TARGET_CAP:
-                break
             ref = row.get("ref")
             if not isinstance(ref, str) or op not in (row.get("ops") or []):
                 continue
@@ -153,6 +151,7 @@ def build(
                 continue
             if op == "type" and not values:
                 continue
+            pairs: list[tuple[str, Move]] = []
             for option, move in _targets(op, row):
                 held = known.get(move.key)
                 if held is not None:
@@ -162,10 +161,14 @@ def build(
                         held.risky = move.risky
                     held.guard, held.args, held.label = move.guard, move.args, move.label
                     move = held
-                else:
-                    known[move.key] = move
-                if not offer(move):
-                    continue
+                if offer(move):
+                    pairs.append((option, move))
+            # Only what is offered takes room: a row that still does not fit is
+            # skipped whole, and its new moves are not kept.
+            if len(cands) + len(pairs) > TARGET_CAP:
+                continue
+            for option, move in pairs:
+                known.setdefault(move.key, move)
                 cands[option] = move
                 guards[move.key] = move.guard
         if cands:

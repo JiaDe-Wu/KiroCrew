@@ -191,15 +191,19 @@ decision, since `schedule_abort_for` is fire-and-forget and the downstream
 applied-audit only fires on success.
 
 **Eager respawn is a UX optimization, not a correctness requirement.** After a hard
-kill, `_eager_respawn` runs as a tracked background task (a strong reference is
-kept, because the event loop holds only a weak one and the task could otherwise be
-garbage-collected mid-respawn). It calls the ordinary `get_or_create(key)`, so the
-warm pool and the persisted session-resume mapping are honored with no new fast
-path, and then releases the per-session semaphore that `get_or_create` acquires on
-every return path, so the next real user message can run. On failure it logs at
-debug and does nothing more: the next user message calls `get_or_create` again, so
-a transient pool exhaustion recovers on its own and a deeper problem surfaces on
-that message exactly as it would have anyway.
+kill, the successor start (`_respawn_as`) runs as a tracked background task (a
+strong reference is kept, because the event loop holds only a weak one and the task
+could otherwise be garbage-collected mid-respawn). It calls the ordinary
+`get_or_create(key)` with the stopped session's own identity
+(`allocation_identity`, as the reset successor does), so the chat keeps running on
+the agent it is set to, the warm pool and the persisted session-resume mapping are
+honored with no new fast path, and it re-arms the successor's first-turn
+observation, so a failed native resume replays the history. It then releases the
+per-session semaphore that `get_or_create` acquires on every return path, so the
+next real user message can run. On failure it logs at debug and does nothing more:
+the next user message calls `get_or_create` again, so a transient pool exhaustion
+recovers on its own and a deeper problem surfaces on that message exactly as it
+would have anyway.
 
 ### Handler response to a cancelled turn
 
@@ -219,7 +223,7 @@ deliberately **not** treated as a failure:
 
 ### Dashboard
 
-`POST /api/chat/slots/{slot}/stop` (`dashboard/chat_handlers.py`), with an optional
+`POST /api/chat/slots/{slot}/stop` (`dashboard/chat_api/turn_stop.py`), with an optional
 `?force=true`.
 
 **First press** sets `slot._stop_state = "soft_pending"`, inserts a `stop_event`
@@ -235,6 +239,12 @@ running turn". A genuine in-flight turn whose cooperative cancel does not confir
 answers `stop_turn` with a non-acked outcome instead, which escalates to the hard
 kill on its own (step 2 above); `"idle"` is the signal that there is no provider
 turn to kill, so the handler names the state rather than forcing a reset.
+That settle, and the `"compacting"` undo, apply only while `_stop_generation`
+still equals the value this press claimed. A turn end can reset the posture
+during the `stop_turn` await and a later press can claim a new generation;
+the older press's outcome then leaves that press's card and `soft_pending`
+alone, so its next press still escalates. `/interrupt` follows the same rule
+with its `claim_generation`.
 
 **Second press escalates on ANY second press**, not only when the client computed
 `force=true`. The client derives `force` from the WS-echoed `stop_state`, which can

@@ -38,6 +38,7 @@ from kiro_crew.subagent_parts.run_limits import (
 
 if TYPE_CHECKING:
     from kiro_crew.subagent import (
+        _MEMORY_PRICE_HOLDERS,
         _STARTUP_COLLECT_GRACE_SECS,
         _STARTUP_HANDSHAKES,
         _STARTUP_LAUNCH_MARGIN_SECS,
@@ -281,6 +282,9 @@ class SubagentManager:
         self._last_spawn_ts: float = 0.0  # monotonic time of the last actual start (stagger gate)
         self.hook_store: Any = None  # Optional ScriptHookStore, set by server.py
         self._agents: dict[str, SubagentInfo] = {}
+        # Host memory sizing reads what our settled runtimes hold (macOS) from
+        # every live manager (``_host_mem_term``).
+        _MEMORY_PRICE_HOLDERS.add(self)
         # Continuable conversations: session_key ("subagent:<conv-id>") -> last-used
         # ``time.monotonic()`` reading, for the reaper's idle-TTL sweep. The reaper's
         # first pass rebuilds it from state.json (keep=True runs) after a restart; a
@@ -307,6 +311,10 @@ class SubagentManager:
         except AttributeError:
             pass  # test doubles without the setter
         self._tasks: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
+        # Actual outer task -> (run id, parent), retained until task completion.
+        # Independent of completed-record eviction and the pre-cleanup _tasks pop;
+        # task keys also keep overlapping recovery attempts of one id distinct.
+        self._run_task_owners: dict[asyncio.Task[None], tuple[str, str]] = {}
         # Teardown gates for runs whose terminal report has started, keyed by id and
         # OUTLIVING both dicts above. A "delivered" tombstone excludes a folder from
         # restart orphan reconciliation, so it must not be written while the child is
@@ -462,6 +470,15 @@ class SubagentManager:
         # fast-failing first member cannot fire the wave digest while later POSTs
         # are still in flight. Pruned by finalize_batch().
         self._batch_submitted: dict[str, list[int]] = {}
+        # batch_id -> the ``(app, parent session key)`` every counted submission
+        # was admitted under, or ``None`` when owner-only members span parents.
+        # Both counting sites check and claim synchronously: a conflicting
+        # submission involving an app is refused without counting, changing the
+        # owner or announcing into the wave. Written from what the route handed
+        # the gate, so an app token joins or reconciles only its own wave,
+        # whatever its members' state (queued, refused, finished, evicted).
+        # Pruned by finalize_batch.
+        self._batch_owner: dict[str, tuple[str, str] | None] = {}
         # batch_id -> last submission-progress time.monotonic(), for the reaper's
         # stuck-wave backstop (a wave with lost submissions and no progress is
         # force-reconciled). Pruned by finalize_batch.
@@ -668,8 +685,10 @@ class SubagentManager:
         without this every manager leaks the connection's descriptors and its
         writer executor for the life of the process. Idempotent and safe to call
         from a synchronous teardown: it cancels a still-pending async open, then
-        closes the store if one was attached.
+        closes the store if one was attached. A closed manager also leaves the
+        set host memory sizing reads our settled runtimes from.
         """
+        _MEMORY_PRICE_HOLDERS.discard(self)
         taskq_open_task = self._taskq_init_task
         if taskq_open_task is not None and not taskq_open_task.done():
             taskq_open_task.cancel()
@@ -830,6 +849,7 @@ class SubagentManager:
     _leave_startup = _admission_surface._leave_startup
     running_agents_for = _admission_surface.running_agents_for
     task_memory_rows = _admission_surface.task_memory_rows
+    settled_runtime_hold_gb = _admission_surface.settled_runtime_hold_gb
     spawn = _admission_surface.spawn
     _spawn_after_memory_read = _admission_surface._spawn_after_memory_read
     prepare_spawn = _admission_surface.prepare_spawn
@@ -906,6 +926,7 @@ class SubagentManager:
     _is_startup_stalled = _monitor_surface._is_startup_stalled
     _note_tool_dispatch = staticmethod(_monitor_surface._note_tool_dispatch)
     _note_tool_result = staticmethod(_monitor_surface._note_tool_result)
+    _note_tool_update = staticmethod(_monitor_surface._note_tool_update)
     _clear_tool_dispatch = staticmethod(_monitor_surface._clear_tool_dispatch)
     _retire_subagent_oracle = staticmethod(_monitor_surface._retire_subagent_oracle)
     _stall_verdict = _monitor_surface._stall_verdict
@@ -965,6 +986,8 @@ class SubagentManager:
     queued_count_for = _run_surface.queued_count_for
     queued_count_for_async = _run_surface.queued_count_for_async
     published_queued_depths = _run_surface.published_queued_depths
+    published_queued_labels = _run_surface.published_queued_labels
+    has_current_execution_for = _run_surface.has_current_execution_for
     has_in_memory_pending_work_for = _run_surface.has_in_memory_pending_work_for
     has_unfinished_report_for = _run_surface.has_unfinished_report_for
     queued_count_or_none_async = _run_surface.queued_count_or_none_async

@@ -11,11 +11,15 @@ export function createThemesEndpoints({ post, put, del, j, jfetch: fetch, sessio
   const branding = {
     branding: () => fetch('/api/dashboard/branding').then(j) as Promise<{
       bot_name: string
+      /** `dashboard.instance_label`; empty when unset. */
+      instance_label?: string
       avatar: string
       direct_local?: boolean
       /** Whether the gateway host can open a file manager right now: the launcher
        *  `/api/reveal` starts, and on Linux a desktop session for it. */
       desktop_launcher?: boolean
+      /** `dashboard.remote_editor`, each value the schema refuses already read as "". */
+      remote_editor?: { editor?: string; host?: string }
     }>,
   }
 
@@ -49,10 +53,11 @@ export function createThemesEndpoints({ post, put, del, j, jfetch: fetch, sessio
       language?: string
       /** The Translucent panels switch; '' means never chosen on this workspace. */
       translucent_panels?: TranslucentPanelsStored
+      /** Scheduled mode's switch times, 24-hour `HH:MM`; '' means never saved. */
+      schedule_light?: string
+      schedule_dark?: string
       onboarded?: boolean
       import_onboarded?: boolean
-      /** Gates the gateway's first heartbeat; see `beacon.telemetry_permitted`. */
-      privacy_acked?: boolean
     }) =>
       put('/api/config/theme', body).then(j),
   }

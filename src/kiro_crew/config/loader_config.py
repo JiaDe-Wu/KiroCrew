@@ -23,7 +23,11 @@ from kiro_crew.agent_sdk.backends import (
     resolve_cc_permission_mode,
 )
 from kiro_crew.agent_sdk.capabilities import MODEL_NAMESPACE_ACP, capabilities_for
-from kiro_crew.config.integration_sections import AppSettingsConfig, AwsConfig
+from kiro_crew.config.integration_sections import (
+    AppSettingsConfig,
+    AwsConfig,
+    TemplateSettingsConfig,
+)
 from kiro_crew.config.loader_agents import resolve_crew_identity
 from kiro_crew.config.loader_builders import (
     _restore_stored_harness_fields,
@@ -52,16 +56,17 @@ from kiro_crew.config.loader_document import (
     _config_write_lock,
     _invalidate_config_cache,
     _notify_live_watch,
+    _raw_agent_section,
     read_config_for_update,
     stamp_config_meta,
-    unsandboxed_exec_declared,
+    strip_undeclared_resolved_defaults,
     write_config_atomically,
 )
 from kiro_crew.config.loader_locations import (
     _session_work_dir,
     config_local_path,
     config_path,
-    read_config_text,
+    read_endorsed_config_text,
 )
 from kiro_crew.config.loader_snapshots import (
     _read_hardened_agent_spec,
@@ -126,11 +131,24 @@ from kiro_crew.config.sections import (
     WorkspaceConfig,
     _meta,
     coerce_effort,
+    normalize_agent_model,
 )
 from kiro_crew.effort import is_valid_effort, model_supports_effort
-from kiro_crew.mcp_gateway.rewriter import default_overlay_dir, default_socket_path
 
 logger = logging.getLogger("kiro_crew.config.loader")
+
+
+def template_model_pin(config: KiroCrewConfig, template: str | None) -> str:
+    """The user's model for the agent template *template* (``templates.<name>.model``).
+
+    ``""`` and ``"auto"`` both INHERIT the template's own pin. Total: a config
+    without the table, an unknown template, or a malformed entry reads ``""``.
+    """
+    if not template:
+        return ""
+    templates = getattr(config, "templates", None)
+    entry = templates.get(template) if isinstance(templates, dict) else None
+    return normalize_agent_model(getattr(entry, "model", ""))
 
 
 @dataclass
@@ -374,7 +392,8 @@ class KiroCrewConfig:
                             "(@server, @server/tool*, Running: @server/*, *), that always "
                             "ask before running. A matching MCP server stays mounted but "
                             "loses its blanket auto-approve grant, and a match outranks an "
-                            "auto_approve_tools grant at the gate. The gate follows a change "
+                            "auto_approve_tools or auto_approve_tool_identities grant at the "
+                            "gate. The gate follows a change "
                             "at once; a grant already in the agent spec is withdrawn at the "
                             "next restart, when the spec is rebuilt."
                         ),
@@ -383,12 +402,13 @@ class KiroCrewConfig:
                 },
                 "batch_write_guard": {
                     "type": "boolean",
-                    "default": False,
+                    "default": True,
                     "x-meta": {
                         "label": "Batch write guard",
                         "help": (
-                            "Off by default. When on, refuse a write-class tool call "
-                            "issued in the same parallel tool batch as a read-class "
+                            "On by default; set false to turn it off. Refuses a "
+                            "write-class tool call issued in the same parallel tool "
+                            "batch as a read-class "
                             "call, so the model cannot write arguments that quote a "
                             "read it has not seen returned yet. A discipline guard, not "
                             "a security control: the security floor runs first and is "
@@ -408,6 +428,22 @@ class KiroCrewConfig:
                             "on the command's program and subcommand words, never on "
                             "argument text. Has no effect unless the batch write guard "
                             "is on."
+                        ),
+                    },
+                },
+                "return_answer": {
+                    "type": "boolean",
+                    "default": False,
+                    "x-meta": {
+                        "label": "Webhook answer return",
+                        "help": (
+                            "Off by default. When true, a POST /api/hooks/agent call that "
+                            "sends wait (seconds, at most 300) is held until its run ends "
+                            "or the wait runs out, and a run that finished its turn answers "
+                            "with its outcome and the redacted text delivery sends (a "
+                            "timeout or error run, with its outcome alone). Without it, "
+                            "wait is ignored with a warning and the call returns the "
+                            "accept receipt."
                         ),
                     },
                 },
@@ -458,13 +494,20 @@ class KiroCrewConfig:
         default_factory=dict,
         metadata=_meta("Apps", "Per-app user settings, keyed by the app's manifest name."),
     )
+    templates: dict[str, TemplateSettingsConfig] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Templates", "Per-template user settings, keyed by the agent template's name."
+        ),
+    )
     auto_update: bool = field(
         default=True,
         metadata=_meta(
             "Auto Update",
-            "Where the install can apply updates, true installs them once no work is "
-            "running and restarts; false only notifies. Elsewhere it has no effect. "
-            "On those same installs a policy minimum version applies regardless.",
+            "Where the install can apply updates, true downloads and prepares them "
+            "automatically and they take effect the next time you restart Kiro Crew; "
+            "nothing restarts by itself. False only notifies. Elsewhere it has no "
+            "effect. On those same installs a policy minimum version applies regardless.",
         ),
     )
     #: Opt-in for the Connections gallery, which is merged but held for a later
@@ -556,6 +599,14 @@ class KiroCrewConfig:
         metadata=_meta(
             "Registries",
             "External app registries (org-owned repos). " "Each entry: {name, repo, branch}.",
+        ),
+    )
+    market_registries: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Kiro Space Stores",
+            "Ids of the Kiro Space stores added as App Store sources. Only an id a "
+            "store provider offers is used; the address lives in the provider's code.",
         ),
     )
     # Unknown top-level config.json sections captured verbatim at load() and
@@ -726,6 +777,7 @@ class KiroCrewConfig:
             "memory_stores": {name: asdict(ms_cfg) for name, ms_cfg in self.memory_stores.items()},
             "default_memory_store": self.default_memory_store,
             "apps": {name: asdict(app_cfg) for name, app_cfg in self.apps.items()},
+            "templates": {name: asdict(t_cfg) for name, t_cfg in self.templates.items()},
             "stt": asdict(self.stt),
             "computer_use": asdict(self.computer_use),
             "aws": asdict(self.aws),
@@ -761,6 +813,7 @@ class KiroCrewConfig:
         }
         # External registries (always serialized so save() round-trips the field)
         d["registries"] = [asdict(r) for r in self.registries]
+        d["market_registries"] = list(self.market_registries)
         # ``mcp_gateway.stub_servers`` is the ROSTER in the file but the EFFECTIVE
         # set on the dataclass, so a straight ``asdict`` round-trip would rewrite
         # the file without the servers the operator opted out of -- turning a
@@ -875,10 +928,28 @@ class KiroCrewConfig:
         # reader about one host. On a fresh install there is no file yet, which reads
         # as undeclared and is exactly right: the document this call creates should
         # not contain the key at all.
-        if not unsandboxed_exec_declared():
-            agent_section = d.get("agent")
-            if isinstance(agent_section, dict):
-                agent_section.pop("sandbox_allow_unsandboxed_exec", None)
+        # ``agent.kas_bundle`` is stripped the same way: undeclared, it resolves
+        # to ``False`` and a packaged build prefers the engine per spawn
+        # (``acp.kas_build_default``); writing the ``False`` would turn that off.
+        strip_undeclared_resolved_defaults(d)
+        # Same rule for ``telemetry.enabled``: its absence is load-bearing too.
+        # The default is on, and ``metrics.provider.outbound_consented`` reads a
+        # WRITTEN ``true`` as the operator's own opt-in to recording, which also
+        # permits export. A whole-document save (the boot default-config write,
+        # a CLI one-shot) would otherwise freeze the default in as that opt-in.
+        # Absent stays absent until someone writes the key through a delta
+        # writer (Settings, the Privacy chapter, ``kirocrew telemetry``).
+        # The base file only: an overlay value is not in config.json, and keeping
+        # the snapshot's default there would invent an opt-in under the overlay.
+        # A stored value that is not a bool goes back as stored, so the next load
+        # reads it as false again rather than as a written ``true``.
+        base_telemetry = _raw_agent_section(config_path(), "telemetry") or {}
+        telemetry_section = d.get("telemetry")
+        if isinstance(telemetry_section, dict):
+            if "enabled" not in base_telemetry:
+                telemetry_section.pop("enabled", None)
+            elif not isinstance(base_telemetry["enabled"], bool):
+                telemetry_section["enabled"] = base_telemetry["enabled"]
         # The harness fields go back to disk exactly as ``config.json`` stores
         # them, never from the in-memory value, which is RESOLVED: "no choice"
         # (absent or "") reads as today's default, and a pick this deployment
@@ -897,33 +968,32 @@ class KiroCrewConfig:
         # read there, so a leaf config.json stores keeps its own value.
         overlay_owned: dict | None = None
         local_path = config_local_path()
-        if local_path.is_file():
-            try:
-                raw_local = json.loads(read_config_text(local_path))
-                if isinstance(raw_local, dict):
-                    # Compare CANONICAL values for resource_limits.
-                    # _subtract_overlay recognises an overlay-owned leaf only when
-                    # the emitted value EQUALS the raw overlay value, and this
-                    # section is normalized on load (512.5 -> 512, a refused value
-                    # -> None). A raw comparison therefore stops matching and
-                    # copies an overlay-owned limit into the base file, which is
-                    # the leak the subtraction exists to prevent. Only the keys the
-                    # overlay actually names are canonicalized: feeding the whole
-                    # dataclass would add eight `None` leaves the operator never
-                    # wrote and invite deletions they did not ask for.
-                    rl_overlay = raw_local.get("resource_limits")
-                    if isinstance(rl_overlay, dict):
-                        canonical = asdict(ResourceLimitsConfig.from_raw(rl_overlay))
-                        raw_local = {
-                            **raw_local,
-                            "resource_limits": {
-                                k: canonical[k] for k in rl_overlay if k in canonical
-                            },
-                        }
-                    # Renamed keys compare under the name save() emits.
-                    overlay_owned = _canonical_renamed_keys(raw_local)
-            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
-                pass
+        # Read as the load reads it, with no is_file() check first: a deleted overlay
+        # whose endorsed copy is in force still owns its keys.
+        try:
+            raw_local = json.loads(read_endorsed_config_text(local_path))
+            if isinstance(raw_local, dict):
+                # Compare CANONICAL values for resource_limits.
+                # _subtract_overlay recognises an overlay-owned leaf only when
+                # the emitted value EQUALS the raw overlay value, and this
+                # section is normalized on load (512.5 -> 512, a refused value
+                # -> None). A raw comparison therefore stops matching and
+                # copies an overlay-owned limit into the base file, which is
+                # the leak the subtraction exists to prevent. Only the keys the
+                # overlay actually names are canonicalized: feeding the whole
+                # dataclass would add eight `None` leaves the operator never
+                # wrote and invite deletions they did not ask for.
+                rl_overlay = raw_local.get("resource_limits")
+                if isinstance(rl_overlay, dict):
+                    canonical = asdict(ResourceLimitsConfig.from_raw(rl_overlay))
+                    raw_local = {
+                        **raw_local,
+                        "resource_limits": {k: canonical[k] for k in rl_overlay if k in canonical},
+                    }
+                # Renamed keys compare under the name save() emits.
+                overlay_owned = _canonical_renamed_keys(raw_local)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            pass
 
         # Atomic + mode-preserving: a concurrent reader must never observe a
         # half-written config, and the write must not widen who can read a file
@@ -950,7 +1020,8 @@ class KiroCrewConfig:
                     f"refusing to save over {p}: this snapshot was loaded while the "
                     "file did not parse, so it holds defaults, not the saved settings"
                 )
-            stored = read_config_for_update(p) if p.exists() else {}
+            # No exists() check: a deleted file reads as its endorsed copy, else {}.
+            stored = read_config_for_update(p)
             if overlay_owned is not None:
                 # What config.json stores keeps its own value under an
                 # overlay-owned leaf, so dropping the overlay later still finds it.
@@ -1056,6 +1127,7 @@ class KiroCrewConfig:
         if model_override:
             candidates.append((model_override, "model_override"))
         if agent and agent != "kirocrew":
+            candidates.append((template_model_pin(self, agent), f"templates.{agent}.model"))
             candidates.append((self._resolve_named_agent_model(agent), f"agent spec {agent}"))
         candidates.append((global_model, "agent.model"))
         # A pin says WHAT was picked, never for WHICH harness, so a backend switch
@@ -1411,6 +1483,11 @@ class KiroCrewConfig:
         # backend is ACQUIRED, and on its own routes nothing.
         _gw = self.mcp_gateway
         if _gw.stub_servers:
+            # Imported on the one branch that reads it: the rewriter loads the gateway
+            # manager and the sandbox, which a process that only reads config (every
+            # stdio MCP server, most CLI commands) never uses.
+            from kiro_crew.mcp_gateway.rewriter import default_overlay_dir, default_socket_path
+
             _gw_overlay = _gw.overlay_dir or str(default_overlay_dir())
             _gw_socket = _gw.socket_path or str(default_socket_path())
         else:
@@ -1452,6 +1529,10 @@ class KiroCrewConfig:
             # reason: swallowed by the catch-all, a claude side session would
             # start with the user's full tool set under READ_ONLY.
             side_read_only: bool = False,
+            # A sub-agent spawned with ``include_memory=false``. NAMED for the
+            # same reason: swallowed, its claude session would load and write
+            # Claude Code's auto-memory.
+            include_memory: bool = True,
             **_kwargs: object,
         ):  # return type inferred from build_acp_provider (SDK boundary: config may not name AcpProvider)
             wdir = Path(cwd) if cwd else _session_work_dir(session_key)
@@ -1463,7 +1544,8 @@ class KiroCrewConfig:
             #   1. model_override — the caller's explicit pick. The dashboard
             #      passes the slot's own model, else the Kiro Crew agent's
             #      configured default (see chat_runner._run_chat).
-            #   2. the bound kiro agent's own pinned model, for a named agent.
+            #   2. the bound kiro agent's model, for a named agent: the user's
+            #      templates.<name>.model, else the template's own pin.
             #      Custom agents MUST resolve here because the ACP
             #      session/set_mode path switches prompt/tools but not the model,
             #      so an unset model makes kiro fall back to cli.json's
@@ -1494,7 +1576,7 @@ class KiroCrewConfig:
             # step logs why.
             # circular import: members sits above config in the layering.
             from kiro_crew.acp_backends import ACP_BACKEND_KAS
-            from kiro_crew.crewmate_harness import crewmate_backend_pin
+            from kiro_crew.crewmate_harness import crewmate_backend_pin, route_pin
             from kiro_crew.members import select_provider_backend
 
             # A crewmate's own harness pin outranks the member route and fails
@@ -1510,11 +1592,11 @@ class KiroCrewConfig:
                     crewmate_backend_pin(self, session_key) if backend_override is None else None
                 ),
             )
-            # Enterprise (RFC D6): a session on KAS is refused here, before any process
+            # LTS (RFC D6): a session on KAS is refused here, before any process
             # exists, when boot proved KAS cannot start on this host. KAS sessions only:
             # the Kiro CLI path gains nothing (H13), and the gate above never raises (H3).
             if _backend == ACP_BACKEND_KAS:
-                from kiro_crew.enterprise_boot import refuse_unstartable_kas
+                from kiro_crew.lts_boot import refuse_unstartable_kas
 
                 refuse_unstartable_kas()
             # Resolved BEFORE the model, and threaded into the resolution: the
@@ -1624,6 +1706,8 @@ class KiroCrewConfig:
                 channel_id=channel_id,
                 extra_env=extra_env,
                 acp_backend=_backend,
+                # The pin the selection above used, for KAS's route rule 2.
+                harness_pin=route_pin(self, session_key, backend_override),
                 effort_per_model=_eff_per_model,
                 unbound_effort=_unbound_effort,
                 inherited_effort=_inherited_effort,
@@ -1640,6 +1724,7 @@ class KiroCrewConfig:
                 on_gate_acquired=on_gate_acquired,
                 on_gate_queued=on_gate_queued,
                 side_read_only=side_read_only,
+                include_memory=include_memory,
                 # Only a work dir DERIVED from a one-run key is the provider's
                 # to reclaim at shutdown; an explicit ``cwd`` is the caller's
                 # directory whatever the key says (session_work_dir).

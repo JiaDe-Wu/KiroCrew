@@ -88,6 +88,9 @@ export interface PeopleResponse {
   directory: { state: CapabilityState; people?: PeopleRow[] }
   observed_since?: number | null
   usage_available?: boolean
+  /** True when work per person is not counted at all (fair admission off): a
+   *  setting, so the page says nothing, unlike a reader that failed. */
+  usage_off?: boolean
   people: PeopleRow[]
 }
 
@@ -140,6 +143,48 @@ export function sharedCrewPreviewOn(capabilities: SharedCrewCapabilities): boole
  *  surfaces come back once a teammate connects again. */
 export function someoneJoined(rows: readonly PeopleRow[] | null | undefined): boolean {
   return (rows ?? []).some(row => !row.is_owner && !isUnknownPrincipal(row.principal) && (row.sources ?? []).includes('observed'))
+}
+
+export type PersonSource = 'tailscale' | 'ssm' | 'organization' | 'kiro_login'
+
+/** The connection source a People row came in through, for its chip: read from
+ *  the provenance the server derived, then from the row's own sources. A person
+ *  at this machine came in through none (`null`). A session creator read back
+ *  from a transcript carries no provenance; it takes *fallback*, the one source
+ *  that can have let it in (`soleSource`), and otherwise has no chip.
+ *  The same id strings as `sharedCrewMode.SourceId`, kept apart to avoid a cycle. */
+export function personSource(row: PeopleRow, fallback: PersonSource | null = null): PersonSource | null {
+  const p = row.provenance ?? ''
+  if (p === 'kiro_relay') return 'kiro_login'
+  if (p === 'ssm_invite') return 'ssm'
+  if (p.startsWith('tailscale_') || (row.sources ?? []).includes('tailscale_share')) return 'tailscale'
+  if ((row.sources ?? []).includes('directory')) return 'organization'
+  if (p === 'local_operator') return null
+  return fallback
+}
+
+/** The source a row with no provenance came in through: the only one that is on.
+ *  shortcut: with two or more sources on, such a row has no chip; persisting the
+ *  provenance on the creator stamp would name it. */
+export function soleSource(on: readonly PersonSource[]): PersonSource | null {
+  return on.length === 1 ? on[0] : null
+}
+
+/** One key per person: the login, else an e-mail label (the Kiro relay and
+ *  `owner_name` label people by e-mail), case-insensitive, else the id. The same
+ *  person listed once per source (the owner at this machine and over the relay,
+ *  say) shares one key; two people who only share a display name do not. */
+export function personKey(row: PeopleRow): string {
+  const login = row.principal.display.login.trim().toLowerCase()
+  // An e-mail is one key whether it came as the login or as the label.
+  if (login) return login.includes('@') ? `email:${login}` : `login:${login}`
+  const name = (row.principal.display.name ?? '').trim().toLowerCase()
+  return name.includes('@') ? `email:${name}` : `id:${row.principal.id}`
+}
+
+/** How many people the rows name, one per `personKey`. */
+export function distinctPeopleCount(rows: readonly PeopleRow[]): number {
+  return new Set(rows.map(personKey)).size
 }
 
 /** The invites listed under "Invites": every pending email invite the server
@@ -199,10 +244,14 @@ export function principalName(p: PublicPrincipal | null | undefined): string {
 export function principalInitials(p: PublicPrincipal | null | undefined): string {
   const name = principalName(p)
   if (!name) return '?'
-  const parts = name.split(/[\s@._-]+/).filter(Boolean)
-  const first = Array.from(parts[0] ?? '')[0] ?? '?'
-  const second = parts.length > 1 ? Array.from(parts[1])[0] ?? '' : ''
-  return (first + second).toUpperCase()
+  // A name with spaces keeps its words; an email shows only the part before
+  // the @, so the domain's first letter never stands in for a surname.
+  const label = /\s/.test(name) ? name : name.split('@')[0] || name
+  const parts = label.split(/[\s@._-]+/).filter(Boolean)
+  const first = Array.from(parts[0] ?? '')
+  // One piece (a bare handle) gives its first two letters, not one.
+  const letters = parts.length > 1 ? [first[0], Array.from(parts[1])[0]] : first.slice(0, 2)
+  return letters.join('').toUpperCase() || '?'
 }
 
 /** Read a message row's server-stamped author, or `null` when it carries none. */
@@ -221,6 +270,20 @@ export function messageAuthor(meta: Record<string, unknown> | undefined): Public
       captured_at: typeof a.display?.captured_at === 'number' ? a.display.captured_at : null,
     },
   }
+}
+
+/** The app that sent a user row, or `null` when no app did. The gateway stamps
+ *  `meta.turnActor: "app"` on every send an app token makes. The app's id comes
+ *  from `meta.author`, the app's system principal labelled `app:<name>` (the
+ *  immediate send path), else from `meta.appLabel`, the verified app name a
+ *  steered answer carries. `name` is empty when the row carries neither. */
+export function appSender(meta: Record<string, unknown> | undefined): { name: string } | null {
+  if (meta?.turnActor !== 'app') return null
+  const author = messageAuthor(meta)
+  const label = author?.kind === 'system' ? author.display.name : ''
+  if (label.startsWith('app:')) return { name: label.slice('app:'.length) }
+  const appLabel = typeof meta.appLabel === 'string' ? meta.appLabel.split('/')[0] : ''
+  return { name: appLabel }
 }
 
 /** The id whose messages carry no byline: the verified viewer, so a reader's
@@ -245,6 +308,36 @@ export function bylineSelfId(
 export function bylineFor(author: PublicPrincipal | null, selfId: string): PublicPrincipal | null {
   if (!author || !selfId) return null
   return author.id === selfId ? null : author
+}
+
+/** Rows that carry state rather than a message and draw on no surface: a run of
+ *  one person's messages reads past them. A `system` row is not among them,
+ *  because some draw (the stop card, a skill-load card) and the rest are rare
+ *  enough between two user messages that repeating the name there is harmless. */
+function isStateRow(m: { role: string }): boolean {
+  return m.role === 'done' || m.role === 'queued'
+}
+
+/** True when the user message at `index` continues a run of messages from the
+ *  same person, so its byline would repeat the one just above it. A run breaks
+ *  on a different author, an unstamped message, and any drawn row between the
+ *  two (an agent reply, a tool line, a notice). An Unknown author never
+ *  continues a run: two unattributed messages need not share a sender. Nor does
+ *  a steer row or an app's send: a confirmed or retracted steer draws no byline,
+ *  and an app's send is labelled with the app, so the message after one must
+ *  carry the person's name itself. */
+export function continuesAuthorRun(
+  messages: ReadonlyArray<{ role: string; meta?: Record<string, unknown> }>,
+  index: number,
+): boolean {
+  const author = messageAuthor(messages[index]?.meta)
+  if (!author || isUnknownPrincipal(author)) return false
+  for (let i = index - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (isStateRow(m)) continue
+    return m.role === 'user' && !m.meta?.steer && !appSender(m.meta) && messageAuthor(m.meta)?.id === author.id
+  }
+  return false
 }
 
 /** The setup paths, in the order the People surface offers them. */

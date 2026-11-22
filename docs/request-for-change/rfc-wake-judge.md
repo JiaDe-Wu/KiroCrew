@@ -3,8 +3,8 @@ title: Wake judge — a System One model screens auto-nudge ticks
 status: partial
 author: Raymond Chen
 created: 2026-09-22
-last-audited: 2026-10-06
-audited-at: 9348a25a34
+last-audited: 2026-11-19
+audited-at: fc89562d69
 doc-pr: 12735
 implementation-prs: [12776, 12787, 13759, 14663, 16192]
 tracking-issues: []
@@ -461,7 +461,8 @@ brief is what carries the screening and the lane is what authorizes it.
   questions and required to
   answer in one JSON object with exactly the question ids, each value a
   probability. The parser is as strict as `_from_wire`: any extra key, missing
-  id, non-finite number or prose → invalid answer → FALLBACK. The LLM lane is
+  id, non-finite number or prose → invalid answer → FALLBACK. A raised call is
+  asked once more inside the same budget before that FALLBACK. The LLM lane is
   what makes the interface real for people without a Jev key; it is slower
   (seconds) and costs a small model call, still far below a main-session turn.
   No judge-specific agent template ships: it would differ from `kirocrew-lite`

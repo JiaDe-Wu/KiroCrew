@@ -27,6 +27,7 @@ from kiro_crew.crew_log import session_tree_projection
 from kiro_crew.dashboard.handlers import agent_panel as panel_routes
 from kiro_crew.dashboard.handlers import member_dashboard as routes
 from kiro_crew.dashboard_templates import catalog, instance
+from kiro_crew.testing.synthetic_credentials import github_classic
 
 ROOT = "chat-100"
 DISPATCHED = "chat-101"
@@ -235,7 +236,7 @@ async def test_the_slot_read_denies_an_app_caller(monkeypatch):
 @pytest.mark.asyncio
 async def test_the_slot_read_is_redacted(tmp_path):
     # Assembled at runtime so the source holds no credential-shaped literal.
-    token = "ghp" + "_" + "ZXAMPLEzxampleZXAMPLEzxampleZXAMPLE12"
+    token = github_classic(seed=75)
     manifest = tmp_path / "builtin" / "fixture-board" / "manifest.json"
     manifest.write_text(json.dumps(_manifest(title=f"board {token}")), encoding="utf-8")
     instance.adopt(instance.session_instance_key(ROOT), "fixture-board")
@@ -409,7 +410,7 @@ def test_project_report_words_its_heading_for_a_session():
     page = real.read_text("utf-8")
     assert 'id="pr-eyebrow"' in page
     assert "'What this session is doing'" in page
-    assert "'What this Bot is doing'" in page
+    assert "'What this bot is doing'" in page
     assert ".subject === 'session'" in page
 
 

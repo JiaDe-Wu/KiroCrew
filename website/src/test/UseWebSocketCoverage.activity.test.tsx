@@ -179,6 +179,18 @@ describe('useWebSocket frame router', () => {
     expect(chat().folderSuggestions[BACKGROUND]).toBeUndefined()
   })
 
+  it('marks a folder suggestion the backend already applied, and only on an explicit true', () => {
+    const { ws } = mount()
+    const frame = (slot: string, applied: unknown) => ({
+      type: 'slot_folder_suggestion',
+      data: { slot, folder_id: 'f1', folder_name: 'Reviews', ts: 12, applied },
+    })
+    act(() => { ws.simulateMessage(frame(ACTIVE, true)) })
+    act(() => { ws.simulateMessage(frame(BACKGROUND, 'yes')) })
+    expect(chat().folderSuggestions[ACTIVE]).toMatchObject({ folderId: 'f1', applied: true })
+    expect(chat().folderSuggestions[BACKGROUND]).not.toHaveProperty('applied')
+  })
+
   it('records a plain activity event without disturbing the model catalog', () => {
     const { ws } = mount()
     act(() => {
@@ -285,6 +297,25 @@ describe('useWebSocket frame router', () => {
       expect(seen).toEqual(['dev-fleet'])
     } finally {
       window.removeEventListener('mc:app-reload', listener)
+    }
+  })
+
+  it('re-reads the app list in every tab on an app_state frame (an app turned off elsewhere)', () => {
+    const { ws } = mount()
+    let changed = 0
+    const states: unknown[] = []
+    const listener = () => { changed += 1 }
+    const onState = (e: Event) => { states.push((e as CustomEvent).detail) }
+    window.addEventListener('mc:apps-changed', listener)
+    window.addEventListener('mc:app-state', onState)
+    try {
+      act(() => { ws.simulateMessage({ type: 'app_state', data: { app: 'bvtest', enabled: false, seq: 7, boot: '42' } }) })
+      expect(changed).toBe(1)
+      // The typed event a mounted BrowserView follows (its page does not re-read the list).
+      expect(states).toEqual([{ app: 'bvtest', enabled: false, seq: 7, boot: '42' }])
+    } finally {
+      window.removeEventListener('mc:apps-changed', listener)
+      window.removeEventListener('mc:app-state', onState)
     }
   })
 
@@ -477,13 +508,13 @@ describe('useWebSocket frame router', () => {
     expect(chat().automations).toEqual({})
   })
 
-  it('shows update progress and clears it on the done step', () => {
+  it('shows update progress and keeps the done step for the update flow', () => {
     const { ws } = mount()
     act(() => { ws.simulateMessage({ type: 'update_progress', data: { step: 'download', detail: '40%' } }) })
     expect(dash().updateProgress).toEqual({ step: 'download', detail: '40%' })
 
     act(() => { ws.simulateMessage({ type: 'update_progress', data: { step: 'done', detail: '' } }) })
-    expect(dash().updateProgress).toBeNull()
+    expect(dash().updateProgress).toEqual({ step: 'done', detail: '' })
   })
 
   it('bumps the refresh trigger for a session restart and a refine frame', () => {
@@ -601,7 +632,7 @@ describe('useWebSocket frame router', () => {
       const { ws } = mount()
       act(() => {
         ws.simulateMessage({ type: 'notification', data: { kind: 'info', title: 'Boom', ts: '1' } })
-        ws.simulateMessage({ type: 'approval', data: { id: 'ap-boom', slot: ACTIVE, tool: 'execute_bash', ts: 2 } })
+        ws.simulateMessage({ type: 'approval', data: { id: 'ap-boom', instance: 'inst-ap-boom', slot: ACTIVE, tool: 'execute_bash', ts: 2 } })
         ws.simulateMessage({ type: 'chat_done', data: { slot: ACTIVE } })
       })
       // Each arm swallowed the listener failure and completed its real work.

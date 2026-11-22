@@ -23,6 +23,7 @@ try:
         redact_and_truncate,
         redact_credentials,
         redact_exfiltration_urls,
+        scan_exfiltration_urls,
     )
 
     _HAS_SECURITY = True
@@ -35,7 +36,9 @@ except Exception:  # pragma: no cover - security module always present in prod
 
 
 logger = logging.getLogger("kirocrew.app.spec-builder")
-_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+# ``\Z``, not ``$``: ``$`` also matches before a trailing newline, which would then reach
+# a directory name and a session file name.
+_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}\Z")
 _VALID_TYPES = ("feature", "bug", "quick")
 
 #: Every status this app can be in. index.json is agent-writable, so the stored
@@ -80,6 +83,16 @@ def _redact(text: str) -> str:
     return text
 
 
+def _refuses(text: str) -> bool:
+    """Whether a gate refuses *text*: ``_redact`` changes it, or the exfil scan flags
+    a URL in it. ``_redact`` masks only credential values inside a URL, so a URL that
+    carries other data out survives it unchanged and only the scan decides it. Fails
+    closed, like ``_redact``, when the security module is unavailable."""
+    if _redact(text) != text or not _HAS_SECURITY:
+        return True
+    return bool(scan_exfiltration_urls(text))
+
+
 def _redact_and_truncate(text: str, max_chars: int) -> str:
     """Scrub like ``_redact``, then truncate — never ``_redact(x[:n])``.
 
@@ -100,12 +113,12 @@ def _usable_name(name: str) -> bool:
 
     Two reasons an entry is dropped rather than repaired. The key must satisfy the
     same grammar `create` enforces, because it becomes a slot key and a session
-    filename downstream. And it must survive `_redact` unchanged: index.json is
+    filename downstream. And `_refuses` must pass it: index.json is
     agent-writable, so a credential can be parked in the KEY, and `GET /specs`
     returns the key as `"name"`. Scrubbing it would produce a name that does not
     match the directory the entry points at, so the entry goes instead.
     """
-    return _valid_name(name) and _redact(name) == name
+    return _valid_name(name) and not _refuses(name)
 
 
 def _entry_is_usable(meta: dict) -> bool:
@@ -123,10 +136,12 @@ def _entry_is_usable(meta: dict) -> bool:
 
 #: A slot key is a history-file identity: it becomes a session filename and flows
 #: into core's session-key parsing, so a persisted one is validated before use.
-_SLOT_KEY_RE = re.compile(r"^spec-builder-[A-Za-z0-9_-]{1,96}$")
+#: Anchored at ``\Z``, not ``$``: ``$`` also matches before a trailing newline, which
+#: would then reach a session file name.
+_SLOT_KEY_RE = re.compile(r"^spec-builder-[A-Za-z0-9_-]{1,96}\Z")
 
 #: A per-creation suffix: eight lowercase hex, as minted by _new_slot_key.
-_SLOT_SUFFIX_RE = re.compile(r"^[0-9a-f]{8}$")
+_SLOT_SUFFIX_RE = re.compile(r"^[0-9a-f]{8}\Z")
 
 
 def _owns_slot_key(name: str, key: str) -> bool:
@@ -336,7 +351,9 @@ def _numeric(value: object) -> float:
     return number if math.isfinite(number) else 0.0
 
 
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+# ``\Z``, not ``$``: ``$`` also matches before a trailing newline, which would let a
+# digest with one pass the format check.
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}\Z")
 
 
 def _normalize_approvals(raw: Any, docs: dict) -> dict:

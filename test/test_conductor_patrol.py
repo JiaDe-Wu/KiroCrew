@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
+from hashlib import sha256
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -26,7 +26,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
-from skill_script_helpers import load_skill_script
 
 from kiro_crew import autonudge, autonudge_authz, conductor_patrol
 from kiro_crew import work_ledger as wl
@@ -41,16 +40,6 @@ from kiro_crew.monitoring.models import MonitorActionCompletion, MonitorActionDi
 CONDUCTOR = "chat-p-conductor"
 WORKER = "chat-p-worker"
 WORKER_2 = "chat-p-worker-2"
-
-PATROL_BUDGET = (
-    Path(__file__).resolve().parents[1]
-    / "src"
-    / "kiro_crew"
-    / "builtin_skills"
-    / "goal-conductor"
-    / "scripts"
-    / "patrol_budget.py"
-)
 
 
 class _Svc:
@@ -225,9 +214,9 @@ async def test_first_bind_arms_one_work_ledger_patrol(svc, audits):
     assert armed["slot_key"] == CONDUCTOR
     assert armed["watch"] == "work-ledger"
     assert armed["gate"] is True
-    assert armed["idle_secs"] == 600
-    assert armed["max_cycles"] == 300
-    assert armed["max_runtime_secs"] == 86400
+    assert armed["idle_secs"] == 300
+    assert armed["max_cycles"] == 0
+    assert armed["max_runtime_secs"] == conductor_patrol.patrol_max_runtime_secs()
     assert armed["replace_existing"] is False
     assert "replace_stopped" not in armed  # the authorizer forwards it only when True
     assert armed["message"] == conductor_patrol.PATROL_MESSAGE
@@ -403,18 +392,20 @@ async def test_closed_item_is_never_unpatrolled(svc):
     assert rows[item_id]["unpatrolled"] is False
 
 
-# ── the defaults pass the conductor's own budget check ────────────────────
+# ── the default patrol is permanent ───────────────────────────────────────
 
 
-def test_defaults_pass_patrol_budget_check():
-    pb = load_skill_script("patrol_budget_for_conductor_patrol", PATROL_BUDGET)
-    _doc, code = pb.check(
-        conductor_patrol.PATROL_INTERVAL_SECS,
-        conductor_patrol.PATROL_MAX_CYCLES,
-        conductor_patrol.PATROL_MAX_RUNTIME_SECS,
-    )
-    assert code == 0
-    assert 300 <= conductor_patrol.PATROL_INTERVAL_SECS <= 900
+def test_the_default_patrol_has_no_cycle_cap_and_the_ceiling_as_its_runtime():
+    """No cycle cap; the operator's runtime ceiling (7 days as shipped) is the one
+    runaway backstop (rfc-permanent-patrol.md)."""
+    from kiro_crew.monitoring.limits import DEFAULT_RUNTIME_CEILING_SECS, runtime_ceiling_secs
+
+    assert conductor_patrol.PATROL_MAX_CYCLES == 0
+    assert conductor_patrol.patrol_max_runtime_secs() == runtime_ceiling_secs()
+    assert DEFAULT_RUNTIME_CEILING_SECS == 7 * 86400
+    assert conductor_patrol.PATROL_INTERVAL_SECS == 300
+    message = conductor_patrol.PATROL_MESSAGE
+    assert message.index("one final report") < message.index("call autonudge_stop")
 
 
 # ── the conductor's own monitor_start replaces the default ────────────────
@@ -781,3 +772,77 @@ async def test_an_audit_outage_that_races_closure_still_logs_its_refusal_at_warn
     assert [r.levelno for r in patrol_logs] == [logging.WARNING]
     assert "audit log unavailable" in patrol_logs[0].getMessage()
     assert SERVICE_SHUTTING_DOWN_MESSAGE not in patrol_logs[0].getMessage()
+
+
+def test_the_patrol_stays_open_while_work_is_queued_and_old_loops_still_pass():
+    """Queued work lives outside the ledger, so the patrol's stop names it; the text
+    from before that change stays a shipped one for loops armed with it."""
+    assert "every item is terminal and nothing is queued" in conductor_patrol.PATROL_MESSAGE
+    old = next(
+        message
+        for message in conductor_patrol.SHIPPED_PATROL_MESSAGES
+        if sha256(message.encode("utf-8")).hexdigest()
+        == "8ec9f75e8a8168f0409c2a7257b3eaba0b0d72240bd0d5c854100cb5de7964a5"
+    )
+    assert old != conductor_patrol.PATROL_MESSAGE
+    assert "every item is terminal or the user says stop" in old
+    assert old in conductor_patrol.SHIPPED_PATROL_MESSAGES
+
+
+# Exact persisted text is the fire-time grant; fingerprints keep this expectation
+# independent of edits to PATROL_MESSAGE and its compatibility literals.
+SHIPPED_PATROL_FINGERPRINTS = (
+    "dd2f2e5a2581e881a44b1798ebf8e0ad35e81ca5841ebafa07d23368e19374c0",
+    "8ec9f75e8a8168f0409c2a7257b3eaba0b0d72240bd0d5c854100cb5de7964a5",
+    "679df9b84bcaf4a572d073b2464770c22e2a0fcba4374c96c3c236a87ff568f4",
+    "53f137d75b5cd6efd277b5e5e7f604745609909b911b11398364435b4b82d98b",
+    "8f43cc5a34af73ebbb070ed4fd95e8098b05f8cdd136abbb7bd3b2ba126bf599",
+    "e7defe601f98ada0d43c9891bb6ee3bfe4a5c09851b95963e8f47e6c89b99963",
+)
+
+
+def test_shipped_patrol_texts_are_byte_exact_and_include_the_current_default():
+    fingerprints = {
+        sha256(message.encode("utf-8")).hexdigest()
+        for message in conductor_patrol.SHIPPED_PATROL_MESSAGES
+    }
+    assert fingerprints == set(SHIPPED_PATROL_FINGERPRINTS) | {
+        sha256(conductor_patrol.PATROL_MESSAGE.encode("utf-8")).hexdigest()
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fingerprint", SHIPPED_PATROL_FINGERPRINTS)
+async def test_each_shipped_patrol_survives_reload_and_passes_the_fixed_payload_guard(
+    tmp_path, fingerprint
+):
+    message = next(
+        text
+        for text in conductor_patrol.SHIPPED_PATROL_MESSAGES
+        if sha256(text.encode("utf-8")).hexdigest() == fingerprint
+    )
+    svc = AutoNudgeService(base_dir=tmp_path)
+    try:
+        await svc.add(
+            slot_key=SLOT,
+            message=message,
+            idle_secs=conductor_patrol.PATROL_INTERVAL_SECS,
+            max_cycles=conductor_patrol.PATROL_MAX_CYCLES,
+            watch=conductor_patrol.PATROL_WATCH,
+            gate=True,
+            default_patrol=True,
+        )
+    finally:
+        svc.stop()
+
+    reloaded = AutoNudgeService(base_dir=tmp_path)
+    try:
+        reloaded._load()
+        stored = reloaded.get_by_slot(SLOT)
+        assert stored is not None
+        assert stored.message == message
+        assert conductor_patrol.is_fixed_patrol_payload(stored)
+        stored.message += " Extra instruction."
+        assert not conductor_patrol.is_fixed_patrol_payload(stored)
+    finally:
+        reloaded.stop()

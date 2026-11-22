@@ -31,7 +31,7 @@ from pathlib import Path
 
 from kiro_crew import platform_compat
 from kiro_crew.apps.manager import app_data_dir
-from kiro_crew.security import is_sensitive_path, redact
+from kiro_crew.security import is_sensitive_path, redact, refuses
 
 logger = logging.getLogger("kirocrew.app.pptx-maker")
 
@@ -39,8 +39,10 @@ APP_NAME = "pptx-maker"
 
 # Per-segment allow-list. Deliberately excludes "/", "\" and "." runs, so no
 # traversal or separator can survive it — this is the primary path guard and the
-# resolve()-containment check below is the backstop.
-SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# resolve()-containment check below is the backstop. It ends at ``\Z``, not ``$``,
+# which also matches before a trailing newline that would then reach a path.
+# ``test/test_regex_anchor_contract.py`` holds this package to that rule.
+SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 # Environment override, for development and tests only. Production resolves the
 # deck root from the engine's own config so this app and the engine can never
@@ -223,7 +225,7 @@ def resolve_deck_dir(deck_id: str) -> Path | None:
     """
     if not SEGMENT_RE.match(deck_id or ""):
         return None
-    if redact(deck_id) != deck_id:
+    if refuses(deck_id, redact):
         logger.warning("pptx-maker: refusing a deck id that looks like a credential")
         return None
     root = deck_root()

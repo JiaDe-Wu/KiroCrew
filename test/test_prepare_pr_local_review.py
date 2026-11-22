@@ -35,6 +35,7 @@ from pathlib import Path
 
 import pytest
 from git_maintenance_helpers import git_maintenance_off_entries
+from git_repo_templates import copy_repo
 from skill_script_helpers import load_skill_script
 
 from kiro_crew.platform.update_governance import _GIT_LOCATION_VARS
@@ -274,6 +275,7 @@ def _parity_repo_template(tmp_path_factory):
     (root / "changed.py").write_text("VALUE = 1\n", encoding="utf-8")
     _git(root, "add", "-A")
     _git(root, "commit", "-m", "feat(thing): add VALUE\n\nA body line for intent.")
+    _git(root, "reset", "--hard", "HEAD")  # the ORIG_HEAD and reflog line a copy starts with
     return root
 
 
@@ -291,15 +293,11 @@ def parity_repo(tmp_path, _parity_repo_template):
     contract out of the base commit. A workflow present only in the checkout is
     not authority and fails the run closed.
 
-    Each test receives its own ``copytree`` of the session template. The repo
-    has no remote, so nothing recorded in ``.git`` names the template's path;
-    the ``reset --hard`` re-stats the copied files against the index, because a
-    copied checkout otherwise reads as having "unstaged changes" on Windows.
+    Each test receives its own ``copy_repo`` of the session template, which
+    gives the copied index the copied files' stat data: a plain copy of a
+    checkout reads as having "unstaged changes".
     """
-    root = tmp_path / "repo"
-    shutil.copytree(_parity_repo_template, root)
-    _git(root, "reset", "--hard", "HEAD")
-    return root
+    return copy_repo(_parity_repo_template, tmp_path / "repo")
 
 
 # --------------------------------------------------------------------------
@@ -1071,6 +1069,7 @@ def test_default_out_and_stage_dirs_are_unique_per_run(parity_repo, tmp_path, mo
     scratch = tmp_path / "systmp"
     scratch.mkdir()
     monkeypatch.setattr(local_review.tempfile, "tempdir", str(scratch))
+    monkeypatch.delenv("KIROCREW_SCRATCH", raising=False)
     seen = []
     real = local_review.assemble
 
@@ -1091,6 +1090,33 @@ def test_default_out_and_stage_dirs_are_unique_per_run(parity_repo, tmp_path, mo
     for out_dir, stage_dir in seen:
         assert str(scratch) in out_dir
         assert str(scratch) in stage_dir
+
+
+@pytest.mark.parametrize("scratch", ["set", "unset", "missing"])
+def test_default_dirs_follow_kirocrew_scratch(
+    parity_repo, tmp_path, monkeypatch, capsys, no_gh, scratch
+):
+    """Reviewer subagents share ``$KIROCREW_SCRATCH`` but not this process's
+    ``$TMPDIR``, so default briefs land under the scratch dir when it exists,
+    else under ``$TMPDIR`` (re-read because ``tempfile.tempdir`` is cleared)."""
+    process_tmp, shared, missing = tmp_path / "tmpdir", tmp_path / "scratch", tmp_path / "gone"
+    process_tmp.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("TMPDIR", str(process_tmp))
+    monkeypatch.setattr(local_review.tempfile, "tempdir", None)
+    if scratch == "unset":
+        monkeypatch.delenv("KIROCREW_SCRATCH", raising=False)
+    else:
+        monkeypatch.setenv("KIROCREW_SCRATCH", str(shared if scratch == "set" else missing))
+    capsys.readouterr()
+    assert local_review.main(["--worktree", str(parity_repo), "--base", "main", "--json"]) == 0
+    summary = json.loads(capsys.readouterr().out)
+    paths = [Path(p) for p in summary["tasks"].values()] + [Path(summary["diff"]["path"])]
+    assert len(paths) > 1 and all(p.is_file() for p in paths)
+    expected, other = (shared, process_tmp) if scratch == "set" else (process_tmp, shared)
+    for path in paths:
+        assert path.resolve().is_relative_to(expected.resolve()), path
+    assert list(other.iterdir()) == [] and not missing.exists()
 
 
 def test_malformed_profile_is_an_environment_error_not_a_traceback(
@@ -1800,6 +1826,21 @@ def test_an_older_install_names_the_base_copy_instead_of_the_extractor(parity_re
         shutil.rmtree(short, ignore_errors=True)
 
 
+#: The characters PowerShell reads as a single quote.
+_POWERSHELL_QUOTES = "'\u2018\u2019\u201a\u201b"
+_POWERSHELL_WORD = "[{0}]((?:[^{0}]|[{0}]{{2}})*)[{0}]".format(_POWERSHELL_QUOTES)
+
+
+def _powershell_words(line):
+    """One printed PowerShell line read as PowerShell reads it: the call operator,
+    then single-quoted words in which a doubled quote character stands for one."""
+    assert re.fullmatch("& {0}( {0})*".format(_POWERSHELL_WORD), line), line
+    return [
+        re.sub("([{0}])[{0}]".format(_POWERSHELL_QUOTES), r"\1", word)
+        for word in re.findall(_POWERSHELL_WORD, line)
+    ]
+
+
 def _check_older_install_hint(parity_repo, tmp_path, old, base_sha, short):
     proc = _run_copy(old, parity_repo, tmp_path / "out1", tmp_path / "stage1", short)
     assert proc.returncode == local_review.EXIT_PARITY, proc.stderr
@@ -1813,10 +1854,18 @@ def _check_older_install_hint(parity_repo, tmp_path, old, base_sha, short):
     checkout_copy = parity_repo / local_review.SKILL_REPO_DIR / "scripts" / "local_review.py"
     assert str(checkout_copy) not in proc.stderr
     commands = [line[4:] for line in proc.stderr.splitlines() if line.startswith("    ")]
-    assert len(commands) == 3, proc.stderr
-    add, rerun, remove = (
-        [token.strip('"') for token in shlex.split(c, posix=os.name != "nt")] for c in commands
-    )
+    if os.name == "nt":
+        # PowerShell's three lines always come first; their words are the ones run. The
+        # cmd.exe lines must carry the same words, and are left out only when a path
+        # holds % or !, which cmd.exe expands even inside quotes.
+        words = [_powershell_words(c) for c in commands[:3]]
+        cmd = [[token.strip('"') for token in shlex.split(c, posix=False)] for c in commands[3:]]
+        unsafe = any(ch in path for path in (str(parity_repo), short, sys.executable) for ch in "%!")
+        assert cmd == ([] if unsafe else words), proc.stderr
+    else:
+        words = [shlex.split(c) for c in commands]
+    assert len(words) == 3, proc.stderr
+    add, rerun, remove = words
     detached = add[-2]
     # The hint made the directory itself: new, empty, and private to this user.
     assert os.path.dirname(detached) == short
@@ -1889,6 +1938,58 @@ def test_the_hint_never_runs_branch_controlled_siblings(parity_repo, tmp_path, m
     hint = local_review.stale_copy_hint(str(parity_repo), base_sha, "main")
     assert hint is not None
     text = "\n".join(hint)
-    assert "worktree add --detach" in text and base_sha in text
-    assert "worktree remove" in text
+    # Compare words, not text: on Windows the first three commands are PowerShell's,
+    # each word single-quoted after the "& " call operator, which shlex splits as it
+    # splits the POSIX hint.
+    commands = [line[4:].removeprefix("& ") for line in hint if line.startswith("    ")]
+    add, _, remove = (shlex.split(command) for command in commands[:3])
+    assert add[3:6] == ["worktree", "add", "--detach"]
+    assert add[-1] == base_sha
+    assert remove[3:5] == ["worktree", "remove"]
     assert str(checkout_copy) not in text
+
+
+def test_each_windows_shell_gets_its_own_quoting():
+    """PowerShell reads a line that opens with a quoted path as a string, so its lines
+    take the call operator. cmd.exe expands % and ! even inside double quotes, and a "
+    ends the quoting, so words holding any of them get no cmd.exe lines."""
+    commands = [
+        [r"C:\Py 3\python.exe", r"C:\O'Brien\R&D\lr.py", "--base", "main"],
+        ["git", "-C", "C:\\", "remove", "C:\\Rock\u2019n"],
+    ]
+    assert local_review._shell_lines(commands, windows=True) == [
+        "In PowerShell:",
+        r"    & 'C:\Py 3\python.exe' 'C:\O''Brien\R&D\lr.py' '--base' 'main'",
+        "    & 'git' '-C' 'C:\\' 'remove' 'C:\\Rock\u2019\u2019n'",
+        "In cmd.exe:",
+        r'''    "C:\Py 3\python.exe" "C:\O'Brien\R&D\lr.py" "--base" "main"''',
+        '    "git" "-C" "C:\\\\" "remove" "C:\\Rock\u2019n"',
+    ]
+    for word in (r"C:\%USERNAME%\python.exe", r"C:\Hey!\python.exe", 'main"&whoami&"'):
+        assert local_review._shell_lines([[word]], windows=True) == [
+            "In PowerShell:",
+            "    & '{}'".format(word),
+        ], word
+    # Each of the five characters PowerShell reads as a single quote is doubled.
+    for quote in _POWERSHELL_QUOTES:
+        assert local_review._shell_lines([["a" + quote + "b"]], windows=True)[1] == (
+            "    & 'a" + quote * 2 + "b'"
+        ), hex(ord(quote))
+
+
+def test_the_windows_hint_leads_with_powershell_lines(parity_repo, tmp_path, monkeypatch):
+    """On Windows the hint's first block is PowerShell's, and its run line puts the
+    call operator before the quoted interpreter."""
+    base_sha = _skill_on_base(parity_repo)
+    monkeypatch.setattr(local_review, "__file__", str(_older_install(tmp_path)))
+    monkeypatch.setattr(local_review.tempfile, "tempdir", str(tmp_path))
+    # os.name is process-wide, so it is restored before pytest reports anything.
+    with monkeypatch.context() as windows:
+        windows.setattr(local_review.os, "name", "nt")
+        # The faked os.name would make the runner look up git.EXE and friends,
+        # which this host does not have; git is still the host's own.
+        windows.setattr(local_review._tool_argv, "which", lambda name: shutil.which(name))
+        windows.setattr(local_review.sys, "executable", r"C:\Py 3\python.exe")
+        hint = local_review.stale_copy_hint(str(parity_repo), base_sha, "main")
+    assert hint[2] == "In PowerShell:"
+    assert hint[4].startswith(r"    & 'C:\Py 3\python.exe' "), hint[4]

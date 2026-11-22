@@ -17,7 +17,12 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from closed_peer_helpers import refused_peer_connects  # noqa: F401
 from instances_helpers import _FakeTunnel, _patch_port_probe
+
+from kiro_crew.testing.wait import await_until, finished
+
+pytestmark = pytest.mark.usefixtures("refused_peer_connects")
 
 # ── SshTunnelManager (mocked) ─────────────────────────────────────────────────
 
@@ -144,6 +149,7 @@ class TestSshTunnelArgvCompression:
             ttl="20h",
             remote_port=None,
             embed_parent_port=None,
+            embed_forward_port=None,
             timeout_secs=None,
         ):
             return "SECRET_TOK"
@@ -467,6 +473,9 @@ class TestSshTunnelMultiplexing:
             + "  Port 2222\n"
             + "  IdentityFile ~/.ssh/some-key.pem\n"
             + "  ProxyCommand /bin/true %h %p\n"
+            + "  LocalForward 8888 localhost:8888\n"
+            + "  ExitOnForwardFailure yes\n"
+            + "  LogLevel QUIET\n"
         )
         args = _ssh_args(_build_ssh_tunnel_argv(self._HOST, 7779, 7879))
         resolved = _ssh_effective_config(tmp_path, config, args, self._HOST)
@@ -476,9 +485,15 @@ class TestSshTunnelMultiplexing:
         assert resolved.get("port") == "2222"
         assert "some-key.pem" in resolved.get("identityfile", "")
         assert resolved.get("proxycommand", "").startswith("/bin/true")
+        # The host block's forward rides along with the tunnel's own, so one on
+        # another port already bound elsewhere must not end the tunnel.
+        forwards = resolved.get("localforward", "").splitlines()
+        assert "[127.0.0.1]:7779 [127.0.0.1]:7879" in forwards
+        assert "8888 [localhost]:8888" in forwards
         # The argv's own pins are still in force alongside the inherited values.
         assert resolved.get("batchmode") == "yes"
-        assert resolved.get("exitonforwardfailure") == "yes"
+        assert resolved.get("exitonforwardfailure") == "no"
+        assert resolved.get("loglevel") == "INFO"
         assert resolved.get("addressfamily") == "inet"
 
 
@@ -502,6 +517,7 @@ class TestSshTunnelManager:
             ttl="20h",
             remote_port=None,
             embed_parent_port=None,
+            embed_forward_port=None,
             timeout_secs=None,
         ):
             return "SECRET_TOK"
@@ -738,6 +754,7 @@ class TestSshTunnelManager:
             ttl="20h",
             remote_port=None,
             embed_parent_port=None,
+            embed_forward_port=None,
             timeout_secs=None,
         ):
             raise TokenMintError("nope")
@@ -763,8 +780,35 @@ class TestSshTunnelManager:
         assert reg.get("cd-1").was_connected is True
 
     @pytest.mark.asyncio
+    async def test_a_shutdown_cut_mid_stop_leaves_the_tunnel_to_the_next_shutdown(self, tmp_path):
+        in_stop = asyncio.Event()
+        cut_once = [True]
+
+        class _CutTunnel(_FakeTunnel):
+            async def stop(self):
+                if cut_once[0]:
+                    cut_once[0] = False
+                    in_stop.set()
+                    await asyncio.Event().wait()  # held until the cancel below
+                await super().stop()
+
+        reg, mgr = self._mgr(tmp_path, factory=_CutTunnel)
+        reg.add(name="CD", ssh_host="cd-1", instance_id="cd-1")
+        await mgr.connect("cd-1")
+        tunnel = mgr._tunnels["cd-1"]
+        first = asyncio.ensure_future(mgr.shutdown())
+        await await_until(in_stop, what="the tunnel stop starting")
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert mgr._tunnels.get("cd-1") is tunnel and tunnel.stopped is False
+
+        await finished(mgr.shutdown(), "the repeat shutdown")
+        assert tunnel.stopped is True and mgr.status_all() == {}
+
+    @pytest.mark.asyncio
     async def test_disconnect_clears_local_port(self, tmp_path):
-        # Regression: connect() records the allocated local_port, but
+        # connect() records the allocated local_port, but
         # disconnect() must reset it to the unallocated sentinel. Otherwise the
         # freed port stays recorded and reads as reserved forever.
         from kiro_crew.instances.registry import _UNALLOCATED_PORT

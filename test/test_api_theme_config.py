@@ -20,9 +20,10 @@ def _make_cfg(
     onboarded: bool = False,
     import_onboarded: bool = False,
     language: str = "",
-    privacy_acked: bool = False,
     crewmates_onboarded: bool = False,
     translucent_panels: str = "",
+    theme_schedule_light: str = "",
+    theme_schedule_dark: str = "",
 ):
     """Build a mock KiroCrewConfig with dashboard display fields.
 
@@ -37,9 +38,10 @@ def _make_cfg(
     cfg.dashboard.onboarded = onboarded
     cfg.dashboard.import_onboarded = import_onboarded
     cfg.dashboard.language = language
-    cfg.dashboard.privacy_acked = privacy_acked
     cfg.dashboard.crewmates_onboarded = crewmates_onboarded
     cfg.dashboard.translucent_panels = translucent_panels
+    cfg.dashboard.theme_schedule_light = theme_schedule_light
+    cfg.dashboard.theme_schedule_dark = theme_schedule_dark
     return cfg
 
 
@@ -56,6 +58,20 @@ def _owner_request() -> MagicMock:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("edition", ["oss", "lts"])
+async def test_theme_boot_reports_no_privacy_acknowledgement(monkeypatch, edition) -> None:
+    """No dashboard notice is opened from the boot payload, in either edition."""
+    monkeypatch.setattr("kiro_crew.edition.EDITION", edition)
+    cfg = _make_cfg(onboarded=True)
+    with patch.object(core_mod, "KiroCrewConfig") as mock_cls:
+        mock_cls.load.return_value = cfg
+        resp = await core_mod.api_theme_boot(MagicMock(spec=web.Request))
+    body = json.loads(resp.body)
+    for key in ("privacy_acked", "privacy_ack_version", "kiro_telemetry_ack_version"):
+        assert key not in body
+
+
+@pytest.mark.asyncio
 async def test_theme_boot_returns_defaults() -> None:
     """GET /api/theme/boot returns empty defaults when unconfigured."""
     cfg = _make_cfg()
@@ -67,12 +83,13 @@ async def test_theme_boot_returns_defaults() -> None:
     body = json.loads(resp.body)
     assert body == {
         "mode": "",
+        "schedule_light": "",
+        "schedule_dark": "",
         "color": "",
         "language": "",
         "translucent_panels": "",
         "onboarded": False,
         "import_onboarded": False,
-        "privacy_acked": False,
         "crewmates_onboarded": False,
     }
 
@@ -94,12 +111,13 @@ async def test_theme_boot_returns_configured_values() -> None:
     body = json.loads(resp.body)
     assert body == {
         "mode": "dark",
+        "schedule_light": "",
+        "schedule_dark": "",
         "color": "kiro",
         "language": "",
         "translucent_panels": "on",
         "onboarded": True,
         "import_onboarded": True,
-        "privacy_acked": False,
         "crewmates_onboarded": False,
     }
 
@@ -121,12 +139,13 @@ async def test_theme_config_get() -> None:
     body = json.loads(resp.body)
     assert body == {
         "mode": "light",
+        "schedule_light": "",
+        "schedule_dark": "",
         "color": "emerald",
         "language": "",
         "translucent_panels": "",
         "onboarded": True,
         "import_onboarded": True,
-        "privacy_acked": False,
         "crewmates_onboarded": False,
     }
 
@@ -188,12 +207,13 @@ async def test_theme_config_put_updates_and_persists(cfg_file: Path) -> None:
     assert resp.status == 200
     assert json.loads(resp.body) == {
         "mode": "dark",
+        "schedule_light": "",
+        "schedule_dark": "",
         "color": "monokai",
         "language": "",
         "translucent_panels": "",
         "onboarded": True,
         "import_onboarded": True,
-        "privacy_acked": True,  # falls back to `onboarded` when never written
         "crewmates_onboarded": False,
     }
     dashboard = _read(cfg_file)["dashboard"]
@@ -248,18 +268,33 @@ async def test_an_unreadable_config_is_refused_and_left_byte_identical(
 
 
 @pytest.mark.asyncio
-async def test_theme_config_put_persists_privacy_acked(cfg_file: Path) -> None:
-    """The route must persist the flag the gateway's first-heartbeat gate reads.
+async def test_theme_config_put_still_stores_the_privacy_keys(cfg_file: Path) -> None:
+    """Older dashboards still send them, so the route keeps accepting them.
 
-    Without this write the beacon stays withheld forever on a fresh install: the
-    first-run chapter is the only thing that sets it, and the gateway cannot see
-    the browser's localStorage copy.
+    Nothing reads them to decide what is sent; they are stored as written and
+    the response does not echo them.
     """
     _write(cfg_file, {})
-    resp = await _put({"privacy_acked": True})
+    resp = await _put(
+        {"privacy_acked": True, "privacy_ack_version": 3, "kiro_telemetry_ack_version": 3}
+    )
     assert resp.status == 200
-    assert _read(cfg_file)["dashboard"]["privacy_acked"] is True
-    assert json.loads(resp.body)["privacy_acked"] is True
+    stored = _read(cfg_file)["dashboard"]
+    assert stored["privacy_acked"] is True
+    for key in ("privacy_ack_version", "kiro_telemetry_ack_version"):
+        assert stored[key] == 3
+        assert type(stored[key]) is int
+    assert "privacy_acked" not in json.loads(resp.body)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [True, -1, "3", 10**6])
+async def test_theme_config_put_refuses_a_bad_kiro_telemetry_ack_version(
+    cfg_file: Path, value: object
+) -> None:
+    _write(cfg_file, {"dashboard": {"privacy_acked": True}})
+    with pytest.raises(web.HTTPBadRequest):
+        await _put({"kiro_telemetry_ack_version": value})
 
 
 @pytest.mark.asyncio
@@ -299,10 +334,42 @@ async def test_theme_config_put_persists_translucent_panels(cfg_file: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_theme_config_put_persists_a_schedule(cfg_file: Path) -> None:
+    """Scheduled mode and its two times are workspace-backed like the mode.
+
+    Stored here rather than only in the browser, so a second browser or the
+    desktop app switches at the same times; '' returns a time to its default.
+    """
+    _write(cfg_file, {})
+    resp = await _put({"mode": "schedule", "schedule_light": "06:30", "schedule_dark": "21:15"})
+    assert resp.status == 200
+    dashboard = _read(cfg_file)["dashboard"]
+    assert dashboard["theme_mode"] == "schedule"
+    assert (dashboard["theme_schedule_light"], dashboard["theme_schedule_dark"]) == (
+        "06:30",
+        "21:15",
+    )
+    body = json.loads(resp.body)
+    assert (body["mode"], body["schedule_light"], body["schedule_dark"]) == (
+        "schedule",
+        "06:30",
+        "21:15",
+    )
+    resp = await _put({"schedule_light": ""})
+    assert json.loads(resp.body)["schedule_light"] == ""
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "body",
     [
         {"mode": "invalid"},
+        # Only the 24-hour HH:MM a browser time field submits is a time.
+        {"schedule_light": "7:00"},
+        {"schedule_dark": "24:00"},
+        {"schedule_dark": "19:00:00"},
+        {"schedule_dark": "19:00\n"},
+        {"schedule_light": 700},
         # A bool is the shape a client would reach for first; it is refused so
         # the stored value is always one of the three strings the loader reads.
         {"translucent_panels": True},
@@ -314,11 +381,22 @@ async def test_theme_config_put_persists_translucent_panels(cfg_file: Path) -> N
         {"import_onboarded": "false"},
         {"privacy_acked": "true"},
         {"crewmates_onboarded": "true"},
+        # ``True`` is an int in Python; storing it would read back as version 1.
+        {"privacy_ack_version": True},
+        {"privacy_ack_version": "2"},
+        {"privacy_ack_version": 2.0},
+        {"privacy_ack_version": -1},
+        {"privacy_ack_version": 1001},
         # A valid field ahead of an invalid one: the 400 must apply neither.
         {"color": "monokai", "privacy_acked": "true"},
     ],
     ids=[
         "mode",
+        "schedule_one_digit_hour",
+        "schedule_hour_24",
+        "schedule_seconds",
+        "schedule_trailing_newline",
+        "schedule_int",
         "translucent_panels_bool",
         "translucent_panels_word",
         "onboarded",
@@ -326,6 +404,11 @@ async def test_theme_config_put_persists_translucent_panels(cfg_file: Path) -> N
         "import_onboarded",
         "privacy_acked",
         "crewmates_onboarded",
+        "privacy_ack_version_bool",
+        "privacy_ack_version_str",
+        "privacy_ack_version_float",
+        "privacy_ack_version_negative",
+        "privacy_ack_version_too_big",
         "mixed",
     ],
 )

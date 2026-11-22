@@ -21,8 +21,6 @@ of what would hurt most if broken:
 from __future__ import annotations
 
 import os
-import shutil
-import tempfile
 import textwrap
 import unittest
 from datetime import datetime, timezone
@@ -43,8 +41,13 @@ _needs_sandbox = pytest.mark.skipif(
 class _Env(unittest.TestCase):
     """Isolated data home, and a stubbed login so no test shells out to ``gh``."""
 
+    @pytest.fixture(autouse=True)
+    def _per_test_home(self, tmp_path):
+        """Hand ``setUp`` pytest's per-test directory as the data home."""
+        self._tmp_path = tmp_path
+
     def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = self._tmp_path
         self._prev = os.environ.get("KIROCREW_HOME")
         os.environ["KIROCREW_HOME"] = str(self.tmp)
         schedule_file.reset_login_cache()
@@ -60,7 +63,6 @@ class _Env(unittest.TestCase):
             os.environ.pop("KIROCREW_HOME", None)
         else:
             os.environ["KIROCREW_HOME"] = self._prev
-        shutil.rmtree(self.tmp, ignore_errors=True)
 
     @staticmethod
     def _write(body: str) -> Path:
@@ -504,6 +506,9 @@ class TestRoster(_Env):
         described = rotation.describe(schedule_file.resolve_now(self._at("2026-08-05T12:00")))
         self.assertIn("roster", described)
         self.assertTrue(described["roster"]["members"])
+        # The card also renders incident.io's roster, and only this one may drive the
+        # GitHub-login field and the rotation.yaml warnings.
+        self.assertEqual(described["roster"]["source"], "schedule-file")
 
     def test_no_schedule_means_no_roster_rather_than_an_empty_one(self) -> None:
         """A solo install has no team; the UI should render nothing, not 'team: none'."""

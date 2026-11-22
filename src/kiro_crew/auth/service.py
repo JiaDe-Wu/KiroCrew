@@ -20,7 +20,7 @@ import re
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 import aiohttp
 
@@ -29,8 +29,10 @@ from kiro_crew.auth.login.endpoints import (
     BUILDER_ID_REGION,
     BUILDER_ID_START_URL,
     USER_AGENT,
+    oidc_scopes,
     social_service_url,
 )
+from kiro_crew.auth.refresh import HTTP_TIMEOUT
 from kiro_crew.auth.shape import Transport, select_transport
 from kiro_crew.auth.store import (
     KNOWN_IDENTITIES,
@@ -40,16 +42,11 @@ from kiro_crew.auth.store import (
     TokenStoreError,
 )
 from kiro_crew.auth.whoami import START_URL_EXTRA_KEY
+from kiro_crew.http_proxy import resolve_proxy
 
 logger = logging.getLogger(__name__)
 
 _HEADERS = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
-
-# Every auth request on the shared session is bounded. aiohttp's own default is five
-# minutes, which on a black-holed route leaves a poll hanging many times longer than
-# the dashboard's poll cadence; 30s is longer than any healthy auth call and short
-# enough that a dead route is visible inside one login.
-_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 
 # How many CONSECUTIVE connection-level poll failures one pending login absorbs before
 # a poll reports the auth service unreachable. The poll is the longest-lived request in
@@ -58,6 +55,60 @@ _HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 # the expected case, not evidence the login failed. Any poll that gets an answer clears
 # the count, so only a sustained outage crosses it.
 MAX_POLL_TRANSPORT_FAILURES = 3
+
+
+def _load_relay_viewer_cps_url() -> str:
+    """``tunnel.relay_viewer_cps_url`` while ``tunnel.relay_viewer_enabled`` is on, else "".
+
+    The config build keeps a URL that is not https:// (or loopback http://) as set,
+    with a warning, so it is checked here: such a URL answers "" and sign-in never
+    sends a token to it. A non-empty answer is one the viewer itself would call. An
+    unreadable config answers "", which keeps the prod-only lookup.
+    """
+    tunnel = _load_tunnel()
+    if getattr(tunnel, "relay_viewer_enabled", False) is not True:
+        return ""
+    url = getattr(tunnel, "relay_viewer_cps_url", "")
+    url = url.strip() if isinstance(url, str) else ""
+    if url:
+        from kiro_crew.relay_client.lease import lease_url_problem
+
+        if lease_url_problem(url) is not None:
+            return ""
+    return url
+
+
+def _load_oidc_scope_prefix() -> str:
+    """``tunnel.relay_viewer_oidc_scope_prefix`` (already validated), else ""."""
+    prefix = getattr(_load_tunnel(), "relay_viewer_oidc_scope_prefix", "")
+    return prefix if isinstance(prefix, str) else ""
+
+
+def _load_tunnel() -> Any:
+    """The ``tunnel`` config section, or None when the config cannot be read."""
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    try:
+        return KiroCrewConfig.load().tunnel
+    except Exception as exc:  # noqa: BLE001 - any failure keeps the defaults
+        logger.debug("tunnel settings unreadable for sign-in (%s)", type(exc).__name__)
+        return None
+
+
+async def _relay_viewer_cps_url() -> str:
+    """:func:`_load_relay_viewer_cps_url`, off the event loop (the config read is file I/O)."""
+    return await _off_loop(_load_relay_viewer_cps_url)
+
+
+async def _oidc_scope_prefix() -> str:
+    """:func:`_load_oidc_scope_prefix`, off the event loop."""
+    return await _off_loop(_load_oidc_scope_prefix)
+
+
+async def _off_loop(func: Callable[[], str]) -> str:
+    from kiro_crew.executors import relay_viewer_executor
+
+    return await asyncio.get_running_loop().run_in_executor(relay_viewer_executor(), func)
 
 
 class UnknownLoginError(Exception):
@@ -94,6 +145,10 @@ class LoopbackUnavailableError(Exception):
     """
 
 
+class _LoopbackExchangeError(Exception):
+    """A loopback sign-in's code exchange failed after the browser came back."""
+
+
 class InvalidRegionError(Exception):
     """A caller-supplied region is outside the AWS region-name grammar.
 
@@ -105,7 +160,14 @@ class InvalidRegionError(Exception):
 
 
 class InvalidStartUrlError(Exception):
-    """A caller-supplied Identity Center start URL is not one SSO-OIDC can take."""
+    """A caller-supplied Identity Center start URL is not one SSO-OIDC can take.
+
+    ``reason`` is the broken rule's name from ``LoginTargetError``.
+    """
+
+    def __init__(self, message: str, *, reason: str = "") -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 def _canonical_start_url(raw: str) -> str:
@@ -129,7 +191,8 @@ def _canonical_start_url(raw: str) -> str:
         reason = str(exc)
         raise InvalidStartUrlError(
             f"{reason[:1].upper()}{reason[1:]}. Use your company's AWS access portal "
-            "URL, which looks like https://your-company.awsapps.com/start."
+            "URL, which looks like https://your-company.awsapps.com/start.",
+            reason=exc.reason,
         ) from exc
 
 
@@ -173,6 +236,18 @@ class _PendingOidcLogin:
     start_url: str = ""
     # Same budget as _PendingLogin.transport_failures, for the SSO-OIDC poll.
     transport_failures: int = 0
+
+
+def _idc_lookup_context(pending: _PendingOidcLogin) -> str:
+    """The start URL, region and control planes behind one IdC profile lookup, for logs.
+
+    All three are configuration, not credentials; the token never appears here.
+    """
+    hosts = ", ".join(control_plane.control_plane_urls(pending.region))
+    return (
+        f"start URL {pending.start_url or '(none)'}, region {pending.region}, "
+        f"control planes asked: {hosts}"
+    )
 
 
 # How long the loopback listener waits for the portal to redirect back. Long enough
@@ -249,6 +324,19 @@ def _release(entry: _PendingKind) -> None:
         entry.task.cancel()
 
 
+async def _release_and_wait(entries: list[_PendingKind]) -> None:
+    """Release each entry, then wait until its listener task has unwound.
+
+    Cancelling only asks the listener to stop; its socket closes when the task
+    runs its cleanup. Waiting here means the port is free once the caller returns.
+    """
+    for entry in entries:
+        _release(entry)
+    tasks = [entry.task for entry in entries if isinstance(entry, _PendingLoopbackLogin)]
+    if tasks:
+        await asyncio.wait(tasks)
+
+
 class KasLoginService:
     """Login orchestration for the KAS-mode auth subsystem.
 
@@ -289,7 +377,7 @@ class KasLoginService:
         # Lazy: constructing the session at gateway boot would bind it to a loop the
         # service may never run on; first use always happens on the serving loop.
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=_HTTP_TIMEOUT)
+            self._session = aiohttp.ClientSession(timeout=HTTP_TIMEOUT)
         return self._session
 
     async def close(self) -> None:
@@ -298,8 +386,7 @@ class KasLoginService:
         async with self._lock:
             entries = list(self._pending.values())
             self._pending.clear()
-        for entry in entries:
-            _release(entry)
+        await _release_and_wait(entries)
         if self._session is not None and not self._session.closed:
             await self._session.close()
         self._session = None
@@ -418,12 +505,35 @@ class KasLoginService:
         epoch: int,
         signout_gen: str = "",
     ) -> dict[str, Any]:
-        """Register a fresh SSO-OIDC client and start its device authorization."""
+        """Start an SSO-OIDC device authorization for the ``identity`` slot.
+
+        The client registration the slot's stored sign-in carries is reused while
+        it is in date (:func:`builder_id.stored_client`), as kiro-cli does. A new
+        client is registered otherwise, and also when StartDeviceAuthorization
+        answers the stored one with any error but a start-URL refusal, so a
+        registration AWS refuses can never stop the user signing in again.
+        """
         session = await self._http()
-        client = await builder_id.register_client(region, session=session)
-        auth = await builder_id.start_device_authorization(
-            client, region=region, start_url=start_url, session=session
-        )
+        # Only an explicit scope prefix changes the scopes (kiro-cli's
+        # api.oidc.scopePrefix); unset keeps the public ones for every sign-in.
+        scopes = oidc_scopes(await _oidc_scope_prefix())
+        stored = await asyncio.to_thread(self._store.load, identity)
+        client = builder_id.stored_client(stored, region, scopes)
+        auth = None
+        if client is not None:
+            try:
+                auth = await builder_id.start_device_authorization(
+                    client, region=region, start_url=start_url, session=session
+                )
+            except builder_id.StartUrlRejectedError:
+                raise
+            except builder_id.BuilderIdAuthError as err:
+                logger.info("stored SSO-OIDC client refused, registering a new one: %s", err)
+        if client is None or auth is None:
+            client = await builder_id.register_client(region, session=session, scopes=scopes)
+            auth = await builder_id.start_device_authorization(
+                client, region=region, start_url=start_url, session=session
+            )
         return await self._register_pending(
             _PendingOidcLogin(
                 client=client,
@@ -509,7 +619,9 @@ class KasLoginService:
         payload = {"deviceCode": pending.auth.device_code, "clientId": USER_AGENT}
         answered = False
         try:
-            async with session.post(url, json=payload, headers=_HEADERS) as resp:
+            async with session.post(
+                url, json=payload, headers=_HEADERS, proxy=resolve_proxy(url)
+            ) as resp:
                 # The issuer answered, so whatever went wrong on earlier polls of this
                 # login was transient: the budget starts over.
                 answered = True
@@ -639,18 +751,35 @@ class KasLoginService:
             # This leg deliberately gets no transport budget: the device code is
             # already redeemed, so a later poll cannot re-obtain the token, and
             # answering "pending" would only loop the dashboard until expiry.
+            # The code tells the two apart, so the card can say "no Kiro profile"
+            # only when the lookup answered and the list was empty.
             try:
-                profiles = await control_plane.list_available_profiles(
-                    token.access_token, region=pending.region, session=session
+                listing = await control_plane.list_available_profiles(
+                    token.access_token,
+                    region=pending.region,
+                    session=session,
+                    viewer_cps_url=await _relay_viewer_cps_url(),
                 )
             except control_plane.ControlPlaneError as err:
-                logger.warning("could not resolve IdC profile ARN: %s", err)
+                logger.warning(
+                    "could not resolve IdC profile ARN (%s): %s", _idc_lookup_context(pending), err
+                )
                 await self._forget(login_id)
-                return {"status": "error"}
+                return {"status": "error", "code": "profile_lookup_failed"}
+            profiles = listing.profiles
             if not profiles:
-                logger.warning("IdC login has no available Kiro profiles")
+                # Everything needed to tell a wrong host or region from a real
+                # provisioning gap. None of it is a credential.
+                logger.warning(
+                    "IdC login has no available Kiro profiles "
+                    "(IdC region %s, control plane %s, %d page(s) read, start URL %s)",
+                    pending.region,
+                    listing.url,
+                    listing.pages,
+                    pending.start_url,
+                )
                 await self._forget(login_id)
-                return {"status": "error"}
+                return {"status": "error", "code": "no_kiro_profile"}
             if len(profiles) > 1:
                 # Multi-profile selection UX is a documented follow-up; until then
                 # the first profile wins, and the choice is visible in the log.
@@ -821,6 +950,11 @@ class KasLoginService:
             self._run_loopback(sock, port, provider, state, verifier),
             name=f"kas-loopback-{port}",
         )
+        # Closed however the task ends, including a cancel before its first step,
+        # which never enters _run_loopback. The listener normally closes it with
+        # its runner first; a second close is a no-op, and closing a listening
+        # socket does not block the loop.
+        task.add_done_callback(lambda _task: sock.close())
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=LOOPBACK_TIMEOUT_SECS)
         result = await self._register_pending(
             _PendingLoopbackLogin(task=task, provider=provider, expires_at=expires_at),
@@ -844,17 +978,18 @@ class KasLoginService:
         state: str,
         verifier: str,
     ) -> KasToken:
-        """Serve the callback and exchange the code. Owns the socket.
+        """Serve the callback and exchange the code.
+
+        The socket is closed by the task's done callback (see ``begin_loopback``),
+        not here: a task cancelled before its first step never runs this body.
 
         Returns the token WITHOUT persisting it: the poll persists through
         ``_save_token`` under the pending lock, only while the login is still
         registered, so a cancelled login ("use a code instead", start over) can
         never leave a credential behind that the user did not see land.
         """
-        try:
-            callback = await portal.wait_for_callback(
-                sock, port, state, timeout_secs=LOOPBACK_TIMEOUT_SECS
-            )
+
+        async def _exchange(callback: dict) -> KasToken:
             redirect_uri = portal.rebuild_redirect_uri(
                 port, callback["path"], callback["login_option"]
             )
@@ -863,21 +998,28 @@ class KasLoginService:
             # callback's login_option so the stored provider matches the account.
             chosen = _social_from_login_option(callback["login_option"]) or provider
             session = await self._http()
-            return await portal.exchange_code(
-                chosen, callback["code"], verifier, redirect_uri, session=session
-            )
-        finally:
-            # The listener normally closes the socket with its runner; closing an
-            # already-closed socket is a no-op, so this only matters for the path
-            # where serving never started (cancel racing setup).
-            await asyncio.to_thread(sock.close)
+            try:
+                return await portal.exchange_code(
+                    chosen, callback["code"], verifier, redirect_uri, session=session
+                )
+            except (portal.PortalAuthError, aiohttp.ClientError, asyncio.TimeoutError) as err:
+                # The browser came back; the auth service, reached or not, did not finish.
+                raise _LoopbackExchangeError(str(err)) from err
+
+        # The tab's page waits for the exchange, so it never says "Login complete"
+        # for a sign-in the exchange then fails.
+        return await portal.wait_for_callback(
+            sock, port, state, _exchange, timeout_secs=LOOPBACK_TIMEOUT_SECS
+        )
 
     async def _poll_loopback(self, login_id: str, pending: _PendingLoopbackLogin) -> dict[str, Any]:
         """Report the listener task's state; terminal outcomes drop the entry.
 
-        A timeout or a listener failure carries ``code: loopback_failed`` so the
-        dashboard can degrade to the device flow for the same provider without a
-        detour through an error screen.
+        A timeout (``loopback_timeout``) or a listener failure lets the dashboard
+        degrade to the device flow for the same provider without a detour through
+        an error screen. A failure's code names its cause so the code screen can say
+        why: ``loopback_wrong_address``, ``loopback_exchange_failed``, else
+        ``loopback_failed``.
         """
         if not pending.task.done():
             if datetime.now(timezone.utc) < pending.expires_at:
@@ -905,7 +1047,13 @@ class KasLoginService:
         if isinstance(err, portal.PortalTimeoutError):
             return {"status": "expired", "code": "loopback_timeout"}
         logger.warning("loopback login failed: %s", err)
-        return {"status": "error", "code": "loopback_failed", "error": str(err)}
+        if isinstance(err, portal.PortalAddressError):
+            code = "loopback_wrong_address"
+        elif isinstance(err, _LoopbackExchangeError):
+            code = "loopback_exchange_failed"
+        else:
+            code = "loopback_failed"
+        return {"status": "error", "code": code, "error": str(err)}
 
     async def cancel(self, login_id: str) -> None:
         """Abandon a pending login, releasing its callback port if it holds one.
@@ -991,4 +1139,4 @@ class KasLoginService:
         async with self._lock:
             entry = self._drop_records(login_id)
         if entry is not None:
-            _release(entry)
+            await _release_and_wait([entry])

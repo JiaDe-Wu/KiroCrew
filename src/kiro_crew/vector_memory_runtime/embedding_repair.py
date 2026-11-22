@@ -15,6 +15,7 @@ import logging
 import struct
 from typing import TYPE_CHECKING, Callable, cast
 
+from kiro_crew.vector_memory_runtime import lesson_candidates as _lesson_candidates
 from kiro_crew.vector_memory_runtime import lessons as _lessons
 
 if TYPE_CHECKING:
@@ -296,7 +297,37 @@ def has_pending_embeddings(store: VectorMemoryStore) -> bool:
         "SELECT 1 FROM semantic_memory WHERE is_deleted = 0 AND embedding IS NULL "
         "AND key NOT LIKE 'lesson.%' LIMIT 1",
     )
-    return any(store._fetch_one_locked(sql) is not None for sql in probes)
+    if any(store._fetch_one_locked(sql) is not None for sql in probes):
+        return True
+    # A private store's lesson-dedup queue, or a retirement a flag-off sweep
+    # restores, is work the sweep does too (memory.member_lesson_dedup).
+    if store.algorithm_version != "v2":
+        return False
+    from kiro_crew.memory_lesson_dedup import (
+        MODE_OFF,
+        PENDING_KEY,
+        RETIRED_KEY,
+        configured_mode,
+    )
+
+    if store._fetch_one_locked("SELECT 1 FROM memory_meta WHERE key = ?", (PENDING_KEY,)):
+        return True
+    # A retirement is work only for the flag-off restore; while the flag is on
+    # the marker stays and the sweep has nothing to do for it.
+    return (
+        store._fetch_one_locked("SELECT 1 FROM memory_meta WHERE key = ?", (RETIRED_KEY,))
+        is not None
+        and configured_mode() == MODE_OFF
+    )
+
+
+def _resolve_member_lesson_dedup(
+    store: VectorMemoryStore, should_stop: "Callable[[], bool] | None"
+) -> None:
+    if store.algorithm_version == "v2" and not (should_stop is not None and should_stop()):
+        from kiro_crew.memory_lesson_dedup import resolve_pending
+
+        resolve_pending(store)
 
 
 def backfill_rows(
@@ -375,6 +406,8 @@ def backfill_missing_embeddings(
     from kiro_crew import vector_memory as vm  # circular import: the facade imports this module
 
     if store.embed_fn is None:
+        # The dedup sweep needs no model: a flag-off restore still runs.
+        _resolve_member_lesson_dedup(store, should_stop)
         return 0
     # Repair lesson vectors FIRST: they need no numpy (struct-packed and
     # compared directly, never indexed), and they must be rebuilt even when
@@ -383,6 +416,9 @@ def backfill_missing_embeddings(
     store._backfill_lesson_embeddings(
         progress, pace=pace, max_rows=max_rows_per_kind, should_stop=should_stop
     )
+    # A private store's new consolidation lessons that just got their vector
+    # are checked for a stored copy (memory.member_lesson_dedup).
+    _resolve_member_lesson_dedup(store, should_stop)
     # Same for non-lesson semantic KV rows: struct-packed, no numpy, no
     # FAISS — get_semantic_context ranks them straight from the stored blob.
     # No progress callback: the (done,total) stream belongs to the episodic
@@ -503,13 +539,10 @@ def backfill_lesson_embeddings(
     """Embed lesson rows whose vector is NULL. Returns the count embedded.
 
     Lesson vectors drive semantic dedup and contradiction detection
-    (:meth:`write_lesson`, :meth:`find_contradiction_candidates`). They are
-    otherwise only refilled lazily inside ``write_lesson``, capped at
-    ``_MAX_BACKFILLS_PER_CALL`` per call — fine for the handful of legacy rows
-    that cap was written for, but not for a wholesale invalidation: after
+    (:meth:`write_lesson`, :meth:`find_contradiction_candidates`). This sweep is
+    their only refill: ``write_lesson`` embeds its own rule and no stored one. After
     :meth:`reconcile_embedding_space` clears every lesson vector on a model
-    change, lesson writes are rare enough that recovery could take
-    arbitrarily long, and until then dedup silently degrades and can accept a
+    change, dedup degrades until the sweep has run, and can accept a
     duplicate or contradictory lesson.
 
     Scoped to ``lesson.*`` keys because lessons embed different TEXT than
@@ -581,6 +614,8 @@ def backfill_lesson_embeddings(
                 f"AND is_deleted = 0{store._sem_guard}",
                 (blob, row["key"], row["value_json"]),
             )
+            # The candidate index keeps a sketch of each stored vector: this row has one now.
+            _lesson_candidates.note_key_write(store, row["key"])
         embedded += 1
         if progress is not None:
             progress(embedded, total)

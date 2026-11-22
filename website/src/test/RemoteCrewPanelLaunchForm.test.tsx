@@ -1,9 +1,10 @@
 /**
  * The built-in launch form: an empty region field reads as empty and blocks
- * Launch, and a launch that went out cannot be repeated by a second click on the
- * same settings.
+ * Launch, a launch that went out cannot be repeated by a second click on the
+ * same settings, and the checklist says when it answers for other values than
+ * the ones typed, and a subnet the gateway refuses is shown under its field.
  */
-import { screen, waitFor } from '@testing-library/react'
+import { screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders } from './helpers'
 import { RemoteCrewPanel } from '../pages/settings/RemoteCrewPanel'
@@ -49,7 +50,7 @@ vi.mock('../api/client', () => {
     },
   }
 })
-import { api } from '../api/client'
+import { api, ApiError } from '../api/client'
 
 const PREFLIGHT_OK = {
   reachable: true, account: '1234•••7890', arn: 'arn:aws:iam::x:user/dev',
@@ -81,6 +82,44 @@ const RUNNING_JOB = {
 }
 const DONE_JOB = { ...RUNNING_JOB, status: 'done' as const, instance_id: 'i-0abc123456789def0' }
 const REGION_REQUIRED = 'Enter an AWS Region, for example us-east-1.'
+const STALE = 'The profile or Region changed since this check. Re-check to update.'
+const PRICE_NOTE = 'Prices are us-east-1 on-demand rates; other Regions may differ.'
+const RETRY = 'Fix the problem shown below, or change the Subnet ID above, then choose Launch to try again.'
+const CHECK_CREWS = 'The launch did not finish. Check My Crews before launching again.'
+const CREW_LISTED = 'The launch did not finish. Its crew is listed in My Crews, where you can fix or delete it.'
+const LAUNCHED_ID = 'i-0abc123456789def0'
+// The registry id is derived from the crew name; the EC2 id the job carries is
+// the crew's SSM target. Distinct here, as they are in a real registry.
+const LIVE_CREW = {
+  id: 'kiro-crew-cloud-kc-4d10', name: 'Kiro Crew Cloud (kc-4d10)', connection_method: 'ssm' as const, ssm_target: LAUNCHED_ID,
+  ssh_host: '', aws_profile: '', aws_region: 'us-east-1', ssm_run_as: '', remote_port: 7777, local_port: 0,
+  ttl: '20h', remote_bin: '', was_connected: false,
+  status: { instance_id: 'kiro-crew-cloud-kc-4d10', state: 'disconnected' as const },
+}
+const FAILED_AT_PREFLIGHT = [
+  { key: 'preflight', label: 'Check your AWS setup', state: 'failed' as const },
+  { key: 'provision', label: 'Create the instance', state: 'pending' as const },
+  { key: 'install', label: 'Install Kiro Crew', state: 'pending' as const },
+  { key: 'connect', label: 'Connect', state: 'pending' as const },
+]
+const FAILED_AFTER_REGISTER = [
+  { key: 'preflight', label: 'Checked your AWS setup', state: 'done' as const },
+  { key: 'provision', label: 'Created the instance', state: 'done' as const },
+  { key: 'signin', label: 'Sign in to Kiro', state: 'failed' as const },
+  { key: 'connect', label: 'Connected', state: 'done' as const },
+]
+const FAILED_AT_REGISTER = [
+  { key: 'preflight', label: 'Checked your AWS setup', state: 'done' as const },
+  { key: 'provision', label: 'Created the instance', state: 'done' as const },
+  { key: 'signin', label: 'Sign in to Kiro', state: 'pending' as const },
+  { key: 'connect', label: 'Connect', state: 'failed' as const },
+]
+const FAILED_AT_PROVISION = [
+  { key: 'preflight', label: 'Checked your AWS setup', state: 'done' as const },
+  { key: 'provision', label: 'Create the instance', state: 'failed' as const },
+  { key: 'install', label: 'Install Kiro Crew', state: 'pending' as const },
+  { key: 'connect', label: 'Connect', state: 'pending' as const },
+]
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -101,7 +140,7 @@ beforeEach(() => {
 
 async function openSetup(u: ReturnType<typeof userEvent.setup>) {
   renderWithProviders(<RemoteCrewPanel />)
-  await u.click(await screen.findByRole('radio', { name: /Set up a new one/i }))
+  await u.click(await screen.findByRole('button', { name: 'Add Crew' })); await u.click(await screen.findByRole('button', { name: /Set up a new Crew/ }))
 }
 
 describe('RemoteCrewPanel launch form', () => {
@@ -186,6 +225,65 @@ describe('RemoteCrewPanel launch form', () => {
     expect(vi.mocked(api.cloudLaunch).mock.calls[1]).toEqual(vi.mocked(api.cloudLaunch).mock.calls[0])
   })
 
+  it('after a launch that failed before provisioning, says it failed and offers Launch as the retry', async () => {
+    // Stopped at the AWS check: nothing was created, so repeating the settings is safe.
+    vi.mocked(api.cloudLaunchStatus).mockResolvedValue({ ...RUNNING_JOB, status: 'failed' as const, steps: FAILED_AT_PREFLIGHT })
+    const u = userEvent.setup()
+    await openSetup(u)
+
+    const launch = await screen.findByRole('button', { name: /^Launch$/ })
+    await waitFor(() => expect(launch).not.toBeDisabled())
+    await u.click(launch)
+
+    expect(await screen.findByText(RETRY)).toBeInTheDocument()
+    expect(screen.getAllByRole('alert').some(a => a.textContent?.includes(RETRY))).toBe(true)
+    expect(screen.queryByText(/Launched\. Its progress is shown below/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Launch another crew' })).not.toBeInTheDocument()
+    // Launch is the retry: the reader may fix the cause outside the form or change the subnet first.
+    const retry = screen.getByRole('button', { name: /^Launch$/ })
+    expect(retry).not.toBeDisabled()
+    await u.type(screen.getByRole('textbox', { name: 'Subnet ID (optional)' }), 'subnet-0123abcd')
+    await u.click(retry)
+    await waitFor(() => expect(api.cloudLaunch).toHaveBeenCalledTimes(2))
+    expect(vi.mocked(api.cloudLaunch).mock.calls[1][0]).toMatchObject({ subnet_id: 'subnet-0123abcd' })
+  })
+
+  // From provisioning on a stack may still exist: a refused sign-in leaves a
+  // registered crew, and a failed provision is rolled back best-effort with no
+  // field saying whether the rollback confirmed.
+  // "Listed in My Crews" is said only while the live list holds the instance:
+  // the job is a snapshot, so a registered crew deleted since gets the neutral line.
+  it.each([
+    ['sign-in, with its registered crew in the live list', { instance_id: LAUNCHED_ID, steps: FAILED_AFTER_REGISTER }, [LIVE_CREW], CREW_LISTED],
+    ['sign-in, with its registered crew deleted since', { instance_id: LAUNCHED_ID, steps: FAILED_AFTER_REGISTER }, [], CHECK_CREWS],
+    ['registration, with an instance that never registered', { instance_id: LAUNCHED_ID, steps: FAILED_AT_REGISTER }, [LIVE_CREW], CHECK_CREWS],
+    ['provisioning, with no instance returned', { steps: FAILED_AT_PROVISION }, [], CHECK_CREWS],
+  ])('after a launch that failed during %s, says it failed but keeps the same-settings guard', async (_case, failed, live, line) => {
+    // The list holds the crew only once the launch has gone out, as the gateway's would.
+    vi.mocked(api.listInstances).mockImplementation(async () => ({
+      active: true, warm_set_cap: 5, instances: vi.mocked(api.cloudLaunch).mock.calls.length ? live : [],
+    }) as never)
+    vi.mocked(api.cloudLaunchStatus).mockResolvedValue({ ...RUNNING_JOB, status: 'failed' as const, ...failed })
+    const u = userEvent.setup()
+    await openSetup(u)
+
+    const launch = await screen.findByRole('button', { name: /^Launch$/ })
+    await waitFor(() => expect(launch).not.toBeDisabled())
+    await u.click(launch)
+
+    expect(await screen.findByText(line)).toBeInTheDocument()
+    expect(screen.getAllByRole('alert').some(a => a.textContent?.includes(line))).toBe(true)
+    expect(screen.queryByText(line === CREW_LISTED ? CHECK_CREWS : CREW_LISTED)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Launched\. Its progress is shown below/)).not.toBeInTheDocument()
+    expect(screen.queryByText(RETRY)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^Launch$/ })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Launch another crew' })).toBeInTheDocument()
+    // A different subnet is a different crew, so Launch comes back for it.
+    await u.type(screen.getByRole('textbox', { name: 'Subnet ID (optional)' }), 'subnet-0123abcd')
+    await waitFor(() => expect(screen.getByRole('button', { name: /^Launch$/ })).not.toBeDisabled())
+    expect(api.cloudLaunch).toHaveBeenCalledTimes(1)
+  })
+
   it('offers no launch while a crew setup is still running, which the gateway would refuse', async () => {
     const u = userEvent.setup()
     await openSetup(u)
@@ -202,13 +300,123 @@ describe('RemoteCrewPanel launch form', () => {
     expect(api.cloudLaunch).toHaveBeenCalledTimes(1)
   })
 
+  it('prices each size card like the CLI and says when the Region is not the priced one', async () => {
+    const u = userEvent.setup()
+    await openSetup(u)
+    const card = await screen.findByRole('button', { name: 'Development · arm64' })
+    // The flag is typed into a terminal, so it renders verbatim in a <code> element.
+    expect(within(card).getByText('--size balanced').tagName).toBe('CODE')
+    expect(card).toHaveAccessibleDescription('~$0.33/hr · ~$235/mo if left running (approx)')
+    expect(screen.queryByText(PRICE_NOTE)).toBeNull()
+
+    const region = screen.getByRole('textbox', { name: 'Region' })
+    await u.clear(region)
+    await u.type(region, 'sa-east-1')
+    expect(screen.getByText(PRICE_NOTE)).toBeInTheDocument()
+  })
+
+  it('shows a refused subnet under the Subnet ID field until the field is edited', async () => {
+    const message = 'subnet subnet-0123abcd has no verified internet egress route (NAT or internet gateway).'
+    vi.mocked(api.cloudLaunch).mockRejectedValue(
+      new ApiError(400, message, JSON.stringify({ error: message, code: 'invalid_subnet' })),
+    )
+    const u = userEvent.setup()
+    await openSetup(u)
+    const subnet = await screen.findByRole('textbox', { name: 'Subnet ID (optional)' })
+    await u.type(subnet, 'subnet-0123abcd')
+    const launch = await screen.findByRole('button', { name: /^Launch$/ })
+    await waitFor(() => expect(launch).not.toBeDisabled())
+    await u.click(launch)
+
+    await waitFor(() => expect(subnet).toHaveAttribute('aria-invalid', 'true'))
+    const notice = document.getElementById(subnet.getAttribute('aria-describedby') ?? '')
+    expect(notice).toHaveTextContent(message)
+    // Shown once, under the field: not repeated in the page-top notice.
+    expect(screen.getAllByText(message)).toHaveLength(1)
+
+    await u.type(subnet, '0')
+    expect(subnet).not.toHaveAttribute('aria-invalid')
+    expect(subnet).not.toHaveAttribute('aria-describedby')
+    expect(screen.queryByText(message)).not.toBeInTheDocument()
+  })
+
+  it('reports a refused subnet at the top once the field has been edited while the launch was in flight', async () => {
+    const message = 'subnet subnet-0123abcd has no verified internet egress route (NAT or internet gateway).'
+    let refuse: (e: unknown) => void = () => {}
+    vi.mocked(api.cloudLaunch).mockImplementation(() => new Promise((_resolve, reject) => { refuse = reject }))
+    const u = userEvent.setup()
+    await openSetup(u)
+    const subnet = await screen.findByRole('textbox', { name: 'Subnet ID (optional)' })
+    await u.type(subnet, 'subnet-0123abcd')
+    const launch = await screen.findByRole('button', { name: /^Launch$/ })
+    await waitFor(() => expect(launch).not.toBeDisabled())
+    await u.click(launch)
+    expect(await screen.findByRole('button', { name: /Launching/ })).toBeDisabled()
+    await waitFor(() => expect(api.cloudLaunch).toHaveBeenCalled())
+    // A different subnet, typed before the refusal of the first arrives.
+    await u.clear(subnet)
+    await u.type(subnet, 'subnet-4567efab')
+    refuse(new ApiError(400, message, JSON.stringify({ error: message, code: 'invalid_subnet' })))
+
+    const notice = await screen.findByText(message)
+    expect(screen.getAllByText(message)).toHaveLength(1)
+    // The page-top notice sits above the form; the field's own notice would follow it.
+    expect(notice.compareDocumentPosition(subnet) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(subnet).toHaveValue('subnet-4567efab')
+    expect(subnet).not.toHaveAttribute('aria-invalid')
+    expect(subnet).not.toHaveAttribute('aria-describedby')
+  })
+
+  it('reports a refused subnet at the top once the Add Crew window was closed while the launch was in flight', async () => {
+    const message = 'subnet subnet-0123abcd has no verified internet egress route (NAT or internet gateway).'
+    let refuse: (e: unknown) => void = () => {}
+    vi.mocked(api.cloudLaunch).mockImplementation(() => new Promise((_resolve, reject) => { refuse = reject }))
+    const u = userEvent.setup()
+    await openSetup(u)
+    await u.type(await screen.findByRole('textbox', { name: 'Subnet ID (optional)' }), 'subnet-0123abcd')
+    const launch = await screen.findByRole('button', { name: /^Launch$/ })
+    await waitFor(() => expect(launch).not.toBeDisabled())
+    await u.click(launch)
+    await waitFor(() => expect(api.cloudLaunch).toHaveBeenCalled())
+    await u.click(screen.getByRole('button', { name: 'Close' }))
+    expect(screen.queryByRole('textbox', { name: 'Subnet ID (optional)' })).not.toBeInTheDocument()
+    refuse(new ApiError(400, message, JSON.stringify({ error: message, code: 'invalid_subnet' })))
+
+    expect(await screen.findByText(message)).toBeInTheDocument()
+    expect(screen.getAllByText(message)).toHaveLength(1)
+  })
+
   it('names the missing region in the check line instead of leaving a gap', async () => {
     const u = userEvent.setup()
     await openSetup(u)
     const region = await screen.findByRole('textbox', { name: 'Region' })
     await u.clear(region)
     await u.tab()
-    expect(await screen.findByText('Checked against profile none set (AWS CLI default), with no region set.')).toBeInTheDocument()
+    expect(await screen.findByText('Checked with your default AWS credentials, with no region set.')).toBeInTheDocument()
+  })
+
+  it('marks the checklist out of date while the typed profile differs from the checked one', async () => {
+    const u = userEvent.setup()
+    await openSetup(u)
+    // The answered list: the rows drawn while the check runs carry the same titles.
+    const list = (await screen.findByText('Session Manager plugin', { selector: 'ul:not([aria-busy]) div' })).closest('ul') as HTMLElement
+    const greyMarks = () => list.querySelectorAll('li > span.bg-border-strong').length
+    expect(greyMarks()).toBe(0)
+    expect(screen.queryByText(STALE)).toBeNull()
+
+    // Typing runs no check, so the rows still answer for the default credentials: their
+    // marks turn grey and the line above says so, while the rows' buttons stay usable.
+    await u.type(screen.getByRole('textbox', { name: 'AWS profile' }), 'Admin')
+    expect(greyMarks()).toBe(5)
+    expect(screen.getByText(STALE)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Re-check/ })).toBeEnabled()
+    expect(api.cloudPreflight).not.toHaveBeenCalledWith('Admin', expect.anything())
+
+    // Leaving the field checks the typed profile, and the mark goes away.
+    await u.tab()
+    await waitFor(() => expect(api.cloudPreflight).toHaveBeenLastCalledWith('Admin', 'us-east-1'))
+    expect(await screen.findByText('Checked against profile Admin in us-east-1.')).toBeInTheDocument()
+    expect(screen.queryByText(STALE)).toBeNull()
   })
 })
 

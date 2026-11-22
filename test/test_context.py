@@ -17,6 +17,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from kiro_crew import pinned_fs
 from kiro_crew.config.loader import config_path
 from kiro_crew.context import ContextBuilder, _neutralize_structural_markers
 from kiro_crew.hooks import ContextRule, HookManager, HooksConfig
@@ -290,7 +291,8 @@ class TestContextBuilder:
         assert "tool result" in dash
         assert "END YOUR TURN" not in dash
         assert "NON-BLOCKING" not in dash
-        assert "[OPTIONS:]" in dash
+        # Ending with buttons is no cheaper than a card: the nudge does not steer to it.
+        assert "[OPTIONS:] is cheaper" not in dash
         # A card is an interruption, so the nudge must also carry the restraint
         # contract: silence is the default and only a human-only decision that
         # actually blocks the work earns the interruption.
@@ -1003,6 +1005,62 @@ class TestContextBuilder:
         assert "lobsters" in msg_full
         assert "[SESSION RESUMED" not in msg_full
 
+    def _resume_builder(self, tmp_path):
+        from kiro_crew.learn import Lesson
+
+        lessons = LessonStore(base_dir=tmp_path)
+        lessons.save(
+            Lesson(
+                ts="2026-01-01T00:00:00Z",
+                rule="always end replies with the word ZEBRAFINCH",
+                category="knowledge",
+            )
+        )
+        return ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=lessons,
+        )
+
+    def test_resumed_session_re_sends_lessons(self, tmp_path):
+        """A compacted restored transcript may have lost the standing lessons,
+        so a slim resume re-sends them, as it re-sends the critical rules."""
+        msg, _ = self._resume_builder(tmp_path).build_message(
+            "hello", is_new_session=True, resumed=True, session_key="dashboard:s1"
+        )
+        assert "[SESSION RESUMED" in msg
+        assert "ZEBRAFINCH" in msg, "standing lessons must be re-sent on resume"
+        assert "lessons, skills) was injected" not in msg
+
+    @pytest.mark.skipif(
+        not pinned_fs.supports_pinned_tree_walk(),
+        reason="steering_dirs are refused where a directory cannot be opened relative to a descriptor",
+    )
+    def test_resumed_session_re_sends_folder_steering(self, tmp_path):
+        """A slim resume re-sends the folder steering, except to a scope that
+        withheld the project group."""
+        steer = tmp_path / "folder-steer"
+        steer.mkdir()
+        (steer / "rules.md").write_text("Folder rule: say OSPREYMARK first.\n")
+        builder = self._resume_builder(tmp_path)
+        msg, _ = builder.build_message(
+            "hello",
+            is_new_session=True,
+            resumed=True,
+            session_key="dashboard:s1",
+            steering_dirs=(str(steer),),
+        )
+        assert "OSPREYMARK" in msg, "folder steering must be re-sent on resume"
+        scoped, _ = builder.build_message(
+            "hello",
+            is_new_session=True,
+            resumed=True,
+            session_key="dashboard:s2",
+            steering_dirs=(str(steer),),
+            context_groups=frozenset({"lessons"}),
+        )
+        assert "OSPREYMARK" not in scoped
+
     def test_build_message_injects_folder_breadcrumb(self, tmp_path):
         builder = ContextBuilder(
             memory=MemoryStore(workspace=tmp_path / "ws"),
@@ -1504,6 +1562,13 @@ class TestLoadAgentPrompt:
         self._write_spec(tmp_path, monkeypatch, f"file://{contract}")
         loaded = ContextBuilder._load_agent_prompt("test", owner_template=owner_template)
         assert loaded == "RESOLVED_CONTRACT"
+
+    def test_a_file_uri_spelled_prompt_reads_the_file_it_names(self, tmp_path, monkeypatch):
+        """``file:///C:/...``, what ``Path.as_uri()`` writes on Windows, is an absolute prompt."""
+        own = tmp_path / "own-prompt.md"
+        own.write_text("OWN_URI_PERSONA", encoding="utf-8")
+        self._write_spec(tmp_path, monkeypatch, "file:///" + own.as_posix().lstrip("/"))
+        assert ContextBuilder._load_agent_prompt("test") == "OWN_URI_PERSONA"
 
     def test_owner_template_custom_prompt_omitted(self, tmp_path, monkeypatch):
         """An owner template's own (non-managed) prompt reaches the model through

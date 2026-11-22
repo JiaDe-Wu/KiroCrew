@@ -30,6 +30,7 @@ if TYPE_CHECKING:
         DashboardState,
         PostedOptions,
         _append_footer_actions,
+        _backfill_late_link,
         _condense_thinking,
         _convert_tables,
         _dashboard_state,
@@ -95,6 +96,9 @@ async def _deliver_answer(turn: _SlackTurn) -> None:
     _replayed = turn._replayed
     _stop_reason = turn._stop_reason
     _turn_completed_ok = turn._turn_completed_ok
+    # The busy memory pool refused the build: nothing reached the model, so the
+    # turn writes no transcript row on any branch below.
+    _unsent = turn._unsent
     answer = turn.answer
     client = turn.client
     linked_session_key = turn.routed_link_key
@@ -185,7 +189,7 @@ async def _deliver_answer(turn: _SlackTurn) -> None:
                     await slack.delete_message(channel, answer.thinking_ts)
                 except Exception:
                     logger.debug("Failed to delete thinking placeholder", exc_info=True)
-            if conversation_log and not _is_slack_restricted(session_key):
+            if conversation_log and not _unsent and not _is_slack_restricted(session_key):
                 await save_conversation_turn_off_loop(
                     conversation_log,
                     session_key,
@@ -200,8 +204,13 @@ async def _deliver_answer(turn: _SlackTurn) -> None:
 
         # Strip any inline <thinking> tags that leaked into the text
         _untrimmed = ""
+        # The reply WITH its control tags: the stream's comment hold is settled
+        # against it, because against the stripped reply a held control-tag tail
+        # always reads as content and streams as text.
+        _with_tags = ""
         if answer.accumulated:
             answer.accumulated, inline_thinking = strip_thinking_tags(answer.accumulated)
+            _with_tags = answer.accumulated
             # Trailing control-tag lines are peeled BEFORE the whitespace trim: the
             # trim would erase the indentation that marks a quoted, 4-space-indented
             # tag as code, and the tail grammar would then read it as protocol.
@@ -318,6 +327,10 @@ async def _deliver_answer(turn: _SlackTurn) -> None:
             if not await _post_review_draft(
                 answer, slack, channel, reply_ts, thread_ts, user_id, session_key, clean_text
             ):
+                # No draft landed, so nothing owns "Awaiting review…". The clear
+                # at the top of delivery kept the status for the draft; take it
+                # down here or the requester waits on a review that never comes.
+                await turn.clear_working_indicators()
                 if _turn_completed_ok:
                     await turn.book_failure()
                 turn.release_permit()
@@ -328,7 +341,7 @@ async def _deliver_answer(turn: _SlackTurn) -> None:
             # delivered draft into a failed turn — book success first, then persist.
             if _turn_completed_ok:
                 turn.book_success()
-            if conversation_log and not _is_slack_restricted(session_key):
+            if conversation_log and not _unsent and not _is_slack_restricted(session_key):
                 try:
                     await save_conversation_turn_off_loop(
                         conversation_log,
@@ -345,6 +358,32 @@ async def _deliver_answer(turn: _SlackTurn) -> None:
                     )
             turn.release_permit()
             return
+
+        def _build_footer(options_token: str | None) -> tuple[list[dict], str]:
+            """The timing footer with its OPTIONS / Link-to-Dashboard controls."""
+            footer_blocks, footer_text = build_timing_footer(time.monotonic() - _t0, client)
+            if not footer_blocks and not options:
+                # Timing hidden and no choices: the Link to Dashboard button is all
+                # this footer can still carry, so its notification says that.
+                footer_text = "Link to Dashboard"
+            # Re-read the DASHBOARD link for the footer button only: a mid-turn
+            # click on the turn-start button may have linked the thread to a slot
+            # since turn start, and a second Link button would be redundant. (Not
+            # the session map: the turn's own self-link lands there mid-turn too.)
+            _ds_now = cast("DashboardState | None", _dashboard_state)
+            _footer_link_key = linked_session_key
+            if not _footer_link_key and thread_ts and _ds_now is not None:
+                _slot_now = _ds_now.get_linked_slot(reply_ts)
+                _footer_link_key = _slot_now.key if _slot_now is not None else None
+            footer_blocks = _append_footer_actions(
+                footer_blocks,
+                options,
+                thread_ts,
+                _footer_link_key,
+                _dashboard_state,
+                options_token,
+            )
+            return footer_blocks, footer_text
 
         # ── Answer delivery, then exactly one verdict ──────────────────────────
         # The turn invariant. Read it before touching accounting:
@@ -371,17 +410,25 @@ async def _deliver_answer(turn: _SlackTurn) -> None:
         # push the consecutive-failure breaker toward a session reset.
         _answer_text_to_send = bool(clean_text) and clean_text != _NO_RESPONSE
         _answer_reached = not _answer_text_to_send
+        # True once the timing footer rode in the stream's seal (the answer
+        # message itself); the footer site below then posts no second one.
+        _footer_inline = False
 
         try:
             if answer.use_slack_stream and answer.stream_ts:
-                await answer.finish(_untrimmed)
+                await answer.finish(_with_tags)
                 # ``answer.delivered`` rises only on a confirmed real-text append,
                 # so a stream whose every append was refused (a Slack outage) is a
                 # failure. Applied only when there was answer text, since a
                 # reasoning-only stream lands no append. Read after the seal,
                 # which sends the last held run of text.
-                await answer.seal(
-                    clean_text, redacted=bool(_render_redacted or exfil_warnings or cred_warnings)
+                #
+                # An OPTIONS turn keeps its footer a message of its own: the next
+                # turn strikes the buttons with a ``chat.update`` on that ts.
+                _footer_inline = await answer.seal(
+                    clean_text,
+                    redacted=bool(_render_redacted or exfil_warnings or cred_warnings),
+                    footer_blocks=None if options else _build_footer(None)[0],
                 )
                 if _answer_text_to_send:
                     _answer_reached = answer.delivered
@@ -542,7 +589,7 @@ async def _deliver_answer(turn: _SlackTurn) -> None:
         #
         # Durability-before-invitation is also right on its own terms: a question
         # about a turn that has no record is not answerable after a restart.
-        _skip_writes = _is_slack_restricted(session_key)
+        _skip_writes = _is_slack_restricted(session_key) or _unsent
         _turn_row_ts: str | None = None
         if conversation_log and not _skip_writes:
             # The per-turn hot path: two appends every turn, so this is where the
@@ -558,8 +605,6 @@ async def _deliver_answer(turn: _SlackTurn) -> None:
             )
 
         # ── Timing footer ──
-        elapsed = time.monotonic() - _t0
-        footer_blocks, footer_text = build_timing_footer(elapsed, client)
         # Gated on `options` alone. A top-level Slack message has no ``thread_ts``, so
         # gating on it left every root-thread control untokened -- unprotected on
         # exactly the path a restart strands. ``reply_ts`` is the thread this control
@@ -584,23 +629,7 @@ async def _deliver_answer(turn: _SlackTurn) -> None:
             if options and _turn_row_ts
             else None
         )
-        # Re-read the DASHBOARD link for the footer button only: a mid-turn
-        # click on the turn-start button may have linked the thread to a slot
-        # since turn start, and a second Link button would be redundant. (Not
-        # the session map: the turn's own self-link lands there mid-turn too.)
-        _ds_now = cast("DashboardState | None", _dashboard_state)
-        _footer_link_key = linked_session_key
-        if not _footer_link_key and thread_ts and _ds_now is not None:
-            _slot_now = _ds_now.get_linked_slot(reply_ts)
-            _footer_link_key = _slot_now.key if _slot_now is not None else None
-        footer_blocks = _append_footer_actions(
-            footer_blocks,
-            options,
-            thread_ts,
-            _footer_link_key,
-            _dashboard_state,
-            _options_token,
-        )
+        footer_blocks, footer_text = _build_footer(_options_token)
         # The footer is decoration EXCEPT when it carries an [OPTIONS] control:
         # the trailer was stripped from the answer, so the choices ride ONLY here,
         # which makes the footer (or its fallback) answer-carrying. For such a turn
@@ -613,7 +642,10 @@ async def _deliver_answer(turn: _SlackTurn) -> None:
         _footer_ts: str | None = None
         _options_delivered = False
         try:
-            _footer_ts = await slack.post_blocks(channel, footer_blocks, footer_text, reply_ts)
+            # Already inside the answer message when the seal carried it; an empty
+            # footer (timing hidden, no controls) posts nothing.
+            if not _footer_inline and footer_blocks:
+                _footer_ts = await slack.post_blocks(channel, footer_blocks, footer_text, reply_ts)
             _options_delivered = True
         except Exception:
             logger.warning("Slack footer post_blocks failed for %s", session_key, exc_info=True)
@@ -722,7 +754,17 @@ async def _deliver_answer(turn: _SlackTurn) -> None:
 
         # ── Bidirectional sync: mirror to dashboard if routed to a dashboard session ──
         if linked_session_key and _dashboard_state and answer.accumulated and not _skip_writes:
-            _mirror_to_dashboard(linked_session_key, text, answer.accumulated)
+            await _mirror_to_dashboard(linked_session_key, text, answer.accumulated)
+        # A Link click while this turn ran may have imported its answer unfinished.
+        if _dashboard_state and answer.accumulated and not _skip_writes:
+            _backfill_late_link(
+                reply_ts,
+                msg_ts,
+                linked_session_key,
+                answer.stream_ts,
+                answer.accumulated,
+                answer.rotated_ts,
+            )
         # ── Auto-title Slack thread (fire-and-forget) ──
         # Claim-early-unclaim-on-failure pattern: ``try_claim`` checks and marks in one
         # synchronous step, so concurrent messages (and the transport path, which

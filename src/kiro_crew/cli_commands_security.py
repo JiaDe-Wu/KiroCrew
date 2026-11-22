@@ -19,6 +19,7 @@ import re
 import sys
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 
 from kiro_crew.cli_commands_memory import _finding_store_suffix
 from kiro_crew.config import config_dir
@@ -31,6 +32,9 @@ from kiro_crew.security import (
 )
 from kiro_crew.sel import sel
 from kiro_crew.terminal_safe import safe_terminal_line
+
+if TYPE_CHECKING:
+    from kiro_crew.platform.governance import GovernanceCeiling
 
 _TIME_SELECTOR_RE = re.compile(r"(?i)\A(?P<value>\d+)(?P<unit>[smhdw])\Z")
 
@@ -93,33 +97,132 @@ def _security(args: argparse.Namespace) -> None:
 
     action = getattr(args, "sec_action", None)
     if action == "deny-list":
-        print("🔒 Built-in deny patterns (always enforced):")
-        for p in BUILTIN_DENY_PATTERNS:
-            print(f"  ✗ {p}")
+        # The built-in half shows what the gate enforces: the same opt-out state
+        # (denied_commands.json disable_all / disabled_ids, with floor rules and
+        # governance pins kept on) that Settings > Security reads. Imported here,
+        # not at module scope, so the name does not join the ``cli_commands`` facade.
+        from kiro_crew.dashboard.handlers.security import (
+            _denied_state,
+            _read_denied_data,
+            build_denied_commands_snapshot,
+        )
+        from kiro_crew.security import pinned_builtin_command_ids
+
+        rows = {
+            r["pattern"]: r
+            for r in build_denied_commands_snapshot()["builtins"]
+            if r["source"] == "builtin"
+        }
+        # The snapshot locks a rule pinned by ANY profile; the gate restores only
+        # ceiling pins for every session, and a profile pin only for sessions bound
+        # to that profile. An opted-out rule kept on by a profile pin alone is
+        # therefore not enforced everywhere and gets its own section.
+        state = _denied_state(_read_denied_data())
+        opted_out = set(state["disabled_ids"])
+        ceiling_pins = pinned_builtin_command_ids()
+
+        def _profile_only(p: str) -> bool:
+            row = rows.get(p, {})
+            rid = row.get("id")
+            return (
+                row.get("lock_reason") == "policy"
+                and rid not in ceiling_pins
+                and (state["disable_all"] or rid in opted_out)
+            )
+
+        lock_notes = {"floor": "  (always on: floor rule)", "policy": "  (kept on: governance pin)"}
+        profile_only = [p for p in BUILTIN_DENY_PATTERNS if _profile_only(p)]
+        enforced = [
+            p
+            for p in BUILTIN_DENY_PATTERNS
+            if rows.get(p, {}).get("enabled", True) and p not in profile_only
+        ]
+        turned_off = [
+            p for p in BUILTIN_DENY_PATTERNS if p not in enforced and p not in profile_only
+        ]
+        print("🔒 Built-in deny patterns (enforced):")
+        for p in enforced:
+            # A lock note says why a rule the operator turned off is still on, so
+            # only a rule they turned off gets one.
+            row = rows.get(p, {})
+            note = (
+                lock_notes.get(row.get("lock_reason") or "", "")
+                if state["disable_all"] or row.get("id") in opted_out
+                else ""
+            )
+            print(f"  ✗ {p}{note}")
+        if profile_only:
+            print(
+                "\n🔐 Built-in deny patterns turned off but kept on only for sessions "
+                "bound to a governance profile that pins them:"
+            )
+            for p in profile_only:
+                print(f"  ~ {p}")
+        if turned_off:
+            print("\n🔓 Built-in deny patterns turned off in denied_commands.json (not enforced):")
+            for p in turned_off:
+                print(f"  - {p}")
         cfg_path = config_dir() / "config.json"
-        if cfg_path.exists():
-            try:
-                data = json.loads(read_config_text(cfg_path))
-            except (OSError, ValueError) as exc:
-                # The built-in list above is already printed; say plainly that the
-                # user-configured half could not be read instead of a traceback.
-                print(f"\n⚠️  Could not read user-configured deny patterns from {cfg_path}: {exc}")
-                data = {}
-            hooks = data.get("hooks") if isinstance(data, dict) else None
-            extra = hooks.get("auto_deny_tools", []) if isinstance(hooks, dict) else []
+        local_path = config_dir() / "config.local.json"
+        if cfg_path.exists() or local_path.exists():
+            if cfg_path.exists():
+                try:
+                    json.loads(read_config_text(cfg_path))
+                except (OSError, ValueError) as exc:
+                    # The built-in list above is already printed; say plainly that the
+                    # user-configured half could not be read instead of a traceback.
+                    print(
+                        f"\n⚠️  Could not read user-configured deny patterns from {cfg_path}: {exc}"
+                    )
+            # The gateway reads ``hooks`` from config.json with config.local.json
+            # merged over it, so the list shown here comes from the same merge.
+            # Imported here, not at module scope: this module is a star-import owner
+            # of ``cli_commands``, so a module-level name would join that facade.
+            from kiro_crew.config.loader_locations import read_merged_config_files
+
+            data = read_merged_config_files(cfg_path, local_path)
+            hooks = data.get("hooks")
+            raw = hooks.get("auto_deny_tools", []) if isinstance(hooks, dict) else []
+            # Show what the gate enforces: ``HooksConfig.from_dict`` keeps only the
+            # text entries of a list and reads anything else as no patterns.
+            if not isinstance(raw, list):
+                print(
+                    "\n⚠  hooks.auto_deny_tools is not a list, so no user-configured "
+                    "deny pattern is enforced. Make it a list of patterns."
+                )
+                raw = []
+            extra = [p for p in raw if isinstance(p, str)]
+            skipped = len(raw) - len(extra)
             if extra:
                 print("\n🔧 User-configured deny patterns:")
                 for p in extra:
                     print(f"  ✗ {p}")
+            if skipped:
+                print(
+                    f"\n⚠  {skipped} entries in hooks.auto_deny_tools are not text and "
+                    "are not enforced."
+                )
     elif action == "audit":
-        history_dir = config_dir() / "history"
-        findings = scan_history(history_dir)
+        sessions_dir = config_dir() / "sessions"
+        findings, rows_scanned = scan_history(sessions_dir)
         if findings:
             print(f"⚠️  {len(findings)} suspicious entries found:\n")
             for f in findings:
-                print(f"  📄 {f['file']}")
-                print(f"     {f['warning']}")
-                print(f"     {f['snippet'][:120]}…\n")
+                # A transcript row is agent-written text: one line, no live controls.
+                print(f"  📄 {safe_terminal_line(f['file'])}")
+                print(f"     {safe_terminal_line(f['warning'])}")
+                if f["snippet"]:
+                    print(f"     {safe_terminal_line(f['snippet'][:120])}…")
+                print()
+        elif not rows_scanned:
+            # Nothing was read, so there is no result to call clean.
+            if sessions_dir.is_dir() and any(sessions_dir.glob("*.jsonl")):
+                print(
+                    f"ℹ️  No session transcripts scanned: the transcripts in {sessions_dir} "
+                    "held no rows to audit."
+                )
+            else:
+                print(f"ℹ️  No session transcripts scanned: none found in {sessions_dir}.")
         else:
             print("✅ No suspicious tool usage found in recent history.")
 
@@ -277,16 +380,8 @@ def _policy(args: argparse.Namespace) -> None:
     effective ceiling.  No mutation — purely diagnostic, so it is MCP-safe.
     """
     from kiro_crew.platform.context import current_context
-    from kiro_crew.platform.governance import (
-        CAPABILITY,
-        SCOPE_CATALOG,
-        gate_decision,
-        resolve,
-    )
-    from kiro_crew.platform.governance_profiles import (
-        get_store_profile,
-        resolve_active_scope,
-    )
+    from kiro_crew.platform.governance import CAPABILITY, SCOPE_CATALOG
+    from kiro_crew.platform.governance_profiles import get_store_profile
 
     action = getattr(args, "policy_action", None)
     ceiling = getattr(current_context(), "governance", None)
@@ -344,10 +439,31 @@ def _policy(args: argparse.Namespace) -> None:
                     "(enabled true or false) if you meant to decide it."
                 )
         # Force-load every profile; the store records invalid ones as deny-all.
-        from kiro_crew.platform.governance_profiles import _profiles_dir, fallback_profile_names
+        from kiro_crew.platform.governance_profiles import (
+            _STORE,
+            _profiles_dir,
+            fallback_profile_names,
+        )
 
         pdir = _profiles_dir()
-        if pdir.is_dir():
+        # The store records a directory it could not list (a file at the profiles
+        # path, or EACCES) as one unrecoverable entry; without this check the run
+        # reads as "no profiles" while every profile is dropped. Under a policy
+        # ceiling the boot gate refuses that entry, so validate fails with it; a
+        # standalone host runs policy-only on it, so validate only warns.
+        if any(name.startswith("<dir:") for name in _STORE.unrecoverable_files()):
+            if ceiling is not None:
+                print(
+                    f"   profiles directory {pdir}: INVALID (cannot be listed; "
+                    "no profile applies)"
+                )
+                ok = False
+            else:
+                print(
+                    f"   ⚠  profiles directory {pdir} cannot be listed; no profile "
+                    "applies (a host under a policy ceiling would refuse to boot)"
+                )
+        elif pdir.is_dir():
             for f in sorted(pdir.glob("*.json")):
                 prof = get_store_profile(f.stem)
                 # The store keeps the file stem as a fallback's name, so the name alone
@@ -370,6 +486,16 @@ def _policy(args: argparse.Namespace) -> None:
         print("✅ valid")
 
     elif action == "explain":
+        batch = getattr(args, "batch", None)
+        if (batch is None and args.item is None) or (batch is not None and args.scope is not None):
+            print(
+                "Usage: kirocrew policy explain <scope> <item> [--json] | --batch FILE|-",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        if batch is not None:
+            _explain_batch(ceiling, batch, args.session_key, args.agent, args.app)
+            return
         scope = args.scope
         if scope not in SCOPE_CATALOG:
             print(
@@ -377,23 +503,39 @@ def _policy(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        profile = resolve_active_scope(args.session_key, agent=args.agent, app=args.app)
-        decision = resolve(ceiling, profile, scope, args.item)
-        verdict = "ALLOWED" if decision.permitted else "DENIED"
-        print(f"{verdict}: {scope} → {args.item!r}")
+        record = _explain_record(ceiling, scope, args.item, args.session_key, args.agent, args.app)
+        if getattr(args, "json", False):
+            print(json.dumps(record))
+            return
+        print(f"{record['verdict']}: {scope} → {args.item!r}")
         print(f"   surface session: {args.session_key!r}")
-        print(f"   active profile : {profile.name if profile else '(none — policy only)'}")
-        print(f"   rule/layer     : {decision.rule} / {decision.layer or '—'}")
-        print(f"   reason         : {decision.reason}")
-        # Also show the raw title-classified path (mirrors the live gate).
-        gate = gate_decision(ceiling, profile, args.item)
-        print(f"   gate verdict   : {'ALLOWED' if gate.permitted else 'DENIED'} ({gate.reason})")
+        print(f"   active profile : {record['profile'] or '(none — policy only)'}")
+        print(f"   rule/layer     : {record['rule']} / {record['layer'] or '—'}")
+        print(f"   reason         : {record['reason']}")
+        print(f"   gate verdict   : {record['gate_verdict']} ({record['gate_reason']})")
 
     elif action == "profile":
         prof = get_store_profile(args.name)
         if prof is None:
             print(f"No profile named {args.name!r} in ~/.kiro/crew/profiles/.", file=sys.stderr)
             raise SystemExit(1)
+        # A profile file that is unreadable, unparseable, or whose ``extends``
+        # parent is missing is substituted by the fallback profile (deny-all, or
+        # the looser one a policy declares under ``fallback``) and stored under
+        # the same stem, so ``get_store_profile`` returns a valid-looking profile.
+        # Without this warning the broken file reads as a deliberate, normal one. Enforcement is correct
+        # either way; the warning only lets the operator tell a lockdown they
+        # wrote from a file that failed to load.
+        from kiro_crew.platform.governance_profiles import fallback_profile_names
+
+        if args.name in fallback_profile_names():
+            print(
+                f"⚠️  profile {args.name!r} failed to load (unreadable, invalid, or a "
+                "missing, chained or broken 'extends' parent) and is running as the "
+                "fallback profile shown below. Fix the file, or the parent it extends, "
+                "in ~/.kiro/crew/profiles/.",
+                file=sys.stderr,
+            )
         bind = f"{prof.bind.type}:{prof.bind.id}" if prof.bind else "(unbound)"
         print(f"📄 Profile {prof.name!r}  bind={bind}  extends={prof.extends or '—'}")
         if not prof.controls:
@@ -412,6 +554,108 @@ def _policy(args: argparse.Namespace) -> None:
             "Usage: kirocrew policy {show|validate|explain <scope> <item>|"
             "profile <name>|source|fetch}"
         )
+
+
+def _explain_record(
+    ceiling: GovernanceCeiling | None, scope: str, item: str, session_key: str, agent: str, app: str
+) -> dict[str, object]:
+    """One ``policy explain`` answer: the inputs, then every value its text form prints."""
+    from kiro_crew.platform.governance import gate_decision, resolve
+    from kiro_crew.platform.governance_profiles import resolve_active_scope
+
+    profile = resolve_active_scope(session_key, agent=agent, app=app)
+    decision = resolve(ceiling, profile, scope, item)
+    # The item read as a tool's display title with no arguments, as the gate reads a title.
+    gate = gate_decision(ceiling, profile, item)
+    return {
+        "scope": scope,
+        "item": item,
+        "session_key": session_key,
+        "agent": agent,
+        "app": app,
+        "verdict": "ALLOWED" if decision.permitted else "DENIED",
+        "profile": profile.name if profile else None,
+        "rule": decision.rule,
+        "layer": decision.layer,
+        "reason": decision.reason,
+        "explicit_deny": decision.explicit_deny,
+        "gate_verdict": "ALLOWED" if gate.permitted else "DENIED",
+        "gate_reason": gate.reason,
+    }
+
+
+def _explain_batch(
+    ceiling: GovernanceCeiling | None, source: str, session_key: str, agent: str, app: str
+) -> None:
+    """``policy explain --batch``: one JSON answer per JSON Lines request, in one boot.
+
+    The surface flags are the defaults for a request that leaves those keys out, and
+    other keys are ignored, so a caller may keep its expected verdict on the line. Every
+    record carries its request's line number. A line that is not a request, or names an
+    unknown scope, prints an error record and the run goes on; the command exits 1 after
+    the last line if any did.
+    """
+    from kiro_crew.hooks import safe_read_file
+    from kiro_crew.platform.governance import SCOPE_CATALOG
+
+    # A caller-supplied path goes through the sensitive-path gate, like the CLI's other reads.
+    # Stdin is read as bytes and decoded as UTF-8 with the file path's newline handling,
+    # because text-mode stdin uses the locale code page (cp1252 on Windows), which
+    # mis-reads a BOM or a non-ASCII item. A stream with no byte buffer is read as text.
+    stdin_bytes = getattr(sys.stdin, "buffer", None) if source == "-" else None
+    try:
+        if stdin_bytes is not None:
+            raw = stdin_bytes.read().decode("utf-8")
+            text = raw.replace("\r\n", "\n").replace("\r", "\n")
+        else:
+            text = sys.stdin.read() if source == "-" else safe_read_file(source)
+    except PermissionError:
+        print(
+            "Refusing to read the batch file: it is protected or resolves to a sensitive location.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
+    except (OSError, UnicodeDecodeError) as exc:
+        reason = "it is not UTF-8 text" if isinstance(exc, UnicodeDecodeError) else exc.strerror
+        print(f"Cannot read the batch file: {reason}", file=sys.stderr)
+        raise SystemExit(1) from None
+    failed = False
+    # A UTF-8 BOM decodes to a leading U+FEFF; left on line 1 it makes that
+    # line's ``json.loads`` fail, so an editor that writes a BOM would turn the
+    # first request into an error record. Drop one leading BOM (never an
+    # interior one, which is real content inside a JSON string).
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    # Split on newlines only: splitlines() would also break a JSON string holding U+2028.
+    for number, line in enumerate(text.split("\n"), 1):
+        if not line.strip():
+            continue
+        try:
+            request = json.loads(line)
+            fields = [
+                request["scope"],
+                request["item"],
+                request.get("session_key", session_key),
+                request.get("agent", agent),
+                request.get("app", app),
+            ]
+        except (ValueError, KeyError, TypeError):
+            fields = []
+        record: dict[str, object]
+        if not fields or not all(isinstance(value, str) for value in fields):
+            record = {
+                "line": number,
+                "error": "expected a JSON object with string scope and item "
+                "(and string session_key, agent, app when given)",
+            }
+        elif fields[0] not in SCOPE_CATALOG:
+            record = {"line": number, "error": f"unknown scope {fields[0]!r}"}
+        else:
+            record = {"line": number, **_explain_record(ceiling, *fields)}
+        failed = failed or "error" in record
+        print(json.dumps(record))
+    if failed:
+        raise SystemExit(1)
 
 
 def _print_policy_source() -> None:
@@ -527,6 +771,8 @@ def _policy_fetch(*, force: bool) -> None:
     # "was refused", not "refused": the policy is the object of the refusal, not the
     # thing doing it.
     label = "was refused" if outcome.status == REFRESH_REJECTED else "could not be reached"
-    print(f"❌ The central policy {label}: {outcome.detail}")
-    print("   The ceiling already in effect is unchanged.")
+    # On stderr, as `policy source` and `policy validate` report their failures, so a
+    # config-management run that surfaces only stderr sees why the command exited 1.
+    print(f"❌ The central policy {label}: {outcome.detail}", file=sys.stderr)
+    print("   The ceiling already in effect is unchanged.", file=sys.stderr)
     raise SystemExit(1)

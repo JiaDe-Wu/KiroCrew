@@ -16,9 +16,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from aiohttp import web
+from config_pending_helpers import HAND_EDIT, make_config_json_pending
+from sidecar_fault_helpers import fail_one_sidecar_read
 
 from kiro_crew import agent_state
-from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig, config_path
+from kiro_crew.config.loader import (
+    KiroCrewAgentConfig,
+    KiroCrewConfig,
+    PendingEditBlocksSave,
+    config_path,
+)
 from kiro_crew.dashboard.handlers.agents import api_agent_fork
 
 
@@ -109,6 +116,27 @@ async def test_fork_copies_model_managed(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_fork_a_failed_model_read_fails_and_unwinds(tmp_path, monkeypatch):
+    """One unreadable sidecar read of the source's flag is not "unset". A copy
+    with no flag stops tracking the shipped default, so the fork answers
+    bookkeeping_failed and leaves no copy behind instead of reporting success."""
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    _write_template(agents_dir, "mytemplate")
+    _seed_config("crew-a", "mytemplate")
+    agent_state.set_model_managed("mytemplate", True)
+    fail_one_sidecar_read(monkeypatch, "get_model_managed", "mytemplate")
+
+    with patch("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir):
+        resp = await api_agent_fork(_fork_request("mytemplate", {"crew": "crew-a"}))
+
+    assert resp.status == 500
+    assert json.loads(resp.text)["code"] == "bookkeeping_failed"
+    assert not (agents_dir / "crew-a.json").exists()
+    assert KiroCrewConfig.load().agents["crew-a"].kiro_agent == "mytemplate"
+
+
+@pytest.mark.asyncio
 async def test_fork_collision_gets_numeric_suffix(tmp_path):
     agents_dir = tmp_path / "agents"
     agents_dir.mkdir()
@@ -148,6 +176,70 @@ async def test_fork_idempotent_second_call(tmp_path):
     assert body == {"ok": True, "template": "c", "already_private": True}
     # No -2 copy was created.
     assert not (agents_dir / "c-2.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_fork_repeat_with_an_unreadable_sidecar_creates_nothing(tmp_path, monkeypatch):
+    """One failed sidecar read is not "never forked": the repeat fork of a crew's
+    own copy refuses 409 lineage_unverifiable, creates no second copy and keeps
+    the binding."""
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    _write_template(agents_dir, "mytemplate")
+    _seed_config("c", "mytemplate")
+
+    with patch("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir):
+        first = await api_agent_fork(_fork_request("mytemplate", {"crew": "c"}))
+        assert first.status == 200
+        fail_one_sidecar_read(monkeypatch, "get_fork_info", "c")
+        second = await api_agent_fork(_fork_request("c", {"crew": "c"}))
+
+    assert second.status == 409
+    assert json.loads(second.text)["code"] == "lineage_unverifiable"
+    assert sorted(p.name for p in agents_dir.glob("*.json")) == ["c.json", "mytemplate.json"]
+    assert KiroCrewConfig.load().agents["c"].kiro_agent == "c"
+    # Read the sidecar file itself: the fault wrapper still wraps get_fork_info("c").
+    entry = json.loads(agent_state._state_path().read_text(encoding="utf-8"))["c"]
+    assert (entry["forked_from"], entry["private_to"]) == ("mytemplate", "c")
+
+
+@pytest.mark.asyncio
+async def test_fork_repeat_with_a_corrupt_sidecar_names_the_file(tmp_path):
+    """A sidecar that is not JSON refuses the repeat fork and names the file to restore."""
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    _write_template(agents_dir, "mytemplate")
+    _seed_config("c", "mytemplate")
+
+    with patch("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir):
+        first = await api_agent_fork(_fork_request("mytemplate", {"crew": "c"}))
+        assert first.status == 200
+        agent_state._state_path().write_text("{not json", encoding="utf-8")
+        second = await api_agent_fork(_fork_request("c", {"crew": "c"}))
+
+    assert second.status == 409
+    body = json.loads(second.text)
+    assert body["code"] == "lineage_unverifiable"
+    assert agent_state._STATE_FILENAME in body["error"]
+    assert not (agents_dir / "c-2.json").exists()
+    assert KiroCrewConfig.load().agents["c"].kiro_agent == "c"
+
+
+@pytest.mark.asyncio
+async def test_fork_without_a_sidecar_still_forks(tmp_path):
+    """A missing sidecar is "never forked" under the strict read too."""
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    _write_template(agents_dir, "mytemplate")
+    _seed_config("c", "mytemplate")
+    agent_state._state_path().unlink(missing_ok=True)
+
+    with patch("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir):
+        resp = await api_agent_fork(_fork_request("mytemplate", {"crew": "c"}))
+
+    assert resp.status == 200
+    assert json.loads(resp.text)["template"] == "c"
+    assert KiroCrewConfig.load().agents["c"].kiro_agent == "c"
 
 
 @pytest.mark.asyncio
@@ -271,6 +363,29 @@ async def test_fork_bookkeeping_failure_compensates(tmp_path):
 
     assert resp.status == 500
     assert json.loads(resp.text)["code"] == "bookkeeping_failed"
+    assert not (agents_dir / "design-crew.json").exists()
+    assert agent_state.get_fork_info("design-crew") is None
+
+
+@pytest.mark.asyncio
+async def test_fork_of_a_pending_config_json_hands_the_refusal_to_the_chain(tmp_path, monkeypatch):
+    """config.json has a change pending owner review: the rebind is refused, the copy
+    it created and its lineage are removed, and the refusal reaches the dashboard
+    chain, which answers 409, not the fork's own 500."""
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    _write_template(agents_dir, "mytemplate")
+    _seed_config("design-crew", "mytemplate")
+    path = make_config_json_pending(monkeypatch)
+
+    with (
+        patch("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir),
+        pytest.raises(PendingEditBlocksSave),
+    ):
+        await api_agent_fork(_fork_request("mytemplate", {"crew": "design-crew"}))
+
+    assert path.read_bytes() == HAND_EDIT
+    assert KiroCrewConfig.load().agents["design-crew"].kiro_agent == "mytemplate"
     assert not (agents_dir / "design-crew.json").exists()
     assert agent_state.get_fork_info("design-crew") is None
 

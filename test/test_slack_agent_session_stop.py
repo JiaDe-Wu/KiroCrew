@@ -12,6 +12,7 @@ import asyncio
 from typing import Any
 
 import pytest
+from redaction_structured_cases import github_classic
 from test_slack_agent_session_status import _caps, make_client  # noqa: F401 - autouse fixture
 
 from kiro_crew.config.loader import KiroCrewConfig, MessagingConfig, SlackConfig
@@ -31,10 +32,12 @@ class FakeSessions:
         owners: dict[str, str] | None = None,
         compacting: set[str] | None = None,
         outcome: str = "soft",
+        busy: set[str] | None = None,
     ) -> None:
         self.live = live or set()
         self.owners = owners or {}
         self.compacting = compacting or set()
+        self.busy = busy or set()
         self.outcome = outcome
         self.stops: list[tuple[str, dict[str, Any]]] = []
         self.on_stop: Any = None
@@ -66,6 +69,9 @@ class FakeSessions:
 
     def is_compacting(self, key: str) -> bool:
         return self._fold(key) in self.compacting
+
+    def is_busy(self, key: str) -> bool:
+        return self._fold(key) in self.busy
 
     def dequeue(self, key: str) -> Any:
         return self.queue.pop(0) if self.queue else None
@@ -349,6 +355,26 @@ class TestStop:
         finally:
             fence.exit_turn(turn_b)
         assert not [p for _, p in orch.web.calls if p.get("thread_ts") == "1700.2"]
+
+    @pytest.mark.asyncio
+    async def test_a_single_session_dm_thread_stops_the_turn_its_own_session_runs(
+        self,
+    ) -> None:
+        """A button click's turn runs in its thread's own session, outside the DM's one
+        session: a Stop pressed there stops that turn, as with the flag off."""
+        sessions = FakeSessions(live={"slack:D1", "slack:1700.9"}, busy={"slack:1700.9"})
+        orch = Orch(sessions, flat=True)
+        await _working(orch, channel="D1", thread="1700.9")
+        assert session_events.resolve_session(orch, "D1", "1700.9", stop=True) == (
+            "1700.9",
+            "1700.9",
+            False,
+        )
+        outcome = await session_events.handle_stopped(
+            orch, stop_event(channel="D1", thread_ts="1700.9")
+        )
+        assert outcome == "soft"
+        assert [k for k, _ in sessions.stops] == ["1700.9"]
 
     @pytest.mark.asyncio
     async def test_a_dashboard_linked_thread_stops_its_owner_without_flat_dms(self) -> None:
@@ -1092,7 +1118,7 @@ class TestTitleChanged:
     async def test_a_credential_in_the_title_is_redacted(self) -> None:
         orch = Orch(FakeSessions(live={"slack:1700.1"}))
         orch.conv_log = TitleLog()
-        secret = "AKIA" + "ABCDEFGHIJKLMNOP"
+        secret = github_classic(seed=7)
         await session_events.handle_title_changed(orch, self._event(title=f"keys {secret}"))
         assert secret not in orch.conv_log.titles[0][1]
 
@@ -1173,7 +1199,7 @@ def _record_dispatch(
 
     started: list[str] = []
 
-    async def dispatch(_orch: Any, _key: str, _ts: str, text: str, kwargs: Any) -> None:
+    async def dispatch(_orch: Any, _key: str, _ts: str, text: str, kwargs: Any, **_kw: Any) -> None:
         started.append(text)
         if on_start is not None:
             await on_start()
@@ -1452,6 +1478,27 @@ class TestStopParityWithBangStop:
         await _drain_tasks(orch)
         assert started == []
         assert theirs in sessions.cleared
+
+    @pytest.mark.asyncio
+    async def test_a_shared_users_escalated_reset_keeps_the_owners_messages(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A shared user (slack.shared_access) drops only their own messages, even when
+        their Stop escalates to a reset: the owner's queued work is not theirs."""
+        sessions = FakeSessions(live={"slack:1700.1"}, outcome="hard")
+        orch = Orch(sessions)
+        await _working(orch)
+        started = _record_dispatch(monkeypatch, orch)
+        monkeypatch.setattr(events, "is_shared_listed", lambda u: u == "U1")
+        theirs = _pending("theirs", "UOWNER")
+        mine = _pending("mine", "U1")
+        sessions.queue = [theirs, mine]
+        orch._pending_queue["1700.1"] = [_pending("theirs-pending", "UOWNER")]
+        assert await session_events.handle_stopped(orch, stop_event()) == "hard"
+        await _drain_tasks(orch)
+        assert theirs not in sessions.cleared
+        assert "mine" not in started
+        assert "theirs-pending" in started
 
 
 @pytest.mark.asyncio
@@ -1783,7 +1830,7 @@ async def test_the_queue_drain_records_the_entrys_thread(monkeypatch: pytest.Mon
     orch = Orch(sessions, flat=True)
     gate = asyncio.Event()
 
-    async def dispatch(*_a: Any) -> None:
+    async def dispatch(*_a: Any, **_kw: Any) -> None:
         await gate.wait()
 
     monkeypatch.setattr(events, "_dispatch_queued", dispatch)

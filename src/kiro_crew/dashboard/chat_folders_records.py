@@ -13,10 +13,13 @@ import asyncio
 import logging
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from aiohttp import web
 
+from kiro_crew.config.loader import KiroCrewConfig, config_dir
+from kiro_crew.config.resolution import DEGRADED_WHOLE_CONFIG
 from kiro_crew.dashboard.chat_folder_order import next_folder_order
 from kiro_crew.dashboard.chat_folders_icons import _is_single_emoji, _is_valid_folder_color
 from kiro_crew.dashboard.chat_folders_paths import (
@@ -26,6 +29,7 @@ from kiro_crew.dashboard.chat_folders_paths import (
 )
 from kiro_crew.dashboard.chat_tags import tags_write_lock, validate_folder_tag_ids
 from kiro_crew.dashboard.folder_ownership import _folder_owner_app, _is_descendant
+from kiro_crew.dashboard.handlers import agent_catalog
 from kiro_crew.dashboard.slot_ownership import slot_not_found
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.dashboard.token_auth import (
@@ -34,9 +38,12 @@ from kiro_crew.dashboard.token_auth import (
     refuse_unattributable_caller,
     request_origin,
 )
+from kiro_crew.executors import discovery_executor
 from kiro_crew.instances.crew_ref import clean_crew_ref
 from kiro_crew.messaging.link import is_channel_session_key
+from kiro_crew.owner_only_files import OWNER_ONLY_FILE_MODE
 from kiro_crew.sel import sel
+from kiro_crew.slack.features import folder_project_dir
 
 logger = logging.getLogger("kiro_crew.dashboard.chat_folders")
 
@@ -63,6 +70,15 @@ LAYOUT_ONLY_FIELDS = frozenset({"collapsed", "order"})
 #: The longest ``default_prompt`` a folder keeps. Every slots frame carries the
 #: whole folder list, so this bounds what each folder adds to every frame.
 MAX_FOLDER_DEFAULT_PROMPT_CHARS = 4000
+
+#: The data-home file :func:`migrate_folder_member_labels` writes once it has run.
+#: Builds v0.12.1 and lts-v0.1.0 wrote it too, after rewriting each such label to
+#: the crewmate's key.
+FOLDER_MEMBER_LABELS_MARKER = "folder_member_labels_migrated"
+
+#: The data-home file :func:`migrate_folder_member_labels` writes once it has also
+#: checked, on a home that ran that rewrite, the folders it may have moved.
+FOLDER_MEMBER_KEYS_CHECKED_MARKER = "folder_member_keys_checked"
 
 
 def clean_folder_default_prompt(raw: object) -> str:
@@ -125,7 +141,7 @@ def _folder_history_counts(state: DashboardState) -> dict[str, int]:
     counts: dict[str, int] = {}
     if not state.conversation_log:
         return counts
-    for session in state.conversation_log.list_sessions():
+    for session in state.conversation_log.list_sessions_indexed():
         fid = session.get("folder_id")
         if fid:
             counts[fid] = counts.get(fid, 0) + 1
@@ -187,7 +203,7 @@ def archived_session_names_in_folders(
     if not folder_ids or not log:
         return set()
     names: set[str] = set()
-    for session in log.list_sessions():
+    for session in log.list_sessions_indexed():
         if session.get("folder_id") not in folder_ids:
             continue
         key = ledger_key(str(session.get("key") or ""))
@@ -755,6 +771,131 @@ async def create_folder_record(
     return folder
 
 
+async def _folders_moved_onto_a_crewmate(
+    state: DashboardState, cfg: KiroCrewConfig, shown_by: dict[str, list[str]]
+) -> list[str]:
+    """``name (label)`` of each folder the label rewrite may have moved off a custom agent.
+
+    Its Default agent is a crewmate's key whose label is that crewmate's alone and not
+    itself a key, which is exactly what the rewrite turned into that key, and the label
+    is a custom agent the folder picker offers in the folder's project (its own
+    ``project_dir`` or the nearest ancestor's), so the folder may have held that custom
+    agent before the rewrite.
+    """
+
+    def _candidates(folders: list[dict[str, Any]]) -> tuple[bool, list[tuple[str, str, str]]]:
+        found = []
+        for folder in folders:
+            key = str(folder.get("default_agent") or "")
+            agent = cfg.agents.get(key)
+            label = agent.display_name if agent else ""
+            if label and shown_by.get(label) == [key]:
+                project = folder_project_dir(folders, str(folder.get("id") or "")) or ""
+                found.append((str(folder.get("name") or ""), label, project))
+        return False, found
+
+    # Through the write path, which re-reads a store whose boot load failed or refuses,
+    # so an unread store never marks the check done.
+    candidates = await state.mutate_folders(_candidates)
+    if not candidates:
+        return []
+
+    def _offered() -> dict[str, set[str]]:
+        projects = {project for _, _, project in candidates}
+        return {
+            p: {a.name for a in agent_catalog._templates(Path(p) if p else None)} for p in projects
+        }
+
+    offered = await asyncio.get_running_loop().run_in_executor(discovery_executor(), _offered)
+    return [f"{name} ({label})" for name, label, project in candidates if label in offered[project]]
+
+
+async def migrate_folder_member_labels(state: DashboardState, cfg: KiroCrewConfig) -> None:
+    """Name, in one notice, each folder whose Default agent holds a crewmate's label.
+
+    The folder picker once listed crewmates by key, so a person who knew a crewmate
+    by its label saved the label, and the create route binds a label as a template,
+    without the crewmate's model, workspace or memory. The picker now saves that same
+    label for a same-named custom agent's row, so the stored value cannot say which
+    was meant: it is left as saved, and the notice asks the person to pick the
+    crewmate where that was meant. A label that is itself a key, or that two
+    crewmates share, is not named.
+
+    A home that already holds :data:`FOLDER_MEMBER_LABELS_MARKER` may have run a
+    build that rewrote each such label to the crewmate's key, which moved a folder
+    set to a same-named custom agent onto the crewmate. There the notice instead
+    names each folder :func:`_folders_moved_onto_a_crewmate` finds and asks the
+    person to pick the custom agent again where that was meant. Nothing is rewritten.
+
+    Runs once per data home (:data:`FOLDER_MEMBER_KEYS_CHECKED_MARKER`). A config
+    whose crewmates could not be read, a notice call that raises, a notice whose
+    write fails, or a failed marker write leaves the marker unwritten, so the next
+    start tries again. Never raises.
+    """
+    marker = config_dir() / FOLDER_MEMBER_LABELS_MARKER
+    checked = config_dir() / FOLDER_MEMBER_KEYS_CHECKED_MARKER
+    try:
+        if {DEGRADED_WHOLE_CONFIG, "agents"} & cfg.degraded_sections:
+            return
+        if await asyncio.to_thread(checked.exists):
+            return
+        rewritten = await asyncio.to_thread(marker.exists)
+        shown_by: dict[str, list[str]] = {}
+        for key, agent in cfg.agents.items():
+            if agent.display_name and agent.display_name not in cfg.agents:
+                shown_by.setdefault(agent.display_name, []).append(key)
+
+        def _named(folders: list[dict[str, Any]]) -> tuple[bool, list[str]]:
+            named = []
+            for folder in folders:
+                label = str(folder.get("default_agent") or "")
+                if len(shown_by.get(label, [])) == 1:
+                    named.append(f"{folder.get('name') or ''} ({label})")
+            return False, named
+
+        if rewritten:
+            named = await _folders_moved_onto_a_crewmate(state, cfg, shown_by)
+        else:
+            named = await state.mutate_folders(_named)
+        if named:
+            folders = ", ".join(named)
+            if rewritten:
+                note_id = "folder_agent_key"
+                body = (
+                    f"An earlier update may have moved these folders from a custom agent onto "
+                    f"the bot of the same name, so new chats there run on that bot: {folders}. "
+                    "If you meant the custom agent, pick it again as the Default agent in the "
+                    "folder's settings."
+                )
+            else:
+                note_id = "folder_agent_label"
+                body = (
+                    f"These folders' Default agent has a bot's name, but new chats there do not "
+                    f"run on that bot: {folders}. To use the bot, pick it as the Default agent in "
+                    "the folder's settings."
+                )
+            state.notify(
+                "agent",
+                "Check a folder's Default agent",
+                body,
+                i18n={"id": note_id, "params": {"folders": folders}},
+            )
+            # Read before any await: a later note replaces the state-wide future.
+            persisted = state.last_notification_persist
+            if persisted is not None and not await persisted:
+                logger.warning(
+                    "folder Default agent notice was not stored; it runs again next start"
+                )
+                return
+        if not rewritten:
+            await asyncio.to_thread(marker.touch, mode=OWNER_ONLY_FILE_MODE)
+        await asyncio.to_thread(checked.touch, mode=OWNER_ONLY_FILE_MODE)
+    except Exception:
+        logger.warning(
+            "folder Default agent migration failed; it runs again next start", exc_info=True
+        )
+
+
 def _caller_reaches_a_channel(request: web.Request, caller_key: str) -> bool:
     """Whether a channel can deliver turns into the session behind *caller_key*.
 
@@ -767,7 +908,7 @@ def _caller_reaches_a_channel(request: web.Request, caller_key: str) -> bool:
     a ``channel:`` key (an agent spawned for a channel thread, which
     ``is_channel_session_key`` does not name) and a channel-born slot
     (``session_control._channel_link_of``). The ledger's entry gate covers a
-    channel-born caller through ``_caller_admission``; this endpoint has no
+    channel-born caller through ``caller_admission_with_route``; this endpoint has no
     such gate, so it reads the slot's link here, on the slot found by the
     ledger's normalisation of the key (``session_ledger.ledger_key``).
     """

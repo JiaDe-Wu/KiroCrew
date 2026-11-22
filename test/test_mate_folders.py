@@ -109,6 +109,68 @@ def test_an_empty_display_name_falls_back_to_the_store():
     assert state._folders[0]["name"] == "member-radar-0123"
 
 
+def test_member_label_reads_bot_for_the_first_mate_and_the_key_for_the_rest():
+    from kiro_crew.agent_files import (
+        ASSISTANT_DEFAULT_DISPLAY_NAME,
+        ASSISTANT_MEMBER_NAME,
+        member_label,
+    )
+
+    first = SimpleNamespace(display_name="")
+    assert member_label(ASSISTANT_MEMBER_NAME, first) == ASSISTANT_DEFAULT_DISPLAY_NAME
+    # A renamed first mate keeps its own label, and so does any other member.
+    assert member_label(ASSISTANT_MEMBER_NAME, SimpleNamespace(display_name="Scout")) == "Scout"
+    assert member_label("radar", first) == "radar"
+    assert member_label("radar", SimpleNamespace(display_name="Radar")) == "Radar"
+    # A row that carries no display_name at all reads like a blank one, and so
+    # does one holding only spaces: no surface shows a whitespace label.
+    assert member_label(ASSISTANT_MEMBER_NAME, object()) == ASSISTANT_DEFAULT_DISPLAY_NAME
+    spaces = SimpleNamespace(display_name="   ")
+    assert member_label(ASSISTANT_MEMBER_NAME, spaces) == ASSISTANT_DEFAULT_DISPLAY_NAME
+    assert member_label("radar", spaces) == "radar"
+    # Surrounding space on a real label is trimmed, not grounds for a fallback.
+    assert member_label("radar", SimpleNamespace(display_name=" Radar ")) == "Radar"
+
+
+@pytest.mark.parametrize(
+    ("first_display", "other_display", "store", "expected"),
+    [
+        # The first mate's key is `mate`, an internal id, so a blank display
+        # name names its home folder "Bot" and never the key.
+        ("", "", "member-mate-0123", "Bot"),
+        ("Scout", "", "member-mate-0123", "Scout"),
+        ("   ", "", "member-mate-0123", "Bot"),
+        ("", "", "member-radar-0123", "radar"),
+        ("", "Radar", "member-radar-0123", "Radar"),
+    ],
+)
+def test_display_name_for_principal_labels_the_first_mate_bot(
+    monkeypatch, first_display, other_display, store, expected
+):
+    from kiro_crew.agent_files import ASSISTANT_MEMBER_NAME
+    from kiro_crew.config import KiroCrewConfig
+
+    agents = {
+        ASSISTANT_MEMBER_NAME: SimpleNamespace(
+            memory_store="member-mate-0123", display_name=first_display
+        ),
+        "radar": SimpleNamespace(memory_store="member-radar-0123", display_name=other_display),
+    }
+    monkeypatch.setattr(
+        KiroCrewConfig, "load", classmethod(lambda cls: SimpleNamespace(agents=agents))
+    )
+    assert mf.display_name_for_principal(mf.mate_principal(store)) == expected
+
+
+def test_display_name_for_principal_is_empty_off_a_mate_principal(monkeypatch):
+    from kiro_crew.config import KiroCrewConfig
+
+    monkeypatch.setattr(KiroCrewConfig, "load", classmethod(lambda cls: SimpleNamespace(agents={})))
+    assert mf.display_name_for_principal("some-app") == ""
+    # A store no member claims has no label to read.
+    assert mf.display_name_for_principal(PRINCIPAL) == ""
+
+
 def test_a_person_folder_that_looks_like_a_home_is_not_one():
     # Same owner, but nested: only a TOP-LEVEL marked folder is the home.
     folders = [
@@ -230,6 +292,18 @@ def test_filing_puts_a_mate_chat_in_its_home(_display):
         {"id": "a", "name": "PR review", "parent_id": home, "owner_app": PRINCIPAL}
     )
     assert _run(mf.mate_home_filing(state, execution, "a", conductor=True)) == ("a", "a")
+
+
+def test_a_conductor_naming_a_deleted_subfolder_files_in_its_home(_display):
+    state = _FolderState([{"id": "p", "name": "Finance", "parent_id": ""}])
+    execution = _execution("member-radar-0123", "radar")
+    home, _ = _run(mf.mate_home_filing(state, execution, "", conductor=True))
+    state._folders.append(
+        {"id": "a", "name": "PR review", "parent_id": home, "owner_app": PRINCIPAL}
+    )
+    # The person deletes the empty sub-folder; the Bot still names it.
+    state._folders[:] = [f for f in state._folders if f["id"] != "a"]
+    assert _run(mf.mate_home_filing(state, execution, "a", conductor=True)) == (home, home)
 
 
 def test_a_legacy_conductor_without_a_member_id_gets_no_home(_display):
@@ -370,16 +444,15 @@ def test_subtree_ids_are_what_home_owner_of_locks():
     }
 
 
-def test_folder_cleanup_never_removes_a_mate_home_or_its_subtree():
+def test_folder_cleanup_never_removes_a_mate_home_but_offers_its_empty_subfolders():
     from kiro_crew.dashboard.chat_folder_cleanup import removable_folder_ids
 
     state, home = _state_with_home()
     state._folders.append({"id": "q", "name": "Empty", "parent_id": "p"})
     removable = removable_folder_ids(state._folders, (), include_top_level=True)
     assert home not in removable
-    assert "a" not in removable
-    # The person's empty folders still go.
-    assert set(removable) == {"p", "q"}
+    # An empty folder inside the home goes, as the person's empty folders do.
+    assert set(removable) == {"p", "q", "a"}
     # Once the mate is deleted its home is an ordinary folder again.
     _run(mf.release_mate_home(state, PRINCIPAL))
     removable = removable_folder_ids(state._folders, (), include_top_level=True)

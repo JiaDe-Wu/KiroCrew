@@ -4,10 +4,15 @@ import connectionsRegistry from '../../../../src/kiro_crew/connections/registry.
 /** The registry fields this file reads; the full shape lives in pages/connections/registry.ts. */
 type ConnectionsRegistryRow = { slug: string; name: string; auth?: { mode?: string } }
 
-/** Registry id of the Settings → OAuth Apps card for one pre-registered provider.
- *  Shared with the gallery card's deep link so the two cannot drift. */
+/** Registry id of the Settings → Connections OAuth app part for one
+ *  pre-registered provider, or `google` for the Google entry. */
 export function connectionsOAuthClientEntryId(slug: string): string {
   return `connections.oauth-client-${slug}`
+}
+
+/** The Google products, one entry on the page (pages/connections/connectionsLinks.ts). */
+function isGoogleRegistrySlug(slug: string): boolean {
+  return slug === 'gmail' || slug.startsWith('google-')
 }
 
 /**
@@ -37,7 +42,7 @@ export function connectionsOAuthClientEntryId(slug: string): string {
  * locale.
  */
 export const SETTINGS_MANUAL: ManualSettingEntry[] = [
-  // The Decisions (Jev) card's three per-point consent switches.
+  // The Decisions card's three per-point consent switches.
   //
   // Declared here rather than extracted because the card draws them from ONE component
   // on whichever point's panel is open, labelled from a map keyed by the scope the
@@ -48,6 +53,21 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
   // Every one is GOVERNED: each id is also in `settingsSearchCore.DECISIONS_SETTING_IDS`,
   // so a search that KNOWS `capabilities.decisions` is denied offers none of them, and a
   // user with the feature available can still find the switch they are looking for.
+  // The hosted provider's API key. It REPLACES the entry extracted from the key field
+  // only to anchor the link on that provider's entry in the picker rather than on the
+  // field, which is drawn once the reader chooses the entry: the link lands on the
+  // entry and highlights it, and opening it is the reader's own pick. Governed, like
+  // the three below (`DECISIONS_SETTING_IDS`).
+  {
+    id: 'developer.jev-api-key',
+    labelKey: 'pages.developer.featurePreviewsTab.decisions_api_key_label',
+    descriptionKey: 'pages.developer.featurePreviewsTab.decisions_api_key_desc',
+    tab: 'developer',
+    params: { sub: 'feature-previews' },
+    type: 'input',
+    occurrence: 1,
+    settingId: 'developer.jev-api-key',
+  },
   {
     id: 'developer.also-send-tool-call-arguments-so-jev-can-flag-risky-calls',
     labelKey: 'pages.developer.featurePreviewsTab.decisions_tool_args',
@@ -101,13 +121,52 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
     // Same shape as the third-party-apps override above: the toggle lives in
     // the `redaction` rail section, so without `section=redaction` the deep
     // link lands on the security rail with the card unmounted.
-    id: 'security.redact-credentials-in-files-the-dashboard-opens-for-you',
+    id: 'security.redact-credentials',
     labelKey: 'pages.settings.securityPanel.credential_redaction_toggle',
     descriptionKey: 'pages.settings.securityPanel.credential_redaction_toggle_help',
     tab: 'security',
     type: 'toggle',
     occurrence: 1,
     params: { section: 'redaction' },
+  },
+  // The two MCP safety switches (SecurityPanelSafetySwitches.tsx): same shape,
+  // they live in the `safety` rail section. `configKey` keeps the Advanced
+  // page's read-only rows for both keys linked to these controls.
+  {
+    id: 'security.stop-the-agent-from-editing-its-own-permission-rules',
+    labelKey: 'pages.settings.securityPanel.safetySwitches.protect_label',
+    descriptionKey: 'pages.settings.securityPanel.safetySwitches.protect_desc',
+    tab: 'security',
+    type: 'toggle',
+    occurrence: 1,
+    params: { section: 'safety' },
+    configKey: 'mcp.protect_kiro_permission_rules',
+  },
+  {
+    id: 'security.ask-me-before-running-tools-set-to-auto-approve-in-a-tool-server-s-settings',
+    labelKey: 'pages.settings.securityPanel.safetySwitches.ask_label',
+    descriptionKey: 'pages.settings.securityPanel.safetySwitches.ask_desc',
+    tab: 'security',
+    type: 'toggle',
+    occurrence: 1,
+    params: { section: 'safety' },
+    configKey: 'mcp.honour_auto_approve',
+  },
+  // The review cards for settings files edited outside the dashboard
+  // (SecurityPanelConfigPending.tsx). They render in the Security sub-nav's banner,
+  // above every section, so any section mounts them: `posture` is the one a bare
+  // `/settings/security` opens, which is what the gateway's bell note links to.
+  // They mount only after the config-pending read, so `settingId` makes the
+  // highlight wait for them.
+  {
+    id: 'security.config-pending',
+    labelKey: 'pages.settings.securityPanel.configPending.nav_dot',
+    descriptionKey: 'pages.settings.securityPanel.configPending.search_description',
+    tab: 'security',
+    type: 'buttonGroup',
+    occurrence: 1,
+    params: { section: 'posture' },
+    settingId: 'security.config-pending',
   },
   {
     id: 'security.trust-this-machine-s-tailnet-name',
@@ -167,6 +226,27 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
     tab: 'about',
     type: 'buttonGroup',
     occurrence: 1,
+  },
+  {
+    // About itself, so "version" or "about" finds the page. The anchor is the
+    // install card's version chip (`data-setting-label` in AboutPanel.tsx).
+    id: 'about.version',
+    labelKey: 'pages.settings.aboutPanel.version_label',
+    descriptionKey: 'settings.tabs.about.description',
+    tab: 'about',
+    // Read-only; no primitive fits, and the type only steers the icon.
+    type: 'select',
+    occurrence: 1,
+  },
+  {
+    // The release notes section at the foot of About (ReleasesPanel.tsx carries
+    // the `data-setting-label` anchor). `release=notes` scrolls to and focuses it.
+    id: 'about.release-notes',
+    labelKey: 'pages.settings.releases.section_label',
+    tab: 'about',
+    type: 'select',
+    occurrence: 1,
+    params: { release: 'notes' },
   },
   {
     // Per-channel notification mute + priority overrides: rows are fetched at
@@ -315,9 +395,60 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
     configKey: 'instances.enabled',
   },
   {
+    // RemoteControlCard draws its on/off state from raw markup (no Settings
+    // primitive), so the extractor never sees it.
+    id: 'instances.remote-control',
+    labelKey: 'pages.settings.remoteControlCard.title',
+    tab: 'instances',
+    type: 'toggle',
+    occurrence: 1,
+    settingId: 'instances.remote-control',
+  },
+  // BotChannelPanel's SecretFields take their labels from each channel's spec, so the
+  // extractor never sees them; each spec passes a literal catalog key, indexed here.
+  {
+    id: 'channels.discord-bot-token',
+    labelKey: 'pages.settings.discordPanel.token_label',
+    descriptionKey: 'pages.settings.discordPanel.token_description',
+    tab: 'channels',
+    type: 'input',
+    occurrence: 1,
+    params: { channel: 'discord' },
+  },
+  {
+    id: 'channels.telegram-bot-token',
+    labelKey: 'pages.settings.telegramPanel.token_label',
+    descriptionKey: 'pages.settings.telegramPanel.token_description',
+    tab: 'channels',
+    type: 'input',
+    occurrence: 1,
+    params: { channel: 'telegram' },
+  },
+  {
+    id: 'channels.wecom-bot-id',
+    labelKey: 'pages.settings.weComPanel.bot_id_label',
+    descriptionKey: 'pages.settings.weComPanel.bot_id_description',
+    tab: 'channels',
+    type: 'input',
+    occurrence: 1,
+    params: { channel: 'wecom' },
+  },
+  {
+    id: 'channels.wecom-bot-secret',
+    labelKey: 'pages.settings.weComPanel.token_label',
+    descriptionKey: 'pages.settings.weComPanel.token_description',
+    tab: 'channels',
+    type: 'input',
+    occurrence: 1,
+    params: { channel: 'wecom' },
+  },
+  {
     // Managed credential slots are server-provided, so the shared SecretField
     // label is dynamic at extraction time. These entries index the two fixed
     // integration labels and highlight the matching runtime SecretField.
+    // SecretsPanel opens the slot's
+    // pane for these ids itself (SEARCH_PANE_KINDS): the vault's names are not
+    // a fixed sub-page list the UI index could carry.
     id: 'secrets.wakatime-api-key',
     labelKey: 'settings.secrets.wakatime_api_key_label',
     descriptionKey: 'settings.secrets.wakatime_api_key_description',
@@ -333,29 +464,49 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
     type: 'input',
     occurrence: 1,
   },
-  // The Kiro sign-in card on Agent Harness, where Sign out and Switch account
-  // live. It is built from raw markup inside the KAS row's detail, so the
-  // extractor never sees it. `settingId` is the card's `data-setting-id`: the
-  // highlight waits for it while AgentBackendTab opens the KAS row for this id
-  // (`KIRO_SIGN_IN_SETTING_ID` in pages/developer/kiroSignInLink.ts).
+  // BotChannelPanel's SecretFields take their labels from the channel's spec, so the
+  // extractor never sees them; FeishuPanel's spec passes literal catalog keys.
   {
-    id: 'agent.kiro-sign-in',
+    id: 'channels.feishu-app-id',
+    labelKey: 'pages.settings.feishuPanel.app_id_label',
+    descriptionKey: 'pages.settings.feishuPanel.app_id_description',
+    tab: 'channels',
+    type: 'input',
+    occurrence: 1,
+    params: { channel: 'feishu' },
+  },
+  {
+    id: 'channels.feishu-app-secret',
+    labelKey: 'pages.settings.feishuPanel.app_secret_label',
+    descriptionKey: 'pages.settings.feishuPanel.app_secret_description',
+    tab: 'channels',
+    type: 'input',
+    occurrence: 1,
+    params: { channel: 'feishu' },
+  },
+  // The Kiro sign-in card on Kiro account, where Sign out and Switch account
+  // live. It is built from raw markup the extractor never sees. `settingId` is
+  // the card's `data-setting-id`: the highlight waits for it while the card's
+  // lazy chunk loads (`KIRO_SIGN_IN_SETTING_ID` in pages/developer/kiroSignInLink.ts).
+  {
+    id: 'kiro-account.kiro-sign-in',
     labelKey: 'pages.developer.kiroSignInCard.search_label',
     descriptionKey: 'pages.developer.kiroSignInCard.search_description',
-    tab: 'agent',
+    tab: 'kiro-account',
     type: 'buttonGroup',
     occurrence: 1,
     settingId: 'kiro-sign-in',
   },
-  // Settings → OAuth Apps renders one card per PRE-REGISTERED registry
-  // provider, so the cards are data, not JSX the extractor can see. Derive an
-  // entry per provider from the registry itself: the gallery's "Configure OAuth
-  // app" link deep-links by this id, and `settingId` is what lets the highlight
-  // wait for the card to mount after its async fetch instead of substituting a
-  // same-label field on another provider's card. `labelSuffix` carries the
-  // provider name so search finds "OAuth app — GitHub".
+  // Settings → Connections opens one OAuth app part per PRE-REGISTERED registry
+  // provider, so the parts are data, not JSX the extractor can see. Derive an
+  // entry per provider from the registry itself. A hit opens that card's part
+  // (ConnectionsPage reads the highlight), and `settingId` is what lets the
+  // highlight wait for it to mount after its async fetch instead of
+  // substituting a same-label field on another provider's card. `labelSuffix`
+  // carries the provider name so search finds "OAuth app — GitHub". The six
+  // Google products share one part, so they are one "OAuth app — Google".
   ...(connectionsRegistry as ConnectionsRegistryRow[])
-    .filter(provider => provider.auth?.mode === 'preregistered')
+    .filter(provider => provider.auth?.mode === 'preregistered' && !isGoogleRegistrySlug(provider.slug))
     .map<ManualSettingEntry>(provider => ({
       id: connectionsOAuthClientEntryId(provider.slug),
       labelKey: 'pages.settings.connectionsPanel.oauth_app',
@@ -366,4 +517,14 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
       occurrence: 1,
       settingId: `connections-oauth-client-${provider.slug}`,
     })),
+  {
+    id: connectionsOAuthClientEntryId('google'),
+    labelKey: 'pages.settings.connectionsPanel.oauth_app',
+    labelSuffix: 'Google',
+    descriptionKey: 'pages.settings.connectionsPanel.oauth_app_google',
+    tab: 'connections',
+    type: 'input',
+    occurrence: 1,
+    settingId: 'connections-oauth-client-google',
+  },
 ]

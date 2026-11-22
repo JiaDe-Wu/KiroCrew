@@ -52,12 +52,12 @@ from typing import Any, Literal
 
 from kiro_crew.dashboard.tailnet import (
     POLICY_OFF_DETAIL,
+    _cli_env,
     _cli_path,
     is_governance_pinned_off,
     policy_off,
     refused_cli_detail,
 )
-from kiro_crew.sandbox import scrub_env
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 logger = logging.getLogger(__name__)
@@ -220,12 +220,13 @@ def _run(args: list[str], timeout: float) -> tuple[int, str, str]:
       diagnostic this module exists to avoid. A Windows CI run produced exactly
       that, so it is a real path, not a hypothetical.
 
-    Binary resolution and environment scrubbing are **shared with the read path**
+    Binary resolution and the spawn environment are **shared with the read path**
     rather than re-implemented: ``_cli_path`` accepts only vetted absolute paths
     and never consults ``PATH`` (a writable ``PATH`` entry would make the binary
-    attacker-selectable), and ``scrub_env`` keeps the gateway's credentials out of
-    the child. A second, subtly different copy of either is how one spawn comes to
-    be hardened and its sibling not.
+    attacker-selectable), and ``_cli_env`` keeps the gateway's credentials out of
+    the child and pins the macOS executable to CLI mode. A second, subtly
+    different copy of either is how one spawn comes to be hardened and its
+    sibling not.
     """
     cli = _cli_path()
     if not cli:
@@ -237,7 +238,7 @@ def _run(args: list[str], timeout: float) -> tuple[int, str, str]:
             **UTF8_TEXT,
             timeout=timeout,
             check=False,
-            env=scrub_env(),
+            env=_cli_env(),
         )
     except subprocess.TimeoutExpired as exc:
         return -2, _stream_text(exc.stdout), _stream_text(exc.stderr)
@@ -566,7 +567,7 @@ def _no_cli_result(port: int) -> ServeResult:
 
 
 def policy_refusal(*, audit_tool: str) -> ServeResult | None:
-    """The refusal an enterprise build gives a publish its policy does not permit.
+    """The refusal an LTS build gives a publish its policy does not permit.
 
     ``None`` when publishing may go on: an ``oss`` build, or an enterprise policy
     that permits ``capabilities.tailnet_origin``. Decided by ``tailnet.policy_off``,
@@ -593,7 +594,7 @@ def publish(port: int, *, audit_tool: str = "tailnet_publish") -> ServeResult:
     off means the fleet forbids putting this host's dashboard on a tailnet, so the
     CLI is not spawned at all — refusing after publishing would be theatre.
 
-    In an enterprise build publishing is refused before anything else unless the
+    In an LTS build publishing is refused before anything else unless the
     policy turns ``capabilities.tailnet_origin`` on (:func:`policy_refusal`).
     """
     refused = policy_refusal(audit_tool=audit_tool)

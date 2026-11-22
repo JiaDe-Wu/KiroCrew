@@ -21,7 +21,7 @@
  *
  * ## `ApiTransport` IS a small, intentionally-FROZEN downstream contract
  *
- * A separately-built edition compiles against the seven signatures below and the
+ * A separately-built edition compiles against the signatures below and the
  * `j`/`jNullable` semantics (the session-expiry / auth-banner / `ApiError`
  * recovery pipeline). Nothing analogous to the backend's `CONTRACT_VERSION`
  * guards this frontend seam, so **treat these signatures as frozen** — like the
@@ -38,19 +38,32 @@
 /**
  * The session-key-authenticated request helpers, identical to those the core
  * `api` methods use. `get`/`post`/`put`/`del`/`patch` issue the request with the
- * `X-Session-Key` header; `j`/`jNullable` parse the `Response` and run the
- * session-expiry / auth-banner / `ApiError` recovery pipeline.
+ * `X-Session-Key` header; `getWithSignal` is `get` aborted by `signal`, for a
+ * read the caller bounds with `lib/withDeadline`; `j`/`jNullable` parse the
+ * `Response` and run the session-expiry / auth-banner / `ApiError` recovery
+ * pipeline.
  *
  * Intentionally frozen — see the module header. Add methods, never change these.
  */
 export interface ApiTransport {
   get: (url: string) => Promise<Response>
+  getWithSignal: (url: string, signal: AbortSignal) => Promise<Response>
   post: (url: string, body?: object) => Promise<Response>
   put: (url: string, body: object) => Promise<Response>
   del: (url: string, body?: object) => Promise<Response>
   patch: (url: string, body: object) => Promise<Response>
   j: (r: Response) => Promise<unknown>
   jNullable: (r: Response) => Promise<unknown>
+  /**
+   * The global `fetch`'s shape, sent through the transport's `jfetch`, the path
+   * every helper above takes: the same arguments reach the wire unchanged (no
+   * `X-Session-Key` or `Content-Type` is added), but a write the tunnel edge
+   * throttled is re-sent when `isRetryableWrite` allows it, a read waits its turn
+   * like the helpers' reads, and a send that rejects is journaled. For a caller
+   * whose request does not fit a helper above, so it need not fall back to the
+   * bare global (#40178).
+   */
+  request: (input: string, init?: RequestInit) => Promise<Response>
 }
 
 // Installed once by client.ts (which owns the helpers) at its module load.
@@ -85,10 +98,19 @@ function _resolve(): ApiTransport {
  */
 export const apiTransport: ApiTransport = {
   get: (url) => _resolve().get(url),
+  getWithSignal: (url, signal) => _resolve().getWithSignal(url, signal),
   post: (url, body) => _resolve().post(url, body),
   put: (url, body) => _resolve().put(url, body),
   del: (url, body) => _resolve().del(url, body),
   patch: (url, body) => _resolve().patch(url, body),
   j: (r) => _resolve().j(r),
   jNullable: (r) => _resolve().jNullable(r),
+  // Forwards the caller's argument shape: a one-argument call stays one argument.
+  // Unlike the helpers, it needs nothing client.ts defines to send the request
+  // as written, so before the install (a module or test that never loads
+  // client.ts) it is the global fetch it replaced, rather than a throw.
+  request: (input, init) => {
+    const send = _installed ? _installed.request : fetch
+    return init === undefined ? send(input) : send(input, init)
+  },
 }

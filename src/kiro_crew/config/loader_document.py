@@ -13,20 +13,29 @@ import hashlib as _hashlib
 import json
 import logging
 import os
+import secrets
 import stat as _stat
 import sys
+import threading
 from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 from kiro_crew import __version__, platform_compat, windows_acl
-from kiro_crew.atomic_write import atomic_write, on_event_loop
+from kiro_crew.atomic_write import atomic_write, on_event_loop, text_bytes
 from kiro_crew.aws_project_profiles import PROJECT_PROFILES_KEY, project_profile_refusals
+from kiro_crew.config import loosening_provenance
 from kiro_crew.config import migration as _migration
+from kiro_crew.config import resolution as _resolution
 from kiro_crew.config import sections as _sections
 from kiro_crew.config import write_provenance
-from kiro_crew.config.loader_locations import config_local_path, config_path, read_config_text
+from kiro_crew.config.loader_locations import (
+    config_local_path,
+    config_path,
+    read_config_text,
+    read_endorsed_config_text,
+)
 from kiro_crew.config.migration import CONNECTIONS_UI_MIGRATION_MARKER
 from kiro_crew.config.paths import config_dir
 from kiro_crew.config.validation import _CONFIG_CACHE
@@ -117,15 +126,67 @@ def acp_backend_stored_as_kiro() -> bool:
     return _stored_agent_value("acp_backend") == STORED_BACKEND_KIRO
 
 
+def acp_backend_stored_runs_kas() -> bool:
+    """Whether the stored ``agent.acp_backend`` asks for KAS: no choice (the default) or ``"kas"``.
+
+    Reads the documents (overlay winning) like :func:`acp_backend_stored_as_kiro`.
+    Absent and ``""`` are no choice and take the product default; a stored JSON
+    ``null`` or any other value is not KAS. Read by ``ensure_kiro_cli_kas_verdict``,
+    so a process outside the gateway reads the data home's record of a kiro-cli
+    that refused its v3 engine before a config load that would run KAS.
+    """
+    from kiro_crew.acp_backends import ACP_BACKEND_KAS, DEFAULT_ACP_BACKEND
+
+    value = _stored_agent_value("acp_backend")
+    if value is _ABSENT_AGENT_KEY or value == "":
+        value = DEFAULT_ACP_BACKEND
+    return value == ACP_BACKEND_KAS
+
+
 def acp_backend_bundle_route() -> bool:
-    """Whether the stored ``agent.kas_bundle`` is on (the bundled KAS engine route).
+    """Whether a SAVED ``agent.kas_bundle`` is ``true`` (the bundled KAS engine route).
 
     Reads the documents (overlay winning) like :func:`acp_backend_stored_as_kiro`.
     On the bundle route a Kiro CLI pick stays on kiro-cli: KAS there spawns Crew's
     own bundled engine, which kiro-cli's own v3 support says nothing about, so the
     gateway floor and the per-process probe both decline to promote the pick.
+    An absent key is ``False``, as the loader reads it: a packaged build only
+    PREFERS the engine for an unset key (``acp.kas_build_default``), which leaves
+    a Kiro CLI pick where it was. A stored value that is not a bool reads ``False``
+    too, as the loader's ``_safe_bool`` does, so the two readers agree.
     """
-    return bool(_stored_agent_value("kas_bundle") is True)
+    stored = _stored_agent_value("kas_bundle")
+    return stored if isinstance(stored, bool) else False
+
+
+def kas_bundle_declared() -> bool:
+    """Whether ``config.json`` or the overlay names ``agent.kas_bundle`` at all.
+
+    A saved value always wins over the build's preference
+    (``acp.kas_build_default``), so the route asks this before applying it.
+    """
+    return _agent_key_declared("kas_bundle")
+
+
+#: The ``agent`` keys whose absent value is resolved from the host or the build,
+#: not from the field default, so ``save()`` must leave them off disk while the
+#: operator has not declared them (see :func:`strip_undeclared_resolved_defaults`).
+_RESOLVED_DEFAULT_AGENT_KEYS = ("sandbox_allow_unsandboxed_exec", "kas_bundle")
+
+
+def strip_undeclared_resolved_defaults(document: dict) -> None:
+    """Drop each :data:`_RESOLVED_DEFAULT_AGENT_KEYS` key the documents do not declare.
+
+    Called by :meth:`KiroCrewConfig.save` on the whole-document snapshot, which holds
+    the RESOLVED value of every field: writing one of these back would freeze a
+    platform or build default in as a declaration that outranks the next default.
+    """
+    agent_section = document.get("agent")
+    if not isinstance(agent_section, dict):
+        return
+    for key in _RESOLVED_DEFAULT_AGENT_KEYS:
+        if not _agent_key_declared(key):
+            agent_section.pop(key, None)
 
 
 def acp_backend_overlay_owned() -> bool:
@@ -149,36 +210,44 @@ def _backend_choice_declared(key: str) -> bool:
 _ABSENT_AGENT_KEY = object()
 
 
-def _raw_agent_section(path: Path) -> dict | None:
-    """The raw ``agent`` object of the config document at *path*, or ``None``.
+def _raw_agent_section(path: Path, section: str = "agent") -> dict | None:
+    """The raw *section* object (``agent`` by default) of the config document at *path*.
 
-    An unreadable or non-object document contributes nothing: a corrupt config is
-    not a declaration.
+    ``None`` when absent. An unreadable or non-object document contributes
+    nothing: a corrupt config is not a declaration. Read as the load reads it
+    (:func:`read_endorsed_config_text`).
     """
     try:
-        doc = json.loads(read_config_text(path))
+        doc = json.loads(read_endorsed_config_text(path))
     except (OSError, ValueError):
         return None
-    agent = doc.get("agent") if isinstance(doc, dict) else None
-    return agent if isinstance(agent, dict) else None
+    node = doc.get(section) if isinstance(doc, dict) else None
+    return node if isinstance(node, dict) else None
 
 
 def _raw_stt_provider(path: Path) -> object:
-    """The raw ``stt.provider`` of the config document at *path*, or ``None``."""
+    """The raw ``stt.provider`` of the config document at *path*, or ``None``.
+
+    Read as the load reads it (:func:`read_endorsed_config_text`).
+    """
     try:
-        doc = json.loads(read_config_text(path))
+        doc = json.loads(read_endorsed_config_text(path))
     except (OSError, ValueError):
         return None
     stt = doc.get("stt") if isinstance(doc, dict) else None
     return stt.get("provider") if isinstance(stt, dict) else None
 
 
-def _stored_agent_value(key: str) -> object:
-    """The raw stored ``agent.<key>`` a load would read: overlay first, then base."""
+def _stored_agent_value(key: str, section: str = "agent") -> object:
+    """The raw stored ``<section>.<key>`` a load would read: overlay first, then base.
+
+    *section* is ``agent`` unless named. No field default is filled in, so this
+    tells a written value from a default one.
+    """
     for path in (config_local_path(), config_path()):
-        agent = _raw_agent_section(path)
-        if agent is not None and key in agent:
-            return agent[key]
+        node = _raw_agent_section(path, section)
+        if node is not None and key in node:
+            return node[key]
     return _ABSENT_AGENT_KEY
 
 
@@ -204,16 +273,15 @@ def _lock_target(path: Path) -> Path:
 def _raw_config() -> dict:
     """Load raw config.json as a dict, re-reading the file on every call.
 
-    Uncached on purpose: callers want the bytes on disk right now, and the
+    Uncached on purpose: callers want the file as it reads right now, and the
     validated-config cache is keyed for :meth:`KiroCrewConfig.load`, not for
-    this raw view. An absent, unreadable or non-object file reads as ``{}``, so
-    the annotated ``dict`` holds for every caller.
+    this raw view. Read as the load reads it (:func:`read_endorsed_config_text`):
+    the sandbox resource limits come from here. An absent, unreadable or non-object
+    file reads as ``{}``, so the annotated ``dict`` holds for every caller.
     """
     p = config_path()
-    if not p.exists():
-        return {}
     try:
-        raw = json.loads(read_config_text(p))
+        raw = json.loads(read_endorsed_config_text(p))
     except (json.JSONDecodeError, UnicodeDecodeError, OSError):
         return {}
     return raw if isinstance(raw, dict) else {}
@@ -232,7 +300,28 @@ class ConfigWriteRefused(ValueError):
     on a terminal and to log. A ``ValueError`` so the CLI's existing refusal shape
     applies, and so a caller cannot mistake it for the unreadable-file case
     :class:`ConfigReadError` names.
+
+    ``code`` is the stable error code a dashboard handler answers with.
     """
+
+    code = "config_write_refused"
+
+
+class PendingEditBlocksSave(ConfigWriteRefused):
+    """A save to a protected file that has a change made outside Kiro Crew pending.
+
+    The save would publish the endorsed copy plus its own change over the pending
+    on-disk edit, which would then be lost with no Apply or Discard. Raised by
+    ``loosening_provenance.refuse_save_if_pending`` before anything is endorsed or
+    written. The message is the plain refusal the CLI prints; the dashboard keys its
+    own translation on :attr:`code`.
+    """
+
+    code = "file_pending_review"
+
+    def __init__(self, leaf: str) -> None:
+        super().__init__(loosening_provenance.PENDING_SAVE_REFUSED)
+        self.leaf = leaf
 
 
 class ConfigReadError(Exception):
@@ -274,9 +363,20 @@ def read_config_for_update(path: Path | None = None) -> dict:
     """
     p = path if path is not None else config_path()
     try:
-        if not p.exists():
+        # The read half of a read-modify-write must see what the LOADER sees
+        # (read_config_document reads through the same helper): where the namespace
+        # sandbox seals config.json / config.local.json, a tampered, deleted or
+        # unreadable file reads as the gateway-endorsed copy, so this update cannot
+        # re-endorse the tamper. Any other document read through here is returned as
+        # written.
+        leaf = loosening_provenance.leaf_for(p)
+        if leaf is None:
+            content: bytes | None = _config_text_bytes(p) if p.exists() else None
+        else:
+            content = loosening_provenance.reconciled_bytes(leaf, p, _config_text_bytes)
+        if content is None:
             return {}
-        raw = json.loads(read_config_text(p))
+        raw = json.loads(content)
     except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
         # UnicodeDecodeError is a ValueError, NOT an OSError, so it needs naming
         # explicitly: a config containing invalid UTF-8 (a truncated multi-byte
@@ -383,12 +483,34 @@ def _agent_key_on_disk(path: Path, key: str) -> object:
     ``None`` for an absent, unreadable or unparseable file and for a document
     without that key, which every caller treats as "not shown pre-existing".
     """
-    try:
-        document = json.loads(read_config_text(path))
-    except (OSError, ValueError):
-        return None
+    document = _prior_document(path)
     agent = document.get("agent") if isinstance(document, dict) else None
     return agent.get(key) if isinstance(agent, dict) else None
+
+
+def _prior_document(path: Path) -> object:
+    """The document a write to *path* replaces, as the loader reads it, or ``None``.
+
+    Where the sandbox seals the file, that is the gateway-endorsed copy, not the
+    on-disk bytes: a hand edit waiting for review in Settings is not yet in force, so
+    a value it added is one the write applying it introduces, and the publish floor
+    judges it (the Settings Apply of a pending edit goes through here). Elsewhere the
+    reconcile is a no-op. ``None`` for an absent, unreadable or unparseable file.
+    """
+    try:
+        leaf = loosening_provenance.leaf_for(path)
+        if leaf is None:
+            content: bytes | None = _config_text_bytes(path)
+        else:
+            content = loosening_provenance.reconciled_bytes(leaf, path, _config_text_bytes)
+        return None if content is None else json.loads(content)
+    except (OSError, ValueError):
+        return None
+
+
+def _config_text_bytes(path: Path) -> bytes:
+    """:func:`read_config_text` as bytes: what the loader parses, BOM dropped."""
+    return read_config_text(path).encode("utf-8")
 
 
 def _refuse_agent_env_entries(data: dict, path: Path) -> None:
@@ -424,10 +546,20 @@ def _refuse_agent_env_entries(data: dict, path: Path) -> None:
             detail,
         )
         return
+    # What to do first, then why: the reader acts on the first clause.
+    if isinstance(mapping, dict):
+        names = ", ".join(
+            repr(key)
+            for key, value in mapping.items()
+            if _sections.agent_env_write_refusals({key: value})
+        )
+        action = f"Remove or rename {names} in agent.env"
+    else:
+        action = "Make agent.env an object of NAME: value strings"
     raise ConfigWriteRefused(
-        f"agent.env refuses {detail}. Nothing was written, because an agent "
-        "process would never receive that variable: remove or rename the entry, "
-        "and keep credentials under Settings > Secrets."
+        f"{action}, and keep credentials under Settings > Secrets. agent.env refuses "
+        f"{detail}. Nothing was written, because an agent process would never receive "
+        "that variable."
     )
 
 
@@ -468,15 +600,14 @@ def _refuse_aws_project_profiles(data: dict, path: Path) -> None:
 
 def _aws_project_profiles_on_disk(path: Path) -> object:
     """The ``aws.project_profiles`` value the document at *path* holds, or ``None``."""
-    try:
-        document = json.loads(read_config_text(path))
-    except (OSError, ValueError):
-        return None
+    document = _prior_document(path)
     aws = document.get("aws") if isinstance(document, dict) else None
     return aws.get("project_profiles") if isinstance(aws, dict) else None
 
 
-def write_config_atomically(path: Path, data: dict, *, fsync: bool = False) -> None:
+def write_config_atomically(
+    path: Path, data: dict, *, fsync: bool = False, resolving_pending: bool = False
+) -> None:
     """Write a config dict to *path* atomically, PRESERVING its permissions.
 
     The companion to :func:`read_config_for_update`. Two properties matter:
@@ -579,41 +710,54 @@ def write_config_atomically(path: Path, data: dict, *, fsync: bool = False) -> N
         # the home resolved to its target above and keeps the target's mode.
         mode &= ~GROUP_OTHER_BITS
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(data, indent=2) + "\n"
-    if platform_compat.IS_POSIX:
-        # Vouch for the staged inode before it is published, so a Linux sandbox whose
-        # pre-spawn pass recorded the previous one does not refuse the gateway's own
-        # save. Only the POSIX branch: no other platform runs the namespace launcher
-        # that reads the record.
-        atomic_write(
-            path,
-            payload,
-            fsync=fsync,
-            mode=mode,
-            on_staged=write_provenance.staging_hook(name_as_given),
-        )
-    elif lock_down:
-        # Windows: the mode bits above are inert (fchmod_safe is a documented
-        # no-op), so there is nothing to preserve and no conflict with
-        # restrict_to_owner's implied 0600. atomic_write applies the DACL to the
-        # temp file BEFORE any content reaches it, so an inline credential never
-        # exists in a file readable by other local accounts.
-        #
-        # restrict_on_error="warn", not "raise": config.json must not become
-        # unwritable because a DACL could not be applied (the same trade-off
-        # sel.py and dashboard/refresh_tokens.py take).
-        atomic_write(
-            path,
-            payload,
-            fsync=fsync,
-            restrict_to_owner=True,
-            restrict_on_error="warn",
-        )
-    else:
-        # Reached only by a write INLINE ON THE LOOP to a non-local volume. The
-        # file keeps the ACL it inherits from its parent; offloading the caller
-        # moves it to the branch above, where it gets the DACL.
-        atomic_write(path, payload, fsync=fsync, mode=mode)
+    # Encoded once, as text mode would on this platform (CRLF on Windows), and the same
+    # bytes are endorsed and published, so the endorsed copy equals the file everywhere.
+    payload = text_bytes(json.dumps(data, indent=2) + "\n")
+    # Endorse the writer's own bytes BEFORE the rename publishes them, so the loader can
+    # tell this save from a direct in-sandbox rewrite the per-file read-only bind stops
+    # covering after the rename, and nothing landed on the name around the rename is
+    # ever endorsed. Keyed by the protected file the path RESOLVES to, so a symlinked
+    # config is endorsed under its logical name. Where the sandbox seals these files a
+    # copy that cannot be written aborts the write (loosening_provenance.endorsing).
+    with loosening_provenance.endorsing(
+        loosening_provenance.leaf_for(name_as_given),
+        payload,
+        resolving_pending=resolving_pending,
+    ):
+        if platform_compat.IS_POSIX:
+            # Vouch for the staged inode before it is published, so a Linux sandbox whose
+            # pre-spawn pass recorded the previous one does not refuse the gateway's own
+            # save. Only the POSIX branch: no other platform runs the namespace launcher
+            # that reads the record.
+            atomic_write(
+                path,
+                payload,
+                fsync=fsync,
+                mode=mode,
+                on_staged=write_provenance.staging_hook(name_as_given),
+            )
+        elif lock_down:
+            # Windows: the mode bits above are inert (fchmod_safe is a documented
+            # no-op), so there is nothing to preserve and no conflict with
+            # restrict_to_owner's implied 0600. atomic_write applies the DACL to the
+            # temp file BEFORE any content reaches it, so an inline credential never
+            # exists in a file readable by other local accounts.
+            #
+            # restrict_on_error="warn", not "raise": config.json must not become
+            # unwritable because a DACL could not be applied (the same trade-off
+            # sel.py and dashboard/refresh_tokens.py take).
+            atomic_write(
+                path,
+                payload,
+                fsync=fsync,
+                restrict_to_owner=True,
+                restrict_on_error="warn",
+            )
+        else:
+            # Reached only by a write INLINE ON THE LOOP to a non-local volume. The
+            # file keeps the ACL it inherits from its parent; offloading the caller
+            # moves it to the branch above, where it gets the DACL.
+            atomic_write(path, payload, fsync=fsync, mode=mode)
 
 
 def coerce_dict_section(doc: dict, key: str) -> dict:
@@ -726,9 +870,54 @@ def _config_write_lock(p: Path, *, wait: bool = True) -> Iterator[None]:
     fd = platform_compat.open_create_or_existing(str(lock_path), os.O_RDWR, 0o600)
     try:
         with platform_compat.file_lock(fd, exclusive=True, wait=wait):
-            yield
+            held = _held_lock_paths()
+            key = str(lock_path)
+            held[key] = held.get(key, 0) + 1
+            try:
+                yield
+            finally:
+                held[key] -= 1
+                if not held[key]:
+                    del held[key]
     finally:
         os.close(fd)
+
+
+#: Per sidecar lock path, how many :func:`_config_write_lock` holds this thread is
+#: inside, so code that runs both inside a locked write of THAT file and outside one
+#: can tell which it is in.
+_write_lock_held = threading.local()
+
+
+def _held_lock_paths() -> dict[str, int]:
+    held: dict[str, int] | None = getattr(_write_lock_held, "paths", None)
+    if held is None:
+        held = _write_lock_held.paths = {}
+    return held
+
+
+@contextlib.contextmanager
+def try_config_write_lock(p: Path) -> Iterator[bool]:
+    """Yield whether this thread may write *p*'s config now, never waiting.
+
+    ``True`` inside a :func:`_config_write_lock` this thread already holds, or
+    when the sidecar lock is free and taken for the block; ``False`` when another
+    writer holds it (or it cannot be taken), and the caller skips its write.
+    """
+    target = _lock_target(p)
+    if str(target.parent / (target.name + ".lock")) in _held_lock_paths():
+        yield True
+        return
+    try:
+        held = _config_write_lock(target, wait=False)
+        held.__enter__()
+    except Exception:
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        held.__exit__(None, None, None)
 
 
 def update_config_locked(
@@ -740,6 +929,7 @@ def update_config_locked(
     on_corrupt: Literal["fail", "reset"] = "fail",
     wait_for_lock: bool = True,
     after_write: Callable[[], None] | None = None,
+    resolving_pending: bool = False,
 ) -> dict:
     """Perform an atomic read-modify-write of a config file under an advisory lock.
 
@@ -816,6 +1006,12 @@ def update_config_locked(
     * **Symlink-safe.** The target path is resolved before locking, so a
       symlinked config is updated in place (matching
       ``write_config_atomically``'s behavior).
+    * **Retired keys go.** A write to the base ``config.json`` (*path* is
+      ``config_path()``, however the data home is spelled) drops the retired
+      keys and map entries (``resolution.drop_retired_section_keys``) from what
+      *mutate* returned, as the load-time warning promises; every other key (bar
+      the ``meta`` stamp *stamp_meta* adds), and every other file, is written as
+      returned.
 
     Parameters
     ----------
@@ -844,6 +1040,10 @@ def update_config_locked(
         the event-loop thread, where a POSIX ``flock`` wait would stall the
         gateway for as long as the holder keeps it.  It never relaxes the
         serialization -- a contended acquire declines instead of proceeding.
+    resolving_pending : bool
+        True ONLY for the owner's Apply or Discard of a pending change
+        (the Settings review routes). Every other caller leaves it
+        False, and its save of a pending file raises :class:`PendingEditBlocksSave`.
 
     Returns
     -------
@@ -859,11 +1059,19 @@ def update_config_locked(
         If the mutated document carries content the publish floor never
         persists (a plaintext value under ``agent.deepseek_env``). Raised
         before any byte is written; the existing file is untouched.
+        :class:`PendingEditBlocksSave`, a subclass, when *path* is a protected file
+        with a change made outside Kiro Crew still pending: raised after *mutate*
+        returns a document, before anything is written. A *mutate* that returns
+        ``None`` writes nothing and is never refused.
     OSError
         If the lockfile cannot be opened/created or the lock cannot be acquired
         (including a contended ``wait_for_lock=False`` acquire).
     """
     p = path if path is not None else config_path()
+    # Judged by location, not spelling (the settings import builds *p* from the raw
+    # KIROCREW_HOME), and before the symlink resolve below follows a symlinked file.
+    base = config_path()
+    is_base = p.name == base.name and p.parent.resolve() == base.parent.resolve()
     # Resolve symlinks before locking (same logic as write_config_atomically)
     # so the sidecar sits beside the ACTUAL file, not the symlink.
     try:
@@ -872,19 +1080,27 @@ def update_config_locked(
     except OSError:
         pass
     with _config_write_lock(p, wait=wait_for_lock):
+        unreadable: ConfigReadError | None = None
         try:
             data = read_config_for_update(p)
-        except ConfigReadError:
+        except ConfigReadError as e:
             if on_corrupt == "fail":
                 raise
             # on_corrupt="reset": treat as empty inside the same lock hold.
-            data = {}
+            unreadable, data = e, {}
         result = mutate(data)
         if result is None:
             return data
+        if is_base:
+            # Every locked raw edit lands here, not in save(), so this is where the retired keys
+            # go; config.local.json is the operator's own file and keeps what it holds.
+            _resolution.drop_retired_section_keys(result)
         if stamp_meta:
             result = stamp_config_meta(result)
-        write_config_atomically(p, result, fsync=fsync)
+        if unreadable is None:
+            write_config_atomically(p, result, fsync=fsync, resolving_pending=resolving_pending)
+        else:
+            _replace_keeping_unreadable(p, result, unreadable, fsync, resolving_pending)
         # A same-size replacement can retain an indistinguishable fingerprint
         # on a coarse-timestamp filesystem. Clear eagerly before reporting the
         # write complete so the next load cannot serve the pre-write snapshot,
@@ -895,6 +1111,44 @@ def update_config_locked(
         if after_write is not None:
             after_write()
         return result
+
+
+def _replace_keeping_unreadable(
+    p: Path, result: dict, error: ConfigReadError, fsync: bool, resolving_pending: bool
+) -> None:
+    """Write *result* over the unreadable *p*, keeping its bytes in ``<p>.unreadable``.
+
+    ``.bak`` is the migration's copy of a valid file, so this copy takes its own
+    name, and it is owner-only before any byte lands: the file can hold inline
+    credentials. The bytes are staged beside it first and take the name only once
+    the write has landed, so a write the publish floor refuses leaves the earlier
+    copy as it was. A copy that cannot be staged refuses the reset rather than lose
+    the only bytes there are.
+    """
+    kept = p.with_name(p.name + ".unreadable")
+    # A name of its own per attempt: a copy an earlier reset left under its staged
+    # name (the rename failed) is the only bytes it saved, and this one must not
+    # overwrite it or, if the write is refused, delete it.
+    staged = p.with_name(f"{p.name}.unreadable.{secrets.token_hex(4)}.staged")
+    try:
+        # Read as the loader reads, so a FIFO or device is refused, not waited on
+        # while the config write lock is held.
+        unreadable_bytes = loosening_provenance.read_regular_with_retry(p)
+        atomic_write(staged, unreadable_bytes, restrict_to_owner=True)
+    except OSError as copy_error:
+        raise error from copy_error
+    try:
+        write_config_atomically(p, result, fsync=fsync, resolving_pending=resolving_pending)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            staged.unlink()
+        raise
+    try:
+        os.replace(staged, kept)
+    except OSError:
+        # The bytes are safe under the staged name; say where they are.
+        kept = staged
+    logger.warning("%s; replaced it and kept its previous bytes in %s", error, kept)
 
 
 def _notify_live_watch() -> None:
@@ -949,10 +1203,11 @@ def refresh_config_meta_stamp() -> bool:
     path: a version check on one small file, a rewrite only when it differs.
 
     Deliberately a plain field refresh, not a migration hook: the stamp is
-    replaced, every other key is preserved, and nothing else changes. When
-    the stored version already matches, the file is not rewritten at all
-    (no mtime churn, no ``lastTouchedAt`` bump). Nor is it rewritten while
-    the one-shot legacy ``skills.lazy_load`` rewrite is still due
+    replaced and every other key is preserved, except the retired keys every
+    locked write to ``config.json`` drops. When the stored version already
+    matches, the file is not rewritten at all (no mtime churn, no
+    ``lastTouchedAt`` bump). Nor is it rewritten while the one-shot legacy
+    ``skills.lazy_load`` rewrite is still due
     (``migration.legacy_lazy_load_rewrite_due``): the old stamp is that
     rewrite's proof, and a degraded first load leaves it pending.
 
@@ -1171,6 +1426,10 @@ _SIDECAR_BASE_UNREADABLE = "base_unreadable"
 #: Whether the load that filled this cache entry found ``config.local.json`` present
 #: but unparseable, carried forward the same way for ``_overlay_unreadable``.
 _SIDECAR_OVERLAY_UNREADABLE = "overlay_unreadable"
+
+#: Whether the load that filled this cache entry dropped the ``agents`` value or an
+#: ``agents`` entry in validation, carried forward so a hit reports it the same way.
+_SIDECAR_AGENTS_REPAIRED = "agents_repaired"
 
 
 def _shadowed_base_sections(base: dict, overlay: dict) -> dict:

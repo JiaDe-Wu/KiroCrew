@@ -4,24 +4,27 @@
  * drawn row gets, the tool-group approval routing, and the off-screen measurement
  * farm's rows (same wrappers, measured with the farm flag up only while it builds).
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { renderHook } from '@testing-library/react'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { afterEach, describe, it, expect, onTestFinished, vi } from 'vitest'
+import { act, cleanup, render as renderDom, renderHook, screen, waitFor } from '@testing-library/react'
+import { QueryClient, QueryClientProvider, defaultScheduler, notifyManager, useQuery } from '@tanstack/react-query'
 import { isValidElement, type ReactElement, type ReactNode } from 'react'
 
 vi.mock('../api/client', () => ({
   api: {
     artifactSessionDocs: vi.fn(async () => ({ docs: [] })),
-    resolveApproval: vi.fn(async () => undefined),
+    kasLoginStatus: vi.fn(),
   },
 }))
 
-import { api } from '../api/client'
+import { api, type KasLoginStatus } from '../api/client'
+import { ApiError } from '../api/apiError'
 import { loadChatConfig } from './chat/ChatSettings'
 import type { DisplayItem, TurnItem } from './chat/types'
 import type { ChatMessage } from '../types'
 import { useTranscriptRendering } from './chat/page/transcriptRendering'
 import { UserMessage, AssistantMessage } from './chat'
+import { KIRO_SIGN_IN_NOTICE_POLL_MS } from '../components/KiroSignInNotice'
+import { __resetGatewayConnectedForTests, setGatewayConnected } from '../utils/errorReport'
 
 type Props = Parameters<typeof useTranscriptRendering>[0]
 
@@ -37,8 +40,8 @@ function props(over: Partial<Props> = {}): Props {
     slotHasMore: false, slotOldestIndex: 0, cursorIsForActiveSlot: true, loadingOlder: false, chatConfig: loadChatConfig(),
     activeSlotRemoteBound: false, automationId: undefined, setAutomationOpen: fn(), handleArtifactOpen: vi.fn(async () => undefined),
     handleFileOpen: fn() as never, handleFolderOpen: fn(), handleOpenDiff: fn(), handleSubagentPanelOpen: fn(), sessionTitles: new Map(),
-    handleFork: vi.fn(async () => undefined), highlightTs: null, selectSessionTab: fn(), linkPreviewsOn: false, socialShareOn: false,
-    connectionsUiOn: false, planTaskId: '', showRefusedPress: fn(), approve: vi.fn(async () => undefined), dismissApproval: fn(),
+    handleFork: vi.fn(async () => false), highlightTs: null, landedTs: null, jumpMid: null, selectSessionTab: fn(), linkPreviewsOn: false, socialShareOn: false,
+    connectionsUiOn: false, planTaskId: '', showRefusedPress: fn(), decideRow: vi.fn(async () => undefined),
     revealAppInPanel: fn(), lastTextIdx: -1, regenerating: false, handleRegenerate: fn(), replacingMids: new Set<string>(), continuable: false, continuing: false,
     freshSession: { phase: 'idle' } as never, handleContinue: fn(), handleFreshSession: fn(), interrupted: false, openDefaultModelSetting: fn(),
     openKiroSignIn: fn(), openMemberCapabilities: fn(), openModelPickerFromError: fn(), openTurnLimitSetting: fn(), quoteWholeMessage: fn(),
@@ -64,7 +67,6 @@ const el = (node: ReactNode) => {
   return node as ReactElement<{ className?: string; style?: { maxWidth?: string }; children?: ReactNode; [k: string]: unknown }>
 }
 
-beforeEach(() => { vi.mocked(api.resolveApproval).mockClear() })
 
 describe('renderTurnItem', () => {
   it('draws nothing for a hidden tool completion and for a hidden invisible-only assistant row', () => {
@@ -90,22 +92,24 @@ describe('renderTurnItem', () => {
     expect(el(result.current.renderTurnItem(group, 0)).props.children).toBeNull()
   })
 
-  it('routes a group approval to the newest unresolved permission, else to the page approve', async () => {
+  it('decides a group approval through the newest unresolved permission row, and a group with none names no row', async () => {
     const { result, p } = render()
+    const pending = { approval_id: 'ap-1', mid: 'm-6' }
     const withId: TurnItem = {
       kind: 'group', startIdx: 4,
-      msgs: [msg('tool', '🔧 a', 't5'), msg('permission', 'p', 't6', { approval_id: 'ap-1' })],
+      msgs: [msg('tool', '🔧 a', 't5'), msg('permission', 'p', 't6', pending)],
     }
     const group = el(el(result.current.renderTurnItem(withId, 0)).props.children)
     expect(group.props.pendingPermCount).toBe(1)
     expect(group.props.count).toBe(1)
     await (group.props.onApprove as (a: string) => Promise<void>)('approve')
-    expect(api.resolveApproval).toHaveBeenCalledTimes(1)
-    expect(vi.mocked(api.resolveApproval).mock.calls[0][0]).toBe('ap-1')
-    expect(p.dismissApproval).toHaveBeenCalledWith('ap-1')
+    // Bound to the row the group shows, never a bare id or a bare slot.
+    expect(p.decideRow).toHaveBeenCalledTimes(1)
+    expect(p.decideRow).toHaveBeenCalledWith(pending, 'approve')
 
     const noId: TurnItem = { kind: 'group', startIdx: 6, msgs: [msg('tool', '🔧 b', 't7')] }
-    expect(el(el(result.current.renderTurnItem(noId, 0)).props.children).props.onApprove).toBe(p.approve)
+    await (el(el(result.current.renderTurnItem(noId, 0)).props.children).props.onApprove as (a: string) => Promise<void>)('approve')
+    expect(p.decideRow).toHaveBeenLastCalledWith(undefined, 'approve')
   })
 })
 
@@ -180,6 +184,22 @@ describe('message row handlers', () => {
     expect(first.handleTogglePinForMessage).not.toHaveBeenCalled()
   })
 
+  it('forks with the earlier messages and opens the model picker only on the chat the fork opened', async () => {
+    const { hook, first, rows } = mount()
+    const handleFork = vi.fn(async () => true)
+    const openModelPickerFromError = vi.fn()
+    hook.rerender({ ...first, handleFork, openModelPickerFromError })
+    const forkWithModel = () => (rows().reply.props.onForkWithModel as (i: number, mid?: string) => Promise<void>)(1, 'm-reply')
+    await forkWithModel()
+    expect(handleFork).toHaveBeenCalledWith(1, 'm-reply', 'head')
+    expect(openModelPickerFromError).toHaveBeenCalledTimes(1)
+    // The person opened another chat while the fork ran: the picker would act on that one.
+    handleFork.mockResolvedValueOnce(false)
+    await forkWithModel()
+    expect(handleFork).toHaveBeenCalledTimes(2)
+    expect(openModelPickerFromError).toHaveBeenCalledTimes(1)
+  })
+
   it('gives a replaced row object handlers over its new content', () => {
     const { hook, first, rows } = mount()
     const before = rows().user
@@ -199,7 +219,7 @@ describe('renderFarmItem', () => {
     { kind: 'single', msg: msg('assistant', 'a', 'f4'), idx: 3 },
   ]
 
-  it('mirrors the transcript row wrappers, with default disclosure, and lowers the farm flag after each build', () => {
+  it('mirrors the transcript row wrappers, with default disclosure, and lowers the farm flag after each build', async () => {
     const farmPassRef = { current: false }
     const { result, p } = render({ renderedDisplayItems: items, farmPassRef })
     expect(result.current.renderFarmItem(99)).toBeNull()
@@ -214,11 +234,156 @@ describe('renderFarmItem', () => {
 
     const group = el(el(result.current.renderFarmItem(2)).props.children)
     expect(group.props.disclosureKey).toBe('farm-ctg-2')
-    expect(group.props.onApprove).toBe(p.approve)
+    // The farm replica names no row, so a press on it could only be refused.
+    await (group.props.onApprove as (a: string) => Promise<void>)('approve')
+    expect(p.decideRow).toHaveBeenCalledWith(undefined, 'approve')
     expect(group.props.activityOpen).toBe(false)
 
     const single = el(result.current.renderFarmItem(3))
     expect(single.props.className).toBe('px-4 mx-auto w-full py-1 empty:hidden')
     expect(farmPassRef.current).toBe(false)
+  })
+})
+
+describe('the jump mark on a run of messages that share a ts', () => {
+  const first = msg('assistant', 'first twin', 'same', { mid: 'm-1' })
+  const second = msg('assistant', 'second twin', 'same', { mid: 'm-2' })
+  const third = msg('assistant', 'third twin', 'same', { mid: 'm-3' })
+  const markOf = (node: ReactNode): { target: unknown; cls: string } => {
+    const scope = el(node)
+    const row = el(scope.props.children as ReactNode)
+    return { target: row.props['data-jump-target'], cls: String(row.props.className ?? '') }
+  }
+
+  it('marks only the message whose mid the jump carried', () => {
+    const msgs = [first, second, third]
+    const { result } = render({ messages: msgs, messagesRef: { current: msgs }, landedTs: 'same', jumpMid: 'm-2' })
+    const marks = msgs.map((m, i) => markOf(result.current.renderMessage(i, m)))
+    expect(marks.map(m => m.target)).toEqual([undefined, 'same', undefined])
+    expect(marks.map(m => m.cls.includes('animate-msg-landed'))).toEqual([false, true, false])
+  })
+
+  it('marks every row of that ts when the jump carried no mid', () => {
+    const msgs = [first, second]
+    const { result } = render({ messages: msgs, messagesRef: { current: msgs }, highlightTs: 'same', jumpMid: null })
+    const marks = msgs.map((m, i) => markOf(result.current.renderMessage(i, m)))
+    expect(marks.map(m => m.target)).toEqual(['same', 'same'])
+  })
+})
+
+describe('a signed-out row on the dashboard and in an embed or popout frame (#34690)', () => {
+  const user = msg('user', 'What can you do for me today?', 'k1')
+  const signedOut = msg('error', 'Not signed in to Kiro.', 'k2', { mid: 'm-out', kind: 'auth_required', notice: 'kas_signed_out' })
+  const signedIn: KasLoginStatus = {
+    authenticated: true, provider: 'Google', identity: 'social', transport: 'device',
+    expires_at: '2099-01-01T00:00:00Z', expired: false, has_refresh_token: true, refresh_rejected: false, usable: true,
+  }
+  const readFailed = () => new ApiError(500, 'Could not read the stored sign-in.', '{"error":"Could not read the stored sign-in.","code":"token_store_failed"}')
+
+  afterEach(() => {
+    vi.useRealTimers()
+    cleanup()
+    window.history.replaceState(null, '', '/')
+  })
+
+  function renderRow(over: Partial<Props>, path: string) {
+    window.history.replaceState(null, '', path)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const rows = [user, signedOut]
+    const p = props({ interrupted: true, continuable: true, messages: rows, messagesRef: { current: rows }, ...over })
+    function Row() {
+      const row = useTranscriptRendering(p).renderMessage(1, signedOut)
+      // The row's read as this same render saw it, so a test can wait on a
+      // drawn failure before asserting what the row left out.
+      const read = useQuery({ queryKey: ['kas-login', 'm-out'], queryFn: api.kasLoginStatus, enabled: false })
+      return <><span data-testid="row-read" data-status={read.status} />{row}</>
+    }
+    renderDom(<QueryClientProvider client={client}><Row /></QueryClientProvider>)
+    return client
+  }
+
+  it('withdraws Resume and shows the failure once a later sign-in read fails', async () => {
+    const status = vi.mocked(api.kasLoginStatus)
+    status.mockResolvedValue(signedIn)
+    const client = renderRow({ embedded: true }, '/embed/chat/s1')
+
+    await waitFor(() => expect(screen.getByTestId('error-card-continue')).toBeInTheDocument())
+    expect(screen.queryByTestId('error-card-sign-in-check-failed')).toBeNull()
+
+    status.mockRejectedValue(readFailed())
+    await client.refetchQueries({ queryKey: ['kas-login'] })
+    await waitFor(() => expect(screen.getByTestId('error-card-sign-in-check-failed')).toBeInTheDocument())
+    expect(screen.queryByTestId('error-card-continue')).toBeNull()
+  })
+
+  it('leaves a failed read on the dashboard to the app-level notice, keeping Sign in and withdrawing Resume', async () => {
+    const status = vi.mocked(api.kasLoginStatus)
+    status.mockRejectedValue(readFailed())
+    renderRow({ embedded: false, popout: false }, '/chat/s1')
+
+    await waitFor(() => expect(screen.getByTestId('row-read')).toHaveAttribute('data-status', 'error'))
+    expect(screen.getByTestId('error-card-sign-in')).toBeInTheDocument()
+    expect(screen.queryByTestId('error-card-continue')).toBeNull()
+    expect(screen.queryByTestId('error-card-sign-in-check-failed')).toBeNull()
+  })
+
+  it('leaves a failed read in a chat embedded in a dashboard page to the app-level notice', async () => {
+    vi.mocked(api.kasLoginStatus).mockRejectedValue(readFailed())
+    renderRow({ embedded: true }, '/artifacts/doc-1')
+
+    await waitFor(() => expect(screen.getByTestId('row-read')).toHaveAttribute('data-status', 'error'))
+    expect(screen.queryByTestId('error-card-sign-in-check-failed')).toBeNull()
+    expect(screen.queryByTestId('error-card-continue')).toBeNull()
+  })
+
+  it('leaves a read that failed while the gateway was down to the offline state, then re-reads once it is back', async () => {
+    const status = vi.mocked(api.kasLoginStatus)
+    status.mockRejectedValue(new TypeError('Failed to fetch'))
+    setGatewayConnected(false)
+    onTestFinished(() => __resetGatewayConnectedForTests())
+    renderRow({ embedded: true }, '/embed/chat/s1')
+
+    await waitFor(() => expect(screen.getByTestId('row-read')).toHaveAttribute('data-status', 'error'))
+    expect(screen.queryByTestId('error-card-sign-in-check-failed')).toBeNull()
+    expect(screen.queryByTestId('error-card-continue')).toBeNull()
+
+    status.mockResolvedValue(signedIn)
+    act(() => setGatewayConnected(true))
+    expect(await screen.findByTestId('error-card-continue')).toBeInTheDocument()
+    expect(screen.queryByTestId('error-card-sign-in-check-failed')).toBeNull()
+  })
+
+  it('offers no Resume and reads no sign-in for a row a later request follows', async () => {
+    const status = vi.mocked(api.kasLoginStatus)
+    status.mockClear()
+    status.mockResolvedValue(signedIn)
+    const later = [user, signedOut, msg('user', 'And another thing.', 'k3')]
+    renderRow({ embedded: true, messages: later, messagesRef: { current: later } }, '/embed/chat/s1')
+
+    // An enabled query calls its fetcher while the mount commits, inside the
+    // render's act, so a read that was going to happen already has.
+    expect(screen.getByTestId('error-card')).toBeInTheDocument()
+    expect(status).not.toHaveBeenCalled()
+    expect(screen.queryByTestId('error-card-continue')).toBeNull()
+  })
+
+  it('re-reads on its own clock, so a frame signed in from elsewhere gains Resume', async () => {
+    // Fake timers go on before the render so the query's interval is a fake
+    // one, and no waitFor runs under them. Notifications run on microtasks, so
+    // the `act` around each advance flushes the re-render.
+    vi.useFakeTimers({ shouldAdvanceTime: false })
+    notifyManager.setScheduler(queueMicrotask)
+    onTestFinished(() => notifyManager.setScheduler(defaultScheduler))
+    const status = vi.mocked(api.kasLoginStatus)
+    status.mockResolvedValue({ ...signedIn, authenticated: false, usable: false })
+    const client = renderRow({ embedded: true }, '/embed/chat/s1')
+
+    await act(() => vi.advanceTimersByTimeAsync(0))
+    expect(client.getQueryState(['kas-login', 'm-out'])?.status).toBe('success')
+    expect(screen.queryByTestId('error-card-continue')).toBeNull()
+
+    status.mockResolvedValue(signedIn)
+    await act(() => vi.advanceTimersByTimeAsync(KIRO_SIGN_IN_NOTICE_POLL_MS))
+    expect(screen.getByTestId('error-card-continue')).toBeInTheDocument()
   })
 })

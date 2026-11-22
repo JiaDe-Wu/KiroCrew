@@ -258,8 +258,10 @@ async def test_the_recipe_arms_a_gated_pull_request_loop_with_the_judge_off(
         assert validation.judge_is_off(autonudge_judge.spec_of(loop))
         assert loop.monitor is not None
         assert (loop.monitor.kind, loop.monitor.target) == ("gh-pr", _SUBJECT)
-        # The runtime, not the cycle cap, still ends the loop.
-        assert loop.idle_secs * loop.max_cycles >= loop.max_runtime_secs
+        # The runtime, not the cycle cap, ends the loop: an uncapped gated loop
+        # (babysit) or a cap that covers the runtime (prepare-pr).
+        assert loop.max_runtime_secs > 0
+        assert loop.max_cycles == 0 or loop.idle_secs * loop.max_cycles >= loop.max_runtime_secs
     finally:
         harness.stop()
 
@@ -312,15 +314,15 @@ async def test_each_change_starts_exactly_one_turn(tmp_path, monkeypatch, recipe
     ],
     ids=["merged", "closed"],
 )
-async def test_a_merge_or_close_ends_the_loop_without_a_turn(
+async def test_a_merge_or_close_ends_the_loop_after_one_turn(
     tmp_path, monkeypatch, recipe, ending, outcome
 ):
     harness = _Harness(tmp_path, monkeypatch, [_reading(), _reading(**ending)])
     try:
         loop = await harness.arm(_RECIPES[recipe]())
         await harness.tick(loop)
-        assert await harness.tick(loop) is True, "the ending is settled, not delivered"
-        assert harness.delivered == [loop.id]
+        assert await harness.tick(loop) is False, "the ending is delivered once, then settled"
+        assert harness.delivered == [loop.id, loop.id]
         assert loop.active is False
         assert loop.monitor is not None and loop.monitor.outcome is outcome
         assert harness.expired == [loop.id], "the dashboard notice still goes out"

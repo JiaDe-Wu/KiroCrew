@@ -16,7 +16,9 @@ governed: as the policy language reads it, what no ``allow`` grants is denied.
 * ``allow`` with ``match L`` and no such ``exclude``: ``L`` is allowed;
 * ``allow`` with no ``match`` and no such ``exclude``: everything is allowed, so the
   rules become a deny-list of the ``deny match`` entries (empty when there are none);
-* ``deny``/``ask`` with ``match L``: ``L`` is taken out of the allowed set;
+* ``deny``/``ask`` with ``match L``: ``L`` is taken out of the allowed set. For a
+  capability whose baseline allows something (``permission_mode``) and that no
+  ``allow`` names, that baseline is the allowed set it is taken out of;
 * a capability rules name but nothing grants: nothing is allowed.
 
 An ``allow`` with ``when`` or with ``exclude`` grants nothing here: the reply is already
@@ -37,9 +39,8 @@ fetch fails. Entries compare as the row's Crew matcher compares them. ``ask`` re
 enterprise baseline holds (off, or Crew's default for an open control).
 
 A ruleset row may carry a floor: entries its Crew scope never forbids
-(``approval_modes`` keeps ``normal``, ``trust`` and ``trust_reads``). They are added to
-an allowed set and taken out of a denied one, because the scope refuses a policy that
-forbids one.
+(``approval_modes`` keeps ``normal``). It is added to an allowed set and taken
+out of a denied one, because the scope refuses a policy that forbids it.
 
 An on/off capability (one with no resource) reduces to ``{"enabled": bool}``
 instead, by :func:`switch`:
@@ -65,6 +66,22 @@ strictness of its own. Every other setting is ignored.
 
 A gated row (``subagent``) is a Crew capability switch with an inner list: its ruleset
 lands as ``{"enabled": bool, "scopes": {<inner>: ruleset}}`` (:func:`_gate`).
+
+A row may land in more than one place (:attr:`Managed.also`), each read with its own
+converter: ``app_use`` (``<app>@<version>``) lands in ``app_versions`` as written and in
+``apps`` by app name, where only a deny of every version takes the app away. A row with
+a closed list reads every pattern as the list entries it matches (:func:`_closed`), so
+``harness_use`` never reaches a backend outside ``kas``, ``kiro`` and ``claude``.
+
+The ``skill``, ``mcp`` and ``subagent`` terms also say what may be installed. Their
+install parts merge into the one ``capabilities.extension_install`` gate, by kind
+(``skill:``, ``mcp:``, ``agent:``), in :func:`_install_gate`. A scope-less allow, and an
+``allow all`` or ``allow builtin`` copied onto them, grants install of that kind (RFC
+D13). Plugin sync has no term and stays off.
+
+The ``web_fetch`` and ``web_search`` terms are KAS's to enforce. Only an ``ask`` on
+either is read, into ``unattended_web_tools`` (:func:`web_ask_ruleset`), so trust
+never answers the question KAS asks for it.
 """
 
 from __future__ import annotations
@@ -74,11 +91,12 @@ import json
 import logging
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 import yaml  # type: ignore[import-untyped]
 
 from kiro_crew.platform.governance import _ORDINAL_SCALES, MODE_ALLOW, MODE_DENY
+from kiro_crew.platform.governance_parts.baseline import BASELINE_CONTROLS
 from kiro_crew.platform.governance_parts.catalog import SCOPE_CATALOG
 from kiro_crew.platform.governance_parts.matching import _MATCHERS, _expand
 
@@ -90,6 +108,20 @@ RULESET = "ruleset"
 SWITCH = "switch"
 #: An on/off row with an inner list: a ruleset under ``{"enabled", "scopes"}`` (:func:`_gate`).
 GATE = "gate"
+#: One extension kind's part of the install gate's ``extensions`` list (:func:`_install_gate`).
+INSTALL = "install"
+
+#: Where the install rows land, and its inner list.
+_INSTALL_PATH = ("capabilities", "extension_install")
+_INSTALL_INNER = "extensions"
+#: The extension kinds no policy term grants (RFC D13: plugin sync stays off),
+#: denied when the install list is written as a deny-list.
+_UNGRANTED_KINDS = ("plugin",)
+#: Kinds whose install id is a package, not the policy term's name. A denied name
+#: cannot be matched to a package yet, so it turns that kind's install off. A skill
+#: package is not one: the install seam checks each skill name it holds
+#: (``extension_governance.skill_package_denied``).
+_PACKAGE_KINDS = frozenset({"agent"})
 
 #: A policy pattern's place in a reduction: what it grants, or what it takes away.
 ALLOW_ROLE = "allow"
@@ -146,6 +178,67 @@ def _mcp_patterns(pattern: str, role: str) -> List[str]:
     if "*" in tool:
         return [] if role == ALLOW_ROLE else [f"@{server}"]
     return [f"@{server}/{tool}"]
+
+
+def _mcp_install_ids(pattern: str, role: str) -> List[str]:
+    """A ``server/tool`` policy pattern as the MCP server ids it lets be installed.
+
+    Only a whole server is installed: a bare ``server`` or ``server/*`` names one. A
+    registry id may itself hold ``/`` (``io.github.owner/name``), so the id is all of
+    the pattern before a trailing ``/*``, and a bare pattern with a ``/`` may name
+    either a server id or one tool. An allowed one is dropped, since one tool does not
+    grant its server; a denied one is read as that server id, which only narrows. A
+    denied ``server/*`` also covers every id beneath it. An allowed server glob is
+    dropped, as the ``mcp`` row drops it.
+    """
+    text = pattern.strip()
+    whole = text.endswith("/*")
+    server = text[:-2] if whole else text
+    if not server:
+        return _drop_or_refuse(pattern, role, "no Crew form for this MCP server name")
+    if role == ALLOW_ROLE:
+        if any(c in server for c in "*?[") or ("/" in server and not whole):
+            return []
+        return _single_star(server, role)
+    if whole:
+        return _single_star(server, role) + _single_star(text, role)
+    return _single_star(server, role)
+
+
+def _app_version_patterns(pattern: str, role: str) -> List[str]:
+    """An ``<app>@<version>`` policy pattern as ``app_versions`` patterns.
+
+    A pattern with no ``@`` names no version: an allowed one is dropped, and a denied
+    one is read as every version of that app (``<app>@*``).
+    """
+    if "@" in pattern:
+        return _single_star(pattern, role)
+    return [] if role == ALLOW_ROLE else _single_star(f"{pattern}@*", role)
+
+
+def _app_name_patterns(pattern: str, role: str) -> List[str]:
+    """An ``<app>@<version>`` policy pattern as ``apps`` patterns (the app name).
+
+    An allowed version grants its app: ``app_versions`` still decides which versions
+    load. A denied version takes its app away only when it is every version
+    (``<app>@*``) or names none, so denying one version leaves the app's other
+    versions usable.
+    """
+    app, sep, version = pattern.partition("@")
+    if role == DENY_ROLE and sep and version.strip() != _EVERYTHING:
+        return []
+    return _single_star(app, role) if app.strip() else []
+
+
+def _closed(values: Tuple[str, ...]) -> Callable[[str, str], List[str]]:
+    """A converter that reads a pattern as the entries of the closed list *values* it
+    matches, so an allowed glob or ``*`` never reaches past the list."""
+
+    def convert(pattern: str, role: str) -> List[str]:
+        globbed = _single_star(pattern, role)[0]
+        return [v for v in values if _MATCHERS["identifier"](v, globbed)]
+
+    return convert
 
 
 def _expand_braces(pattern: str, start: int = 0) -> Optional[List[str]]:
@@ -329,7 +422,27 @@ class Managed:
     inner: str = ""
     #: Every value of a closed list, so a deny-list can be written as an allow-list.
     values: Tuple[str, ...] = ()
+    #: The scope's enterprise baseline when it allows something. With no grant of its
+    #: own, a ``deny match`` then takes entries out of this list instead of leaving none.
+    baseline: Tuple[str, ...] = ()
+    #: An install row's extension kind: its patterns land as ``<kind>:<id>``.
+    extension: str = ""
+    #: More places the same rules land, each read with its own converter
+    #: (``app_use`` -> ``app_versions`` and ``apps``).
+    also: Tuple["Managed", ...] = ()
 
+    def targets(self) -> Tuple["Managed", ...]:
+        """This row and each row in :attr:`also`."""
+        return (self,) + self.also
+
+
+def _install(extension: str, convert: Callable[[str, str], List[str]] = _single_star) -> Managed:
+    """An install row: what the term allows of *extension* may be installed."""
+    return Managed(_INSTALL_PATH, INSTALL, extension=extension, convert=convert)
+
+
+#: The policy language's closed ``harnessId`` list, and Crew's floor on it.
+_HARNESSES = ("kas", "kiro", "claude")
 
 #: Each capability Kiro Crew governs from enterprise management, and where it lands.
 MANAGED: Mapping[str, Managed] = MappingProxyType(
@@ -344,8 +457,10 @@ MANAGED: Mapping[str, Managed] = MappingProxyType(
         "permission_mode": Managed(
             ("approval_modes",),
             floor=SCOPE_CATALOG["approval_modes"].always_permitted,
-            # The policy language's closed ``approvalMode`` list.
-            values=SCOPE_CATALOG["approval_modes"].always_permitted + ("yolo",),
+            # The policy language's closed ``approvalMode`` list; only ``normal``
+            # is the floor, so a rule may take out ``trust`` or ``trust_reads``.
+            values=("normal", "trust_reads", "trust", "yolo"),
+            baseline=tuple(cast(List[str], BASELINE_CONTROLS["approval_modes"]["allow"])),
         ),
         "shell": Managed(("commands",), matcher=SCOPE_CATALOG["commands"].matcher),
         "fs_read": Managed(
@@ -361,16 +476,49 @@ MANAGED: Mapping[str, Managed] = MappingProxyType(
         "network_egress": Managed(
             ("network", "egress"), matcher=SCOPE_CATALOG["network.egress"].matcher
         ),
-        "mcp": Managed(("mcp",), matcher=SCOPE_CATALOG["mcp"].matcher, convert=_mcp_patterns),
+        "mcp": Managed(
+            ("mcp",),
+            matcher=SCOPE_CATALOG["mcp"].matcher,
+            convert=_mcp_patterns,
+            also=(_install("mcp", _mcp_install_ids),),
+        ),
         "subagent": Managed(
             ("capabilities", "spawn"),
             GATE,
             matcher=SCOPE_CATALOG["capabilities.spawn"].scope_matchers["agents"],
             inner="agents",
+            also=(_install("agent"),),
         ),
+        "skill": _install("skill"),
         "tailnet_origin": Managed(("capabilities", "tailnet_origin"), SWITCH),
         "browser_use": Managed(("capabilities", "browse"), SWITCH),
         "theme_install": Managed(("capabilities", "theme_install"), SWITCH),
+        # Policy-language batch 1 (RFC D13). ``kas`` is Crew's floor (``agent_sdk.backends``
+        # ``LTS_GOVERNANCE_FLOOR_BACKEND``); the closed list keeps an allowed ``*`` or
+        # glob from reaching any other registered backend.
+        "harness_use": Managed(
+            ("agent_backend",),
+            floor=tuple(cast(List[str], BASELINE_CONTROLS["agent_backend"]["allow"])),
+            convert=_closed(_HARNESSES),
+            values=_HARNESSES,
+            baseline=tuple(cast(List[str], BASELINE_CONTROLS["agent_backend"]["allow"])),
+        ),
+        "app_use": Managed(
+            ("app_versions",),
+            matcher=SCOPE_CATALOG["app_versions"].matcher,
+            convert=_app_version_patterns,
+            also=(
+                Managed(
+                    ("apps",), matcher=SCOPE_CATALOG["apps"].matcher, convert=_app_name_patterns
+                ),
+            ),
+        ),
+        "script_hook": Managed(
+            ("capabilities", "script_hooks"),
+            GATE,
+            matcher=SCOPE_CATALOG["capabilities.script_hooks"].scope_matchers["events"],
+            inner="events",
+        ),
     }
 )
 
@@ -378,7 +526,12 @@ MANAGED: Mapping[str, Managed] = MappingProxyType(
 #: (``policy_distribution_source._source_identity``), so a copy an older table wrote is
 #: refetched and translated again instead of served.
 TRANSLATION_TAG = hashlib.sha256(
-    repr(sorted((name, row.path, row.kind, row.floor) for name, row in MANAGED.items())).encode()
+    repr(
+        sorted(
+            (name, tuple((r.path, r.kind, r.floor, r.extension) for r in row.targets()))
+            for name, row in MANAGED.items()
+        )
+    ).encode()
 ).hexdigest()[:12]
 
 #: How often the running gateway re-reads the policy: five minutes, the Kiro agent's
@@ -387,12 +540,15 @@ TRANSLATION_TAG = hashlib.sha256(
 REFRESH_INTERVAL_SECS = 300
 
 #: The boot controls of every translated document. The enterprise policy has no rule for
-#: them, so they hold the enterprise defaults: the terminal off, a failed policy load
-#: refuses to start, and no boot-time sandbox requirement. The sandbox level itself is
+#: them, so they hold the enterprise defaults: a failed policy load refuses to start, and
+#: no boot-time sandbox requirement. ``allow_terminal`` is left out, so a translated
+#: policy has no opinion on the dashboard terminal. The sandbox level itself is
 #: the ``sandbox.min_level`` floor :func:`sandbox_floor` sets (RFC D7).
-BOOT: Mapping[str, bool] = MappingProxyType(
-    {"require_sandbox": False, "allow_terminal": False, "fail_closed": True}
-)
+#: A change here bumps ``enterprise_policy_fetch.TRANSLATION_REVISION``, so the first
+#: refresh after an upgrade fetches a full reply instead of keeping an older build's
+#: document. TRANSLATION_TAG is left alone: changing it would refuse that cached copy
+#: outright and stop an offline host from booting.
+BOOT: Mapping[str, bool] = MappingProxyType({"require_sandbox": False, "fail_closed": True})
 
 _DENY_EFFECTS = ("deny", "ask")
 _EFFECTS = ("allow",) + _DENY_EFFECTS
@@ -615,7 +771,7 @@ def ruleset(
 ) -> Optional[Dict[str, Any]]:
     """The Crew ruleset for *capability*'s rules, or ``None`` if no rule names it."""
     row = row or MANAGED.get(capability) or _DEFAULT_ROW
-    named = deny_all = allow_all = False
+    named = deny_all = allow_all = allow_named = False
     denied: List[str] = []
     excludes: List[List[str]] = []
     granted: List[str] = []
@@ -630,6 +786,9 @@ def ruleset(
         match = _patterns(rule, "match", capability) if _present(rule, "match") else None
         exclude = _patterns(rule, "exclude", capability) if _present(rule, "exclude") else None
         if effect == "allow":
+            # Named even when skipped below: a dropped grant must still keep the
+            # baseline out, so it only narrows.
+            allow_named = True
             if rule.get("when") is not None or exclude is not None:
                 continue
             if match is None or _covers_everything(match, row):
@@ -657,6 +816,9 @@ def ruleset(
         allowed = _intersect(excludes, capability, row)
     elif allow_all:
         return {"mode": MODE_DENY, "deny": _sorted_unique(denied, row)}
+    elif row.baseline and not allow_named:
+        # Only denies name it (``permission_mode``): they narrow the baseline it keeps.
+        allowed = list(row.baseline)
     else:
         allowed = granted
     allowed = _without_denied(allowed, denied, capability, row)
@@ -719,6 +881,94 @@ def _gate(rs: Optional[Dict[str, Any]], inner: str) -> Optional[Dict[str, Any]]:
     return {"enabled": True, "scopes": {inner: rs}}
 
 
+def _named_deny(rules: List[Mapping[str, Any]], capability: str) -> bool:
+    """Whether a ``deny``/``ask`` rule on *capability* names resources with ``match``."""
+    return any(
+        rule.get("capability") == capability
+        and rule.get("effect") in _DENY_EFFECTS
+        and _present(rule, "match")
+        for rule in rules
+    )
+
+
+def _install_gate(
+    rules: List[Mapping[str, Any]], targets: Sequence[Tuple[str, Managed]]
+) -> Optional[Dict[str, Any]]:
+    """The extension-install gate the install rows reduce to, or ``None`` if no rule
+    names any of their terms.
+
+    Each kind's term reduces on its own to: off, everything, a list of ids, or
+    everything but a list. One Crew ruleset holds one mode, so the kinds are written
+    as one allow-list (``skill:*``, ``mcp:github``) when no kind is "everything but",
+    or else as one deny-list that also denies each kind that is off and each kind no
+    term grants (``plugin:*``). A kind that is "everything but" beside a kind with a
+    list has neither form, so its install is turned off, which only narrows; the
+    policy is not refused for it, since a refusal would fail every other control.
+    Install is never left on with no list, which would admit plugin sync.
+
+    A ``skill`` row lands by skill name: the install seam checks every skill a
+    package holds. A denied skill name inside an allowed glob has no one-mode form, so
+    skill install is turned off for it, which only narrows.
+
+    shortcut: an agent is installed by package, not by the term's name, so a named
+    deny on ``subagent`` turns agent install off rather than miss the package; read
+    the names once install maps an agent package to its names.
+    """
+    named = False
+    listed: Dict[str, List[str]] = {}
+    everything: List[str] = []
+    off: List[str] = list(_UNGRANTED_KINDS)
+    excepted: Dict[str, List[str]] = {}
+    for capability, row in targets:
+        kind = row.extension
+        named_deny = _named_deny(rules, capability)
+        try:
+            rs = ruleset(rules, capability, row)
+        except Unrepresentable:
+            # A denied name inside an allowed glob has no one-mode form. A skill or
+            # agent install is then off, which only narrows, so only that refusal
+            # is dropped; a malformed rule, or an MCP one, still refuses the policy.
+            if kind == "mcp" or not named_deny:
+                raise
+            named = True
+            off.append(kind)
+            continue
+        if kind in _PACKAGE_KINDS and named_deny:
+            named = True
+            off.append(kind)
+            continue
+        if rs is None:
+            off.append(kind)
+            continue
+        named = True
+        if rs["mode"] == MODE_ALLOW:
+            if rs["allow"]:
+                listed[kind] = [f"{kind}:{p}" for p in rs["allow"]]
+            else:
+                off.append(kind)
+        elif rs["deny"]:
+            excepted[kind] = [f"{kind}:{p}" for p in rs["deny"]]
+        else:
+            everything.append(kind)
+    if not named:
+        return None
+    if excepted and not listed:
+        deny = [p for ps in excepted.values() for p in ps] + [f"{k}:*" for k in off]
+        inner: Dict[str, Any] = {"mode": MODE_DENY, "deny": sorted(set(deny))}
+    else:
+        if excepted:
+            logger.warning(
+                "Extension install for %s is off: a deny-list beside another kind's "
+                "allow-list has no one-mode form",
+                ", ".join(sorted(excepted)),
+            )
+        allow = [p for ps in listed.values() for p in ps] + [f"{k}:*" for k in everything]
+        if not allow:
+            return {"enabled": False}
+        inner = {"mode": MODE_ALLOW, "allow": sorted(set(allow))}
+    return {"enabled": True, "scopes": {_INSTALL_INNER: inner}}
+
+
 def _control(
     rules: List[Mapping[str, Any]], capability: str, row: Managed
 ) -> Optional[Dict[str, Any]]:
@@ -777,20 +1027,57 @@ def sandbox_floor(configuration: Sequence[Mapping[str, Any]]) -> Optional[str]:
     return strictest
 
 
+def web_ask_ruleset(rules: List[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The ``unattended_web_tools`` ruleset: the web terms an ``ask`` rule names, denied.
+
+    KAS enforces ``web_fetch`` and ``web_search`` itself (RFC D8), so Crew reads only
+    whether an ``ask`` rule names one, directly or through ``all`` or ``builtin``, to
+    keep trust from answering KAS's question (``kiro_crew.web_ask_rule``). A rule's
+    ``match``, ``exclude`` and ``when`` are not read: any ``ask`` on a term reaches a
+    person for every call of it, which only asks more. ``allow`` and ``deny`` are KAS's
+    to apply. ``None`` when no ``ask`` rule names either term.
+    """
+    from kiro_crew.agent_sdk.kas_capabilities import meta_capability_expansion
+    from kiro_crew.web_ask_rule import TERMS
+
+    asked: set[str] = set()
+    for rule in rules:
+        if rule.get("effect") != "ask":
+            continue
+        capability = rule.get("capability")
+        reached = meta_capability_expansion(capability) if isinstance(capability, str) else None
+        asked.update(term for term in TERMS if term == capability or term in (reached or ()))
+    if not asked:
+        return None
+    return {"mode": MODE_DENY, "deny": [term for term in TERMS if term in asked]}
+
+
 def translate(policy: str, configuration: Sequence[Mapping[str, Any]] = ()) -> Dict[str, Any]:
     """Translate a Trust V2 *policy* and the reply's *configuration* into a Crew policy
     document, or raise."""
-    rules = _with_meta(_rules(policy))
+    raw_rules = _rules(policy)
+    rules = _with_meta(raw_rules)
     doc = neutral_document()
     floor = sandbox_floor(configuration)
     if floor is not None:
         doc["sandbox"] = {"min_level": floor}
+    install: List[Tuple[str, Managed]] = []
     for capability, row in MANAGED.items():
-        control = _control(rules, capability, row)
-        if control is None:
-            continue
-        node = doc
-        for key in row.path[:-1]:
-            node = node.setdefault(key, {})
-        node[row.path[-1]] = control
+        for target in row.targets():
+            if target.kind == INSTALL:
+                install.append((capability, target))
+                continue
+            _place(doc, target.path, _control(rules, capability, target))
+    _place(doc, _INSTALL_PATH, _install_gate(rules, install))
+    _place(doc, ("unattended_web_tools",), web_ask_ruleset(raw_rules))
     return doc
+
+
+def _place(doc: Dict[str, Any], path: Tuple[str, ...], control: Optional[Dict[str, Any]]) -> None:
+    """Write *control* at *path* in *doc*; ``None`` leaves the path unnamed."""
+    if control is None:
+        return
+    node = doc
+    for key in path[:-1]:
+        node = node.setdefault(key, {})
+    node[path[-1]] = control

@@ -22,14 +22,16 @@ from kiro_crew.history_cache import (
     _TranscriptIndexBase,
     _TranscriptRowIndexEntry,
 )
+from kiro_crew.history_metadata_line import (
+    METADATA_LINE_READABLE,
+    METADATA_LINE_TRANSIENT,
+    parse_metadata_line,
+)
 from kiro_crew.history_projection_contract import (
     _HISTORY_LOGGER,
     _TRANSCRIPT_PAGE_INDEX_MAX_CHECKPOINTS,
     _TRANSCRIPT_PAGE_INDEX_STRIDE,
     _TRANSCRIPT_PAGE_READ_ATTEMPTS,
-    METADATA_LINE_CORRUPT,
-    METADATA_LINE_READABLE,
-    METADATA_LINE_TRANSIENT,
     ChainRevision,
     TranscriptPage,
     TranscriptRevisionChanged,
@@ -49,6 +51,7 @@ from kiro_crew.warm_task_brief_contract import is_warm_task_brief_message
 
 if TYPE_CHECKING:
     from kiro_crew.history import ConversationLog
+    from kiro_crew.history_files import CacheIdentity
 
 
 class TranscriptReadProjection:
@@ -62,6 +65,9 @@ class TranscriptReadProjection:
         from kiro_crew import history_page_index
 
         history_page_index.forget(path)
+        from kiro_crew.transcript_count import forget_count
+
+        forget_count(path)
 
     def recent(
         self,
@@ -81,9 +87,9 @@ class TranscriptReadProjection:
             messages = messages[:-exclude_last_n]
         messages = [message for message in messages if not is_warm_task_brief_message(message)]
         if roles:
-            messages = [message for message in messages if message["role"] in roles]
+            messages = [message for message in messages if message.get("role") in roles]
         return [
-            {"role": message["role"], "content": message["content"]}
+            {"role": message.get("role"), "content": message.get("content", "")}
             for message in messages[-max_messages:]
         ]
 
@@ -101,9 +107,9 @@ class TranscriptReadProjection:
             messages = messages[:-exclude_last_n]
         messages = [message for message in messages if not is_warm_task_brief_message(message)]
         if roles:
-            messages = [message for message in messages if message["role"] in roles]
+            messages = [message for message in messages if message.get("role") in roles]
         return [
-            {"role": message["role"], "content": message["content"]}
+            {"role": message.get("role"), "content": message.get("content", "")}
             for message in messages[-max_messages:]
         ]
 
@@ -133,7 +139,7 @@ class TranscriptReadProjection:
             and not is_warm_task_brief_message(item)
         ]
         for message in cited[-max_messages:]:
-            content = message["content"]
+            content = message.get("content") or ""
             snippet = content[:150] + "…" if len(content) > 150 else content
             result.append(
                 {
@@ -194,7 +200,7 @@ class TranscriptReadProjection:
         candidates = [message for message in candidates if not is_warm_task_brief_message(message)]
         candidates.sort(key=lambda message: message.get("ts", ""))
         return [
-            {"role": message["role"], "content": message["content"]}
+            {"role": message.get("role"), "content": message.get("content", "")}
             for message in candidates[-max_messages:]
         ]
 
@@ -202,7 +208,9 @@ class TranscriptReadProjection:
         """Return the shared read-only cached transcript projection."""
         return self._log._read_messages(key)
 
-    def read_file_change_messages(self, key: str) -> list[dict]:
+    def read_file_change_messages(
+        self, key: str, *, identity: CacheIdentity | None = None
+    ) -> list[dict]:
         """Return lightweight rows carrying only ``ts`` and the changed paths.
 
         Each row is ``{"ts", "role", "meta": {"file_changes": [{"path": str}, ...]}}``,
@@ -211,16 +219,28 @@ class TranscriptReadProjection:
         change entries without a string ``path`` and rows left with none are
         dropped, and every other field of a change (``before``/``after``) is
         not kept.
+
+        *identity* is the file's cache identity as the caller already knows it
+        (``ConversationLog.listing_identities``). When the cached rows were read
+        at that identity and this process wrote nothing since, they are returned
+        with no ``stat``, so they are as current as that identity.
         """
-        path = self._log._path(key)
         generation = self._log._cache_gen(key)
+        cached = self._log._file_change_cache.get(key)
+        if (
+            identity is not None
+            and cached is not None
+            and cached.stamp == identity
+            and cached.generation == self._log._cache_gen(key)
+        ):
+            return cached.messages
+        path = self._log._path(key)
         try:
             before = path.stat()
         except FileNotFoundError:
             self._log._file_change_cache.pop(key, None)
             return []
-        stamp = (before.st_mtime_ns, before.st_size, before.st_ino, before.st_dev)
-        cached = self._log._file_change_cache.get(key)
+        stamp = self._log._cache_identity(before)
         if (
             cached is not None
             and cached.stamp == stamp
@@ -278,7 +298,7 @@ class TranscriptReadProjection:
             after = path.stat()
         except OSError:
             return messages
-        after_stamp = (after.st_mtime_ns, after.st_size, after.st_ino, after.st_dev)
+        after_stamp = self._log._cache_identity(after)
         if after_stamp == stamp:
             self._log._publish_if_current(
                 self._log._file_change_cache,
@@ -699,6 +719,42 @@ class TranscriptReadProjection:
 
         return history_page_index.relocate(handle, base)
 
+    def transient_free_prefix(self, key: str) -> int:
+        """Bytes at the head of *key*'s file known to hold no transient-role row. BLOCKING."""
+        base = self._log._page_index_base.get(key)
+        if base is None or not base.clean_end:
+            return 0
+        try:
+            with open(self._log._path(key), "rb") as handle:
+                held = self._handle_extends_base(handle, base)
+        except OSError:
+            return 0
+        return 0 if held is None else held.clean_end
+
+    def mark_transient_free(self, key: str, end: int) -> None:
+        """Record that the file's first *end* bytes hold no transient-role row. BLOCKING.
+
+        Kept only up to the index base's last record boundary, and only while the
+        file still holds the base's rows; otherwise nothing is recorded.
+        """
+        from kiro_crew import history_page_index
+
+        base = self._log._page_index_base.get(key)
+        path = self._log._path(key)
+        if base is None:
+            return
+        try:
+            with open(path, "rb") as handle:
+                held = self._handle_extends_base(handle, base)
+        except OSError:
+            return
+        end = 0 if held is None else min(end, held.scanned_end)
+        if held is None or end <= held.clean_end:
+            return
+        marked = held._replace(clean_end=end)
+        self._log._page_index_base[key] = marked
+        history_page_index.persist(path, marked, force=True)
+
     def _row_index(self, key: str) -> _TranscriptRowIndexEntry:
         """Return a sparse valid-message-row index for one file revision."""
         from kiro_crew import history_page_index
@@ -771,7 +827,14 @@ class TranscriptReadProjection:
                     else history_page_index.body_digest(handle, head_len, scanned_end, frozen)
                 )
                 if head_len is not None and digest is not None:
-                    saved = _TranscriptIndexBase(head_len, scanned_end, digest, row_count, frozen)
+                    saved = _TranscriptIndexBase(
+                        head_len,
+                        scanned_end,
+                        digest,
+                        row_count,
+                        frozen,
+                        0 if base is None else base.clean_end,
+                    )
                     self._log._page_index_base[key] = saved
                     history_page_index.persist(path, saved, force=False)
 
@@ -946,6 +1009,7 @@ class TranscriptReadProjection:
                 try:
                     metadata, readable = self._log._read_metadata_status(key)
                 except Exception:
+                    # A read that raises skips the key, as one reporting unreadable does below.
                     continue
                 if not readable:
                     continue
@@ -1027,6 +1091,8 @@ class TranscriptReadProjection:
         worker thread and must not make a blocking event-loop writer wait. With
         nothing published, no memo depends on the lock.
         """
+        from kiro_crew.transcript_count import count_and_store, stored_count
+
         path = self._log._path(key)
         try:
             identity = self._log._cache_identity(path.stat())
@@ -1042,10 +1108,13 @@ class TranscriptReadProjection:
         with fill_lock:
             if not path.exists():
                 return 0
+            stored = stored_count(path)
+            if stored is not None:
+                return stored
             attempts = _history_facade()._METADATA_READ_ATTEMPTS
             for attempt in range(attempts):
                 try:
-                    return count_messages(path)
+                    return count_and_store(path, count_messages)
                 except FileNotFoundError:
                     return 0
                 except OSError:
@@ -1170,7 +1239,7 @@ class TranscriptReadProjection:
                 break
             wanted += max_messages - len(kept)
         formatted = [
-            {"role": message["role"], "content": message["content"]}
+            {"role": message.get("role"), "content": message.get("content", "")}
             for message in kept[-max_messages:]
         ]
         self._log._publish_if_current(
@@ -1254,6 +1323,36 @@ class TranscriptReadProjection:
         with self._log._locked(key):
             return self._log._last_row_ts(key)
 
+    # How many newest rows the speech read looks through. A system row lands a
+    # handful of rows after the answer it follows; a window this size is far past
+    # that, and bounds the read on a transcript whose tail is all tool rows.
+    _SPEECH_TS_WINDOW = 64
+
+    def last_speech_row_ts(self, key: str) -> str | None:
+        """Return the timestamp of the newest SPEECH row, skipping system rows.
+
+        Speech is what ``is_speech_row`` accepts: a user or assistant row with
+        visible text, so a compaction or watchdog-recycle notice, a tool row or a
+        sub-agent envelope appended after an answer does not move it. ``None``
+        when the newest rows hold no speech: the caller cannot place the
+        conversation, and treats that as "no evidence it moved on". A full window
+        with no speech (a long tool-only turn) is evidence it did: that case
+        returns the newest row's timestamp, as :meth:`last_row_ts` would.
+        """
+        from kiro_crew.dashboard.system_notices import is_speech_row
+
+        with self._log._locked(key):
+            tail = self._log._read_tail_messages(self._log._path(key), self._SPEECH_TS_WINDOW, None)
+        for row in reversed(tail):
+            if is_speech_row(row.get("role"), row.get("content"), row.get("meta")):
+                timestamp = row.get("ts")
+                return timestamp if isinstance(timestamp, str) and timestamp else None
+        if len(tail) >= self._SPEECH_TS_WINDOW:
+            # The window may have cut off the newest speech: fail closed (stale).
+            timestamp = tail[-1].get("ts")
+            return timestamp if isinstance(timestamp, str) and timestamp else None
+        return None
+
     def last_message_preview(
         self,
         key: str,
@@ -1319,6 +1418,7 @@ class TranscriptReadProjection:
         # Function-local: dashboard.state imports kiro_crew.history at module
         # scope, which lands back here, so a top-level import would be a
         # cycle. By preview time the dashboard module is long since loaded.
+        from kiro_crew.dashboard.host_sandbox_refusal import is_refusal_row
         from kiro_crew.dashboard.state import is_stop_event_row
         from kiro_crew.dashboard.system_notices import is_speech_row
 
@@ -1401,6 +1501,10 @@ class TranscriptReadProjection:
                     # Machinery: skipped for the TEXT, kept for the recency.
                     if not newest_epoch:
                         newest_epoch = _row_epoch(data)
+                    continue
+                # The host owner's runbook: a preview string has no row type for the
+                # non-owner edge to redact by, so it never quotes one (as search).
+                if is_refusal_row(data):
                     continue
                 if not text:
                     continue
@@ -1508,29 +1612,15 @@ class TranscriptReadProjection:
                     exc_info=True,
                 )
                 return {}, METADATA_LINE_TRANSIENT
-            try:
-                first = raw_first.decode("utf-8").strip()
-            except UnicodeDecodeError:
-                # Every line writer encodes UTF-8, so bytes that do not decode
-                # are damage (a torn or foreign write), exactly like bytes that
-                # are not JSON. Reporting them TRANSIENT made every writer defer
-                # for good, so the line could never be rewritten and the session
-                # refused every turn.
-                return {}, METADATA_LINE_CORRUPT
-            if not first:
+            # Damaged bytes are reported CORRUPT, never TRANSIENT: reporting them
+            # transient made every writer defer for good, so the line could never
+            # be rewritten and the session refused every turn.
+            metadata, state = parse_metadata_line(raw_first)
+            if state != METADATA_LINE_READABLE:
+                return {}, state
+            if not raw_first.decode("utf-8").strip():
+                # An empty first line is readable and holds nothing to cache.
                 return {}, METADATA_LINE_READABLE
-            try:
-                data = json.loads(first)
-                metadata = (
-                    data if isinstance(data, dict) and data.get("_type") == "metadata" else {}
-                )
-            except json.JSONDecodeError:
-                # A damaged first line cannot establish whether this was a
-                # member session. Keep get_metadata's legacy empty-dict view,
-                # but tell identity-sensitive readers to refuse the operation.
-                # Every line writer replaces the file atomically, so bytes that
-                # are not JSON are not a write in flight: no retry reads them.
-                return {}, METADATA_LINE_CORRUPT
             self._log._publish_if_current(
                 self._log._meta_cache,
                 key,

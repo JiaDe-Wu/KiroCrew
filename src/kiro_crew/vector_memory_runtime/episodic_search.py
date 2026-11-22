@@ -215,6 +215,19 @@ def search_episodic(
         now = vm.datetime.now(tz=timezone.utc)
         candidates: list[dict] = []
         with store._db_lock:
+            # The checks above ran unlocked: an owner edit, a model swap, a
+            # rollback or a concurrent search can drop the index while this
+            # thread waits for the lock. Read it once here and fall back.
+            index, id_map = store._faiss_index, store._faiss_id_map
+            if index is None or index.ntotal == 0:  # type: ignore[attr-defined]
+                return store._sqlite_vector_search(
+                    query_embedding,
+                    query_text,
+                    limit,
+                    mmr=mmr,
+                    tag_filter=tag_filter,
+                    relevance_filter=relevance_filter,
+                )
             # MMR reranks from the FULL candidate pool (see the _mmr_rerank pool
             # comment: truncating toward `limit` silently drops the
             # relevant-but-diverse tail pick that is the whole point of MMR). The
@@ -233,11 +246,11 @@ def search_episodic(
             # whenever native work must stay bounded independently of lifetime
             # tombstones.
             k = (
-                min(_text_scoring._MMR_MAX_POOL, store._faiss_index.ntotal)  # type: ignore[attr-defined]
+                min(_text_scoring._MMR_MAX_POOL, index.ntotal)  # type: ignore[attr-defined]
                 if mmr and not tag_filter
-                else min(max(limit * 2, 16), store._faiss_index.ntotal)  # type: ignore[attr-defined]
+                else min(max(limit * 2, 16), index.ntotal)  # type: ignore[attr-defined]
             )
-            distances, indices = store._faiss_index.search(vec.reshape(1, -1), k)  # type: ignore[attr-defined]
+            distances, indices = index.search(vec.reshape(1, -1), k)  # type: ignore[attr-defined]
             # FAISS returns ids and distances only. Every hit is resolved in
             # a single IN (...) query over an explicit column list: one
             # "SELECT *" per hit is an N+1 that also drags each row's
@@ -247,7 +260,7 @@ def search_episodic(
             for dist, idx in zip(distances[0], indices[0]):
                 if idx == -1:
                     break
-                hits.append((store._faiss_id_map[int(idx)], float(dist)))
+                hits.append((id_map[int(idx)], float(dist)))
             hit_ids = [mem_id for mem_id, _ in hits]
             blocked = store._ineligible_ids(
                 [record_meta.record_id_for("episode", mem_id) for mem_id in hit_ids]
@@ -437,7 +450,6 @@ def sqlite_vector_search(
     q = [x / norm for x in query_embedding] if norm > 0 else query_embedding
     q_len = len(q)
 
-    blocked = store._ineligible_ids()
     if vm._HAS_NUMPY:
         scoring = store._episodic_scoring_set(q_len)
         if scoring is not None:
@@ -453,7 +465,6 @@ def sqlite_vector_search(
                 tag_filter,
                 relevance_filter,
                 vm.datetime.now(tz=timezone.utc),
-                blocked,
             )
 
     # Serialized via the locked helper — two threads running a statement at
@@ -655,7 +666,6 @@ def rank_from_scoring_set(
     tag_filter: list[str] | None,
     relevance_filter: bool,
     now: datetime,
-    blocked: set[str] | None = None,
 ) -> list[dict]:
     """Score, filter and rank from the resident set; resolve winner bodies.
 
@@ -680,12 +690,6 @@ def rank_from_scoring_set(
     sims_rounded = vm.np.round(sims, 4)
 
     keep = vm.np.ones(len(scoring.ids), dtype=bool)
-    if blocked:
-        keep &= vm.np.fromiter(
-            (record_meta.record_id_for("episode", mem_id) not in blocked for mem_id in scoring.ids),
-            dtype=bool,
-            count=len(scoring.ids),
-        )
     if tag_filter:
         wanted = {t.lower() for t in tag_filter}
         keep &= vm.np.fromiter(
@@ -704,6 +708,24 @@ def rank_from_scoring_set(
     surviving = vm.np.flatnonzero(keep)
     if surviving.size == 0:
         return []
+    # Eligibility only matters for the rows the masks kept, so look it up by
+    # their record ids (the record_id PRIMARY KEY) rather than scanning all of
+    # memory_record_meta, a table that grows with every revision and forget.
+    # A row with no identity has no metadata to block it and stays ranked.
+    surviving_ids = [
+        record_meta.record_identity_or_none("episode", scoring.ids[int(i)]) for i in surviving
+    ]
+    blocked = store._ineligible_ids([rid for rid in surviving_ids if rid is not None])
+    if blocked:
+        surviving = surviving[
+            vm.np.fromiter(
+                (rid is None or rid not in blocked for rid in surviving_ids),
+                dtype=bool,
+                count=len(surviving_ids),
+            )
+        ]
+        if surviving.size == 0:
+            return []
 
     # max(0, timedelta.days): a whole-day floor, and never negative for a row
     # stamped in the future.

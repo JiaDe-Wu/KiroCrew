@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from chat_test_helpers import _make_state
 from dashboard_chat_helpers import _provider_mock
+from real_session_manager import real_sessions
+from redaction_structured_cases import github_classic
 
 from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_KIRO
 from kiro_crew.agent_sdk.capabilities import capabilities_for
@@ -158,7 +160,7 @@ class TestBroadcastCompactionResultBackoff:
 
         msg = _broadcast_compaction_result(state, slot, self._failed_event())
 
-        assert msg is not None and msg.startswith("❌"), msg
+        assert msg is not None and msg.startswith("Error: "), msg
         assert not [
             c for c in state.broadcast_ws.call_args_list if c.args and c.args[0] == "context_usage"
         ]
@@ -166,9 +168,9 @@ class TestBroadcastCompactionResultBackoff:
     def test_notice_prefixes_pin_the_frontend_parser_contract(self, tmp_path, monkeypatch):
         """The dashboard folds the compaction row by parsing its TEXT: the
         frontend (``website/src/pages/chat/CompactionCard.tsx``,
-        ``parseCompactionNotice``) keys on the exact ``✅ Conversation compacted``
-        lead (colon or period) for the folded card and on a ``❌`` lead for the
-        error notice, and the row is tagged ``kind="compaction"`` so the registry
+        ``parseCompactionNotice``) keys on the ``Conversation compacted`` lead
+        (colon or period, with or without the older U+2705) for the folded card
+        and on an ``Error:`` (or older U+274C) lead for the error notice, and the row is tagged ``kind="compaction"`` so the registry
         can claim it. Nothing else pins the writer side, so a wording change here
         would silently unfold a multi-KB summary back into a plain notice. This
         test is that pin — change both sides together."""
@@ -179,11 +181,11 @@ class TestBroadcastCompactionResultBackoff:
         with_summary = _broadcast_compaction_result(
             state, slot, self._completed_event("## Goal\nship")
         )
-        assert with_summary == "\u2705 Conversation compacted: ## Goal\nship"
+        assert with_summary == "Conversation compacted: ## Goal\nship"
         without_summary = _broadcast_compaction_result(state, slot, self._completed_event(""))
-        assert without_summary == "\u2705 Conversation compacted."
+        assert without_summary == "Conversation compacted."
         failed = _broadcast_compaction_result(state, slot, self._failed_event("too large"))
-        assert failed is not None and failed.startswith("\u274c Compaction failed: ")
+        assert failed is not None and failed.startswith("Error: Compaction failed: ")
 
         tagged = [m for m in slot.messages if m.get("role") == "assistant"]
         assert tagged and all((m.get("meta") or {}).get("kind") == "compaction" for m in tagged)
@@ -194,13 +196,21 @@ class TestBroadcastCompactionResultBackoff:
         (``STATUS_LEAD_RE`` in ``CompactionCard.tsx``: 🔄 U+1F504, ♻ U+267B,
         ⏳ U+23F3) and one ⚠-led failure it routes to the error surface. A glyph
         swap here (⏳ U+23F3 vs ⌛ U+231B was a real review-round slip) would
-        leave a raw emoji beside the card's icon with nothing red on this side."""
+        leave a raw emoji beside the card's icon with nothing red on this side.
+
+        The RSS hold notice leads with ⚠️ U+26A0 U+FE0F, which ``NoticeCard.tsx``'s
+        ``LEAD_EMOJI_RE`` strips into its warn tone. No compaction wording follows
+        it, so ``FAILED_LEAD_RE`` leaves it a notice."""
         from kiro_crew.dashboard import state as st
+        from kiro_crew.dashboard.state_parts.session_events import rss_hold_notice
+        from kiro_crew.session_rss_rebound import RssHold
 
         assert st._AUTO_COMPACT_NOTICE.startswith("\U0001f504 ")
         assert st._SESSION_RECYCLED_NOTICE.startswith("\u267b\ufe0f ")
         assert st.stuck_turn_notice(120).startswith("\u23f3 ")
         assert st._AUTO_COMPACT_FAILED_NOTICE.startswith("\u26a0 Auto-compact failed")
+        hold = RssHold(rss_mb=2100, ceiling_mb=1536, limit_mb=4200, recycles=3)
+        assert rss_hold_notice(hold).startswith("\u26a0\ufe0f The watchdog stopped recycling")
 
 
 class TestRunChatCompactDeferredWait:
@@ -344,13 +354,14 @@ class TestRunChatCompactDeferredWait:
                 LLMEvent(kind=EVENT_COMPLETE),
             ]
         )
-        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+        state.sessions = real_sessions(client)
 
         from kiro_crew.dashboard.chat import _run_chat
 
         await _run_chat(state, slot, "continue after provider compaction")
 
-        state.sessions.mark_needs_reinjection.assert_called_once_with("dashboard:s1")
+        assert state.sessions.consume_needs_reinjection("dashboard:s1") is True
+        assert state.sessions.consume_needs_reinjection("dashboard:s1") is False
 
     @pytest.mark.asyncio
     async def test_kiro_backend_broadcasts_real_post_compaction_usage(self, tmp_path, monkeypatch):
@@ -571,7 +582,7 @@ class TestRunChatCompactDeferredWait:
             tmp_path, monkeypatch, "context too large to summarize"
         )
         assert self._compaction_notice(slot) == (
-            "❌ Compaction failed: context too large to summarize"
+            "Error: Compaction failed: context too large to summarize"
         )
 
     @pytest.mark.asyncio
@@ -580,7 +591,7 @@ class TestRunChatCompactDeferredWait:
     ):
         """No reason means no dangling colon — the old wording stands."""
         slot = await self._run_failed_compaction(tmp_path, monkeypatch, None)
-        assert self._compaction_notice(slot) == "❌ Compaction failed."
+        assert self._compaction_notice(slot) == "Error: Compaction failed."
 
     @pytest.mark.asyncio
     async def test_failed_compaction_blank_reason_keeps_the_bare_notice(
@@ -588,7 +599,7 @@ class TestRunChatCompactDeferredWait:
     ):
         """A whitespace-only reason is treated as absent, not printed."""
         slot = await self._run_failed_compaction(tmp_path, monkeypatch, "   ")
-        assert self._compaction_notice(slot) == "❌ Compaction failed."
+        assert self._compaction_notice(slot) == "Error: Compaction failed."
 
     @pytest.mark.asyncio
     async def test_failed_compaction_reason_is_redacted(self, tmp_path, monkeypatch):
@@ -597,11 +608,12 @@ class TestRunChatCompactDeferredWait:
         Same redact pair as the sibling `completed` branch, which already treats
         the provider's text as untrusted.
         """
+        secret = github_classic(seed=13)
         slot = await self._run_failed_compaction(
-            tmp_path, monkeypatch, "auth failed for AKIAIOSFODNN7EXAMPLE key"
+            tmp_path, monkeypatch, f"auth failed for {secret} key"
         )
         notice = self._compaction_notice(slot)
-        assert "AKIAIOSFODNN7EXAMPLE" not in notice
+        assert secret not in notice
         assert "Compaction failed:" in notice
 
     @pytest.mark.asyncio

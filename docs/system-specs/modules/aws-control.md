@@ -28,6 +28,19 @@ are the `aws_control.conversation_export` row of the sensitive-store read allowl
 files. Neither is a seam: an app must not add itself to the read allowlist, and the
 posture tables are core's audit of the app's code.
 
+**Adopted onto its own repository.** The wheel pins the app (`apps/adoption-pins.json`,
+[app-kit-platform.md § 33](app-kit-platform.md#33-former-built-in-adoption)) at
+`KiroCrewCaptain/kirocrew-app-aws-control` with `minAppSdkLevel` 2, the level of the
+`ctx.lifecycle` enabled switch every route checks first, so a host whose record is
+builtin-owned swaps it in place onto that tree at a restart, keeping `data/` (the drive, the library and the
+backup state), `.app_secret`, the approved grants and `enabled`; the rail keeps
+`/aws-control` and the `Cloud` glyph. The repository's `app.json` declares the same
+`permissions` as the wheel copy (its own namespace, `storage`, `network` and `jobs`), so
+E9 holds nothing back. The adopted tree's own seams module fills the three seams above while
+it is loaded, and an unload (disable, update, uninstall) hands each back to the provider
+the wheel copy registered (`seams.release_app`). A fix to the app lands in that
+repository first; a change to the wheel copy needs its `App repo:` line.
+
 These leave with the app, and until then this repository runs them at the app's paths:
 
 * `.github/workflows/crew-image-build.yml`, which runs `crew/scripts/crew_image_build_plan.py`
@@ -166,7 +179,8 @@ canonical path. Missing, uncheckable, or refused fallback directories stay off
 the child `PATH`. This lets the CLI find a bare `credential_process` helper by
 name when a desktop-launched gateway's minimal `PATH` holds neither fallback.
 Per-user dirs such as `~/.local/bin` are reached only through the inherited
-`PATH`.
+`PATH`. The child gets none of the gateway's Python interpreter settings
+(`sandbox.without_python_env`), because aws-cli v1 is a Python program.
 
 ## Drive and destructive operations
 
@@ -554,13 +568,12 @@ rather than by a second walk of the source also means it cannot disagree with wh
 actually be sent, and that a redaction switch changes the fingerprint.
 
 **Every read of the finished archive comes from ONE descriptor, and so does the
-upload.** On `main` the archive was staged by name and then re-resolved from that name
-four times -- the entry-set digest, the recorded size, the AWS CLI `--body` open, and
-the body digest -- so a same-UID process that replaced the file between any two of those
-resolutions made the upload carry bytes nothing checked, off-host and unrecallable
-(#13259). The fix opens the finished archive ONCE through a checked descriptor and reads
-the size, both fingerprints and the upload body all from it, so no step re-resolves the
-name.
+upload.** Re-resolving the staged archive by name for each of the entry-set digest,
+the recorded size, the AWS CLI `--body` open and the body digest would let a same-UID
+process that replaced the file between two of those resolutions make the upload carry
+bytes nothing checked, off-host and unrecallable. So the app opens the finished archive
+ONCE through a checked descriptor and reads the size, both fingerprints and the upload
+body all from it, and no step re-resolves the name.
 
 Both kinds build the archive BY NAME in a private staging directory this app cuts and
 PINS (`storage.pinned_staging`: `mkdtemp` 0700 under the masked staging root, then a
@@ -579,17 +592,17 @@ checked descriptor -- and it streams THAT descriptor to the AWS CLI as `--body
 passes the name held by the pinned directory handle and re-verifies the inode against the
 held descriptor afterwards (`_assert_same_file`, a detect-not-prevent backstop). A caller
 with no descriptor of its own (the label sidecar, the library push, the drive spool)
-still passes a bare name exactly as before -- those bodies are not re-hardened by #13259.
+still passes a bare name -- those bodies are not held by a descriptor.
 
-This is the whole fix: the archive bytes that are CHECKED are the bytes that are
+So the archive bytes that are CHECKED are the bytes that are
 UPLOADED, on every platform the backup already ran on -- Linux, macOS, the BSDs, Windows.
 The inode pin fixes WHICH file the descriptor reaches; it does not hold the file's CONTENT
 unrewritable in place against a same-UID writer for the whole (minutes-long) transfer. A
 producer that writes the body into a descriptor it never lets a name reach -- so the
-content is held from creation -- is the larger follow-up tracked in #13550, for both the
-sessions and the snapshot producers. The sessions kind keeps its pre-existing
+content is held from creation -- is not built, for either the sessions or the snapshot
+producer (`backup.py` says so at both call sites). The sessions kind keeps its
 descriptor-pinned-traversal requirement (`run_sessions_backup` refuses where the traversal
-cannot be pinned, as it did on `main`); no NEW capability gate is added, so no platform
+cannot be pinned); no other capability gate is added, so no platform
 loses a backup it had.
 
 Two normalizations are part of the digest's definition, each measured against the real
@@ -691,7 +704,10 @@ that DECODED and then failed to parse, and bytes that are not UTF-8 never reache
 parser. Overwriting them would replace every account's toggles, retention count and run
 history -- including the `upload_versions` records the ownership test reads -- on the
 strength of a document nobody read. The abandoning error stays an `OSError` subclass, so
-`set_nightly`'s existing handler needs no change. Neither reader catches the wider
+`set_nightly`'s existing handler needs no change. A leading UTF-8 byte-order mark (a
+Windows "UTF-8 with BOM" save) is not content, so both readers parse past it
+(`user_json.loads_user_json`): such a file is read whole, the mutation carries every
+account forward, and the sweep applies its configured keep count. Neither reader catches the wider
 `ValueError`,
 so a surprising one stays loud. Neither is ever derived from `nightly` in either
 direction: authorizing unattended uploads is not authorizing permanent deletes, and
@@ -1848,7 +1864,14 @@ density), so the remove flow, the Reconnect disclosure and the hand-off gating
 exist once. A row carries two controls, the select surface and its overflow
 menu; Reconnect (offered on a degraded resolved row) and Remove are items in
 that menu, and the health word on the row is the cue that the menu holds
-something to do. The bare `/aws-control` path and an unknown pane segment both land on
+something to do. A failing key's Reconnect leads with that key's own probe
+error (`profiles[].detail`, redacted server-side) as an `AwsErrorNotice`, so
+the cause is on screen before any generic guidance. The Refresh button on the
+Overview and Accounts panes re-probes every key (`GET /accounts?refresh=1`,
+which also skips the identity probe's 30-second cache) into the list's one
+cache entry: a plain read is answered from the five-minute snapshot, so a key
+fixed after the page loaded would keep its failure. The bare
+`/aws-control` path and an unknown pane segment both land on
 Overview; every named pane path is unchanged. The month-to-date figure shares the
 Usage pane's cost cache entry and, like it, settles to a dash with a visible
 reason (consent missing, or the read failed) rather than a tooltip. A read that
@@ -1951,9 +1974,9 @@ the name: the card's label still comes from the slug-keyed join, and the folder
 named in the confirm is built from that same shared slug, so under slug reuse the
 reader can be shown one artifact's name over another's bytes with nothing on
 screen able to separate them. Establishing whose copy it is needs the pushed
-`meta.json` sidecar and is tracked by #6987; the same slug-targeted removal is
-offered from the picker on the current release, so this placement neither
-introduces that gap nor closes it. Removal is therefore not gated on local state
+`meta.json` sidecar, which this card does not read; the same slug-targeted removal
+is offered from the picker, so this placement neither introduces that gap nor
+closes it. Removal is therefore not gated on local state
 at all, which is
 what makes a copy pushed from another machine (`remoteOnly` above) removable
 rather than stranded. It is gated the way folder deletion is: the menu item
@@ -2049,7 +2072,13 @@ ledger, the local profile scan) and every mutation whose error was never read
 A failed read must not fall through to the surface's empty state — a failed
 listing is not an empty folder, a failed profile scan is not "nothing left to
 add" — and the tests for each state assert the empty state's absence alongside
-the notice. Two states are deliberately NOT errors: a 403 whose code is
+the notice. A profile scan that fails because the gateway's `aws` is AWS CLI v1,
+which has no `configure list-profiles`, is answered 501 `unsupported_aws_cli_v1`
+by both the listing and the register route (`deploy.profiles.aws_cli_is_v1` asks
+`aws --version` once the scan failed), and its notice names the version and the
+remedy, AWS CLI v2 first on the gateway's PATH, with no Try again, because no
+retry clears it; `kirocrew doctor` names the same cause on its profiles line.
+Two states are deliberately NOT errors: a 403 whose code is
 `app_disabled` renders the disabled-app copy (any other 403 — a non-owner
 caller's `dashboard_owner_required` — is an error to diagnose and goes to the
 notice), and a costs 409 `aws_consent_required` is answered by the Cost Explorer
@@ -2246,8 +2275,8 @@ fails in a way nothing reports: with `KIRO_HOME` unset the specs resolve to the 
 HOME's `~/.kiro/agents`, which every instance under that `$HOME` shares, and a backend
 on a non-default data home (`KIROCREW_HOME=<data home>`) REFUSES to rewrite a shared
 agents directory -- the specs it writes pin the writer's data home into every managed
-MCP server entry, which breaks strict session identity for a default-home gateway
-(#9690). The refusal is correct and stays. Its consequence in the container was that the
+MCP server entry, which breaks strict session identity for a default-home gateway.
+The refusal is correct and stays. Its consequence in the container was that the
 supervisor's crew spec landed in the shared directory carrying no ownership provenance,
 the backend read it as another home's, declined, and never wrote the default spec at
 all; the boot looked healthy and every turn died at `DerivedSpecStale: the default agent

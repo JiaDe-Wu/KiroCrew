@@ -18,10 +18,13 @@ Modules, from the wire up:
 * :mod:`~kiro_crew.relay_client.streams` -- one relayed request or WebSocket.
 * :mod:`~kiro_crew.relay_client.connection` -- one host connection.
 * :mod:`~kiro_crew.relay_client.client` -- the loop that keeps a connection live.
+* :mod:`~kiro_crew.relay_client.lease` -- the host token source that holds this
+  Crew's lease (``RenewCrewLease``).
 * :mod:`~kiro_crew.relay_client.provider` -- the ``TunnelProvider`` and the rule
   that selects it.
 
-It is off by default (``tunnel.relay_enabled``). The package imports nothing from
+It is off unless ``tunnel.relay_enabled`` asks for it (``remote_control.hosting``:
+on, or unset on a team Crew or a workload host). The package imports nothing from
 ``kiro_crew.tunnel``: the platform composition root imports it, and ``platform/``
 keeps zero imports of the tunnel package.
 """

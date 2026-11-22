@@ -8,8 +8,8 @@ The only backend that needs BOTH faces:
   mounts its own user- and project-scope ``mcpServers`` and plugins beside it):
   empty means the harness works and every Crew tool is absent, with no error.
 * **File** — ``<work_dir>/.claude/settings.local.json``, which the adapter loads
-  itself, carries the model allowlist, the resolved model, the permission mode
-  and the deny rules derived from ``disabledTools``.
+  itself, carries the model allowlist, the permission mode and the deny rules
+  derived from ``disabledTools``. The pinned model is pushed live, never written.
 
 The translation itself lives in :mod:`kiro_crew.acp.session_mcp` (spec entry ->
 array element, ``tools`` allowlist, registry filter) and in ``AcpClient``'s
@@ -26,7 +26,15 @@ from collections.abc import Collection
 from typing import Any, Mapping
 
 from kiro_crew.acp.session_mcp import session_mcp_projection
-from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE, ACP_BACKENDS_MATE_WORKER_MCP_TOOL_LIMITS
+from kiro_crew.acp_backends import (
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKENDS_MATE_WORKER_MCP_TOOL_LIMITS,
+    ACP_BACKENDS_MATE_WORKER_NATIVE_TOOL_LIMITS,
+)
+from kiro_crew.agent_sdk.claude_worker_tools import (
+    claude_agent_builtin_tools,
+    claude_worker_builtin_tools,
+)
 from kiro_crew.providers.mirrors.base import (
     RESOURCES_NO_READER,
     TOOLS_SETTINGS_GATE_CHANNEL,
@@ -275,6 +283,11 @@ class ClaudeCodeMirror(AgentConfigMirror):
             session_key=str(kwargs.get("session_key") or ""),
             worker_mcp_tool_limits_honoured=self.backend
             in ACP_BACKENDS_MATE_WORKER_MCP_TOOL_LIMITS,
+            worker_native_tool_limits_honoured=self.backend
+            in ACP_BACKENDS_MATE_WORKER_NATIVE_TOOL_LIMITS,
+        )
+        builtin_tools = _session_builtin_tools(
+            agent, projection.agent_spec, str(kwargs.get("session_key") or "")
         )
         if not permission_surface_owned:
             logger.warning(
@@ -285,7 +298,11 @@ class ClaudeCodeMirror(AgentConfigMirror):
                 "client's log lines for that file name the cause and its fix; removing the "
                 "file does not help while another Crew session holds it.",
             )
-            return SessionProjection(params={"mcpServers": []}, zero_tools=projection.zero_tools)
+            return SessionProjection(
+                params={"mcpServers": []},
+                zero_tools=projection.zero_tools,
+                builtin_tools=builtin_tools,
+            )
         out: list[dict[str, Any]] = list(projection.servers)
         for stub in stub_elements:
             if not isinstance(stub, Mapping):
@@ -313,4 +330,34 @@ class ClaudeCodeMirror(AgentConfigMirror):
             derived_spec_snapshot=projection.derived_spec_snapshot,
             zero_tools=projection.zero_tools,
             agent_spec=projection.agent_spec,
+            builtin_tools=builtin_tools,
         )
+
+
+def _session_builtin_tools(
+    agent: str | None, spec: object, session_key: str
+) -> tuple[str, ...] | None:
+    """The claude built-ins *agent*'s session keeps (``SessionProjection.builtin_tools``).
+
+    A Bot's worker keeps the built-ins of the native tools its file does not
+    exclude. A named agent whose spec Crew does not write keeps the built-ins of
+    the tools its spec ``tools`` lists (``claude_agent_builtin_tools``). Either
+    rides the session's ``tools`` option, which no settings file can widen, so it
+    holds on a withheld array too. ``None`` for every other session, which keeps
+    claude's whole preset (``tools: []`` has its own zero-tool path).
+    """
+    from kiro_crew.agent_sdk.spec_builtin_tools import _crew_written_agents
+    from kiro_crew.mate_worker import MATE_WORKER_AGENT
+    from kiro_crew.members import is_crewmate_worker_session
+
+    if not agent or not isinstance(spec, dict):
+        return None
+    if agent == MATE_WORKER_AGENT:
+        # Keyed on the agent, as the read that let those excludes through is.
+        excluded = spec.get("excludedTools")
+        if not isinstance(excluded, list):
+            return None
+        return claude_worker_builtin_tools(ref for ref in excluded if isinstance(ref, str))
+    if agent in _crew_written_agents() or is_crewmate_worker_session(session_key):
+        return None
+    return claude_agent_builtin_tools(spec.get("tools"))

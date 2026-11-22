@@ -59,6 +59,7 @@ from kiro_crew.platform.wheel_engine import (
     WheelUpdateNotReady,
     WheelUpdateSnapshotFailed,
 )
+from kiro_crew.platform.wheel_engine_contract import _PUT_OFF_REASON
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.state import DashboardState
@@ -323,7 +324,6 @@ def shown_failure_text(text: str, limit: int | None = FAILURE_TEXT_CHARS) -> str
     ``kirocrew update``'s own print.
     """
     full = _redacted(text)
-    logger.debug("Wheel update failure detail: %s", full)
     if limit is None or len(full) <= limit:
         return full
     head_end = full.find(": ")
@@ -332,15 +332,19 @@ def shown_failure_text(text: str, limit: int | None = FAILURE_TEXT_CHARS) -> str
 
 
 def userns_reattach_needed(version: str) -> bool:
-    """Would promoting *version* move the launcher a userns profile applies to?
+    """Would promoting *version* move the launcher out of a userns profile's attachment?
 
     On a host that restricts unprivileged user namespaces, ``kirocrew service
     install`` attaches the ``kirocrew-userns`` AppArmor profile to the RESOLVED
-    launcher path, and promotion makes that path resolve into the new tree. The
-    running gateway keeps its label, but the next fresh service start would run
-    unconfined and the agent sandbox could not be built. True only when the
-    profile applies to the launcher today (the same predicate ``kirocrew doctor``
-    reports) and the promoted one differs.
+    launcher, and promotion makes that path resolve into the new tree. An
+    attachment naming every versioned tree's launcher
+    (``crew-venv-*/bin/kirocrew``, what ``service install`` renders for a
+    managed install, :func:`apparmor.service_attachment`) covers the new tree
+    too. One naming a single tree's exact path does not: the running gateway
+    keeps its label, but the next fresh service start would run unconfined and
+    the agent sandbox could not be built. True only when the profile applies to
+    the launcher today (the same predicate ``kirocrew doctor`` reports) and its
+    attachment does not cover the promoted one.
     """
     if not sys.platform.startswith("linux"):
         return False
@@ -356,7 +360,7 @@ def userns_reattach_needed(version: str) -> bool:
         return False
     layout = wheel_engine.managed_venv_layout()
     promoted = os.path.realpath(layout.versioned_tree(version) / "bin" / "kirocrew")
-    return promoted != attached
+    return not apparmor.attachment_covers(attached, promoted)
 
 
 def userns_reattach_remedy(version: str) -> str:
@@ -366,8 +370,10 @@ def userns_reattach_remedy(version: str) -> str:
         "AppArmor profile is attached to, so the sandbox profile would stop applying at "
         "the next service start. Run `kirocrew update`, then `kirocrew service install` "
         "(which re-attaches the profile and restarts the service onto the new version). "
-        "Both are needed after every update while that profile is in use; `kirocrew "
-        "doctor` reports the attachment under Sandbox."
+        "When the directory holding the install is owned by the service's account and "
+        "writable by no other, that attaches the profile to every version an update "
+        "installs, so later updates apply on their own; `kirocrew doctor` reports the "
+        "attachment under Sandbox."
     )
 
 
@@ -377,8 +383,10 @@ def userns_reattach_after_apply(version: str) -> str:
         f"Kiro Crew {version} is installed, and the kirocrew-userns AppArmor profile is "
         "still attached to the previous launcher, so the sandbox profile stops applying "
         "at the next service start. Run `kirocrew service install`, which re-attaches "
-        "the profile and restarts the service onto the new version. `kirocrew doctor` "
-        "reports the attachment under Sandbox."
+        "the profile and restarts the service onto the new version. When the directory "
+        "holding the install is owned by the service's account and writable by no other, "
+        "that attaches the profile to every version an update installs, so later updates "
+        "keep it applying. `kirocrew doctor` reports the attachment under Sandbox."
     )
 
 
@@ -498,9 +506,40 @@ def classify(exc: BaseException | None) -> WheelApplyOutcome:
 class _Running:
     cancel: ApplyCancel
     future: asyncio.Future[Path]
+    version: str = ""
+    # A routine install nobody asked for (``refuse_if_unattended_off``).
+    unattended: bool = False
 
 
 _IN_FLIGHT: set[_Running] = set()
+
+
+def _user_put_off(version: str, config: object | None = None) -> bool:
+    """Whether the update prompt's "Remind me tomorrow" or "Skip this version"
+    holds *version* now, read from *config* or from a fresh load."""
+    from kiro_crew.update_deferral import user_deferred_update
+
+    if config is None:
+        from kiro_crew.config import KiroCrewConfig
+
+        config = KiroCrewConfig.load()
+    return user_deferred_update(config, version)
+
+
+def stop_put_off_applies(config: object) -> int:
+    """Stop each unattended apply whose version *config* says the user put off.
+
+    The update coordinator reads the deferral only before it starts a build, and
+    a build runs for minutes while the prompt is on screen, so an answer given
+    during it would otherwise be installed anyway. A person's approve and a
+    floor's mandatory update are left running. Returns how many were stopped.
+    """
+    stopped = 0
+    for running in list(_IN_FLIGHT):
+        if running.unattended and _user_put_off(running.version, config):
+            running.cancel.set(_PUT_OFF_REASON)
+            stopped += 1
+    return stopped
 
 
 def applies_in_flight() -> int:
@@ -555,7 +594,9 @@ async def run_wheel_apply(
 
     *refuse_if_unattended_off* is for a routine install nobody asked for: it is
     refused at the swap, as ``deferred``, when the security policy has turned
-    unattended installs off since the caller decided to install. A person's
+    unattended installs off, or the user put *version* off in the update prompt,
+    since the caller decided to install; :func:`stop_put_off_applies` ends it
+    sooner, as ``cancelled``, the moment that answer is saved. A person's
     approve and a floor's mandatory update leave it False.
 
     ``busy`` at once, without queueing, when this process already runs one,
@@ -602,6 +643,10 @@ async def run_wheel_apply(
 
             if not unattended_apply_allowed():
                 raise WheelUpdateNotReady("the security policy turned off unattended installs")
+            # The prompt stays open while this builds, so its answer can land
+            # after the coordinator decided to install.
+            if _user_put_off(version):
+                raise WheelUpdateNotReady(f"{version} was {_PUT_OFF_REASON}")
 
     def _before_promote() -> None:
         # Read at the swap, after the download and build: before the memory copy
@@ -646,7 +691,7 @@ async def run_wheel_apply(
             await asyncio.shield(asyncio.to_thread(wheel_engine.release_update_lock, held_lock_fd))
         raise
     future.add_done_callback(_retrieve)
-    running = _Running(cancel, future)
+    running = _Running(cancel, future, version, refuse_if_unattended_off)
     _IN_FLIGHT.add(running)
     try:
         try:
@@ -704,6 +749,7 @@ __all__ = [
     "shown_failure_text",
     "snapshot_memory_before_update",
     "snapshot_refusal",
+    "stop_put_off_applies",
     "stop_wheel_applies",
     "userns_reattach_after_apply",
     "userns_reattach_needed",

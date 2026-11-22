@@ -132,6 +132,7 @@ from kiro_crew.autonudge_service.model import (  # noqa: F401 -- re-exported
     runtime_budget_exceeded,
     stored_bound,
     terminal_notification_delivery_matches,
+    terminal_wake_line,
 )
 from kiro_crew.autonudge_service.store import (  # noqa: F401 -- re-exported
     _NUDGES_FILE,
@@ -174,6 +175,7 @@ from kiro_crew.autonudge_service.subject import (  # noqa: F401 -- re-exported
     read_session_texts,
 )
 from kiro_crew.autonudge_service.timers import (  # noqa: F401 -- re-exported
+    _BOOT_WAKE_STAGGER_SECS,
     _MONITOR_RETRY_BACKOFF_SECS,
     _MONITOR_RETRY_MAX_BACKOFF_SECS,
     _OVERDUE_REARM_SECS,
@@ -424,19 +426,20 @@ def get_instance() -> "AutoNudgeService | None":
     return _INSTANCE
 
 
-def release_approval_hold_for(slot_key: str | None, *, why: str) -> None:
+def release_approval_hold_for(slot_key: str | None, *, why: str, arm: bool = True) -> None:
     """End *slot_key*'s approval hold, if its loop has one. Best-effort.
 
     The one call the approval paths make once a person answers a prompt. It
     schedules ``AutoNudgeService.release_approval_hold`` (which awaits its own
     durable write) and returns at once. A monitoring convenience must never change
     how that answer is applied, so a missing service, an empty key or a fault here
-    is swallowed.
+    is swallowed. A caller about to run a turn passes ``arm=False``: that turn's end
+    re-arms the loop.
     """
     try:
         svc = _INSTANCE
         if svc is not None and slot_key:
-            _timers._schedule_release(svc, slot_key, why=why)
+            _timers._schedule_release(svc, slot_key, why=why, arm=arm)
     except Exception:
         logger.debug("autonudge.release_approval_hold failed", exc_info=True)
 
@@ -453,6 +456,7 @@ class AutoNudgeService:
         emit_judge_notice: Callable[[NudgeLoop, str], Awaitable[None]] | None = None,
         worker_running: Callable[[str], bool] | None = None,
         worker_closed: Callable[[str], bool] | None = None,
+        pull_remote_reports: Callable[[str], Awaitable[Any]] | None = None,
     ) -> None:
         self._base_dir = base_dir or config_dir()
         # The durable store's state and file protocol (see autonudge_service.store).
@@ -485,6 +489,11 @@ class AutoNudgeService:
         #: different question: a closed worker is stale AT ONCE, where an idle one waits
         #: out the staleness window. Absent means "not closed", which keeps the window.
         self._worker_closed_resolver = worker_closed
+        #: ``conductor key -> pull that board's remote worker reports``, awaited at the
+        #: start of each work-ledger tick so the hold and the probe read them on that
+        #: tick. Injected because the pull needs ``DashboardState``. ``None`` pulls
+        #: nothing, which leaves local-only ledgers exactly as they are.
+        self._remote_report_puller = pull_remote_reports
         self._loops: dict[str, NudgeLoop] = {}
         self._timers: dict[str, asyncio.Task] = {}
         # Loop ids whose re-arm was requested while their fire window was open.
@@ -507,6 +516,9 @@ class AutoNudgeService:
         #: other arm, so it always describes the timer actually armed. A push landing
         #: while it is set buys nothing new: the armed tick has not read the ledger yet.
         self._pushed_ticks: set[str] = set()
+        # Loop id -> seconds its next timer naps before its countdown: set only by
+        # ``start()`` to spread the loops due at boot (``_BOOT_WAKE_STAGGER_SECS``).
+        self._boot_holds: dict[str, float] = {}
         #: Loop ids whose RUNNING tick was armed by a worker's push. Such a tick goes
         #: through the probe gate rather than spending the post-wake follow-up (the
         #: free follow-up belongs to the loop's own cadence), and a quiet answer keeps
@@ -911,8 +923,12 @@ class AutoNudgeService:
                     logger.warning(
                         "AutoNudge: could not persist loaded-state repair", exc_info=True
                     )
+            # Loops overdue at boot are held _BOOT_WAKE_STAGGER_SECS apart, so the
+            # sessions they wake cold-start one at a time instead of together.
+            due_at_boot = 0
             for loop in self._loops.values():
                 if loop.active:
+                    offset = float(due_at_boot * _BOOT_WAKE_STAGGER_SECS)
                     # A work-ledger loop resumes at delay ZERO instead of toward its
                     # persisted deadline, and only this kind does. The crew-log wake is a
                     # push off an in-process queue, so every push in flight when this
@@ -933,10 +949,20 @@ class AutoNudgeService:
                         # turn without reading the ledger -- the opposite of why the
                         # replay exists. A pushed tick always goes through the probe.
                         # Marked AFTER arming: _arm_timer clears the mark it replaces.
+                        # Never held: a user turn cancels a held timer, and the
+                        # re-arm goes to the deadline, which would lose this replay.
                         self._arm_timer(loop, delay=0.0)
                         self._pushed_ticks.add(loop.id)
                     else:
+                        overdue = 0 < loop.next_due_ts <= time.time()
                         self._arm_from_deadline(loop)
+                        # Set after arming: an arm drops the hold of the timer it
+                        # replaces. A user turn that cancels a held timer loses
+                        # nothing: the re-arm finds the loop overdue again.
+                        if overdue:
+                            if offset > 0 and loop.id in self._timers:
+                                self._boot_holds[loop.id] = offset
+                            due_at_boot += 1
             global _INSTANCE
             _INSTANCE = self
         # The crew-log bus subscriptions that pull a work-ledger loop forward when its
@@ -1247,14 +1273,17 @@ class AutoNudgeService:
         task.add_done_callback(_finish)
 
     def _worker_running(self, session_key: str) -> bool:
-        """Whether *session_key*'s slot has a turn in flight.
+        """Whether *session_key* owns proven current or queued work.
 
-        False when no resolver was injected, which is the direction that cannot
-        lose a signal: the work-ledger probe uses this for the "not running" half
-        of the staleness conjunction, so an unknown liveness produces a stall wake
-        the conductor may not have needed (one turn) rather than silence about a
-        worker that stopped without reporting (the task). A resolver that raises is
-        treated the same way -- a slot-table read must not kill a tick.
+        The injected resolver defines the positive liveness fact. The work-ledger
+        binding uses ``session_activity.session_work_pending``; another caller may
+        supply a narrower predicate. False when no resolver was injected, which is
+        the direction that cannot lose a signal: the work-ledger probe uses this
+        for the "not running" half of the staleness conjunction, so an unknown
+        liveness produces a stall wake the conductor may not have needed (one turn)
+        rather than silence about a worker that stopped without reporting (the task).
+        A resolver that raises is treated the same way -- a state read must not kill
+        a tick.
         """
         resolver = self._worker_running_resolver
         if resolver is None or not session_key:
@@ -1276,6 +1305,12 @@ class AutoNudgeService:
         from kiro_crew import ledger_wake
 
         return ledger_wake.worker_looping(self, session_key)
+
+    def _worker_loop_held(self, session_key: str) -> bool:
+        """Whether *session_key*'s session holds an active loop that cannot fire."""
+        from kiro_crew import ledger_wake
+
+        return ledger_wake.worker_loop_held(self, session_key)
 
     def _observes_work_ledger(self, loop: NudgeLoop) -> bool:
         """Whether *loop*'s monitor is a work-ledger watch THIS gateway may arm.
@@ -1373,6 +1408,7 @@ class AutoNudgeService:
     _run_timer_callback = _firing._run_timer_callback
     _extend_for_open_ledger = _firing._extend_for_open_ledger
     _holds_for_person_wait = _firing._holds_for_person_wait
+    _pull_remote_reports = _firing._pull_remote_reports
     _run_fire_cycle = _firing._run_fire_cycle
     _settle_fire_cycle = _firing._settle_fire_cycle
     _finish_fire_cycle = _firing._finish_fire_cycle

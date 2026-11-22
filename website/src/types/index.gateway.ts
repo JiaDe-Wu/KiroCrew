@@ -65,6 +65,21 @@ export interface StatusData {
    */
   update_channel?: string
   /**
+   * The advance notice of the next update, shown inline under About > Updates.
+   * `announced` is a published notice for a version the feed does not offer
+   * yet. `date` is `YYYY-MM-DD` or "" when unknown, `highlights` holds at most
+   * three lines taken from that version's notes, and `notes_url` is an `https://`
+   * link or "". `null` when there is no notice. Display only; optional because an
+   * older gateway does not send it.
+   */
+  update_upcoming?: {
+    state: 'announced'
+    version: string
+    date: string
+    highlights: string[]
+    notes_url: string
+  } | null
+  /**
    * Is the running build ahead of everything `update_channel` publishes? True
    * means that lane has never shipped these bytes, so the install is not on it
    * and only re-running the installer moves it — the state a channel switch
@@ -94,6 +109,14 @@ export interface StatusData {
    */
   update_auto_effect?: 'install' | 'notify' | 'mandatory' | 'unknown'
   /**
+   * True when `update_auto_effect` is `notify` only because the security policy
+   * turns unattended installs off: a person's Update still installs here. It
+   * says so for every install shape, where `update_can_apply` is false on a
+   * managed venv whose Update is the arm and approve flow. Absent on older
+   * gateways (reads as false).
+   */
+  update_auto_manual_only?: boolean
+  /**
    * Whether the desktop app bundles and launches this gateway, from the baked
    * packaging stamp. Independent of `update_managed_by`, which reads `command`
    * on that same bundle when a policy `updates` provider is configured. There,
@@ -102,6 +125,13 @@ export interface StatusData {
    * own updater owning the update.
    */
   update_bundled_by_app?: boolean
+  /**
+   * The command the sign-in sentences name in place of the catalog's
+   * `kirocrew token`: on a container gateway, `docker exec kirocrew kirocrew
+   * token`, run on the host. Empty, or absent on older gateways, keeps the
+   * catalog's command. Read through `api/signInCommand.ts`.
+   */
+  sign_in_command?: string
   /**
    * Commit distance from a git checkout's upstream, both directions. Diverged
    * (both > 0) reports `update_available: false` exactly like a current
@@ -122,6 +152,21 @@ export interface StatusData {
   update_required?: boolean
   /** The floor that made the update mandatory (bare release, '' when none). */
   update_min_version?: string
+  /**
+   * "Update ready, restart to use it": a new version is installed beside the
+   * running one (`staged`, `installed`), or the served bundle is gone
+   * (`assets_gone`). The gateway never restarts itself for it; a person does.
+   */
+  update_restart_ready?: boolean
+  update_restart_ready_version?: string
+  update_restart_ready_reason?: 'staged' | 'assets_gone' | ''
+  /** The person armed an update (Update when I restart): the gateway applies it at its
+   *  next start, before it serves anything. `null` when nothing is armed. */
+  update_armed_version?: string | null
+  /** Unix seconds the armed update was armed; the desktop reads it to tell a fresh arm from a stale one. */
+  update_armed_at?: number | null
+  /** Why the last boot-time apply failed; the old version is running. */
+  pending_apply_error?: string | null
   update_progress?: { step: string; detail: string } | null
   version?: string
   /**
@@ -169,7 +214,7 @@ export interface StatusData {
   yolo_until_shutdown_permitted?: boolean
   /** HTTP reply only: whether this account owns the data home's key entries,
    *  and the gateway's repair line when it does not. Absent on an older gateway. */
-  data_home_access?: { ok: boolean; home: string; foreign: string[]; fix_command: string }
+  data_home_access?: { ok: boolean; home: string; foreign: string[]; owner: string; help_url: string }
   /** Auto-approve modes forbidden by the `approval_modes` policy scope. Today the
    * scope governs `yolo` only, so this is `['yolo']` or empty; `normal`, `trust`
    * and `trust_reads` are non-deniable and never appear. The approval-mode picker
@@ -211,6 +256,8 @@ export interface StatusData {
  * type-checks; consumers treat absence as "unknown", never as a verdict.
  */
 export interface UpdateCheckResult {
+  /** When this check finished, epoch seconds: the stamp the status frame carries as `update_last_checked_at`. */
+  last_checked_at?: number | null
   supported?: boolean
   managed_by?: string
   mode?: string
@@ -256,11 +303,22 @@ export interface UpdateCheckResult {
   commits_behind?: number
   error_code?: string | null
   unavailable_reason?: string | null
+  /**
+   * Container installs only: the newer release whose image the gateway
+   * confirmed on GHCR (a 200 manifest), and its release-notes page. Absent
+   * whenever that confirmation did not happen.
+   */
+  image_available_version?: string
+  image_release_notes_url?: string
   remediation?: { kind?: string; message?: string; command?: string } | null
   current_version?: string
   auto_update?: boolean
   /** Whether config.local.json sets `auto_update`, so the switch cannot change it. */
   overlay_override?: boolean
+  /** Whose entry that is: the person's own (`user`) or a policy an edition enforces (`policy`). */
+  overlay_source?: 'user' | 'policy' | null
+  /** The policy keeping the entry in place, when `overlay_source` is `policy`. */
+  overlay_policy?: { label: string; detail: string } | null
   minimum_version_enforced?: string
   update_required?: boolean
   /** Legacy alias some older payloads carried; `latest_version` is authoritative. */
@@ -304,6 +362,14 @@ export interface SessionStorageBatch {
   sessions: number; bytes: number
 }
 
+/** At least what Claude Code's own store keeps for the Claude chats this instance
+ *  can still resume. Another program's files, which Storage never moves, so no
+ *  session row and no other total includes it. */
+export interface ClaudeCodeStorage {
+  bytes: number
+  sessions: number
+}
+
 /**
  * What sessions cost on disk, and what may be reclaimed.
  *
@@ -317,6 +383,7 @@ export interface SessionStorageReport {
   reclaimable_sessions: number; reclaimable_bytes: number
   /** Non-empty when this instance must not reclaim — show it instead of the action. */
   reclaim_blocked_reason: string
+  claude_code?: ClaudeCodeStorage
   buckets: SessionStorageBucket[]
   trash: {
     bytes: number
@@ -382,6 +449,7 @@ export interface SessionInventoryList {
   total_sessions: number
   reclaimable_bytes: number
   reclaim_blocked_reason: string
+  claude_code?: ClaudeCodeStorage
   /** Every conversation, plus only the LARGEST replay-only sessions — see `background`. */
   sessions: SessionInventoryItem[]
   /** The replay-only group as a whole. `listed` is how many of `sessions` it
@@ -444,7 +512,8 @@ export interface RemoteCrewApprovalState {
 
 export interface RemoteCrewCapabilities {
   instance_id: string
-  /** The peer's gateway version, or "" when it could not be read. */
+  /** The peer's gateway version, or "" when it could not be read (its reason is
+   *  `unavailable.version`). */
   version: string
   local_version: string
   /** The equality gate the backend enforces on every dispatch. False also covers
@@ -453,6 +522,9 @@ export interface RemoteCrewCapabilities {
   /** The peer runs a strictly older build than this machine (exact version,
    *  so a patch skew counts). Absent from a gateway that predates the field. */
   behind?: boolean
+  /** The peer runs a strictly newer build than this machine; the mirror of
+   *  `behind`, false for an unknown or unordered version. */
+  ahead?: boolean
   agents: { name: string; description: string; scope: string; model: string }[]
   /** The agent the PEER falls back to when the session has picked none. "" when
    *  the roster read failed — never substitute this machine's default, which
@@ -471,15 +543,16 @@ export interface RemoteCrewCapabilities {
 export interface InstanceVersionRow {
   id: string
   name: string
-  /** The peer's gateway version, or "" when it did not answer. */
+  /** The peer's gateway version, or "" when it is unknown (see `error`). */
   version: string
   /** Strictly older than `local_version`; never true for an unknown version. */
   behind: boolean
   /** This dashboard can run the crew's updater: false for a chained crew
    *  (no shell from here) and a fargate or headless one (no gateway). */
   updatable: boolean
-  /** Why the crew's version could not be read (the carrier's code), or "" when
-   *  it answered. A crew with an error is never `behind`: its version is unknown. */
+  /** Why the crew's version is unknown (the carrier's code, or
+   *  `capability_malformed_reply` for an answer naming no version), or "" when it
+   *  is known. A crew with an error is never `behind`: its version is unknown. */
   error?: string
 }
 

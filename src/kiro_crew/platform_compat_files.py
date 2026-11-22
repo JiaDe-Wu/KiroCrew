@@ -23,6 +23,7 @@ import shutil
 import stat
 import struct
 import sys
+import time
 from ctypes import wintypes
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,7 @@ from kiro_crew.platform_compat_links import (
     _WIN_OPEN_EXISTING,
     is_link_or_junction,
     lstat_is_name_surrogate,
+    unlink_link_or_junction,
 )
 from kiro_crew.platform_compat_native import IS_LINUX, IS_MACOS, IS_POSIX, IS_WINDOWS
 
@@ -282,40 +284,15 @@ TCC_PROTECTED_HOME_DIRS: frozenset[str] = frozenset(
         "Pictures",
         "Movies",
         "Music",
+        # Not a TCC folder itself, but it holds the iCloud Drive and cloud-drive
+        # mounts (``Mobile Documents``, ``CloudStorage``), each of which prompts,
+        # and many Full-Disk-Access gated leaves (``Mail``, ``Messages``,
+        # ``Safari``, ``Containers/com.apple.*``) that Apple adds to each
+        # release. A home-rooted walk has no reason to enter any of it; a
+        # project inside a cloud drive is opened by naming its root.
+        "Library",
     }
 )
-# ``Library`` is deliberately absent from the set ABOVE, but it is not
-# unpruned — see TCC_LIBRARY_WALKABLE_CHILDREN. It cannot be a plain member
-# here because it must be *descended into* to reach the cloud-drive mounts,
-# which a top-level name prune would make unreachable.
-
-#: Children of ``~/Library`` that stay walkable; every other child is pruned
-#: from a home-rooted walk. This is an ALLOWLIST on purpose.
-#:
-#: Much of ``~/Library`` is gated behind Full Disk Access — ``Mail``,
-#: ``Messages``, ``Safari``, ``Calendars``, ``HomeKit``, ``Cookies``,
-#: ``IdentityServices``, ``Suggestions``, ``PersonalizationPortrait``,
-#: ``Metadata/CoreSpotlight``, ``Containers/com.apple.*`` and several
-#: ``Application Support`` leaves (``AddressBook``, ``CallHistoryDB``,
-#: ``MobileSync``, ``com.apple.TCC``) — and Apple keeps ADDING to that list
-#: with each release. A denylist would therefore go stale and silently start
-#: leaking prompts again on the next macOS version, so the rule is inverted:
-#: name the two paths worth reaching and drop the rest.
-#:
-#: The two kept entries are the modern cloud-drive mount points, which are
-#: common project homes and hold real search hits:
-#: ``~/Library/CloudStorage/<Provider>/`` (OneDrive / Google Drive / Dropbox)
-#: and ``~/Library/Mobile Documents/`` (iCloud Drive).
-TCC_LIBRARY_WALKABLE_CHILDREN: frozenset[str] = frozenset(
-    {
-        "CloudStorage",
-        "Mobile Documents",
-    }
-)
-
-#: The single ``~/Library`` component name, kept as a constant because the walk
-#: pruner compares it positionally rather than by membership.
-_LIBRARY_DIR = "Library"
 
 
 def rename_noreplace(
@@ -455,41 +432,32 @@ def tcc_prune_walk_dirs(root: str, dirpath: str, dirnames: list[str]) -> list[st
     to :func:`os.walk` plus the ``dirpath``/``dirnames`` of the current step and
     assign the result back into ``dirnames[:]``.
 
-    Two positions prune, and only when *root* is the user's home directory
+    Only one position prunes, and only when *root* is the user's home directory
     itself (see :func:`tcc_protected_dirs_for_walk` for why an explicitly
-    scoped root is never pruned):
-
-    * at *root* — drop the gated top-level folders (``Downloads``, ``Desktop``,
-      ...). ``Library`` is NOT dropped here, so the walk can reach the cloud
-      mounts below it.
-    * at ``<root>/Library`` — keep only TCC_LIBRARY_WALKABLE_CHILDREN and drop
-      every other child, most of which is Full-Disk-Access gated.
+    scoped root is never pruned): at *root*, drop the gated top-level folders
+    (``Downloads``, ``Desktop``, ``Library``, ...).
 
     Every deeper position returns *dirnames* untouched. A name that merely
     matches a gated folder further down the tree (a project's own
     ``Documents/``) is not gated and stays walkable.
 
     Callers MUST pass the same ``str`` they hand to :func:`os.walk`: the
-    positional comparisons rely on ``dirpath`` being built by joining onto
+    positional comparison relies on ``dirpath`` being built by joining onto
     ``top`` verbatim, which is what ``os.walk`` guarantees.
     """
     if not IS_MACOS:
         return dirnames
-    # Positional gate FIRST: only two walk positions can prune, so every other
-    # directory in a large tree returns without paying the realpath syscall
-    # that the home check below costs.
-    at_root = dirpath == root
-    at_library = not at_root and dirpath == os.path.join(root, _LIBRARY_DIR)
-    if not (at_root or at_library):
+    # Positional gate FIRST: only the root can prune, so every other directory
+    # in a large tree returns without paying the realpath syscall that the home
+    # check below costs.
+    if dirpath != root:
         return dirnames
     # Doubles as the "is root the home directory" test and inherits that
     # helper's failure handling (an unresolvable root prunes nothing).
     protected = tcc_protected_dirs_for_walk(root)
     if not protected:
         return dirnames
-    if at_root:
-        return [d for d in dirnames if d not in protected]
-    return [d for d in dirnames if d in TCC_LIBRARY_WALKABLE_CHILDREN]
+    return [d for d in dirnames if d not in protected]
 
 
 # ---------------------------------------------------------------------------
@@ -533,7 +501,15 @@ def chmod_safe(path: str | os.PathLike, mode: int) -> None:
             logger.warning("Cannot set permissions on %s", path)
 
 
-def _clear_readonly_and_retry(func: Any, path: str, _exc: BaseException) -> None:
+def _clear_readonly_and_retry(
+    func: Any,
+    path: str,
+    _exc: BaseException,
+    *,
+    root: str | None = None,
+    root_fd: int | None = None,
+    failed: list[str] | None = None,
+) -> None:
     """``shutil.rmtree`` error hook: drop the read-only bit, then retry once.
 
     Windows checks the read-only ATTRIBUTE on the file being deleted, whereas
@@ -541,34 +517,126 @@ def _clear_readonly_and_retry(func: Any, path: str, _exc: BaseException) -> None
     which a git checkout is full, since loose objects are written read-only —
     cannot be unlinked on Windows even when its directory is writable.
 
-    Only Windows gets the chmod, and only for an entry that is not a link. On
-    POSIX the entry's own mode never decides whether it can be removed, so a
-    chmod there buys nothing, and ``os.chmod`` follows a symlink: a tree an
-    agent wrote could aim one at any file this process can reach and have its
-    mode rewritten. The write bit is ADDED to the current mode, never set in
-    its place, so a failed retry leaves a directory still listable.
+    On Windows the chmod goes on the entry, and only on an entry that is not a
+    link. On POSIX the entry's own mode never decides whether it can be
+    removed, and ``os.chmod`` follows a symlink: a tree an agent wrote could aim
+    one at any file this process can reach and have its mode rewritten. So on
+    POSIX the write bit goes on the PARENT directory instead (a Go module cache
+    is ``0555`` directories), and only when the removal was refused
+    (``EACCES``/``EPERM``), *root* names the tree being removed, *root_fd* is
+    the descriptor :func:`rmtree_force` holds on it, and the parent lies inside
+    it: see :func:`_retry_within_root`. The write bit is ADDED to
+    the current mode, never set in its place, so a failed retry leaves a
+    directory still listable.
 
     Only a removal (``unlink``/``rmdir``) is retried. ``rmtree`` also reports a
     directory it could not open or list (``os.open``, ``os.scandir``, ...);
     the read-only bit is not why those failed, and ``os.open(path)`` called
     with ``path`` alone raises ``TypeError``, which would unwind past
     ``rmtree_force``'s "never raises" contract. Those are logged and left.
+
+    A path that stays is logged, or appended to *failed* when the caller
+    collects them to report once.
     """
+
+    def _give_up() -> None:
+        if failed is None:
+            logger.warning("Cannot remove %s", path)
+        else:
+            failed.append(path)
+
     if func not in (os.unlink, os.remove, os.rmdir):
-        logger.warning("Cannot remove %s", path)
+        _give_up()
         return
     try:
         if not IS_POSIX:
             info = os.lstat(path)
             if not (stat.S_ISLNK(info.st_mode) or lstat_is_name_surrogate(info)):
                 os.chmod(path, stat.S_IMODE(info.st_mode) | stat.S_IWRITE)
+        elif (
+            root is not None
+            and root_fd is not None
+            and getattr(_exc, "errno", None) in (errno.EACCES, errno.EPERM)
+        ):
+            _retry_within_root(func, path, root, root_fd)
+            return
         func(path)
     except OSError:
-        logger.warning("Cannot remove %s", path)
+        _give_up()
 
 
-def rmtree_force(path: str | os.PathLike) -> bool:
-    """Remove a directory tree, defeating Windows read-only files. Never raises.
+def _retry_within_root(func: Any, path: str, root: str, root_fd: int) -> None:
+    """Add the owner write bit to *path*'s parent inside *root*, then retry *func* there.
+
+    The parent is first compared by name with *root*, so nothing above the tree
+    being removed is touched, the root's own parent included. It is then reached
+    from *root_fd*, the descriptor :func:`rmtree_force` opened on the root before
+    the walk, never from a path: each component is opened with ``O_NOFOLLOW``
+    relative to the one before and checked to be a directory, so a component
+    swapped for a symlink stops the walk, and a swapped ancestor of the root is
+    never looked at again. The chmod and the retried removal both go through
+    the final descriptor. Raises :class:`OSError` on any refusal and the entry
+    stays. A refused walk changes nothing; a failed retry leaves the write bit
+    added on that in-tree parent.
+    """
+    parent = os.path.abspath(os.path.dirname(path))
+    top = os.path.abspath(root)
+    if parent != top and not parent.startswith(top.rstrip(os.sep) + os.sep):
+        raise OSError(errno.EACCES, "parent is outside the tree being removed", path)
+    rel = os.path.relpath(parent, top)
+    parts = [] if rel == os.curdir else rel.split(os.sep)
+    name = os.path.basename(path)
+    if any(part in ("", os.curdir, os.pardir) for part in parts) or name in (
+        "",
+        os.curdir,
+        os.pardir,
+    ):
+        raise OSError(errno.EACCES, "path is not a plain entry of the tree", path)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(os.curdir, flags, dir_fd=root_fd)
+    try:
+        for part in parts:
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            if not stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(errno.ENOTDIR, "component is not a directory", path)
+        info = os.fstat(fd)
+        os.fchmod(fd, stat.S_IMODE(info.st_mode) | stat.S_IWUSR)
+        func(name, dir_fd=fd)
+    finally:
+        os.close(fd)
+
+
+def _open_root(root: str, expect: tuple[int, int] | None) -> tuple[int | None, bool]:
+    """Open *root* for :func:`_retry_within_root`; ``(fd, refused)``. POSIX only.
+
+    *expect* is the ``(st_dev, st_ino)`` the caller read when it chose the tree.
+    A root that is not that directory (an ancestor swapped since) is
+    refused, so nothing is removed or chmodded. A root that cannot be opened
+    gets no retry descriptor and is left to ``rmtree``'s own checks.
+    """
+    if not IS_POSIX:
+        return None, False
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return None, expect is not None and os.path.lexists(root)
+    if expect is not None:
+        info = os.fstat(fd)
+        if (info.st_dev, info.st_ino) != expect:
+            os.close(fd)
+            return None, True
+    return fd, False
+
+
+def rmtree_force(
+    path: str | os.PathLike,
+    *,
+    failures: list[str] | None = None,
+    expect: tuple[int, int] | None = None,
+) -> bool:
+    """Remove a directory tree, defeating read-only entries. Never raises.
 
     Returns True when *path* is gone afterwards.
 
@@ -577,12 +645,33 @@ def rmtree_force(path: str | os.PathLike) -> bool:
     objects under ``.git/objects`` refuse to unlink, ``ignore_errors`` swallows
     every one of those failures, and the caller reports success over a tree that
     is still on disk — so the project name stays taken and the next create
-    answers 409.
+    answers 409. On POSIX the same holds for a tree of read-only directories,
+    such as a Go module cache.
+
+    Entries that could not be removed are logged as ONE warning with their
+    count, so a large stuck tree costs one line. A caller passing *failures*
+    gets the paths appended there instead and logs them itself. A caller passing
+    *expect*, the ``(st_dev, st_ino)`` of the directory it chose, gets the tree
+    left alone (counted as stuck) when *path* names a different directory.
 
     The return value is what lets a caller tell a real deletion from a partial
     one; the boolean is derived from the filesystem rather than from the hook,
     because a surviving file is the only thing that actually matters.
     """
+    failed: list[str] = []
+    root = os.fspath(path)
+    root_fd, refused = _open_root(root, expect)
+    if refused:
+        failed.append(root)
+        if failures is not None:
+            failures.extend(failed)
+        else:
+            logger.warning("Cannot remove %s: it is not the directory chosen", path)
+        return False
+
+    def _hook(func: Any, target: str, exc: BaseException) -> None:
+        _clear_readonly_and_retry(func, target, exc, root=root, root_fd=root_fd, failed=failed)
+
     # `onexc` replaced `onerror` in 3.12 and the old name warns; this project
     # still supports 3.9+, so pick by capability rather than by version number.
     kwarg = "onexc" if sys.version_info >= (3, 12) else "onerror"
@@ -590,30 +679,108 @@ def rmtree_force(path: str | os.PathLike) -> bool:
         if kwarg == "onerror":  # pragma: no cover - exercised on Python < 3.12
 
             def _legacy(func: Any, target: str, exc_info: Any) -> None:
-                _clear_readonly_and_retry(func, target, exc_info[1])
+                _hook(func, target, exc_info[1])
 
             shutil.rmtree(path, onerror=_legacy)
         else:
-            shutil.rmtree(path, onexc=_clear_readonly_and_retry)  # type: ignore[call-arg]
+            shutil.rmtree(path, onexc=_hook)  # type: ignore[call-arg]
+        gone = not os.path.lexists(path)
     except FileNotFoundError:
         # A missing ROOT is success. A nested entry can disappear during rmtree while
         # the root survives, especially through the Python <3.12 onerror path.
-        return not os.path.lexists(path)
+        gone = not os.path.lexists(path)
     except OSError:
-        logger.warning("Cannot remove %s", path)
-        return False
-    return not os.path.lexists(path)
+        failed.append(root)
+        gone = False
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+    if not gone and not failed:
+        failed.append(root)  # left behind with no refusal reported, e.g. refilled mid-walk
+    if failures is not None:
+        failures.extend(failed)
+    elif failed:
+        logger.warning("Cannot remove %d entries under %s", len(failed), path)
+    return gone
+
+
+#: Windows sharing (32) and lock (33) violations: another process holds a file
+#: open. Both clear once that process closes the handle.
+_SHARING_VIOLATION_WINERRORS = (32, 33)
+#: Bounded wait for a holder to let go: about three seconds in total, long
+#: enough for a just-stopped process to close its file, short enough that a
+#: holder that never releases still fails the delete promptly.
+_RMTREE_MAX_ATTEMPTS = 15
+_RMTREE_BACKOFF_SECONDS = 0.2
+
+
+def remove_with_retry(path: str | os.PathLike, *, retry_hint: str) -> None:
+    """Remove a file or a directory tree, retrying the Windows sharing-violation window.
+
+    On Windows, deleting a file another process holds open raises
+    ``PermissionError`` with ``winerror`` 32 (or 33 for a byte-range lock), so
+    an editor or a scanner with one file open fails the whole delete. Each retry
+    resumes on whatever is left, so the path goes as soon as the holder
+    releases. Every other error, and every error on POSIX (which unlinks open
+    files), propagates on the first attempt. A link or junction is unlinked,
+    never traversed.
+
+    The retry sleeps, so it is skipped on a thread running an event loop, the
+    same gate :func:`kiro_crew.atomic_write.replace_with_retry` uses.
+
+    When the budget runs out the raised error names the held file, followed by
+    *retry_hint* telling the user what to close before trying again.
+    """
+    # atomic_write imports platform_compat, so this import cannot sit at module top.
+    from kiro_crew.atomic_write import on_event_loop
+
+    for attempt in range(_RMTREE_MAX_ATTEMPTS):
+        try:
+            if is_link_or_junction(path):
+                unlink_link_or_junction(path)
+            elif os.path.isdir(path):
+                shutil.rmtree(path)
+            else:
+                os.unlink(path)
+            return
+        except PermissionError as exc:
+            if getattr(exc, "winerror", None) not in _SHARING_VIOLATION_WINERRORS:
+                raise
+            held = exc.filename or str(path)
+            if attempt == _RMTREE_MAX_ATTEMPTS - 1 or on_event_loop():
+                raise PermissionError(
+                    exc.errno, f"{held} is held open by another process. {retry_hint}"
+                ) from exc
+            logger.debug(
+                "delete contended at %s; retrying (attempt %d/%d)",
+                held,
+                attempt + 1,
+                _RMTREE_MAX_ATTEMPTS,
+            )
+            time.sleep(_RMTREE_BACKOFF_SECONDS)
 
 
 _WIN_FILE_SHARE_READ_WRITE_DELETE = 0x00000001 | 0x00000002 | 0x00000004
 
 
-def open_log_file_for_tail(path: str | os.PathLike) -> int:
-    """Open a binary read fd without blocking the log writer's rename/rotation.
+def open_file_for_shared_read(path: str | os.PathLike) -> int:
+    """Open a binary read fd that every other holder of the file can share.
 
-    Windows CRT opens omit FILE_SHARE_DELETE. This separate log-only helper
-    permits rotation even during a read; security pinning helpers must not.
-    The caller owns the returned descriptor and must close it.
+    Windows CRT opens grant FILE_SHARE_READ | FILE_SHARE_WRITE and omit
+    FILE_SHARE_DELETE, so they are a sharing violation against any program
+    that holds the file with delete access: Word and Excel hold every open
+    document that way, and a log writer that rotates by rename does too.
+    ``CreateFileW`` here grants all three, so the open succeeds whenever the
+    holder shares reading, and this handle never blocks that holder's own
+    rename, replace or delete. A holder that does not share reading still
+    refuses the open; the raised ``OSError`` carries its ``winerror`` (32 or
+    33, :data:`_SHARING_VIOLATION_WINERRORS`) for the caller to report.
+
+    It follows a link at the name, as ``os.open`` does, so a caller that must
+    refuse one checks the name first. Never use it to pin a path: another
+    process can rename or delete the name while this handle is held. POSIX
+    has no share modes; it is a plain read-only open there. The caller owns
+    the returned descriptor and must close it.
     """
     if IS_POSIX:
         return os.open(os.fspath(path), os.O_RDONLY)

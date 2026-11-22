@@ -859,6 +859,12 @@ class TestApiSpawnEffortDropped:
         ],
     )
     def test_unavailable_selection_omits_both_claims(self, selection):
+        from kiro_crew.execution_context import bind_session_execution
+
+        # A parent with an execution record admits its child from that record, so
+        # the selection reaches only the receipt. Without one, the route admits
+        # the child from the selection and refuses an unusable one.
+        bind_session_execution("dashboard:1", execution_for_store(""))
         data = self._spawn(
             {
                 "task": "x",
@@ -1171,7 +1177,7 @@ class TestAppliedLineRendering:
         )
         assert len(bodies) == 2
         line = next(ln for ln in result.splitlines() if "reasoning_effort=" in ln)
-        assert line == "ℹ reasoning_effort='high' for a1, a2: pending-note"
+        assert line == "Note: reasoning_effort='high' for a1, a2: pending-note"
 
     def test_plain_spawn_without_effort_renders_its_receipt(self):
         """A spawn that asks for no effort still renders the receipt: every
@@ -1199,7 +1205,7 @@ class TestAppliedLineRendering:
             can_work=False,
             keep=False,
         )
-        assert "ℹ reasoning_effort='high' for a1: pending-note" in result.splitlines()
+        assert "Note: reasoning_effort='high' for a1: pending-note" in result.splitlines()
 
     def test_api_spawn_returns_applied_for_capable_model(self):
         from kiro_crew.config.loader import AgentConfig, KiroCrewConfig

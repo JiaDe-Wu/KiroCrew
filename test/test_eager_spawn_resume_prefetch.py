@@ -21,6 +21,7 @@ from eager_spawn_helpers import (  # noqa: F401 -- fixtures are used by name
 from kiro_crew.agent_sdk.backends import ACP_BACKEND_KAS
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.state import _ChatSlot
+from kiro_crew.start_priority import StartPriority
 
 
 class TestRemoveIfUnclaimed:
@@ -104,12 +105,51 @@ class TestResumePrefetchWiring:
         assert kwargs["speculative_resume"] is True
 
     @pytest.mark.asyncio
+    async def test_the_prefetch_claims_as_its_persons_turn(self):
+        """The tab's next turn is its person's, so a ``cron:`` batch it starts is one."""
+        from kiro_crew.agent_sdk.kas_project_hooks import PERSON_TURN
+
+        slot = _ChatSlot("t1")
+        state = _mock_state(slot)
+        seen: list[bool] = []
+
+        async def get_or_create(*_a, **_kw):
+            seen.append(PERSON_TURN.get())
+            return MagicMock(), True, False
+
+        state.sessions.get_or_create = AsyncMock(side_effect=get_or_create)
+        with patch.object(chat_runner.KiroCrewConfig, "load", _cfg(True)):
+            await chat_runner._eager_spawn(state, slot)
+        assert seen == [True]
+
+    @pytest.mark.asyncio
     async def test_default_path_does_not_opt_in(self):
         slot = _ChatSlot("t1")
         state = _mock_state(slot)
         with patch.object(chat_runner.KiroCrewConfig, "load", _cfg(True)):
             await chat_runner._eager_spawn(state, slot)
         assert state.sessions.get_or_create.await_args.kwargs["speculative_resume"] is False
+
+    @pytest.mark.asyncio
+    async def test_the_owners_return_reaches_the_allocation(self):
+        """The focus prefetch says a person is about to wait on this re-open."""
+        slot = _ChatSlot("t1")
+        state = _mock_state(slot)
+        with patch.object(chat_runner.KiroCrewConfig, "load", _native_resume_cfg()):
+            await chat_runner._eager_spawn(state, slot, allow_resume=True, focus_resume=True)
+        kwargs = state.sessions.get_or_create.await_args.kwargs
+        assert kwargs["focus_resume"] is True
+        # Its place in the start queues is unchanged.
+        assert kwargs["start_priority"] is StartPriority.BACKGROUND
+
+    @pytest.mark.asyncio
+    async def test_a_resume_start_that_is_not_the_owners_return_says_nobody_waits(self):
+        """A reload's respawn resumes too, and keeps the wait it always had."""
+        slot = _ChatSlot("t1")
+        state = _mock_state(slot)
+        with patch.object(chat_runner.KiroCrewConfig, "load", _native_resume_cfg()):
+            await chat_runner._eager_spawn(state, slot, allow_resume=True)
+        assert state.sessions.get_or_create.await_args.kwargs["focus_resume"] is False
 
     @pytest.mark.asyncio
     async def test_resumed_prefetch_arms_ttl(self):

@@ -98,7 +98,7 @@ from kiro_crew.config.integration_sections import (  # noqa: F401
     AwsConfig,
 )
 from kiro_crew.config.loader_agents import resolve_agent_identity
-from kiro_crew.config.loader_config import KiroCrewConfig
+from kiro_crew.config.loader_config import KiroCrewConfig, template_model_pin
 from kiro_crew.config.migration import (  # noqa: F401
     _REPORTED_SUPERSEDED_KEYS,
     CONNECTIONS_UI_MIGRATION_MARKER,
@@ -190,6 +190,7 @@ from kiro_crew.config.section_builders import (  # noqa: F401
     _build_power_config,
     _build_publish_config,
     _build_session_summary_config,
+    _build_shared_access,
     _build_skills_config,
     _build_slack_config,
     _build_stt_config,
@@ -442,7 +443,6 @@ from kiro_crew.constants import (  # noqa: F401 - loader namespace compatibility
     SUBAGENT_TIMEOUT_SECS,
 )
 from kiro_crew.effort import is_valid_effort, model_supports_effort  # noqa: F401
-from kiro_crew.mcp_gateway.rewriter import default_overlay_dir, default_socket_path  # noqa: F401
 
 # The memory-store shape rule, applied to store NAMES at load. Leaf module:
 # stdlib only at module scope (it imports this one lazily), so no cycle.
@@ -483,6 +483,20 @@ def app_model_pin(config: KiroCrewConfig, app_name: str | None) -> str:
     return normalize_agent_model(getattr(entry, "model", ""))
 
 
+def _template_model(config: KiroCrewConfig, template: str, in_scope: Callable[[str], str]) -> str:
+    """The model *template* runs on: the user's ``templates.<name>.model``, else its pin.
+
+    ``""`` for the built-in ``kirocrew`` template, which tracks the global, and
+    when neither names a model the active harness can claim.
+    """
+    if not template or template == "kirocrew":
+        return ""
+    chosen = in_scope(template_model_pin(config, template))
+    if chosen:
+        return chosen
+    return in_scope(normalize_agent_model(config._resolve_named_agent_model(template)))
+
+
 def _agent_tier_model(
     config: KiroCrewConfig,
     agent_name: str | None,
@@ -493,9 +507,10 @@ def _agent_tier_model(
 ) -> str:
     """The model the agent itself pins: its crew's ``model``, else its template's.
 
-    Tiers 1 and 2 of :func:`resolve_effective_model`. ``""`` when neither pins a
-    model the active harness can claim. A *template* the caller names is the
-    template tier itself, with no crew above it.
+    Tiers 1 and 2 of :func:`resolve_effective_model`; the template tier is
+    :func:`_template_model`. ``""`` when neither pins a model the active harness
+    can claim. A *template* the caller names is the template tier itself, with no
+    crew above it.
     """
     if template is not None:
         kiro_agent, model_pin = template, ""
@@ -505,11 +520,7 @@ def _agent_tier_model(
         )
     if in_scope(model_pin):
         return model_pin
-    if kiro_agent and kiro_agent != "kirocrew":
-        pinned = normalize_agent_model(config._resolve_named_agent_model(kiro_agent))
-        if in_scope(pinned):
-            return pinned
-    return ""
+    return _template_model(config, kiro_agent or "", in_scope)
 
 
 def _model_scope_filter(config: KiroCrewConfig, backend: str | None = None) -> Callable[[str], str]:
@@ -529,8 +540,9 @@ def resolve_app_spawn_model(config: KiroCrewConfig, app_name: str, agent_name: s
     """The model an app's background spawn of *agent_name* runs on, or ``""``.
 
     The app's own ``apps.<name>.model`` when the user set one, unless the spawned
-    template itself pins a model, which wins as it does for an app session. That
-    pin is the spawn's whole agent tier: an app spawn is a template spawn, which
+    template has a model of its own (the user's ``templates.<name>.model``, else
+    its pin), which wins as it does for an app session. That model is the spawn's
+    whole agent tier: an app spawn is a template spawn, which
     allocates with ``crew_agent=""``, so its session (``session._session_model``)
     never reads a crew's pin, not even one of a crew that shares the template's
     name. ``""`` leaves the spawn exactly as it is without the setting.
@@ -539,9 +551,8 @@ def resolve_app_spawn_model(config: KiroCrewConfig, app_name: str, agent_name: s
     app_pin = in_scope(app_model_pin(config, app_name))
     if not app_pin:
         return ""
-    if agent_name and agent_name != "kirocrew":
-        if in_scope(normalize_agent_model(config._resolve_named_agent_model(agent_name))):
-            return ""
+    if _template_model(config, agent_name, in_scope):
+        return ""
     return app_pin
 
 
@@ -561,8 +572,9 @@ def resolve_effective_model(
     (``create_provider_factory._acp``) cannot drift apart. Tiers, highest first:
 
     1. the KiroCrew agent's own ``model``
-    2. the bound kiro agent's pinned ``model`` (skipped for the built-in
-       ``kirocrew`` agent, which tracks the global by design)
+    2. the bound kiro agent's model: the user's ``templates.<name>.model``, else
+       the template's pinned ``model`` (skipped for the built-in ``kirocrew``
+       agent, which tracks the global by design)
     3. for a session an app owns (*app_name*), the user's ``apps.<name>.model``
     4. the global ``agent.model`` default
     5. the installed ``kirocrew.json`` / bundled ``defaults.json`` model
@@ -689,6 +701,18 @@ _OWNERS = (
 for _owner in _OWNERS:
     _importlib.import_module(_owner)
 
+#: The MCP gateway's two path defaults, which this module has always served. Read on
+#: first use (:func:`__getattr__`) instead of imported: the rewriter that owns them loads
+#: the gateway manager and the sandbox, which a process that only reads config never uses.
+_GATEWAY_PATH_DEFAULTS = frozenset({"default_overlay_dir", "default_socket_path"})
+
+
+def __getattr__(name: str) -> Any:
+    if name in _GATEWAY_PATH_DEFAULTS:
+        return getattr(_importlib.import_module("kiro_crew.mcp_gateway.rewriter"), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 #: Owner-bound name this module does not bind -> the owner that answers a read of it.
 _EXPORTS: dict[str, str] = {}
 _EXPORTS.update(_facade_mirror.install(_sys.modules[__name__], _OWNERS, excluded=()).served)
@@ -701,6 +725,11 @@ _sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
 # public name of the family, as it was when the family was one module.
 __all__ = sorted(name for name in set(globals()) | set(_EXPORTS) if not name.startswith("_"))
 
+if TYPE_CHECKING:  # the names ``__getattr__`` reads on first use, for type checkers
+    from kiro_crew.mcp_gateway.rewriter import (  # noqa: F401
+        default_overlay_dir,
+        default_socket_path,
+    )
 if TYPE_CHECKING:  # every owner-defined name this module forwards, for type checkers
     from kiro_crew.config.loader_agents import (  # noqa: F401
         _crew_autocompact_pct,
@@ -717,28 +746,38 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         _JSON_TYPE_LABELS,
         _MEMBER_HARNESS_KEY,
         _SECURITY_BOUNDED_FIELDS,
+        MEMBER_BACKEND_INHERITED_ATTR,
+        _agent_section_fields,
         _build_agent_config,
         _build_dashboard_config,
         _build_session_config,
         _build_telemetry_config,
         _builtin_adoption_markers,
         _builtin_adoption_nav,
+        _chat_runtime_sharing_harnesses,
         _clamp_compact_wait_secs,
         _clamp_security_bounds,
         _crew_mode_agent_or_default,
         _default_memory_mode_from,
         _default_session_folder_or_empty,
+        _dict_or_default,
         _feature_previews,
         _folder_sort_from,
         _jira_auth_entry,
+        _lane_weights_from,
         _load_background_hold_secs,
         _load_idle_exempt_keys,
         _log_config_clamp_event,
+        _market_registry_ids,
+        _member_fallback_logged,
         _member_remap_logged,
+        _note_member_fallback,
         _note_member_remap,
         _otlp_endpoint_rows,
+        _percent_list,
         _read_backend_choice,
         _registry_entry,
+        _resolved_kas_bundle,
         _restore_stored_harness_fields,
         _restore_stored_stt_provider,
         _session_folder_root_or_empty,
@@ -751,6 +790,8 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         _translucent_panels_from,
         consume_managed_service_launch_environment,
         launched_as_managed_service,
+        mark_member_backend_inherited,
+        member_backend_inherited,
         resolve_loop_stall_exit_after,
     )
     from kiro_crew.config.loader_credentials import (  # noqa: F401
@@ -776,6 +817,8 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         CRED_SLACK_BOT_TOKEN,
         CRED_TELEGRAM_BOT_TOKEN,
         CRED_WAKATIME_API_KEY,
+        CRED_WAKATIME_OAUTH_CLIENT_SECRET,
+        CRED_WAKATIME_OAUTH_TOKENS,
         CRED_WEBEX_BOT_TOKEN,
         CRED_WECOM_BOT_ID,
         CRED_WECOM_SECRET,
@@ -836,11 +879,14 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
     )
     from kiro_crew.config.loader_document import (  # noqa: F401
         _ABSENT_AGENT_KEY,
+        _RESOLVED_DEFAULT_AGENT_KEYS,
+        _SIDECAR_AGENTS_REPAIRED,
         _SIDECAR_BASE_SHADOW,
         _SIDECAR_BASE_UNREADABLE,
         _SIDECAR_OVERLAY_UNREADABLE,
         ConfigReadError,
         ConfigWriteRefused,
+        PendingEditBlocksSave,
         _agent_key_declared,
         _agent_key_on_disk,
         _aws_project_profiles_on_disk,
@@ -848,12 +894,15 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         _bind_content_digest,
         _cached_validated_data,
         _config_fingerprint,
+        _config_text_bytes,
         _config_write_lock,
         _content_digest_of,
         _deepseek_env_on_disk,
+        _held_lock_paths,
         _invalidate_config_cache,
         _lock_target,
         _notify_live_watch,
+        _prior_document,
         _raw_agent_section,
         _raw_config,
         _raw_stt_provider,
@@ -862,21 +911,27 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         _refuse_deepseek_env_plaintext,
         _refuse_unpublishable,
         _refuse_vault_env_plaintext,
+        _replace_keeping_unreadable,
         _shadowed_base_sections,
         _store_validated_data,
         _stored_agent_value,
         _type_names,
+        _write_lock_held,
         acp_backend_bundle_route,
         acp_backend_declared,
         acp_backend_overlay_owned,
         acp_backend_stored_as_kiro,
+        acp_backend_stored_runs_kas,
         coerce_config_field,
         coerce_dict_section,
         config_content_stamp,
+        kas_bundle_declared,
         member_acp_backend_declared,
         read_config_for_update,
         refresh_config_meta_stamp,
         stamp_config_meta,
+        strip_undeclared_resolved_defaults,
+        try_config_write_lock,
         unsandboxed_exec_declared,
         unsandboxed_exec_platform_default,
         update_config_locked,
@@ -899,11 +954,17 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         decisions_consent_path,
         denied_commands_path,
         materialize_workspace_dir,
+        memory_provider_bench_dir,
+        memory_provider_consent_path,
+        memory_provider_migrations_dir,
         normalize_workspace_path,
         oauth_endpoints_path,
         outbox_dir,
+        overlay_entry,
         overlay_pins,
+        project_hooks_consent_path,
         read_config_text,
+        read_endorsed_config_text,
         read_local_secret,
         read_merged_config_files,
         registry_trust_path,
@@ -917,6 +978,8 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         _TOP_LEVEL_DEFAULTS,
         ConfigDocument,
         _parse_app_settings,
+        _parse_template_settings,
+        _recording_config_reader,
         build_config,
         default_project_dir,
         load_config_with_content_stamp,
@@ -942,12 +1005,14 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         _MATERIALIZED_COMPLETE,
         _MATERIALIZED_LAST_DROPPED,
         _MATERIALIZED_MATE_ONLY,
+        _MATERIALIZED_MEMO,
         _MATERIALIZED_REFRESH_APPLIED,
+        _MATERIALIZED_REFRESH_FLIGHT,
         _MATERIALIZED_REFRESH_ISSUED,
+        _MATERIALIZED_SCAN_COUNTS,
         _MATERIALIZED_SEEN,
         _MATERIALIZED_SEEN_MAX,
         _MATERIALIZED_SEEN_NAME_MAX_CHARS,
-        _MATERIALIZED_SKIPPED,
         _MATERIALIZED_STEMS,
         _SCAN_STATE,
         DEFAULT_KIRO_TEMPLATE,
@@ -958,21 +1023,22 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         _locked_workspace_dir,
         _log_default_agent_reset,
         _materialized_kiro_agent,
+        _memo_key,
+        _MemoKey,
         _project_declares_agent,
         _project_scope_excludes,
         _read_hardened_agent_spec,
+        _refresh_or_reuse,
         _remember_seen,
         _removal_evidence,
         _report_dropped,
+        _scan_and_install,
         _scan_materialized_agents,
         _scan_materialized_index,
         _workspace_declares,
         agent_alias_snapshot,
         default_template,
         dispatch_kiro_agent,
-        materialized_agents_generation,
-        materialized_refresh_ticket,
-        materialized_skipped_stems,
         materialized_snapshot_complete,
         member_template_id,
         next_config_load_ticket,
@@ -984,6 +1050,7 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         published_autocompact_pct,
         published_config_timezone,
         refresh_materialized_agents,
+        rescan_before_refusal,
         reset_dangling_default_agent,
         resolve_effective_agent,
         schedule_materialized_agents_refresh,

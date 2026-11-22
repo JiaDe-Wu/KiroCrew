@@ -114,6 +114,7 @@ const PANEL_CHORDS = [
  */
 const RAIL_ROWS = [
   { route: '/chat', navId: 'chat', name: 'Sessions', aria: 'Alt+C', display: 'Alt + C' },
+  { route: '/projects', navId: 'projects', name: 'Task Runner', aria: 'Alt+P', display: 'Alt + P' },
   { route: '/schedule', navId: 'schedule', name: 'Schedule', aria: 'Alt+S', display: 'Alt + S' },
 ] as const
 
@@ -155,11 +156,11 @@ describe('nav shortcut hint — derivation from the registry', () => {
   })
 
   it('pins which rail routes carry a chord, so un-hiding a surface surfaces the question', () => {
-    // Two of the four panel chords have no rail row: /notifications is
-    // hiddenFromNav (topbar bell) and /projects is appOnly. Both are filtered
-    // out of the set the rail iterates, so the hint they would get has nowhere
-    // to render. Asserted as an equality rather than a containment: if either is
-    // un-hidden later, this reddens and the new row's hint gets considered.
+    // One of the four panel chords has no rail row: /notifications is
+    // hiddenFromNav (topbar bell), so it is filtered out of the set the rail
+    // iterates and the hint it would get has nowhere to render. Asserted as an
+    // equality rather than a containment: if it is un-hidden later, this reddens
+    // and the new row's hint gets considered.
     expect(railRoutesWithChord().sort()).toEqual(RAIL_ROWS.map(r => r.route).sort())
   })
 })
@@ -272,8 +273,8 @@ describe('App nav rail — rows declare and display their chord', () => {
   it('leaves a row with no chord undeclared, and that row is present', async () => {
     renderWithProviders(<App />, { route: '/chat' })
     // Presence first: an absent row would satisfy "no attribute" vacuously.
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Settings' })).toBeInTheDocument())
-    expect(screen.getByRole('button', { name: 'Settings' })).not.toHaveAttribute('aria-keyshortcuts')
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Account & Settings' })).toBeInTheDocument())
+    expect(screen.getByRole('button', { name: 'Account & Settings' })).not.toHaveAttribute('aria-keyshortcuts')
     expect(screen.getByRole('button', { name: 'Artifacts' })).not.toHaveAttribute('aria-keyshortcuts')
   })
 
@@ -323,7 +324,7 @@ describe('App nav rail — rows declare and display their chord', () => {
   it('drops every hint when shortcuts are switched off', async () => {
     localStorage.setItem(SHORTCUTS_ENABLED_KEY, '0')
     renderWithProviders(<App />, { route: '/chat' })
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Settings' })).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Account & Settings' })).toBeInTheDocument())
     for (const { name, navId } of RAIL_ROWS) {
       expect(screen.getByRole('button', { name })).not.toHaveAttribute('aria-keyshortcuts')
       expect(screen.queryByTestId(`nav-shortcut-${navId}`)).toBeNull()
@@ -357,16 +358,14 @@ describe('App topbar bell — the control Alt+N actually operates', () => {
     expect(bell()).toHaveAttribute('aria-keyshortcuts', 'Alt+N')
   })
 
-  it('keeps the chord OUT of the tooltip, because an attribute cannot be marked opaque', async () => {
+  it('keeps the chord OUT of the hover hint', async () => {
     renderWithProviders(<App />, { route: '/chat' })
     await waitFor(() => expect(bell()).toBeInTheDocument())
-    // Not a stylistic choice. The render-time i18n gate scans `title` for Latin
-    // runs under the en-XA pseudolocale and its attribute branch honours no
-    // `[data-i18n-opaque]` escape, so a chord here is 220 untranslated-attribute
-    // findings. Pinned so nobody "improves" it back: the tooltip is the base copy
-    // and nothing else, while aria-keyshortcuts above carries the chord.
-    expect(bell().getAttribute('title')).toBe('Notifications')
-    expect(bell().getAttribute('title')).not.toMatch(/Alt/)
+    // Pinned so nobody "improves" it: the hint is the base copy and nothing
+    // else, while aria-keyshortcuts above carries the chord and the visible
+    // chord stays a rail affordance.
+    expect(bell()).not.toHaveAttribute('title')
+    expect(bell()).toHaveAccessibleDescription('Notifications')
   })
 
   it('keeps the chord out of the bell accessible name', async () => {

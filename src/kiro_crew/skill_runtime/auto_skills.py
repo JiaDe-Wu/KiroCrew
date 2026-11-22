@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Literal
 
+from kiro_crew.skill_runtime import authoring as _authoring
+
 if TYPE_CHECKING:
     from kiro_crew.skills import AutoSkillProvenance, ClaimRefusal, SkillsLoader
 
@@ -75,7 +77,11 @@ def find_similar(
     for name, skill_file, _within in loader._iter():
         if exclude and name == exclude:
             continue
-        meta = loader._cached_frontmatter(skill_file, within=_within)
+        # A reader: one SKILL.md that is not UTF-8 is left out of the compare,
+        # never the whole dedupe (rationale on the helper).
+        meta = loader._readable_frontmatter(skill_file, within=_within)
+        if meta is None:
+            continue
         existing = meta.get("description", "")
         if not existing:
             continue
@@ -177,7 +183,7 @@ def create_auto_skill(
             # the safe side: overwriting destroys their content.
             logger.info("Auto skill %s claimed concurrently, skipping", name)
             return None
-    (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
+    _authoring._write_new_skill_md(skill_dir, content)
     loader._invalidate_iter_cache()  # new skill visible to trigger matching now
     logger.info("Created auto skill: %s", name)
     return name
@@ -259,13 +265,18 @@ def update_auto_skill(
         _vn = 0
     if _vn > 1:
         _carry.append(f"version: {_vn}")
-    if str(existing_meta.get("pinned", "")).strip().lower() in ("true", "1", "yes"):
+    if sk.frontmatter_pinned(existing_meta):
         _carry.append("pinned: true")
     if str(existing_meta.get("inject_on_trigger", "")).strip().lower() == "false":
         _carry.append("inject_on_trigger: false")
     if _carry:
         content = content.replace("\n---\n", "\n" + "\n".join(_carry) + "\n---\n", 1)
-    skill_file.write_text(content, encoding="utf-8")
+    # Atomic replace through update_skill's pinned-directory write, which keeps
+    # the file's mode and ACL: a write that fails part way must leave the live
+    # skill as it was, not truncated.
+    if not loader.update_skill(name, content):
+        logger.warning("Refusing to refine %s: its skill file could not be replaced", name)
+        return False
     loader._invalidate_iter_cache()  # so the refined triggers/description apply now
     logger.info("Refined auto skill: %s", name)
     return True
@@ -458,6 +469,8 @@ def run_skill_lifecycle(
 
     Returns a counts dict: ``{checked, marked_stale, archived, capped}``.
     """
+    from kiro_crew import skills as sk  # circular import: the facade imports this module
+
     if now is None:
         now = time.time()
     if cron_referenced is None:
@@ -475,7 +488,7 @@ def run_skill_lifecycle(
         # recorded rather than reading it unconfined for a ranking signal.
         meta = loader._cached_frontmatter(Path(s["path"]), within=s.get("confine_root"))
         hits, anchor = loader._auto_activity(key, s["path"], meta)
-        pinned = str(meta.get("pinned", "")).strip().lower() == "true"
+        pinned = sk.frontmatter_pinned(meta)
         slug = key.split("/")[-1]
         exempt_row = (
             pinned

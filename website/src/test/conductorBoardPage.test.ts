@@ -230,7 +230,7 @@ describe('kirocrew-conductor page', () => {
     const band = document.querySelector('#cb-you .band')
     expect(band).not.toBeNull()
     expect(all('#cb-you .v').map((n) => n.textContent)).toEqual(['Approve the merge of PR 4', HOSTILE])
-    expect(text('#cb-you .tag')).toBe('your Bot wrote this')
+    expect(text('#cb-you .tag')).toBe('your bot wrote this')
     expect(text('#cb-you .band')).toContain('Nothing sends until you press send.')
     expect(document.querySelector('#cb-you img')).toBeNull()
   })
@@ -268,6 +268,29 @@ describe('kirocrew-conductor page', () => {
     expect(text('#cb-you .v')).toBe('stuck one \u2014 is stuck (approval)')
   })
 
+  it("drops an answered ask from needs you when the host's awaits_person says so", () => {
+    mount({
+      items: [
+        item({ item_id: 'a', title: 'answered', status: 'question', awaits_person: false }),
+        item({ item_id: 'b', title: 'still asking', status: 'blocked', reason: 'needs_human', awaits_person: true }),
+      ],
+    })
+    expect(text('#cb-you .v')).toBe('still asking \u2014 is stuck (needs a person)')
+    expect(all('#cb-you .v')).toHaveLength(1)
+    const pills = all('#cb-tasks .card').map((c) => [c.querySelector('.t')?.textContent, c.querySelector('.pill')?.textContent])
+    expect(pills).toContainEqual(['still asking', 'needs you'])
+    expect(pills).not.toContainEqual(['answered', 'needs you'])
+  })
+
+  it('redraws a task card once its ask is answered and nothing else changed', () => {
+    const asked = { item_id: 'a', title: 'one', status: 'question', reason: 'approval', worker: 'idle' }
+    mount({ items: [item({ ...asked, awaits_person: true })] })
+    expect(text('#cb-tasks .card .pill')).toBe('needs you')
+    refill({ items: [item({ ...asked, awaits_person: false })] })
+    expect(text('#cb-tasks .card .pill')).not.toBe('needs you')
+    expect(document.querySelector('#cb-tasks .card button.reply')).toBeNull()
+  })
+
   it('shows the published note as the Bot wrote it', () => {
     mount({
       items: [],
@@ -281,7 +304,7 @@ describe('kirocrew-conductor page', () => {
     // The stamp is shown in the reader's own format, never as the raw string.
     expect(note?.textContent).toContain('sent ')
     expect(note?.textContent).not.toContain('2026-10-13T02:00:00')
-    expect(text('#cb-note .tag')).toBe('your Bot wrote this')
+    expect(text('#cb-note .tag')).toBe('your bot wrote this')
     expect(document.querySelector('#cb-note img')).toBeNull()
   })
 
@@ -394,7 +417,7 @@ describe('kirocrew-conductor page', () => {
 
   it('says there is no goal yet instead of a dash', () => {
     mount({})
-    expect(text('h1')).toBe('No goal yet. Give this Bot one in chat.')
+    expect(text('h1')).toBe('No goal yet. Give this bot one in chat.')
   })
 
   it('says so when the board is empty and nothing needs the reader', () => {

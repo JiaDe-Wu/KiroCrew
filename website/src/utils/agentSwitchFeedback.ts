@@ -43,15 +43,36 @@ export function isMemberNeedsNewChatError(error: unknown): boolean {
   )
 }
 
+/**
+ * Whether *error* is the refusal to move a conductor mode chat off its agent
+ * (HTTP 409, `crew_mode_locked`). Same structural match as
+ * `isTurnInFlightError`.
+ */
+export function isCrewModeLockedError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false
+  const { status, body } = error as { status?: unknown; body?: unknown }
+  return (
+    status === 409
+    && typeof body === 'string'
+    && parseErrorCode(body) === 'crew_mode_locked'
+  )
+}
+
 /** What the shared switch notice shows. `newChatAgent` names a crewmate the
- *  notice offers to open a new chat with. `error` marks a failure or refused
+ *  notice offers to open a new chat with. `openSlot` names a session that
+ *  was started without opening it (a follow-up run), which the notice offers
+ *  to open. `error` marks a failure or refused
  *  request (a switch or setting write, a folder create), which the notice
  *  renders through ErrorNotice with its agent hand-off; without it the message
  *  is plain status text for something that did not fail (a deferred model
  *  pick, no effort to cycle, no closed session to reopen, the focus-mode hint). */
 export interface AgentSwitchNotice {
   message: string
+  /** An error notice's plain-language lead, shown before `message`; `message`
+   *  stays the raw failure so the agent hand-off can find its journal entry. */
+  title?: string
   newChatAgent?: string
+  openSlot?: string
   error?: true
 }
 
@@ -76,6 +97,9 @@ export function agentSwitchFailureNotice(error: unknown, name: string): AgentSwi
       error: true,
     }
   }
+  // A locked conductor mode chat is working as designed: plain status, not an
+  // error card.
+  if (isCrewModeLockedError(error) && name) return { message: agentSwitchFailureMessage(error, name) }
   return agentSwitchErrorNotice(error)
 }
 
@@ -96,9 +120,15 @@ export function agentSwitchFailureNotice(error: unknown, name: string): AgentSwi
  * when the rejection carries no usable message, so a non-Error throw still
  * surfaces.
  */
-export function agentSwitchFailureMessage(error: unknown): string {
+export function agentSwitchFailureMessage(error: unknown, agent = ''): string {
   if (isTurnInFlightError(error)) {
     return i18nT('utils.agentSwitchFeedback.turn_in_flight')
+  }
+  // The picker, `/agent` and the keyboard cycle were refused outright: the chat
+  // stays on its agent and no turn restarts, so this is not the in-turn
+  // transcript note's copy.
+  if (agent && isCrewModeLockedError(error)) {
+    return i18nT('utils.agentSwitchFeedback.crew_mode_locked', { agent })
   }
   // `errMessage` owns reading a message off a rejection object, including the
   // plain serialized form a Redux Toolkit thunk boundary produces, so this stops

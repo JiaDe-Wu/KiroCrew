@@ -99,6 +99,16 @@ describe('selectContinuable', () => {
     }))).toBe(true)
   })
 
+  it("reads a harness advisory as the turn's answer, and a mode report not", () => {
+    // Mirrors `test_a_turn_an_advisory_answered_does_not_read_as_interrupted`.
+    const advisory = msg('notice', '⚠️ Stop says: the test suite is still failing', { kind: 'harness_advisory' })
+    expect(selectTurnInterrupted(state({ messages: [msg('user'), advisory] }))).toBe(false)
+    expect(selectTurnInterrupted(state({ messages: [msg('user'), advisory, msg('error', 'boom')] }))).toBe(true)
+    // A held advisory the runner's teardown lands after the error row.
+    expect(selectTurnInterrupted(state({ messages: [msg('user'), msg('error', 'boom'), advisory] }))).toBe(true)
+    expect(selectTurnInterrupted(state({ messages: [msg('user'), msg('notice', 'ℹ️ This session switched to Plan mode.')] }))).toBe(true)
+  })
+
   it('is true when tool rows ran but no assistant text landed', () => {
     expect(selectContinuable(state({
       messages: [msg('user'), msg('tool_call', 'grep'), msg('tool_result', 'hit')],
@@ -154,6 +164,10 @@ describe('selectContinuable', () => {
     // `relay_archive_refusal` answers 409 `relay_archive_read_only` for
     // `executor == "remote"`, so an offer here is a button that cannot work.
     expect(selectContinuable(state({ messages: [msg('user')] }, [{ key: 'slot-1', executor: 'remote' }]))).toBe(false)
+  })
+
+  it('is false on a read-only cron run transcript — the server refuses Continue there too', () => {
+    expect(selectContinuable(state({ messages: [msg('user')] }, [{ key: 'slot-1', executor: 'local', cron_run_read_only: true }]))).toBe(false)
   })
 
   it('is false on a crew-bound slot whose relayed turn died mid-stream', () => {
@@ -292,6 +306,18 @@ describe('selectContinuable', () => {
     expect(selectContinuable(state({
       messages: [msg('user'), msg('inject', '[Continue — requested by the user]\nresume')],
     }))).toBe(true)
+  })
+
+  it("is true when a heartbeat prompt is the chat's only request and its turn failed", () => {
+    expect(selectContinuable(state({
+      messages: [msg('inject', '💓 Heartbeat\n\nreport', { injectKind: 'heartbeat' }), msg('error', 'session start timed out')],
+    }))).toBe(true)
+  })
+
+  it('is false when only a non-heartbeat inject row is present', () => {
+    expect(selectContinuable(state({
+      messages: [msg('inject', 'resume', { injectKind: 'recovery' })],
+    }))).toBe(false)
   })
 })
 
@@ -573,6 +599,11 @@ describe('slotIsRemoteBound', () => {
     expect(slotIsRemoteBound({})).toBe(false)
   })
 
+  it('is true for a cron run transcript reopened read-only — the server answers 409 `cron_run_read_only`', () => {
+    expect(slotIsRemoteBound({ executor: 'local', cron_run_read_only: true })).toBe(true)
+    expect(slotIsRemoteBound({ executor: 'local', cron_run_read_only: false })).toBe(false)
+  })
+
   it('is false for a missing slot (null / undefined)', () => {
     expect(slotIsRemoteBound(undefined)).toBe(false)
     expect(slotIsRemoteBound(null)).toBe(false)
@@ -582,5 +613,41 @@ describe('slotIsRemoteBound', () => {
     // The server refuses this same half-open shape; the predicate must agree by
     // reading `executor` alone, never the presence of an `instance_id`.
     expect(slotIsRemoteBound({ instance_id: 'nobita' } as { executor?: string })).toBe(false)
+  })
+})
+
+describe('selectTurnInterrupted on a model the backend refused', () => {
+  // The terminal card a spent ladder leaves on a capacity/rollout refusal
+  // settles the turn: Resume would send it to the same refused model. Mirrors
+  // `is_model_unavailable_row` in `state_parts/transcript_rows.py`.
+  const card = (carrier: 'meta' | 'kind') =>
+    carrier === 'meta'
+      ? msg('error', "❌ Model 'claude-haiku-5.5' is unavailable", { kind: 'model_unavailable' })
+      : ({ ...msg('error', "❌ Model 'claude-haiku-5.5' is unavailable"), kind: 'model_unavailable' } as ChatMessage)
+
+  it.each(['meta', 'kind'] as const)('reads the card as settled (%s carrier)', carrier => {
+    expect(selectTurnInterrupted(state({ messages: [msg('user'), card(carrier)] }))).toBe(false)
+  })
+
+  it('looks past the retry notices before the card', () => {
+    const retrying = msg('error', '⟳ Connection unstable — retrying…')
+    expect(selectTurnInterrupted(state({ messages: [msg('user'), retrying, card('meta')] }))).toBe(false)
+  })
+
+  it('still counts a later unanswered turn as interrupted', () => {
+    expect(selectTurnInterrupted(state({ messages: [msg('user'), card('meta'), msg('user', 'again')] }))).toBe(true)
+  })
+
+  it('still counts a later sub-agent completion turn as interrupted', () => {
+    const sub = msg('subagent', '[sub-agent completion]')
+    expect(selectTurnInterrupted(state({ messages: [msg('user'), card('meta'), sub] }))).toBe(true)
+    expect(selectTurnInterrupted(state({ messages: [msg('user'), card('meta'), sub, msg('error', '❌ HTTP 503')] }))).toBe(true)
+  })
+
+  it.each([
+    ['a throttle', msg('error', '❌ Bedrock is throttling requests.')],
+    ['another kind', msg('error', '❌ limit', { kind: 'usage_limit' })],
+  ])('keeps Resume on %s', (_label, row) => {
+    expect(selectTurnInterrupted(state({ messages: [msg('user'), row] }))).toBe(true)
   })
 })

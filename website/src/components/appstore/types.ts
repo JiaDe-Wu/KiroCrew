@@ -102,6 +102,12 @@ export type RegistryApp = {
   verified?: boolean
   installed: boolean
   installedVersion?: string
+  /**
+   * `"market"` when the installed app of this name came from a Kiro Space store
+   * (its source is `market:<ref>@<n>`). The row then offers no Update: that would
+   * reinstall it from this git row.
+   */
+  installedFrom?: 'market'
   enabled?: boolean
   updateAvailable?: boolean
   origin?: string     // "builtin" | "registry" | "local" | "external"
@@ -112,7 +118,8 @@ export type RegistryApp = {
     // global shortcuts, tray). A UX gate only — the marker is client-side.
     requiresDesktopApp?: boolean }
   manifest?: {
-    permissions?: { sessionApproval?: boolean }
+    permissions?: { api?: string[]; sessionApproval?: boolean; memberThreads?: boolean; workerAutoApprove?: boolean; chatSlots?: boolean; hiddenSessions?: boolean; chatLaunch?: unknown; reachableByUserSessions?: string[]; desktopCapabilities?: string[]; browser?: string[]; webhookSource?: boolean }
+    mcpServers?: Record<string, McpServerView>
     platform?: { requiresDesktopApp?: boolean }
   }
 }
@@ -124,6 +131,7 @@ export type RegistryApp = {
 export type AdoptionReasonCode =
   // Transient: retried with backoff.
   | 'network_unreachable' | 'network_timeout' | 'http_status' | 'disk_full' | 'config_unreadable'
+  | 'stage_io_failed'
   // Deterministic, re-checked each boot without a network call.
   | 'admission_denied' | 'trust_conflict' | 'trust_overlay_owned' | 'permission_widening'
   | 'platform_mismatch' | 'host_too_old' | 'host_sdk_too_old'
@@ -155,7 +163,7 @@ export type InstalledApp = {
   enabled: boolean
   sessionApprovalConsentPending?: boolean
   /** Approved api/events entries, present only while an update's new ones await approval. */
-  approvedGrants?: { api?: string[]; events?: string[] }
+  approvedGrants?: { api?: string[]; events?: string[]; bots?: string[] }
   /** Approved link-preview hosts and text patterns, and the ones an update holds back. */
   linkPreviewGrant?: LinkPreviewGrantRow
   /** Approved message actions, and the entries an update holds back. */
@@ -165,6 +173,20 @@ export type InstalledApp = {
   composerActionGrant?: ComposerActionGrantRow
   /** Approved selection-action items, and the changed ones an update holds back. */
   selectionActionGrant?: SelectionActionGrantRow
+  /** Whether the owner approved `permissions.workerAutoApprove`; absent when undeclared. */
+  workerAutoApproveGrant?: { approved: boolean; staged: boolean }
+  /** `permissions.reachableByUserSessions` verbs the owner approved, and the ones an update holds back; absent when undeclared. */
+  userSessionReachGrant?: { approved: string[]; staged: string[] }
+  /** `permissions.desktopCapabilities` the owner approved, and the ones an update holds back; absent when undeclared. */
+  desktopCapabilitiesGrant?: { approved: string[]; staged: string[] }
+  /** `ui.frameSources` origins the owner approved, and the ones an update or edit holds back; absent when undeclared. */
+  frameSourcesGrant?: { approved: string[]; staged: string[] }
+  /** `permissions.browserSites` pages the owner approved, and the ones waiting; absent when undeclared. */
+  browserSitesGrant?: { approved: string[]; staged: string[] }
+  /** `permissions.kiroOperations` the owner approved, and the ones waiting; absent when undeclared. */
+  kiroOperationsGrant?: { approved: string[]; staged: string[] }
+  /** `permissions.browser` verbs the owner approved, the ones waiting, and whether the `app_browser_sdk` preview is on; absent when undeclared. */
+  browserGrant?: { approved: string[]; staged: string[]; preview: boolean }
   installedAt: string
   source?: string
   origin?: string     // "builtin" | "registry" | "local" | "external"
@@ -234,6 +256,8 @@ export type InstalledApp = {
       panelTabs?: unknown
       messageActions?: unknown
     }
+    /** Normalized by `mcpServerConfigs`: object entries only, display fields typed. */
+    mcpServers?: Record<string, McpServerView>
     permissions?: {
       api?: string[]
       events?: string[]
@@ -242,6 +266,18 @@ export type InstalledApp = {
       cron?: boolean
       network?: boolean
       sessionApproval?: boolean
+      memberThreads?: boolean
+      workerAutoApprove?: boolean
+      chatSlots?: boolean
+      hiddenSessions?: boolean
+      chatLaunch?: unknown
+      reachableByUserSessions?: string[]
+      desktopCapabilities?: string[]
+      /** `permissions.browser` verbs (apps/browser_sdk.py). */
+      browser?: string[]
+      webhookSource?: boolean
+      /** Bot scopes, `"read"` and `"wake"` (apps/bot_grants.py). */
+      bots?: string[]
     }
     setup?: { onInstall?: string; onUpdate?: string; onUninstall?: string; onEnable?: string; onDisable?: string }
     minKiroCrewVersion?: string
@@ -307,6 +343,8 @@ export function sourceLabel(app: Pick<RegistryApp, '_registry' | 'origin' | 'pro
   if (app.provenance === 'official' || app.provenance === 'core') {
     return i18nT('components.appstore.types.kirocrew_registry')
   }
+  // An installed record carries no ``provenance``: a local install claims no registry.
+  if (app.origin === 'local') return i18nT('appStoreSources.local')
   // Legacy fallback (older gateway: no ``provenance`` field).
   if (app.origin === 'builtin') return i18nT('components.appstore.types.built_in')
   return i18nT('components.appstore.types.kirocrew_registry')
@@ -367,6 +405,112 @@ export function isRegistrySourced(app: Pick<InstalledApp, 'source' | 'origin'>):
 }
 
 /**
+ * Whether an installed app came from a Kiro Space store (`market:<ref>@<n>`).
+ *
+ * Such an app has no Sync and no Update yet: its recorded source is not a folder,
+ * and the gateway refuses both (`app_update_market_source`). Same untrusted-shape
+ * guard as {@link isRegistrySourced}.
+ */
+export function isMarketSourced(app: Pick<InstalledApp, 'source'>): boolean {
+  return typeof app.source === 'string' && app.source.startsWith('market:')
+}
+
+/** One Kiro Space store the build offers (`GET /api/apps/market/registries`). */
+export type MarketRegistryOffer = { id: string; label: string; web: string }
+
+/** A store's sign-in state; `detail` says why it is `unknown`, when known. */
+export type MarketRegistryStatus = {
+  state: 'signed_in' | 'needs_sign_in' | 'no_access' | 'unknown'
+  account: string
+  detail?: 'cli_missing' | 'cli_outdated'
+}
+
+export type MarketRegistriesResponse = {
+  offers: MarketRegistryOffer[]
+  added: string[]
+  status: Record<string, MarketRegistryStatus>
+}
+
+/** A number the store gave (`ok`), did not give (`absent`) or could not read. */
+export type MarketCount = { status: 'ok'; value: number } | { status: 'absent' | 'unavailable' }
+
+/** One app listing in a Kiro Space store, as the gateway shapes it. */
+export type MarketListingRow = {
+  registry: string
+  ref: string
+  name: string
+  displayName: string
+  summary: string
+  category: string
+  tags: string[]
+  publisher: string
+  latestVersion: number | null
+  latestSemver: string
+  trust: string
+  official: boolean
+  canPublish: boolean
+  rating: MarketCount
+  ratingCount: MarketCount
+  downloads: MarketCount
+  installed: boolean
+  installedVersion: number | null
+  /** An app of this name is installed from another source. */
+  nameTaken: boolean
+  lastPublishedAt?: string
+}
+
+/** A failed store read: the code, and the status read again after it. */
+export type MarketReadError = { code: string }
+
+export type MarketListingsResponse = {
+  ok: boolean
+  registry: string
+  status: MarketRegistryStatus
+  /** The account the rows were read for; `''` with no rows. */
+  account: string
+  rows: MarketListingRow[]
+  truncated: boolean
+  error?: MarketReadError
+}
+
+export type MarketListingResponse = {
+  ok: boolean
+  registry: string
+  status: MarketRegistryStatus
+  /** The account the listing was read for; `''` without one. */
+  account: string
+  listing: MarketListingRow | null
+  error?: MarketReadError
+}
+
+/** A store sign-in view: a device code and the page to approve it on. */
+export type MarketSignInView = {
+  ok: boolean
+  registry: string
+  state?: string
+  reason?: string
+  code?: string
+  approvalPage?: string
+}
+
+/** The confirm data `POST /api/apps/market/install` answers (`build_confirm`). */
+export type MarketInstallConfirm = {
+  app: { ref: string; version: number; appVersion: string; publisher: string; sha256Prefix: string }
+  components: { kind: string; name: string; sha256Prefix: string }[]
+  permissions: {
+    notice: string
+    commands: string[]
+    network: string[]
+    files: string[]
+    background: string[]
+    mcpServers: string[]
+    agents: string[]
+  }
+  size: number
+  trustLabel: string
+}
+
+/**
  * Sanitize a self-reported GitHub star count for display.
  *
  * Internal to `normalizeRegistryApp`: every surface that renders a registry
@@ -379,6 +523,59 @@ export function isRegistrySourced(app: Pick<InstalledApp, 'source' | 'origin'>):
  */
 function sanitizeStargazersCount(v: unknown): number | undefined {
   return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : undefined
+}
+
+/** One `mcpServers` entry as the detail page's MCP card reads it. */
+export interface McpServerView {
+  url?: string
+  command?: string
+  autoApprove?: string[]
+  [key: string]: unknown
+}
+
+/**
+ * `mcpServers` from third-party app.json. The manifest parser checks only that
+ * the map is an object, so an entry can be `null`, a string, or carry a
+ * non-list `autoApprove`; keep object entries and type the fields the card
+ * renders, so one bad entry cannot take the page down.
+ */
+export function mcpServerConfigs(v: unknown): Record<string, McpServerView> | undefined {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined
+  // `fromEntries` defines each name as an own key, so a server named
+  // `__proto__` (a plain JSON key the backend registers and launches) stays
+  // listed instead of hitting the object-literal prototype setter.
+  return Object.fromEntries(
+    Object.entries(v as Record<string, unknown>)
+      .filter(([, raw]) => raw && typeof raw === 'object' && !Array.isArray(raw))
+      .map(([name, raw]) => {
+        const c = raw as Record<string, unknown>
+        const view: McpServerView = {
+          ...c,
+          url: typeof c.url === 'string' ? c.url : undefined,
+          command: typeof c.command === 'string' ? c.command : undefined,
+          autoApprove: Array.isArray(c.autoApprove) ? c.autoApprove.filter((t): t is string => typeof t === 'string') : [],
+        }
+        return [name, view]
+      }),
+  )
+}
+
+/**
+ * A store row's `manifest.permissions`, read the way the manifest parser grants
+ * them (`Permissions.from_dict`): a yes/no grant only on a literal `true`, a list
+ * grant only from a real list of strings, `memory` only as a string. The row
+ * carries the raw app.json block, so `"storage": "false"` or `"api": "/x"`
+ * would otherwise show as granted or reach `.map`.
+ */
+export function storePermissions(v: unknown): Record<string, unknown> | undefined {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined
+  const p = v as Record<string, unknown>
+  const list = (x: unknown) => (Array.isArray(x) ? x.filter((s): s is string => typeof s === 'string') : [])
+  const out: Record<string, unknown> = { ...p }
+  for (const k of ['api', 'events', 'mcpTools', 'reachableByUserSessions']) out[k] = list(p[k])
+  for (const k of ['storage', 'network', 'cron', 'sessionApproval', 'memberThreads', 'workerAutoApprove']) out[k] = p[k] === true
+  out.memory = typeof p.memory === 'string' ? p.memory : ''
+  return out
 }
 
 /**
@@ -402,6 +599,18 @@ export function normalizeRegistryApp(raw: RegistryApp): RegistryApp {
     version: str(raw?.version, '0.0.0'),
     author: str(raw?.author),
     tags: Array.isArray(raw?.tags) ? raw.tags.filter((t): t is string => typeof t === 'string') : [],
+    // The store page maps these; app.json is third-party, so a string or an
+    // object here would otherwise reach `.map` (the installed path coerces too).
+    highlights: Array.isArray(raw?.highlights) ? raw.highlights.filter((h): h is string => typeof h === 'string') : [],
+    ...(raw?.manifest && typeof raw.manifest === 'object'
+      ? {
+          manifest: {
+            ...raw.manifest,
+            mcpServers: mcpServerConfigs(raw.manifest.mcpServers),
+            permissions: storePermissions(raw.manifest.permissions),
+          },
+        }
+      : {}),
     stargazersCount: sanitizeStargazersCount(raw?.stargazersCount),
   }
 }
@@ -464,6 +673,7 @@ export function normalizeInstalledApp<T extends InstalledApp>(raw: T): T {
       tags: strings(manifest.tags),
       jobFamilies: strings(manifest.jobFamilies),
       highlights: strings(manifest.highlights),
+      mcpServers: mcpServerConfigs(manifest.mcpServers),
       useCases: strings(manifest.useCases),
       configuration: strings(manifest.configuration),
       // Art fields, coerced here for the reason in this function's docstring: the

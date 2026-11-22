@@ -17,7 +17,13 @@ projection does not bridge such an entry). Redirects are not followed, so a
 header is only ever sent to the recorded url's origin. No header value is ever
 written to stderr or into an error the engine sees.
 
-Standard library only: the engine starts this once per server.
+Standard library only, plus the standard-library leaf
+:mod:`kiro_crew.mcp_structured_text`, until a request fails: the engine starts
+this once per server. A failed request then imports
+:mod:`kiro_crew.asset_downloader`, which carries the platform layer, to name its
+cause in plain words (``connection refused``). A result whose payload is only in
+``structuredContent`` is relayed with that object added as a JSON text block,
+since the engine reads only ``content``.
 """
 
 from __future__ import annotations
@@ -33,6 +39,8 @@ import urllib.parse
 import urllib.request
 from typing import IO, Any, Iterator
 
+from kiro_crew.mcp_structured_text import with_structured_text
+
 _SESSION_HEADER = "Mcp-Session-Id"
 _PROTOCOL_HEADER = "MCP-Protocol-Version"
 #: How long one read from the server may block. A tool call can run for minutes;
@@ -42,6 +50,10 @@ _READ_TIMEOUT_SECS = 600.0
 _DRAIN_SECS = 5.0
 #: JSON-RPC "server error" range; the bridge's own failures use it.
 _BRIDGE_ERROR = -32000
+#: Sent unless the entry's own headers name one. urllib's default
+#: ``Python-urllib/x.y`` is refused 403 by bot filters (Atlassian Rovo's), which
+#: then reads as a bad auth header.
+_USER_AGENT = "kirocrew-mcp-bridge/1"
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -89,6 +101,14 @@ def _opener(url: str = "") -> urllib.request.OpenerDirector:
     if parts.scheme.lower() == "http" and _normalized_host(parts.hostname) in _LOOPBACK_HOSTS:
         handlers.append(urllib.request.ProxyHandler({}))
     return urllib.request.build_opener(*handlers)
+
+
+def _network_cause(exc: BaseException) -> str:
+    """:func:`kiro_crew.asset_downloader.network_failure_cause`, imported once a request
+    failed: at module scope every server start would pay for the platform layer."""
+    from kiro_crew.asset_downloader import network_failure_cause
+
+    return network_failure_cause(exc)
 
 
 def _request_ids(msg: Any) -> list[Any]:
@@ -146,6 +166,8 @@ class Bridge:
     ) -> None:
         self._url = url
         self._headers = dict(headers)
+        if not any(name.lower() == "user-agent" for name in self._headers):
+            self._headers["User-Agent"] = _USER_AGENT
         self._server = server
         self._out, self._err = out, err
         self._opener = opener or _opener(url)
@@ -180,6 +202,11 @@ class Bridge:
                         version = result.get("protocolVersion")
                         if isinstance(version, str) and version:
                             self._protocol = version
+                    # The engine reads only ``content``: a payload only in
+                    # ``structuredContent`` reached it as no output.
+                    with_text = with_structured_text(result)
+                    if with_text is not None:
+                        item = {**item, "result": with_text}
                 self._out.write(json.dumps(item, separators=(",", ":")).encode("utf-8") + b"\n")
             self._out.flush()
         return answered
@@ -239,7 +266,7 @@ class Bridge:
             self._fail(ids, f"could not be reached ({type(exc).__name__})")
             return
         except (urllib.error.URLError, OSError, ValueError) as exc:
-            reason = getattr(exc, "reason", None) or type(exc).__name__
+            reason = _network_cause(exc) or getattr(exc, "reason", None) or type(exc).__name__
             self._fail(ids, f"could not be reached ({reason})")
             return
         answered: list[Any] = []
@@ -262,7 +289,8 @@ class Bridge:
             self._fail([i for i in ids if i not in answered], f"stopped answering ({reason})")
             return
         except OSError as exc:
-            self._fail([i for i in ids if i not in answered], f"stopped answering ({exc})")
+            reason = _network_cause(exc) or str(exc)
+            self._fail([i for i in ids if i not in answered], f"stopped answering ({reason})")
             return
         missing = [i for i in ids if i not in answered]
         if missing:

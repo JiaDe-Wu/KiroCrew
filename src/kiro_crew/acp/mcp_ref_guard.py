@@ -15,7 +15,7 @@ finding differently.
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from typing import Any
 
 from kiro_crew.acp.mcp_session_report import NAME_CAP, sanitize_sink_text
@@ -129,11 +129,13 @@ def warn_unresolved_server_refs(
     backend: str,
     agent: str,
     gateway_enabled: bool,
+    mcp_json: Iterable[str] = (),
 ) -> list[str]:
     """Evaluate the detector and log ONE structured line when it finds something.
 
     Returns the refs -- SANITIZED -- so a caller can also record them where a user
-    will see them.
+    will see them. *mcp_json* is handed to the resolver unchanged: the servers the
+    spec's opt-in mounts from the user's ``mcp.json``, read in the caller's hop.
 
     **A ref is untrusted text, and this is the boundary where it becomes a sink
     payload.** It is the substring of a ``tools`` entry after ``@``, so its content
@@ -155,7 +157,9 @@ def warn_unresolved_server_refs(
     channel is the projection. Reading the line without knowing which world it
     came from is what made this defect take three diagnoses.
     """
-    raw = drop_gate_withheld(unresolved_server_refs(spec, wire_servers, backend=backend))
+    raw = drop_gate_withheld(
+        unresolved_server_refs(spec, wire_servers, backend=backend, mcp_json=mcp_json)
+    )
     if not raw:
         return []
     unresolved = [safe for safe in (sanitize_sink_text(ref, NAME_CAP) for ref in raw) if safe]
@@ -332,7 +336,11 @@ def warn_unset_env_placeholders(
     skipped, because its text can carry one. Returns ``(entries, omitted)``
     exactly as :func:`warn_remote_header_secret_refs` does.
     """
-    from kiro_crew.mcp_gateway.rewriter import _ENV_VAR_PLACEHOLDER, _placeholder_source_env
+    from kiro_crew.mcp_gateway.rewriter import (
+        _ENV_VAR_PLACEHOLDER,
+        _placeholder_source_env,
+        _placeholder_value,
+    )
 
     routed_view = _placeholder_source_env()
     found: list[str] = []
@@ -346,13 +354,17 @@ def warn_unset_env_placeholders(
             values = [item.get("value") for item in env if isinstance(item, Mapping)]
         else:
             values = []
-        present = child_env if by_kiro_cli else routed_view
         unset = dict.fromkeys(
             ref
             for value in values
             if isinstance(value, str)
             for ref in _ENV_VAR_PLACEHOLDER.findall(value)
-            if ref.isidentifier() and ref not in present
+            if ref.isidentifier()
+            and (
+                ref not in child_env
+                if by_kiro_cli
+                else _placeholder_value(routed_view, ref) is None
+            )
         )
         server = sanitize_sink_text(name, NAME_CAP)
         names = [n for n in (sanitize_sink_text(ref, NAME_CAP) for ref in unset) if n]

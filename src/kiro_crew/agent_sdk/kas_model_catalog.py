@@ -1,9 +1,11 @@
 """The KAS engine's model catalog, read off the ``model`` select it advertises.
 
-Measured on the bundled engine (KAS 0.66.33, run from Kiro Crew's own install
+Measured on the bundled engine (KAS 0.66.117, run from Kiro Crew's own install
 with no kiro-cli on the host; the frame is
-``test/fixtures/acp_frames/kas/bundle-session-live.jsonl``): a ``session/new``
-response carries NO ``models`` object. The model list is the ``configOptions``
+``test/fixtures/acp_frames/kas/bundle-session-live.jsonl``): neither the
+``session/new`` response nor the ``config_option_update`` that follows it carries
+a ``models`` object, and from 0.66.117 the ``model`` select comes only in that
+update, not in the response. The model list is the ``configOptions``
 ``model`` select alone, one option per served model --
 ``{value, name, description, _meta.kiro.{rateMultiplier, rateUnit, hasEffort,
 ...}}`` -- and no option carries a structured context-window field.
@@ -11,7 +13,8 @@ response carries NO ``models`` object. The model list is the ``configOptions``
 On kiro-cli's relay route the dashboard picker reads ``kiro-cli chat
 --list-models`` (``dashboard/handlers/agents.py``), a catalog kiro-cli prints
 from its account API. On the bundle route there is no kiro-cli to ask, so the
-select IS the catalog. This module turns the select into rows shaped like that
+select IS the catalog, and so it is on a relay started on Crew's sign-in alone
+once kiro-cli's gate refuses. This module turns the select into rows shaped like that
 ``--list-models`` catalog (``model_id`` / ``model_name`` / ``display_name`` /
 ``description`` / ``rate_multiplier``), so the readers that already consume
 catalog rows -- ``model_registry.refresh_kiro_catalog`` for the ``acp``
@@ -21,7 +24,7 @@ session's advertised (entitlement) list; see model-selection.md, "KAS sends no
 ``models`` object". It is a catalog, read the way the kiro-cli catalog is.
 
 The last select a KAS session advertised is kept in memory, process-wide, for
-``GET /api/models`` on the bundle route (``dashboard/handlers/models_kas_bundle.py``).
+``GET /api/models`` on those routes (``dashboard/handlers/models_kas_bundle.py``).
 In memory only, like the catalog's prices: what the engine serves is a fact
 about the account signed in NOW, so a cold process has no catalog until a
 session advertises one. A select is what ONE account is served, so the
@@ -34,8 +37,9 @@ dashboard's sign-in card, or ``kirocrew kas login`` / ``kas logout`` in a shell
 -- and needs no notice from the writer.
 Recorded by the shared-runtime driver (``AcpSessionHandle.store_session_config``;
 KAS runs on ``AcpRuntime`` only, ``ACP_BACKENDS_ACP_RUNTIME``) on a positive KAS
-identity, so a KAS session on either route records; only the bundle-route picker
-READS it.
+identity, so a KAS session on either route records; the picker READS it on the
+bundle route, and on the relay only where that relay starts on Crew's sign-in
+alone and kiro-cli's gate refuses.
 """
 
 from __future__ import annotations
@@ -150,8 +154,13 @@ def vault_identity() -> str:
 
     Blocking (reads the vault); call off the loop. Never raises. The one read
     both the KAS harness's stamp (``acp/harness/kas.py``, ``SessionExtras.vault_identity``)
-    and the picker's match go through.
+    and the picker's match go through. On a workload-identity host it is the
+    workload's own key, and the vault is not read.
     """
+    from kiro_crew import workload_identity
+
+    if workload_identity.active():
+        return workload_identity.catalog_identity()
     # Deferred: kiro_crew.auth pulls the ``cryptography`` wheel, which must not
     # load on the session drivers' import path (see kiro_crew.acp.kas_host_auth).
     from kiro_crew.auth.bridge import vault_identity_fingerprint
@@ -166,7 +175,9 @@ def record_catalog(resp: dict[str, Any], backend: str, *, identity: object) -> b
     is the engine's catalog -- is a KAS wire fact, and no other harness's select
     is read as one. Another backend records nothing and nothing is cleared: a
     response that advertises no select (a ``session/load`` on some engines) must
-    not wipe a catalog a ``session/new`` recorded a moment ago.
+    not wipe a catalog a ``session/new`` recorded a moment ago, and neither must
+    one whose select names only the session's current model (a KAS
+    ``session/load`` from kiro-cli 3.4; ``select_lists_only_its_current_model``).
 
     *identity* is the vault fingerprint read as the producing session's request
     went out (``AcpSessionHandle.request_vault_identity``), kept with the rows.
@@ -179,6 +190,17 @@ def record_catalog(resp: dict[str, Any], backend: str, *, identity: object) -> b
     if backend == ACP_BACKEND_KAS:
         rows = catalog_rows_from_session(resp)
         if rows:
+            # Lazy for the same import-order reason as ``catalog_rows_from_session``.
+            from kiro_crew.acp.session_handle_model_selection import (
+                model_select_envelope,
+                select_lists_only_its_current_model,
+            )
+
+            if select_lists_only_its_current_model(model_select_envelope(resp) or {}):
+                logger.debug(
+                    "KAS model catalog not recorded: the select names only the session's model"
+                )
+                return False
             if not (isinstance(identity, str) and identity):
                 logger.debug(
                     "KAS model catalog not recorded: the request carried no vault identity"

@@ -7,6 +7,9 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router-dom'
+import { Provider } from 'react-redux'
+import { createTestStore } from '../../test/helpers'
+import { setUpdateProgress } from '../../store/dashboardSlice'
 import { api } from '../../api/client'
 import { ApiError } from '../../api/apiError'
 import type { SharedCrewPreviewSetting } from '../../api/sharedCrew'
@@ -15,6 +18,7 @@ import {
   SHARED_CREW_RESTART_VERIFY_TIMEOUT_MS,
 } from './FeaturePreviewsSection'
 import { sharedCrewPreviewKey } from './sharedCrewPreviewSetting'
+import { cachePreviewFlag, PREVIEW_CONNECTED_COMPUTERS } from '../../utils/previewFlags'
 
 vi.mock('../../api/client', async importOriginal => {
   const actual = await importOriginal<typeof import('../../api/client')>()
@@ -23,6 +27,7 @@ vi.mock('../../api/client', async importOriginal => {
     api: {
       ...actual.api,
       sharedCrewPreview: vi.fn(),
+      sharedCrewCapabilities: vi.fn(),
       sharedCrewSetPreview: vi.fn(),
       restartGateway: vi.fn(),
       dashboardConfig: vi.fn(),
@@ -52,6 +57,7 @@ const toggle = () => screen.findByRole('switch', { name: 'Shared Crew' })
 
 beforeEach(() => {
   vi.resetAllMocks()
+  vi.mocked(api.sharedCrewCapabilities).mockResolvedValue({ shared_crew_preview: false } as never)
   vi.mocked(api.dashboardConfig).mockResolvedValue({ decisions_enabled: false } as never)
   vi.mocked(api.kirocrewConfig).mockResolvedValue({} as never)
   vi.mocked(api.getDecisionsConsent).mockResolvedValue({ enabled: false, endpoint: '', configured_endpoint: '', permits: false })
@@ -59,6 +65,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers()
+  localStorage.removeItem(PREVIEW_CONNECTED_COMPUTERS)
 })
 
 describe('Shared Crew preview card', () => {
@@ -90,6 +97,7 @@ describe('Shared Crew preview card', () => {
     read.mockResolvedValue(setting({ enabled: true, active: false, restart_required: false }))
     mount()
     expect(await screen.findByTestId('shared-crew-preview-restart')).toHaveTextContent('Restart the gateway to apply')
+    expect(screen.getByTestId('shared-crew-preview-restart-hint')).toBeInTheDocument()
   })
 
   it('a matching stored choice and running state asks for nothing', async () => {
@@ -97,6 +105,13 @@ describe('Shared Crew preview card', () => {
     mount()
     await toggle()
     expect(screen.queryByTestId('shared-crew-preview-restart')).toBeNull()
+    // No warn-coloured "Restart" badge either: with nothing pending, the row says
+    // only, in muted text, that a change applies at the next restart.
+    expect(screen.queryByText('Restart')).toBeNull()
+    const hint = screen.getByTestId('shared-crew-preview-restart-hint')
+    expect(hint).toHaveTextContent('Takes effect after a restart')
+    expect(hint).toHaveClass('text-muted')
+    expect(screen.getByRole('switch', { name: 'Shared Crew' }).getAttribute('aria-describedby')).toContain('shared-crew-preview-restart-hint')
   })
 
   it('shows a failed refresh over the last preview answer and keeps the switch', async () => {
@@ -198,6 +213,26 @@ describe('Shared Crew preview card', () => {
     expect(button).not.toBeDisabled()
   })
 
+  it('a restart refused after its 200 reports failure without waiting out verification (#35351)', async () => {
+    read.mockResolvedValue(setting({ enabled: true, restart_required: true }))
+    restart.mockResolvedValue({ ok: true, status: 'restarting' })
+    const store = createTestStore()
+    render(
+      <Provider store={store}>
+        <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+          <MemoryRouter><FeaturePreviewsSection /></MemoryRouter>
+        </QueryClientProvider>
+      </Provider>,
+    )
+    const button = await screen.findByTestId('shared-crew-preview-restart-button')
+    fireEvent.click(button)
+    await waitFor(() => expect(button).toBeDisabled())
+    act(() => { store.dispatch(setUpdateProgress({ step: 'restarting', detail: 'Restarting server…' })) })
+    act(() => { store.dispatch(setUpdateProgress({ step: 'error', detail: 'Sessions did not drain in time.' })) })
+    expect(await screen.findByTestId('shared-crew-preview-restart-error')).toHaveAttribute('role', 'alert')
+    expect(button).not.toBeDisabled()
+  })
+
   it('the environment override shows the switch on and disabled, with a state label', async () => {
     read.mockResolvedValue(setting({ enabled: false, active: true, env_override: true }))
     mount()
@@ -234,5 +269,50 @@ describe('Shared Crew preview card', () => {
     read.mockRejectedValue(new ApiError(500, 'boom', '{}'))
     mount()
     expect(await screen.findByTestId('shared-crew-preview-load-error')).toHaveAttribute('role', 'alert')
+  })
+})
+
+describe('Connected computers on a shared Crew', () => {
+  it.each([
+    { enabled: true, active: true, env_override: false, restart_required: false },
+    { enabled: false, active: true, env_override: true, restart_required: false },
+    { enabled: false, active: true, env_override: false, restart_required: true },
+  ])('shows computers off and unavailable while Shared Crew is active: %j', async shared => {
+    read.mockResolvedValue(setting(shared))
+    cachePreviewFlag(PREVIEW_CONNECTED_COMPUTERS, true)
+    mount()
+    await toggle()
+    const computer = screen.getByRole('switch', { name: 'Connected computers' })
+    expect(computer).toHaveAttribute('aria-checked', 'false')
+    expect(computer).toHaveAttribute('aria-disabled', 'true')
+    expect(screen.getByText('Off on a shared Crew')).toBeInTheDocument()
+    expect(screen.getByText('Chats on this server can work in a folder on your own computer. Nothing is shared until you approve it on that computer.')).toBeInTheDocument()
+    fireEvent.click(computer)
+    expect(localStorage.getItem(PREVIEW_CONNECTED_COMPUTERS)).toBe('1')
+    expect(computer).toHaveAttribute('aria-checked', 'false')
+  })
+
+  it.each([false, true])('keeps the saved computer switch when Shared Crew is inactive, stored shared=%s', async enabled => {
+    read.mockResolvedValue(setting({ enabled, active: false, restart_required: enabled }))
+    cachePreviewFlag(PREVIEW_CONNECTED_COMPUTERS, true)
+    mount()
+    await toggle()
+    const computer = screen.getByRole('switch', { name: 'Connected computers' })
+    expect(computer).toHaveAttribute('aria-checked', 'true')
+    expect(computer).not.toHaveAttribute('aria-disabled', 'true')
+    expect(screen.queryByText('Off on a shared Crew')).toBeNull()
+    fireEvent.click(computer)
+    expect(computer).toHaveAttribute('aria-checked', 'false')
+  })
+
+  it('uses the shared capability for a teammate without access to the owner setting', async () => {
+    read.mockRejectedValue(new ApiError(403, 'owner only', '{}'))
+    vi.mocked(api.sharedCrewCapabilities).mockResolvedValue({ shared_crew_preview: true } as never)
+    cachePreviewFlag(PREVIEW_CONNECTED_COMPUTERS, true)
+    mount()
+    await screen.findByText('Off on a shared Crew')
+    const computer = screen.getByRole('switch', { name: 'Connected computers' })
+    expect(computer).toHaveAttribute('aria-checked', 'false')
+    expect(computer).toHaveAttribute('aria-disabled', 'true')
   })
 })

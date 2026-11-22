@@ -14,6 +14,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from real_session_manager import open_session, real_sessions
+from redaction_structured_cases import aws_secret
 from slack_gateway_helpers import _restore_update_check_cache  # noqa: F401
 from slack_gateway_helpers import (
     _make_orchestrator,
@@ -24,6 +26,10 @@ from slack_gateway_helpers import (
 
 from kiro_crew.history import ConversationLog
 
+# A synthetic AWS secret key: an AWS key ID in the secret's place stays
+# visible as an identifier, so the value here has the secret key's shape.
+_AWS_SECRET = aws_secret(seed=41)
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Tests: Subagent Slack injection timeout
 # ═══════════════════════════════════════════════════════════════════════════
@@ -32,9 +38,9 @@ from kiro_crew.history import ConversationLog
 class TestSubagentSlackInjection:
     """Subagent injection into Slack sessions."""
 
-    def _setup(self):
+    def _setup(self, sessions=None):
         orch = _make_orchestrator(slack_enabled=True, owner_id="U1")
-        orch.sessions = _mock_sessions()
+        orch.sessions = _mock_sessions() if sessions is None else sessions
         orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
@@ -100,7 +106,9 @@ class TestSubagentSlackInjection:
     @pytest.mark.asyncio
     async def test_cron_injection_timeout(self):
         """Cron injection timeout → notifies failure."""
-        orch, mock_sm = self._setup()
+        orch, mock_sm = self._setup(real_sessions())
+        # The cron run's live session: a completion continues it.
+        await open_session(orch.sessions, "cron:job1")
         on_done = mock_sm.call_args[1]["on_done"]
         orch.subagent_mgr.running = []
 
@@ -128,7 +136,7 @@ class TestSubagentSlackInjection:
         orch.subagent_mgr.notify_injection_failed.assert_called_once_with(
             info, reason=f"injection timed out after {int(INJECTION_TIMEOUT)}s"
         )
-        orch.sessions.reset.assert_any_await("cron:job1")
+        assert not orch.sessions.has_session("cron:job1")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -139,9 +147,9 @@ class TestSubagentSlackInjection:
 class TestInjectWithRetry:
     """_inject_with_retry error handling."""
 
-    def _setup(self):
+    def _setup(self, sessions=None):
         orch = _make_orchestrator(slack_enabled=True, owner_id="U1")
-        orch.sessions = _mock_sessions()
+        orch.sessions = _mock_sessions() if sessions is None else sessions
         orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
@@ -171,7 +179,8 @@ class TestInjectWithRetry:
         """AcpProcessDied during injection → resets session."""
         from kiro_crew.acp.client import AcpProcessDied
 
-        orch, mock_sm = self._setup()
+        orch, mock_sm = self._setup(real_sessions())
+        await open_session(orch.sessions, "C123:ts.1")
         on_done = mock_sm.call_args[1]["on_done"]
 
         info = MagicMock()
@@ -194,7 +203,7 @@ class TestInjectWithRetry:
             await on_done(info)
 
         mock_stream.assert_awaited_once()
-        orch.sessions.reset.assert_awaited_once_with(info.parent_session_key)
+        assert not orch.sessions.has_session(info.parent_session_key)
         orch.subagent_mgr.notify_injection_failed.assert_called_once_with(
             info, reason="ACP process died"
         )
@@ -205,7 +214,8 @@ class TestInjectWithRetry:
         """PromptBusyExhaustedError → resets session."""
         from kiro_crew.llm_helpers import PromptBusyExhaustedError
 
-        orch, mock_sm = self._setup()
+        orch, mock_sm = self._setup(real_sessions())
+        await open_session(orch.sessions, "C123:ts.2")
         on_done = mock_sm.call_args[1]["on_done"]
 
         info = MagicMock()
@@ -228,7 +238,7 @@ class TestInjectWithRetry:
             await on_done(info)
 
         mock_stream.assert_awaited_once()
-        orch.sessions.reset.assert_awaited_once_with(info.parent_session_key)
+        assert not orch.sessions.has_session(info.parent_session_key)
         orch.subagent_mgr.notify_injection_failed.assert_called_once_with(
             info, reason="provider dead after prompt-busy retries"
         )
@@ -243,9 +253,9 @@ class TestInjectWithRetry:
 class TestSlackSubagentCompletionPersistence:
     """Verify subagent completions injected into Slack sessions are persisted."""
 
-    def _setup(self):
+    def _setup(self, sessions=None):
         orch = _make_orchestrator(slack_enabled=True, owner_id="U1")
-        orch.sessions = _mock_sessions()
+        orch.sessions = _mock_sessions() if sessions is None else sessions
         orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
@@ -315,14 +325,18 @@ class TestSlackSubagentCompletionPersistence:
         assert assistant_call[0][2] == "synthesized response"
 
     @pytest.mark.asyncio
-    async def test_slack_subagent_redacts_response_before_persist(self):
-        """LLM response is redacted (credentials/exfil URLs) before persisting,
-        since the dashboard replay is an external surface."""
+    async def test_slack_subagent_redacts_response_before_persist(self, tmp_path):
+        """The sub-agent completion reaches disk through the write boundary, so a
+        credential in the LLM response is not stored: the dashboard replay is an
+        external surface."""
+        from kiro_crew.history import ConversationLog
+
         orch, mock_sm = self._setup()
+        orch.conv_log = ConversationLog(tmp_path)
         on_done = mock_sm.call_args[1]["on_done"]
         info = self._make_info()
         # Response carries a credential-shaped token that must not reach disk raw.
-        leaked = "result aws_secret_" "access_key=AKIAIOSFODNN7EXAMPLE done"
+        leaked = "result aws_secret_" f"access_key={_AWS_SECRET} done"
 
         with (
             patch(
@@ -335,10 +349,10 @@ class TestSlackSubagentCompletionPersistence:
         ):
             await on_done(info)
 
-        assert orch.conv_log.append.call_count == 2
-        persisted_response = orch.conv_log.append.call_args_list[1][0][2]
-        # The raw secret value must not be persisted verbatim.
-        assert "AKIAIOSFODNN7EXAMPLE" not in persisted_response
+        rows = orch.conv_log.read_messages(info.parent_session_key)
+        assert [row["role"] for row in rows] == ["user", "assistant"]
+        assert rows[1]["content"].startswith("result ")
+        assert all(_AWS_SECRET not in row["content"] for row in rows)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -779,7 +793,7 @@ class TestSubagentChannelTransportDelivery:
         orch, mock_sm = self._setup(parent_channel="telegram:12345", transport=transport)
         on_done = mock_sm.call_args[1]["on_done"]
         info = self._make_info("telegram:kirocrew:direct:12345")
-        leaked = "result aws_secret_" "access_key=AKIAIOSFODNN7EXAMPLE done"
+        leaked = "result aws_secret_" f"access_key={_AWS_SECRET} done"
 
         with (
             patch(
@@ -793,7 +807,7 @@ class TestSubagentChannelTransportDelivery:
 
         transport.send_message.assert_awaited_once()
         sent_text = transport.send_message.await_args[0][1]
-        assert "AKIAIOSFODNN7EXAMPLE" not in sent_text
+        assert _AWS_SECRET not in sent_text
 
     @pytest.mark.asyncio
     async def test_forum_parent_without_links_degrades_to_notification(self):

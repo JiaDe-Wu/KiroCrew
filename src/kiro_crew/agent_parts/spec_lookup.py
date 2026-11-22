@@ -21,7 +21,7 @@ if TYPE_CHECKING:
         agent_spec_candidates,
         is_markdown_spec,
         is_registered_agent_name,
-        is_sensitive_path,
+        is_sensitive_canonical_path,
         iter_agent_spec_files,
         kiro_agents_dir_path,
         logger,
@@ -43,6 +43,35 @@ def _read_spec_capped(path: Path) -> dict | None:
     capped reader is used lives in one place.
     """
     return _read_agent_spec(path, operation="agent_spec_lookup", source="unknown")
+
+
+def _scanned_name(path: Path) -> tuple[str | None] | None:
+    """The ``name`` *path*'s spec declares, for the scan of :func:`_resolve_spec_path`.
+
+    ``None`` when the file is not a JSON object; ``(None,)`` when it declares no
+    string name. Read through :func:`_read_spec_capped`. One session start runs that
+    scan once for its own agent and once for each sub-agent target, over the same
+    folder. Inside ``build_reuse.one_build`` a file is read once and only its
+    declared name is kept, under the file's identity (device, inode, size,
+    modification and change times), so a spec written meanwhile, a materialized one
+    included, is read again.
+    """
+    from kiro_crew.build_reuse import reuse
+
+    def read() -> tuple[str | None] | None:
+        data = _read_spec_capped(path)
+        if not isinstance(data, dict):
+            return None
+        declared = data.get("name")
+        return (declared if isinstance(declared, str) else None,)
+
+    st = path.lstat()
+    identity = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    return reuse(
+        ("agent-spec-name", str(path), identity),
+        read,
+        weight=lambda kept: len(str(path)) + len((kept or (None,))[0] or ""),
+    )
 
 
 def _spec_path_is_safe(path: Path, agents_dir: Path) -> bool:
@@ -84,13 +113,17 @@ def _spec_path_shape_refusal(path: Path, agents_dir: Path) -> str | None:
     is right for a caller that only needs permission to rewrite; it is wrong for
     one that would REPLACE the file on that answer, because then a transient error
     on the probe would destroy a spec that was intact.
+
+    The resolved path is judged on :func:`security.is_sensitive_canonical_path`:
+    off the event loop it answers inline, so a resolver child that misses its
+    deadline cannot refuse a plain spec as a sensitive target.
     """
     if path.is_symlink():
         return "a link stands at the spec's name"
     resolved = path.resolve()
     if resolved.parent != agents_dir.resolve():
         return "the path resolves outside the agents directory"
-    if is_sensitive_path(str(resolved)):
+    if is_sensitive_canonical_path(str(resolved)):
         return "the path resolves to a sensitive target"
     return None
 
@@ -171,12 +204,12 @@ def _resolve_spec_path(name: str, agents_dir: Path | None, *, follow_pin: bool) 
         if not _spec_path_is_safe(spec_path, agents_dir):
             continue
         try:
-            data = _read_spec_capped(spec_path)
+            scanned = _scanned_name(spec_path)
         except (OSError, ValueError):
             continue
-        if not isinstance(data, dict):
+        if scanned is None:
             continue
-        declared = data.get("name")
+        (declared,) = scanned
         if declared == name:
             declared_matches.append(spec_path)
         elif spec_path in direct:

@@ -36,7 +36,7 @@ from kiro_crew.effort import EFFORT_LEVELS, is_valid_effort
 from kiro_crew.llm_helpers import slot_switch_session_lock
 from kiro_crew.members import select_provider_backend
 from kiro_crew.messaging.link import is_channel_session_key
-from kiro_crew.security import redact
+from kiro_crew.security import redact, refuses
 from kiro_crew.sel import sel
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -73,7 +73,7 @@ async def set_model_target(
     to force it stops the target first (``session_stop``) and retries. A later
     pick replaces an earlier one that has not been applied yet.
 
-    Two picks the picker allows are refused here. "Auto (Jev)" arms per-turn
+    Two picks the picker allows are refused here. "Auto (decision model)" arms per-turn
     routing, which the model route keeps owner-only. A crew-bound (remote)
     target runs its turns on the peer, where this pick would never be applied.
 
@@ -140,13 +140,13 @@ async def set_model_target(
             or folded in _JEV_ROUTE_SPELLINGS
         ):
             raise SessionControlError(
-                "Auto and Auto (Jev) can only be picked by the owner from the model picker",
+                "Auto and Auto (decision model) can only be picked by the owner from the model picker",
                 code="model_owner_only",
                 status=403,
             )
         if not model:
             raise SessionControlError("model is required", code="model_rejected", status=400)
-        if redact(model) != model:
+        if refuses(model, redact):
             # The pick is stored on the slot and broadcast to every dashboard, so a
             # credential-shaped argument is refused rather than persisted.
             raise SessionControlError(
@@ -192,14 +192,23 @@ async def set_model_target(
     from kiro_crew.crewmate_harness import CrewmateHarnessUnavailable, crewmate_backend_pin
 
     target_key = effective_session_key(slot)
+    # A session created on a harness is judged on that harness.
+    from kiro_crew.members import session_backend_pick
+
+    pick = session_backend_pick(target_key)
     try:
-        backend = select_provider_backend(
-            target_key,
-            member_backend,
-            default_backend,
-            crew_backend=(
-                crewmate_backend_pin(loaded_cfg, target_key) if loaded_cfg is not None else None
-            ),
+        backend = (
+            select_provider_backend(
+                target_key,
+                member_backend,
+                default_backend,
+                backend_override=pick,
+                crew_backend=crewmate_backend_pin(loaded_cfg, target_key) if pick is None else None,
+            )
+            if loaded_cfg is not None
+            else select_provider_backend(
+                target_key, member_backend, default_backend, crew_backend=None
+            )
         )
     except CrewmateHarnessUnavailable as exc:
         raise SessionControlError(str(exc), code=exc.code, status=409) from None
@@ -927,12 +936,28 @@ async def land_model_pick_after_channel_turn(state: "DashboardState", slot: "_Ch
     # starts while the switch awaits its reply would read the same stdout.
     # Taken without waiting: a turn that already holds the lease lands the pick
     # at its own release.
-    lease_key = state.sessions._fold_key(effective_session_key(slot))
-    if slot_switch_session_lock(effective_session_key(slot)).locked():
-        # A dashboard switch or turn start holds the session lock and may be
-        # waiting for this lease; taking the lease first would deadlock it.
+    session_key = effective_session_key(slot)
+    lease_key = state.sessions._fold_key(session_key)
+    if slot_switch_session_lock(session_key).locked():
+        # Taking the lease while a dashboard switch or turn start holds the
+        # session lock would leave the live switch below waiting for that lock
+        # with the lease held.
         return
     if not await state.sessions.try_acquire(lease_key):
+        return
+    if (
+        state.sessions._fold_key(effective_session_key(slot)) != lease_key
+        or slot_switch_session_lock(session_key).locked()
+    ):
+        # ``try_acquire`` awaits the Kiro account check before taking the lease.
+        # The slot can be rebound or the session lock taken during that wait.
+        # Without this check, the live switch could act without its session's
+        # lease or wait for the lock while holding this lease, which makes every
+        # other caller see the session as busy.
+        #
+        # Release before registering this landing so the release observer
+        # schedules another attempt. It returns above while the lock stays held.
+        state.sessions.release(lease_key, wake_queue=True)
         return
     _LANDING_LEASES.add(lease_key)
     try:
@@ -956,10 +981,11 @@ def landing_holds_lease(key: str) -> bool:
     return key in _LANDING_LEASES
 
 
-#: Lowercased spellings of the picker's Jev entry that ``session_set_model``
-#: refuses alongside the exact sentinel: its display label and any case of the
-#: sentinel id. Owner-only, like the sentinel itself.
-_JEV_ROUTE_SPELLINGS = frozenset({"auto (jev)", "auto:jev"})
+#: Lowercased spellings of the picker's decision-model entry that
+#: ``session_set_model`` refuses alongside the exact sentinel: its display
+#: label (the current one and the one older clients still show) and any case of
+#: the sentinel id. Owner-only, like the sentinel itself.
+_JEV_ROUTE_SPELLINGS = frozenset({"auto (decision model)", "auto (jev)", "auto:jev"})
 
 
 def _target_busy_error(body: dict[str, Any] | None = None) -> SessionControlError:

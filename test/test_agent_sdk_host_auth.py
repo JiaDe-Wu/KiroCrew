@@ -685,7 +685,9 @@ def test_an_uncontained_expose_leaf_is_dropped_not_honoured(monkeypatch) -> None
     # a re-exposure stays a HOST decision rather than a declared one.
     monkeypatch.setitem(gate.ADAPTER_EXPOSED_CREDENTIAL_LEAVES, enforced, ("Documents/notes.txt",))
     hidden = gate.adapter_hidden_credential_dirs(enforced)
-    assert gate.adapter_expose_files(enforced, hidden) == ()
+    assert gate.adapter_expose_files(enforced, hidden) == (
+        os.path.join(os.path.expanduser("~"), ".ssh", "known_hosts"),
+    )
 
 
 def test_a_sibling_of_a_masked_directory_is_not_treated_as_inside_it() -> None:
@@ -722,6 +724,24 @@ def test_the_unprobed_remedy_never_asserts_the_sign_in_state() -> None:
             )
 
 
+def test_a_harness_that_signs_in_on_its_own_says_where_its_terminal_is() -> None:
+    """A dashboard-only user is told the sign-in runs on the gateway host, and where
+    the dashboard opens a terminal there."""
+    own = [
+        d
+        for d in host_auth.AGENT_AUTH_DECLARATIONS
+        if d.entitlement_source == host_auth.ENTITLEMENT_OWN_CREDENTIAL_FILE
+    ]
+    assert len(own) >= 6
+    for declaration in own:
+        for text in (
+            host_auth.sign_in_remedy(declaration.backend),
+            host_auth.signed_out_message(declaration.backend),
+        ):
+            assert "terminal on the gateway host" in text, declaration.backend
+            assert host_auth.HOST_TERMINAL_NOTE in text, declaration.backend
+
+
 def test_the_kiro_signed_out_message_tells_the_user_to_send_again() -> None:
     """The signed-out message ends at sending again, not at starting a new chat.
 
@@ -741,11 +761,11 @@ def test_the_kiro_signed_out_message_tells_the_user_to_send_again() -> None:
     kas = host_auth.signed_out_message("kas")
     assert kas != expected
     assert "kiro-cli login" not in kas
-    assert "Settings → Agent Harness → Kiro sign-in" in kas
+    assert "Settings → Kiro account" in kas
     assert kas.endswith("then send your message again.")
     # The standing (unprobed) remedy names the same path, in plain prose.
     remedy = host_auth.declaration_for("kas").sign_in_remedy
-    assert "Settings → Agent Harness → Kiro sign-in" in remedy and "kiro-cli login" not in remedy
+    assert "Settings → Kiro account" in remedy and "kiro-cli login" not in remedy
     assert "start a new chat" not in remedy
 
 
@@ -776,6 +796,60 @@ def test_kas_messages_name_the_route_the_last_spawn_took(monkeypatch):
         "Run `kiro-cli login` in your terminal, then send your message again."
     )
     assert "start a new chat" not in kas_bundle.KAS_BUNDLE_SIGN_IN_REMEDY
+
+
+def test_a_kas_message_for_a_runtime_names_that_runtimes_route(monkeypatch):
+    """The route a caller passes is the failing runtime's own, so another
+    chat's later spawn on a different route does not change the message."""
+    from kiro_crew.acp import kas_route
+
+    base = host_auth.declaration_for("kas").signed_out_message
+    bundle = kas_route.KasRoute(bundle=True, reason=kas_route.REASON_NO_KIRO_CLI)
+    launcher = kas_route.KasRoute(bundle=False, reason=kas_route.REASON_KIRO_CLI_LAUNCHER)
+    # The last spawn in the process went to the launcher relay...
+    monkeypatch.setattr(kas_route, "_LAST_SPAWN_ROUTE", launcher)
+    # ...but this runtime runs Crew's own engine: its message says so.
+    assert host_auth.signed_out_message("kas", route=bundle) == f"{bundle.describe()}. {base}"
+    # And the reverse: a launcher runtime names kiro-cli's sign-in while the last
+    # spawn was the bundle.
+    monkeypatch.setattr(kas_route, "_LAST_SPAWN_ROUTE", bundle)
+    assert host_auth.signed_out_message("kas", route=launcher).endswith(
+        "Run `kiro-cli login` in your terminal, then send your message again."
+    )
+    # ``None`` is a runtime that recorded no route: the bare sentence.
+    assert host_auth.signed_out_message("kas", route=None) == base
+    # Unset keeps the process-wide reading for a caller holding no runtime.
+    assert host_auth.signed_out_message("kas") == f"{bundle.describe()}. {base}"
+    # Another harness never takes a KAS route, passed or not.
+    assert host_auth.signed_out_message("", route=bundle) == host_auth.signed_out_message("")
+
+
+def test_every_route_reason_reads_back_from_its_own_sentence():
+    """``kas_sentence_route`` rebuilds the sentence for a listed set of routes, so
+    a ``REASON_*`` added to ``kas_route`` and missed there would quietly keep the
+    English and lose its row kind. Every reason, on the arm a spawn records it on,
+    reads back as the route that wrote it."""
+    from kiro_crew.acp import kas_route
+
+    reasons = [
+        value
+        for name, value in vars(kas_route).items()
+        if name.startswith("REASON_") and isinstance(value, str)
+    ]
+    assert reasons
+    routes = [kas_route.RELAY, kas_route.KasRoute(bundle=True)]
+    for reason in reasons:
+        if reason == kas_route.REASON_KIRO_CLI_LAUNCHER:
+            # The launcher reason is only ever recorded on the relay arm.
+            routes += [
+                kas_route.KasRoute(bundle=False, reason=reason, crew_auth=crew_auth)
+                for crew_auth in (False, True)
+            ]
+        else:
+            routes.append(kas_route.KasRoute(bundle=True, reason=reason))
+    for route in routes:
+        text = host_auth.signed_out_message("kas", route=route)
+        assert host_auth.kas_sentence_route(text) == route, route
 
 
 # The kiro-cli command named is the one this host's spawn runs

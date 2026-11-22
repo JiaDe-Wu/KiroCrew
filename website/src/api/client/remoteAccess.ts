@@ -41,7 +41,7 @@ export interface TailnetStatusData {
  * `handlers/tailnet_mobile._derive_step`) so this list is rendered, never
  * re-computed here — one owner for the state machine.
  *
- * - `policy_off` — an enterprise build whose policy does not turn tailnet on. Dead end.
+ * - `policy_off` — an LTS build whose policy does not turn tailnet on. Dead end.
  * - `pinned` — an administrator's policy forbids tailnet access. Dead end.
  * - `untrusted_cli` / `install` / `start_daemon` / `sign_in` / `enable_magicdns`
  *   — the ways there is no usable tailnet name, kept apart because each is a
@@ -137,7 +137,31 @@ export interface TailnetMobileQr {
   link_window_secs: number
 }
 
-export function createRemoteAccessEndpoints({ get, post, j }: ClientTransport) {
+/**
+ * GET/PUT /api/remote-control: personal Remote Control, whose one control is
+ * `tunnel.relay_enabled`. `requested` is what config asks for. `locked` says this
+ * build ignores the setting (an LTS build's tunnel lock), so no restart connects.
+ * `running` says the relay client is connected now, so other devices can reach this
+ * Crew. `relayed` says this page reached the Crew through the Kiro relay, where the
+ * server refuses the off (it could only be undone at the machine), so the card
+ * shows the state read-only. The dashboard can only turn it off; turning it on is
+ * the terminal command.
+ */
+/** The one key of the `/api/remote-control` read (the card and the settings search). */
+export const REMOTE_CONTROL_QUERY_KEY = ['remote-control'] as const
+
+export interface RemoteControlState {
+  requested: boolean
+  locked: boolean
+  running: boolean
+  /** Not connected yet but on its way (starting, or waiting for a host token): no restart needed. */
+  connecting?: boolean
+  relayed?: boolean
+  /** Why config keeps a requested relay from starting, in plain words; absent otherwise. */
+  problem?: string
+}
+
+export function createRemoteAccessEndpoints({ get, post, put, j }: ClientTransport) {
   const mobileAccess = {
     // `sessionKey` MUST carry the active slot's key (`dashboard:<slot>`) when one
     // is active: the server's restricted-session guard reads X-Session-Key, and
@@ -178,6 +202,10 @@ export function createRemoteAccessEndpoints({ get, post, j }: ClientTransport) {
     // it instead of the shared `dashboard:ui` placeholder.
     tailnetMobileQr: (sessionKey?: string) =>
       post('/api/tailnet/mobile/qr', {}, sessionKey).then(j) as Promise<TailnetMobileQr>,
+    remoteControl: () => get('/api/remote-control').then(j) as Promise<RemoteControlState>,
+    /** One-click off writes an explicit `false`, so it stays off across a restart. */
+    turnOffRemoteControl: () =>
+      put('/api/remote-control', { enabled: false }).then(j) as Promise<RemoteControlState>,
   }
 
   return { mobileAccess }

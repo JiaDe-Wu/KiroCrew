@@ -427,6 +427,24 @@ def test_every_webhook_deny_steers_its_cause_before_rejecting(
     assert client.rejected == [_REQUEST_ID]
 
 
+class _AcknowledgingClient(_SteeringClient):
+    """kiro-cli folds the steered notice and has the model acknowledge it inline."""
+
+    async def stream(self, _message: str):
+        yield self._permission_event
+        yield AcpEvent(kind=EVENT_TEXT_CHUNK, text="Checking. [STEERING steer-83cc1f2a: The notice")
+        yield AcpEvent(kind=EVENT_TEXT_CHUNK, text=" named the rule.]I could not push the branch.")
+        yield AcpEvent(kind=EVENT_COMPLETE, usage=TurnUsage(duration_ms=0, credits=1.0))
+
+
+def test_the_notices_steer_acknowledgement_is_not_in_the_result(monkeypatch):
+    """The ack is protocol: the result the webhook delivers and records is the answer."""
+    client = _AcknowledgingClient()
+    *_, result_text = _drive(monkeypatch, None, client=client)
+    assert [kind for kind, _ in client.trace] == ["steer", "reject"], client.trace
+    assert result_text == "Checking. I could not push the branch."
+
+
 def test_an_unauditable_auto_approve_steers_the_audit_cause(monkeypatch):
     class _RaisingSel(_RecordingSel):
         def log_tool_invocation(self, **kwargs) -> None:
@@ -452,3 +470,28 @@ def test_an_unauditable_auto_approve_steers_the_audit_cause(monkeypatch):
     text = _notice(client)
     assert "could not write the audit record" in text
     assert client.approved == []
+
+
+@pytest.mark.parametrize("edition", ["lts", "oss"])
+def test_an_org_ask_on_a_kas_web_call_is_refused_by_a_webhook_turn(monkeypatch, edition):
+    """``web_ask_rule``: nobody is attached to a webhook turn, so in LTS a hook
+    auto-approve does not answer KAS's ask on an organisation's web rule."""
+    from types import SimpleNamespace
+
+    from kiro_crew import web_ask_rule
+
+    monkeypatch.setattr(web_ask_rule, "edition", SimpleNamespace(is_lts=lambda: edition == "lts"))
+    event = _permission_event(
+        title="Fetching https://example.com",
+        tool_kind="fetch",
+        is_shell=False,
+        harness_tool_id="web_fetch",
+        kas_builtin_ids=True,
+        kas_managed_ask=True,
+    )
+    client, sel, _gate, _text = _drive(monkeypatch, TOOL_AUTO_APPROVE, event=event)
+    if edition == "lts":
+        assert client.approved == [] and client.rejected == [_REQUEST_ID]
+        assert [r["error"] for r in _denial_rows(sel)] == ["web_ask_rule"]
+    else:
+        assert client.approved == [_REQUEST_ID]

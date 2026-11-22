@@ -12,9 +12,12 @@ dispatch), and the empty install.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
 import json
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -53,6 +56,12 @@ def dispatched(monkeypatch):
 def _interrupted(slot) -> None:
     """A user row with no reply: the shape a gateway restart mid-turn leaves."""
     slot.append("user", "refactor the parser", "msg msg-u")
+
+
+def _interrupted_long_ago(slot) -> None:
+    """The same unanswered user row, left a month ago."""
+    _interrupted(slot)
+    slot.messages[-1]["ts"] = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
 
 
 def _start_failed(slot) -> None:
@@ -554,10 +563,21 @@ _COUNT_FIXTURE = Path(__file__).parent / "fixtures" / "resume_all_candidates.jso
 #: The slots-payload fields the browser's count reads (``interruptedIdleSlots``
 #: plus the chat page's ``isChatPageSurface`` filter).
 _COUNT_ROW_FIELDS = frozenset(
-    {"mode", "surface", "running", "interrupted", "subagents_running", "executor"}
+    {
+        "mode",
+        "surface",
+        "running",
+        "interrupted",
+        "interrupted_stale",
+        "subagents_running",
+        "executor",
+    }
 )
+#: Fields a fixture row names only where they are set.
+_OPTIONAL_ROW_FIELDS = frozenset({"crew_root", "cron_run_read_only"})
 _TRANSCRIPTS = {
     "interrupted": _interrupted,
+    "interrupted_long_ago": _interrupted_long_ago,
     "start_failed": _start_failed,
     "finished": _finished,
     "empty": lambda _slot: None,
@@ -588,6 +608,8 @@ def _build_from_facts(state, entries: list[dict], monkeypatch) -> None:
             building.add(slot.key)
         if "executor" in facts:
             slot.executor = facts["executor"]
+        if facts.get("cron_run_read_only"):
+            slot.cron_run_read_only = True
         if "mode" in facts:
             slot.mode = facts["mode"]
         if "agent" in facts:
@@ -599,6 +621,7 @@ def _build_from_facts(state, entries: list[dict], monkeypatch) -> None:
     state.subagents = SimpleNamespace(
         running_agents_for=lambda key: ["child"] if key in children else [],
         published_queued_depths=lambda: {},
+        published_queued_labels=lambda: {},
     )
     state._slots_under_construction = building
 
@@ -627,13 +650,15 @@ def test_the_server_total_is_the_count_the_sidebar_reads_from_the_shared_fixture
             assert entry["key"] not in payload, f"{entry['key']} is in the slots payload"
             continue
         assert (
-            _COUNT_ROW_FIELDS <= set(want) <= _COUNT_ROW_FIELDS | {"crew_root"}
+            _COUNT_ROW_FIELDS <= set(want) <= _COUNT_ROW_FIELDS | _OPTIONAL_ROW_FIELDS
         ), f"{entry['key']}: name every field the count reads"
         # ``crew_root`` is on a worker's row only; a row the fixture gives none
         # must carry none, or the sidebar would drop a row this case counts.
+        # ``cron_run_read_only`` is named only on the row that is marked.
         got = {field: payload[entry["key"]].get(field) for field in _COUNT_ROW_FIELDS}
         got["crew_root"] = payload[entry["key"]].get("crew_root") or None
-        assert got == {"crew_root": None, **want}, entry["key"]
+        got["cron_run_read_only"] = payload[entry["key"]].get("cron_run_read_only")
+        assert got == {"crew_root": None, "cron_run_read_only": False, **want}, entry["key"]
 
     crew = case.get("crew_mode", False)
     picked = mod.collect_interrupted_idle(state, crew_mode=crew)
@@ -1068,7 +1093,7 @@ def test_a_candidate_waits_for_memory_preparation_startup_has_not_published(
     preparing = [True]
     monkeypatch.setattr(memory_startup, "memory_startup_preparing", lambda: preparing[0])
     # A zero poll only yields, so the waits below are a count of loop turns.
-    monkeypatch.setattr(mod, "_MEMORY_TASK_POLL_SECONDS", 0)
+    monkeypatch.setattr(memory_startup, "_TASK_PUBLICATION_POLL_SECONDS", 0)
     state = _make_state(tmp_path)
     _interrupted(state.get_or_create_slot("a"))
 
@@ -1122,6 +1147,51 @@ def test_no_resumed_turn_starts_while_memory_preparation_runs(tmp_path, dispatch
 
     assert len(outcome["resumed"]) == mod.RESUME_ALL_MAX_RUNNING + 2
     assert dispatched.started.await_count == mod.RESUME_ALL_MAX_RUNNING + 2
+
+
+def test_a_run_ends_once_the_backstop_fails_a_wedged_preparation(tmp_path, dispatched, monkeypatch):
+    """The backstop fails the fence but cannot cancel the worker thread, so the
+    published task stays pending. Each candidate is then reported failed, the run
+    sends its one frame, and a later press starts a new run instead of getting
+    409. No recovery entry is queued: the drain would park it behind that task.
+    """
+    from kiro_crew import memory_startup
+
+    monkeypatch.setattr(memory_startup, "_active", None)
+    # A zero recheck only yields, so the waits below are a count of loop turns.
+    monkeypatch.setattr(memory_startup, "_FENCE_RECHECK_SECONDS", 0)
+    state = _make_state(tmp_path)
+    for i in range(6):
+        _interrupted(state.get_or_create_slot(f"s{i}"))
+
+    async def drive():
+        frames = _frames(state)
+        startup = memory_startup.MemoryStartup.begin()
+        try:
+            state.memory_startup_task = asyncio.get_running_loop().create_future()
+            status, _body = mod.start_resume_all(state, {"app": ""})
+            assert status == 202
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert frames.call_count == 0, "a live pass still holds them"
+            startup.fail(TimeoutError("memory preparation did not finish"))
+            await _drain(state)
+            ((_event, outcome),) = [c.args for c in frames.call_args_list]
+            second, _body = mod.start_resume_all(state, {"app": ""})
+            await _drain(state)
+            return outcome, second
+        finally:
+            startup.stop()
+            startup.release()
+
+    outcome, second = asyncio.run(drive())
+
+    assert outcome["resumed"] == [] and outcome["skipped"] == []
+    assert sorted(f["slot"] for f in outcome["failed"]) == [f"s{i}" for i in range(6)]
+    assert {f["error"] for f in outcome["failed"]} == {"MemoryStartupUnavailable"}
+    assert dispatched.started.await_count == 0
+    assert all(not slot._queue for slot in state._slots.values())
+    assert second == 202, "the first run ended, so a later press is not a 409"
 
 
 @pytest.mark.asyncio
@@ -1242,3 +1312,138 @@ def test_the_sidebar_names_the_same_bound_the_run_holds():
     ).read_text(encoding="utf-8")
     (shown,) = re.findall(r"export const RESUME_ALL_MAX_RUNNING = (\d+)", source)
     assert int(shown) == mod.RESUME_ALL_MAX_RUNNING
+
+
+# ── the boot after a planned restart (``restart_resume``) ───────────────────
+
+
+def _record(monkeypatch, tmp_path, names: list[str] | None) -> Path:
+    """Point the record at *tmp_path*; write *names* as a planned restart would."""
+    from kiro_crew.dashboard import restart_resume
+
+    path = tmp_path / "resume-intent.json"
+    monkeypatch.setattr(restart_resume, "intent_path", lambda: path)
+    if names is not None:
+        restart_resume.write_intent(names)
+    return path
+
+
+def _boot(state) -> MagicMock:
+    from kiro_crew.dashboard import restart_resume
+
+    async def _go() -> None:
+        await restart_resume.resume_after_restart(state)
+        await _drain(state)
+
+    frames = _frames(state)
+    asyncio.run(_go())
+    return frames
+
+
+def test_a_planned_restart_resumes_only_the_chats_it_recorded_once(
+    tmp_path, dispatched, monkeypatch
+):
+    state = _make_state(tmp_path)
+    _interrupted(state.get_or_create_slot("cut"))
+    _interrupted(state.get_or_create_slot("crashed-earlier"))
+    path = _record(monkeypatch, tmp_path, ["cut"])
+
+    ((event, outcome),) = [c.args for c in _boot(state).call_args_list]
+
+    assert event == mod.RESUME_ALL_DONE_FRAME
+    assert outcome["resumed"] == ["cut"]
+    assert not path.exists(), "the record is cleared after its one attempt"
+    dispatched.started.assert_awaited_once()
+    # The next boot finds no record and resumes nothing, so it never loops.
+    _boot(state)
+    dispatched.started.assert_awaited_once()
+
+
+def test_a_record_left_by_a_restart_that_never_happened_resumes_nothing(
+    tmp_path, dispatched, monkeypatch
+):
+    """A record older than a restart takes belongs to a restart that did not run.
+
+    A later crash boot must not resume those chats, and the record is still
+    cleared so no boot reads it again.
+    """
+    import os
+    import time
+
+    from kiro_crew.dashboard import restart_resume
+
+    state = _make_state(tmp_path)
+    _interrupted(state.get_or_create_slot("cut"))
+    path = _record(monkeypatch, tmp_path, ["cut"])
+    old = time.time() - restart_resume._INTENT_MAX_AGE_SECS - 60
+    os.utime(path, (old, old))
+
+    assert _boot(state).call_args_list == []
+    dispatched.started.assert_not_awaited()
+    assert not path.exists()
+
+
+def test_a_planned_restart_with_no_running_chat_clears_an_earlier_record(tmp_path, monkeypatch):
+    """An empty record removes a stale one, so it cannot outlive this restart."""
+    from kiro_crew.dashboard import restart_resume
+
+    path = _record(monkeypatch, tmp_path, ["left-over"])
+    assert path.exists()
+    restart_resume.write_intent([])
+    assert not path.exists()
+
+
+def test_a_boot_with_no_record_resumes_nothing(tmp_path, dispatched, monkeypatch):
+    """A crash writes no record: its chats keep Resume and wait for the owner."""
+    state = _make_state(tmp_path)
+    slot = state.get_or_create_slot("crashed")
+    _interrupted(slot)
+    path = _record(monkeypatch, tmp_path, None)
+
+    assert _boot(state).call_args_list == []
+    dispatched.started.assert_not_awaited()
+    # The chat is left exactly as the crash left it: one unanswered user row.
+    assert [(m["role"], m["content"]) for m in slot.messages] == [("user", "refactor the parser")]
+    assert not path.exists()
+
+
+def test_a_recorded_chat_waiting_on_an_approval_is_refused_and_cleared(
+    tmp_path, dispatched, monkeypatch
+):
+    state = _make_state(tmp_path)
+    slot = state.get_or_create_slot("asks")
+    _interrupted(slot)
+    path = _record(monkeypatch, tmp_path, ["asks"])
+    pending = MagicMock()
+    pending.done.return_value = False
+    slot._approval_futures = {"tool-1": pending}
+
+    ((_event, outcome),) = [c.args for c in _boot(state).call_args_list]
+
+    assert outcome["skipped"] == [{"slot": "asks", "code": "slot_approval_pending"}]
+    assert not path.exists()
+    dispatched.started.assert_not_awaited()
+
+
+def test_the_dashboard_boot_schedules_the_resume_once_ready_and_never_awaits_it():
+    """Off the boot path: one call after ``state.ready`` is set, not awaited."""
+    from kiro_crew.dashboard import server
+
+    tree = ast.parse(inspect.getsource(server.start_dashboard))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "schedule_resume_after_restart"
+    ]
+    ready = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Attribute) and t.attr == "ready" for t in node.targets)
+    ]
+    awaited = {id(node.value) for node in ast.walk(tree) if isinstance(node, ast.Await)}
+    assert len(calls) == 1 and ready
+    assert calls[0].lineno > max(ready)
+    assert id(calls[0]) not in awaited

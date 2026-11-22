@@ -1,14 +1,16 @@
 import { useEffect, useState, lazy, Suspense, type ReactNode } from 'react'
 import { TOPBAR_FOCUS_Z, TOPBAR_Z } from '../../lib/themeDecorLayer'
-import { kiroUsageSegment } from './kiroUsageReadout'
+import { kiroSignInSegment, kiroUsageSegment } from './kiroUsageReadout'
 import { metricsSegment, MetricsErrorNotice } from './metricsReadout'
 import { ResourcePostureChip } from './resourcePostureChip'
-import { Bell, Fullscreen, Menu, Plug, Unplug } from 'lucide-react'
+import { Bell, Fullscreen, Loader2, Menu, Plug, Unplug } from 'lucide-react'
 import { motion } from 'framer-motion'
-import { isWinElectron } from '../../lib/electron'
+import { isWinElectron, isLinuxFramelessElectron, shellServesLinuxAppMenu } from '../../lib/electron'
 import { setNativeBadgeCount } from '../platform/electronBridge'
 import { SELECTION_INERT_ATTR } from '../../pages/chat/useSelectionInertOverlays'
+import { PackLoaderImage } from '../../pages/chat/PackLoaderImage'
 import ErrorBoundary from '../../components/ErrorBoundary'
+import ErrorNotice from '../../components/ErrorNotice'
 import { useNotificationSheet, NotificationSheet } from '../notifications/notificationSheet'
 import InstanceTabBar from '../../components/InstanceTabBar'
 import { getTopBarWidgets } from '../../apps/topBarWidgets'
@@ -16,6 +18,7 @@ import { getCapsuleSegments } from '../../apps/capsuleSegments'
 import { IS_MAC } from '../../hooks/useKeyboardShortcuts'
 import { useNavShortcutHint } from '../../hooks/useNavShortcutHint'
 import FeedbackPill from '../../components/FeedbackPill'
+import HoverTip from '../../components/HoverTip'
 import { Glass } from '../../components/Glass'
 import WindowsTitlebarMenu from '../../components/WindowsTitlebarMenu'
 import { NavHistoryArrows } from '../../components/NavHistoryArrows'
@@ -29,10 +32,24 @@ import MilestonesIndicator, { MilestonesPill } from '../../components/milestones
 import MilestonesSheet from '../../components/milestones/MilestonesSheet'
 import { useExplorePreviewSwitch } from '../../components/milestones/useMilestones'
 import { useExplorePreview } from '../../hooks/usePreviewFlag'
+import { isEmbeddedPane } from '../../lib/embedded'
 
 // Lazy, like App.tsx's update-found popup: the pill renders nothing without an update,
 // so its code rides the on-demand chunk instead of the app core.
 const UpdatePill = lazy(() => import('../../components/UpdatePill'))
+// The switcher with its Team Crews group, lazy so the relay list's code stays
+// out of the app core. The group renders nothing while the relay viewer is off.
+const TeamCrewsSwitcher = lazy(() => import('../../components/TeamCrewsGroup'))
+
+/** The Crew switcher with Team Crews (the plain one until its code loads); an SSH
+ *  pane's own bar lists the Remote Crews its window relays (lib/paneRelayCrews.ts). */
+function CrewSwitcher() {
+  return !isEmbeddedPane() ? (
+    <Suspense fallback={<InstanceTabBar variant="inline" />}>
+      <TeamCrewsSwitcher variant="inline" />
+    </Suspense>
+  ) : <InstanceTabBar variant="inline" />
+}
 
 // Corner radius, in px, of the top bar's Liquid Glass pills (the search
 // trigger, the readout capsule; components/FeedbackPill.tsx carries the same
@@ -59,10 +76,12 @@ const TOPBAR_PILL_RADIUS = 12
  *  hamburger therefore shows by default and the swap happens on the img's
  *  `load` event, never on an assumption: `loadedSrc` records WHICH src loaded,
  *  so a branding/theme change falls back to the hamburger until the new asset
- *  proves itself, and an `error` clears the record. The img stays mounted
- *  (display:none) while hidden so the browser still fetches it. The hamburger
- *  sits in a w-6 box matching the img, keeping the 40px tap target and the
- *  16px page-gutter alignment identical through the swap. */
+ *  proves itself, and an `error` clears the record. The logo stays mounted
+ *  (display:none) while hidden so the browser still fetches it, and renders
+ *  through PackLoaderImage so an animated pack logo holds its first frame
+ *  under reduced motion. The hamburger sits in a w-6 box matching the logo,
+ *  keeping the 40px tap target and the 16px page-gutter alignment identical
+ *  through the swap. */
 export function MobileNavGlyph({ avatar }: { avatar: string }) {
   const [loadedSrc, setLoadedSrc] = useState<string | null>(null)
   const showLogo = !!avatar && loadedSrc === avatar
@@ -74,7 +93,7 @@ export function MobileNavGlyph({ avatar }: { avatar: string }) {
         </span>
       )}
       {!!avatar && (
-        <img src={avatar} alt="" aria-hidden="true" onLoad={() => setLoadedSrc(avatar)} onError={() => setLoadedSrc(null)} className={`w-6 h-6 rounded-md shrink-0 object-contain transition-transform duration-300 group-hover:rotate-[-8deg] ${showLogo ? '' : 'hidden'}`} />
+        <PackLoaderImage src={avatar} onLoad={() => setLoadedSrc(avatar)} onError={() => setLoadedSrc(null)} className={`w-6 h-6 rounded-md shrink-0 object-contain transition-transform duration-300 group-hover:rotate-[-8deg] ${showLogo ? '' : 'hidden'}`} />
       )}
     </>
   )
@@ -106,20 +125,15 @@ function NotificationsBellButton() {
 
   return (
     <div ref={containerRef} className="relative">
+      <HoverTip label={unacked.length > 0 ? i18nT('app.notification_count', { count: unacked.length }) : i18nT('app.notifications')}>
       <button
         className={`flex items-center justify-center w-7 h-7 rounded-md hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0 relative ${open ? 'text-accent' : 'text-muted hover:text-text'}`}
         onClick={sheet.toggle}
-        // Chord declared to assistive tech ONLY, deliberately not in the tooltip.
-        // The render-time i18n gate scans `TEXT_ATTRS` (render-scan.mjs:293 --
-        // title, aria-label, placeholder, alt, aria-placeholder) for Latin runs
-        // under the en-XA pseudolocale, and its attribute branch (:499) has no
-        // opaque escape: the `[data-i18n-opaque]` / `kbd` exemption applies to
-        // ELEMENTS, so a keycap can be exempted in text but never inside an
-        // attribute value. A chord appended here read as 220 untranslated-attribute
-        // findings. `aria-keyshortcuts` is not in that list and is the standards
-        // declaration anyway, so the non-visual route survives; the VISIBLE hint
-        // stays a rail affordance, where it can be marked opaque.
-        title={unacked.length > 0 ? i18nT('app.notification_count', { count: unacked.length }) : i18nT('app.notifications')}
+        // Chord declared to assistive tech ONLY, deliberately not in the hover
+        // hint (navShortcutHint.test.tsx pins it): the hint is the base copy, and
+        // `aria-keyshortcuts` is the standards declaration, so the non-visual
+        // route survives. The VISIBLE chord stays a rail affordance, where the
+        // render-time i18n gate's `kbd` / `[data-i18n-opaque]` escape can mark it.
         aria-label={i18nT('app.notifications')}
         {...uiLocation('shell.notifications', bellRef)}
         aria-keyshortcuts={shortcut?.ariaKeyshortcuts}
@@ -133,6 +147,7 @@ function NotificationsBellButton() {
           </span>
         )}
       </button>
+      </HoverTip>
       {/* The sheet's scope owner, outside the sheet's own open conditional. */}
       <GuideRevealScope id="menu:shell.notifications" open={open}>
         <NotificationSheet sheet={sheet} />
@@ -150,16 +165,25 @@ function NotificationsBellButton() {
  */
 export function ShellHeader({ shell }: { shell: AppShell }) {
   const {
-    connected, updateAvailable, authRequired, gatewayStatusMsg, focusModeChord, focusModeExitMsgVisible, focusChromeInert, dispatch, colorTheme, resolvedMode, branding, avatar, isMobile, focusMode,
-    toggleFocusMode, focusActive, topPeek, topPeekSurface, topChromeShown, slotOwners, commandPalette,
-    setKiroUsageOpen, kiroUsageState, usageSegmentHidden, metrics, capsuleCollapsed, setCapsuleCollapsed,
+    connected, gatewayConnecting, updateAvailable, authRequired, gatewayStatusMsg, gatewayStatusAnnounce, relayRetrying, focusModeChord, focusModeExitMsgVisible, focusChromeInert, dispatch, colorTheme, resolvedMode, branding, avatar, isMobile, focusMode,
+    toggleFocusMode, focusActive, topPeek, topPeekSurface, topChromeShown, quickSearchLauncher, commandPalette,
+    setKiroUsageOpen, kiroUsageState, usageSegmentHidden, kiroSignInPrompt, openKiroSignIn, metrics, capsuleCollapsed, setCapsuleCollapsed,
     capsuleLayoutPulse, pulseCapsuleLayout, sysMetrics, metricsProbeRef, metricsGroupRef, setReportProblemOpen,
-    requestFeature, toggleNav, mobileSingle, membersRoute, membersBarPending, mobileNavOpen,
+    requestFeature, toggleNav, mobileSingle, membersRoute, membersBarPending, mobileNavOpen, topbarSearch,
   } = shell
   // Every Explore surface below mounts only while its Feature Preview is on.
   // Turning it off closes an open sheet; turning it on reads milestones once.
   const explore = useExplorePreview()
   useExplorePreviewSwitch(explore)
+  // Desktop only: the phone form has no full-width search to hide (its centre
+  // track is already `auto`), and its layout is not this setting's to change.
+  const searchHidden = !isMobile && !topbarSearch
+  // The search trigger's hint, gated on the same condition as the trigger's
+  // label and aria-label, so the hint never contradicts the words under the
+  // cursor or promises the corpus search the launcher deliberately omits. The
+  // owned branch drops "(K)" because the chord is already printed in the
+  // visible label.
+  const searchHint = quickSearchLauncher ? i18nT('app.open_command_bar') : i18nT('app.search_everywhere_k')
   return (
     <>
       {/* The one Milestones panel; the top-bar indicator, the phone menu row
@@ -183,7 +207,11 @@ export function ShellHeader({ shell }: { shell: AppShell }) {
         // more when those rungs still leave contents overflowing
         // (useTopbarCollapse in useAppShell). Desktop only, on purpose: below 768px the
         // phone header's icon-only search and container rungs already fit.
-        className={`topbar topbar-glass relative pl-2 pr-3${mobileSingle ? ' topbar-single' : ''}${isMobile ? ' topbar-phone' : ' tb-measured'}`}
+        //
+        // `topbar-no-search` is the desktop form with "Show search in the top
+        // bar" turned off: the centre cell holds only the focus-mode toggle,
+        // and the side tracks take the width the search box leaves.
+        className={`topbar topbar-glass relative pl-2 pr-3${mobileSingle ? ' topbar-single' : ''}${isMobile ? ' topbar-phone' : ' tb-measured'}${searchHidden ? ' topbar-no-search' : ''}`}
         // On a phone the chat title is portaled into this bar, above the
         // transcript: inert while a transcript selection is held, so a dragged
         // handle cannot land on the title (useSelectionInertOverlays).
@@ -235,12 +263,32 @@ export function ShellHeader({ shell }: { shell: AppShell }) {
         {!mobileSingle && (
         <div className="tb-left relative h-full">
           <div className="tb-measure">
-          {/* Windows only: the application menu shares this cluster. It needs no
-              width reservation of its own: the identity group is sized by its own
-              grid track, and the menu growing from the hamburger to its six
-              labels therefore consumes the GROUP's width -- which its collapse
-              ladder responds to -- instead of eating the centred search's. */}
-          {!isMobile && isWinElectron && <WindowsTitlebarMenu />}
+          {/* The application menu shares this cluster. Its name reflects the
+              platform it is modelled on, and it serves every frameless surface:
+              Windows, and Linux under a CSD Wayland compositor, which draws no
+              menu bar of its own. A framed window is excluded because its
+              compositor draws that bar itself.
+              It needs no width reservation of its own: the identity group is
+              sized by its own grid track, and the menu growing from the
+              hamburger to its six labels therefore consumes the GROUP's width
+              -- which its collapse ladder responds to -- instead of eating the
+              centred search's.
+              `!isMobile` is deliberate, and this surface stays desktop-only:
+              below MOBILE_BREAKPOINT the trigger is hidden, and the native
+              accelerators Menu.setApplicationMenu installs host every action
+              that carries one. The accelerator-less items in
+              electron/app-menu.js have no host at that width -- the same gap a
+              Windows window has, which hides its native bar outright.
+              The Linux term also asks the SHELL, not just the window:
+              `shellServesLinuxAppMenu` is the installed shell saying its
+              `menuItems` guard admits this surface. The two halves install
+              separately, so an older shell reports `linuxFrameless` while
+              still answering [] -- mounting on the window alone would paint a
+              trigger whose popups open empty. Windows keeps its original
+              single term, having never needed the capability. */}
+          {!isMobile
+            && (isWinElectron || (isLinuxFramelessElectron && shellServesLinuxAppMenu))
+            && <WindowsTitlebarMenu />}
 
           {/* Route-history Back/Forward (#8258). Desktop layout only: on mobile
               the platform owns Back (left-edge swipe), and the drill-in surfaces
@@ -275,7 +323,9 @@ export function ShellHeader({ shell }: { shell: AppShell }) {
               <MobileNavGlyph avatar={avatar} />
             </button>
           )}
-          <InstanceTabBar variant="inline" />
+          {/* Desktop app only: the same switcher, plus Team Crews while the relay
+              viewer is on. Until its code loads, the plain switcher stands in. */}
+          <CrewSwitcher />
           </div>
         </div>
         )}
@@ -292,7 +342,9 @@ export function ShellHeader({ shell }: { shell: AppShell }) {
             width and the sessions toggle stays on the gutter. */}
         {mobileSingle && (
           <div data-testid="topbar-lead" className="relative h-full flex items-center gap-1.5 min-w-0">
-            <InstanceTabBar variant="inline" />
+            {/* The same switcher as the wide bar, so a note's Open on a Team Crew
+                (`?relay_crew=`) is read at every width. */}
+            <CrewSwitcher />
             {getTopBarWidgets().map(w => (
               <ErrorBoundary key={w.id} scope={`topbar-widget:${w.id}`} fallback={null}>
                 <w.component />
@@ -314,13 +366,24 @@ export function ShellHeader({ shell }: { shell: AppShell }) {
             `data-topbar-overlay` is read by the crew-pin capture harnesses
             (website/scripts/capture-crew-pin-chips.mjs, record-crew-pin-chips.mjs,
             capture-crew-chip-shrink.mjs) to find this cell; nothing in src/
-            reads it any more. Keep it. */}
+            reads it any more. Keep it.
+
+            With "Show search in the top bar" off (`searchHidden`) the search
+            trigger is left out, whichever surface owns the quick-search slot,
+            and the focus-mode toggle is the cell's only control. The header's
+            `topbar-no-search` form keeps this track `auto`, so it shrinks to
+            the toggle, and gives the freed width to the side tracks. The
+            command palette's keyboard trigger (useCommandPalette) still opens
+            search, or the owning app's launcher. */}
         {!isMobile && (
           <div data-topbar-overlay className="flex items-center gap-1.5 min-w-0">
           {/* The trigger IS a Liquid Glass pane (components/Glass.tsx, chip
               recipe) rendered as the button, the same material as the
               sidebar's search field and the composer dock: no border and no
               fill of its own, `glass-hover` for the hover step. */}
+          {/* Its HoverTip wrapper takes the trigger's `flex-1` track. */}
+          {!searchHidden && (
+          <HoverTip label={searchHint} className="flex-1 min-w-0">
           <Glass
             as="button"
             type="button"
@@ -329,43 +392,36 @@ export function ShellHeader({ shell }: { shell: AppShell }) {
             onClick={commandPalette.openPalette}
             {...uiLocation('shell.search')}
             className="glass-shadow glass-hover h-7 flex-1 min-w-0 px-3 text-muted hover:text-text transition-colors flex items-center justify-center gap-2 cursor-pointer"
-            /* The trigger has to describe the surface it actually opens. While an app
-               owns the quick-search slot the gesture opens a launcher -- typing runs
+            /* The trigger has to describe the surface it actually opens. While the
+               Command Bar is on the gesture opens a launcher -- typing runs
                commands and does not search the corpora this label promises -- so
                naming "search for anything" there is the most visible mispromise in
                the product. */
             aria-label={
-              slotOwners['quick-search']
+              quickSearchLauncher
                 ? i18nT('app.open_command_bar')
                 : i18nT('app.search_sessions_files_and_commands')
             }
-            // Gated on the same condition as the label and aria-label above. Leaving
-            // this one unconditional made the hover contradict the words under the
-            // cursor and promise the corpus search the launcher deliberately omits --
-            // the diff's own fix applied to two of three attributes. The owned branch
-            // drops "(K)" because the chord is already printed in the visible label.
-            title={
-              slotOwners['quick-search']
-                ? i18nT('app.open_command_bar')
-                : i18nT('app.search_everywhere_k')
-            }
           >
             <span className="text-[13px] truncate min-w-0">
-              {slotOwners['quick-search']
+              {quickSearchLauncher
                 ? i18nT('app.k_run_a_command')
                 : i18nT('app.k_search_for_anything')}
             </span>
           </Glass>
+          </HoverTip>
+          )}
           {/* Focus mode. `aria-pressed` rather than a second label, so a screen
               reader gets the state from the control instead of from copy that
               would have to be kept in step with the icon. */}
+          <HoverTip label={i18nT(IS_MAC ? 'app.focus_mode_title_mac' : 'app.focus_mode_title')}>
           <button
             type="button"
             data-testid="focus-mode-toggle"
             // A sighted keyboard user who activates this with Enter/Space is the
             // one person the inert chrome leaves stranded: the toggle they just
             // pressed vanishes, Tab cannot bring it back, and the chord that can
-            // lived only in the hover title. So on a keyboard activation that
+            // lived only in the hover hint. So on a keyboard activation that
             // turns focus mode ON, the shared shell notice (the agent-switch card)
             // shows the same sentence the live region speaks, in display
             // spelling. `detail === 0` is how a keyboard-synthesised click differs
@@ -380,15 +436,15 @@ export function ShellHeader({ shell }: { shell: AppShell }) {
             className={`flex items-center justify-center w-7 h-7 rounded-md hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0 ${focusMode ? 'text-accent' : 'text-muted hover:text-text'}`}
             aria-label={i18nT('app.focus_mode')}
             aria-pressed={focusMode}
-            // The chord as currently bound (focusModeChord): the `title` below
-            // names the default for sighted hover, this names the live one for
+            // The chord as currently bound (focusModeChord): the hint names the
+            // default for sighted hover, this names the live one for
             // assistive tech. Omitted when the user unbound it.
             aria-keyshortcuts={focusModeChord ?? undefined}
             {...uiLocation('shell.focus-mode')}
-            title={i18nT(IS_MAC ? 'app.focus_mode_title_mac' : 'app.focus_mode_title')}
           >
             <Fullscreen size={15} />
           </button>
+          </HoverTip>
           </div>
         )}
         {/* Mobile centre cell. On the chat page it is the slot the chat page
@@ -484,16 +540,16 @@ export function ShellHeader({ shell }: { shell: AppShell }) {
               not something a phone user acts on; the session-expired banner
               stays the offline signal there. */}
           {!isMobile && (() => {
-            const offline = !connected
+            const offline = !connected && !gatewayConnecting
             // `gatewayStatusMsg` (useAppShell) is the announced cause; see its
             // comment for why auth wording wins over transport state. It mirrors
-            // the branch the button `title` already uses (minus the
+            // the branch the button's hint already uses (minus the
             // collapse-toggle suffix, which is interaction text, not a status
             // cause).
             // The connection dot doubles as the capsule collapse toggle, so its
             // accessible name must name that action -- not just the gateway
-            // state. title and aria-label share this composed value; the
-            // role="status" live region stays pure gatewayStatusMsg (a status
+            // state. The hint and aria-label share this composed value; the
+            // role="status" live region stays pure gatewayStatusAnnounce (a status
             // region announces the connection cause, not the button's toggle
             // affordance, which would speak "click to collapse" on every
             // reconnect).
@@ -512,26 +568,33 @@ export function ShellHeader({ shell }: { shell: AppShell }) {
             // Padding + negative margin keep a usable hit target without
             // growing the visual dot.
             segments.push(
+              <HoverTip key="conn" label={capsuleActionMsg} className="tb-capsule-keep">
               <button
-                key="conn"
                 className="flex items-center justify-center p-1.5 -m-1.5 rounded-full bg-transparent border-none cursor-pointer shrink-0"
                 onClick={() => { pulseCapsuleLayout(); setCapsuleCollapsed(c => !c) }}
-                title={capsuleActionMsg}
                 aria-label={capsuleActionMsg}
                 aria-expanded={!capsuleCollapsed}
               >
                 {/* The glyph's SHAPE carries the state (WCAG 1.4.1): a plug when
-                    connected, an unplugged plug when offline. Colour is only
-                    the second cue, so a red/green colour-blind reader still
-                    sees the state without hovering. */}
-                {offline
+                    connected, an unplugged plug when offline, a spinner while
+                    the first socket is still opening. Colour is only the
+                    second cue, so a red/green colour-blind reader still sees
+                    the state without hovering. */}
+                {/* A relay Crew window still retrying spins in the warn colour:
+                    it is reconnecting on its own, which is not an outage. */}
+                {relayRetrying
+                  ? <Loader2 aria-hidden="true" data-conn-state="reconnecting" size={12} strokeWidth={2.25} className="text-[var(--warn)] animate-spin motion-reduce:animate-none" />
+                  : offline
                   ? <Unplug aria-hidden="true" data-conn-state="offline" size={12} strokeWidth={2.25} className="text-danger transition-colors duration-300 animate-pulse [animation-iteration-count:3]! motion-reduce:animate-none" />
-                  : <Plug aria-hidden="true" data-conn-state="connected" size={12} strokeWidth={2.25} className="text-ok transition-colors duration-300" />}
+                  : gatewayConnecting
+                    ? <Loader2 aria-hidden="true" data-conn-state="connecting" size={12} strokeWidth={2.25} className="text-muted animate-spin motion-reduce:animate-none" />
+                    : <Plug aria-hidden="true" data-conn-state="connected" size={12} strokeWidth={2.25} className="text-ok transition-colors duration-300" />}
                 {/* Live-region announcement lives in its own hidden span:
                     role="status" on the button itself would override its
                     implicit button role for screen readers. */}
-                <span role="status" className="sr-only">{gatewayStatusMsg}</span>
+                <span role="status" className="sr-only">{gatewayStatusAnnounce}</span>
               </button>
+              </HoverTip>
             )
             // Resource pressure indicator — always visible when tight/critical
             if (sysMetrics?.posture && sysMetrics.posture !== 'ample' && sysMetrics.posture !== 'unknown') {
@@ -547,7 +610,9 @@ export function ShellHeader({ shell }: { shell: AppShell }) {
             }
             if (!capsuleCollapsed) {
             if (!isMobile) segments.push(metricsSegment(metrics, seg))
-            const usage = kiroUsageSegment({ kiroUsageState, usageSegmentHidden, setKiroUsageOpen }, seg, isMobile)
+            const usage = kiroSignInPrompt
+              ? kiroSignInSegment(openKiroSignIn, seg, isMobile)
+              : kiroUsageSegment({ kiroUsageState, usageSegmentHidden, setKiroUsageOpen }, seg, isMobile)
             if (usage) segments.push(usage)
             }
             // Extension slot: downstream-registered capsule segments (e.g. an
@@ -589,13 +654,43 @@ export function ShellHeader({ shell }: { shell: AppShell }) {
                 <Glass
                   variant="chip"
                   radius={TOPBAR_PILL_RADIUS}
-                  className={`tb-capsule glass-shadow flex items-center gap-2 h-7 px-2.5 ${offline ? 'glass-danger' : ''}`}
+                  className={`tb-capsule glass-shadow flex items-center gap-2 h-7 px-2.5 ${offline && !relayRetrying ? 'glass-danger' : ''}`}
                 >
                   {segments.flatMap((s, i) => (i === 0 ? [s] : [<span key={`sep-${i}`} className="w-px h-3.5 bg-border shrink-0" aria-hidden="true" />, s]))}
                 </Glass>
               </motion.div>
             )
           })()}
+          {/* Desktop: the offline cause in words, beside the dot it explains.
+              The dot carries the cause only in its tooltip and sr-only text,
+              and the phone's strip below cannot do this job here: the header
+              is its own stacking layer, so the rail and the chat panes paint
+              over anything hanging below it. In flow in the actions group, so
+              the collapse ladder makes room for it (shell-chrome.css). The
+              same inline ErrorNotice as MetricsErrorNotice beside it, with
+              `announce` off: the dot's `role="status"` span already announces
+              `gatewayStatusAnnounce`. Quiet while the session-expired banner speaks,
+              and while the first socket is still opening. */}
+          {/* A relay Crew window still retrying says so quietly: a warn dot and
+              one muted word, no error surface. The window's centre view
+              (RelayReconnectingView) explains it and is the live region. */}
+          {!isMobile && relayRetrying && (
+            <span data-testid="topbar-reconnecting" className="tb-offline-notice shrink-0 flex items-center gap-1.5 text-xs text-muted min-w-0">
+              <span aria-hidden="true" className="w-1.5 h-1.5 rounded-full bg-[var(--warn)] shrink-0" />
+              <span className="tb-offline-notice-msg truncate">{i18nT('app.relay_crew_connecting')}</span>
+            </span>
+          )}
+          {!isMobile && !connected && !gatewayConnecting && !authRequired && !relayRetrying && (
+            <ErrorNotice
+              variant="inline"
+              announce={false}
+              noHandoffReason="The gateway is offline, so a hand-off to the agent cannot be delivered."
+              message={gatewayStatusAnnounce}
+              messageClassName="tb-offline-notice-msg"
+              className="tb-offline-notice shrink-0"
+              testId="topbar-offline-notice"
+            />
+          )}
           {!isMobile && <MetricsErrorNotice metrics={metrics} />}
           {/* Explore (RFC "Milestones for New-User Feature Discovery" 4.6): its
               own pill next to the readout capsule (after the capsule's own
@@ -677,19 +772,24 @@ export function ShellHeader({ shell }: { shell: AppShell }) {
             capsule read; auth expiry keeps its own banner (api/client.ts), so
             this stays quiet then rather than saying "reconnecting" over a fix
             that is pasting a token. Absolute (out of the bar's grid flow) so
-            the three-track invariant holds. */}
-        {isMobile && !connected && !authRequired && (
-          <div
-            role="status"
-            data-testid="mobile-offline-strip"
-            // `pointer-events-none`: the strip hangs over the top 24px of
-            // whatever <main> paints; a readout must not swallow the taps and
-            // scroll starts that land there while the socket is down.
-            className="absolute left-0 right-0 top-full z-[1] pointer-events-none flex items-center justify-center gap-1.5 h-6 text-[12px] font-medium text-danger-text bg-danger-subtle border-b border-danger/30"
-          >
-            <span aria-hidden="true" className="w-1.5 h-1.5 rounded-full bg-danger animate-pulse [animation-iteration-count:3]! motion-reduce:animate-none" />
-            {i18nT('app.gateway_offline_reconnecting')}
-          </div>
+            the three-track invariant holds. The same ErrorNotice as the
+            desktop notice, announced: nothing else on the phone speaks it.
+            `pointer-events-none`: the strip hangs over the top 24px of
+            whatever <main> paints; a readout must not swallow the taps and
+            scroll starts that land there while the socket is down. */}
+        {isMobile && !connected && !gatewayConnecting && !authRequired && !relayRetrying && (
+          <ErrorNotice
+            variant="inline"
+            noHandoffReason="The gateway is offline, so a hand-off to the agent cannot be delivered."
+            message={gatewayStatusAnnounce}
+            messageClassName="text-danger-text"
+            // z-40: on the Crewmates page the identity stack hangs its name
+            // chip below the bar (fixed, z-30, in this header's stacking
+            // context: `.topbar-glass` has a transform). The offline message
+            // is the transient one and the phone's only one, so it wins.
+            className="absolute left-0 right-0 top-full z-40 pointer-events-none justify-center h-6 font-medium bg-danger-subtle border-b border-danger/30"
+            testId="mobile-offline-strip"
+          />
         )}
         {/* Session expired on the phone: the auth banner (api/client.ts) is the
             visible message and has no live region, and the capsule's sr-only

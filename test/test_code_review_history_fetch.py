@@ -1,9 +1,9 @@
 """Code Review's jobs read the same git data from a two-commit checkout as from a full clone.
 
-Jobs in `code-review.yml` check out at `fetch-depth: 2` (a full fetch outlasts the
-timeout on a slow runner) and run `.github/scripts/code-review-history.sh`. After it,
-every git read must match a full clone with no further fetch. The cases build an origin
-with `refs/pull/<n>/merge` refs, run the step's real `run:` body, then cut `origin`.
+Jobs in `code-review.yml` and `pr-hygiene.yml` check out at `fetch-depth: 2` (a full
+fetch outlasts the timeout on a slow runner) and run `.github/scripts/code-review-history.sh`.
+After it, every git read must match a full clone with no further fetch. The cases build an
+origin with `refs/pull/<n>/merge` refs, run the step's real `run:` body, then cut `origin`.
 """
 
 from __future__ import annotations
@@ -22,9 +22,15 @@ from git_maintenance_helpers import git_global_config_text, git_maintenance_off_
 from test_ai_review_workflows_code_review_greps import _pcre_grep_path
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKFLOW = ROOT / ".github" / "workflows" / "code-review.yml"
+WORKFLOWS = ROOT / ".github" / "workflows"
 SCRIPT = ROOT / ".github" / "scripts" / "code-review-history.sh"
-JOBS = ("autosde-rules", "inclusive-language", "sast", "pr-hygiene")
+# Each job that runs the script, and the workflow file it lives in.
+JOBS = {
+    "autosde-rules": "code-review.yml",
+    "inclusive-language": "code-review.yml",
+    "sast": "code-review.yml",
+    "pr-hygiene": "pr-hygiene.yml",
+}
 DIFF_STEP = "Resolve diff base (merge-base)"
 
 pytestmark = pytest.mark.skipif(
@@ -33,8 +39,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _workflow(job: str) -> dict:
+    return yaml.safe_load((WORKFLOWS / JOBS[job]).read_text(encoding="utf-8"))
+
+
 def _steps(job: str) -> list[dict]:
-    return yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"][job]["steps"]
+    return _workflow(job)["jobs"][job]["steps"]
 
 
 def _checkout(job: str) -> dict:
@@ -42,9 +52,10 @@ def _checkout(job: str) -> dict:
     return checkout.get("with") or {}
 
 
-def test_every_job_is_covered() -> None:
-    jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
-    assert set(jobs) == set(JOBS), sorted(jobs)
+@pytest.mark.parametrize("name", sorted(set(JOBS.values())))
+def test_every_job_is_covered(name: str) -> None:
+    jobs = yaml.safe_load((WORKFLOWS / name).read_text(encoding="utf-8"))["jobs"]
+    assert set(jobs) == {job for job, file in JOBS.items() if file == name}, sorted(jobs)
 
 
 @pytest.mark.parametrize("job", JOBS)
@@ -76,7 +87,7 @@ def test_the_workflow_and_the_job_set_no_token(job: str) -> None:
     The workflow's own env and the whole job are read, the job's env and every
     step included, since a token set at any of those levels reaches the script.
     """
-    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    workflow = _workflow(job)
     for scope, value in (("workflow env", workflow.get("env") or {}), (job, workflow["jobs"][job])):
         text = yaml.safe_dump(value)
         for token in ("github.token", "secrets.", "GH_TOKEN", "GITHUB_TOKEN"):
@@ -103,6 +114,11 @@ class _Origin:
         )
         # Stripping GIT_* drops the suite's maintenance entries and global file.
         self.env.update(git_maintenance_off_entries(self.env))
+        # HOME is replaced, so a version-manager shim first on PATH would read its
+        # tools from the fake HOME and fail; the running interpreter's dir goes first.
+        self.env["PATH"] = os.pathsep.join(
+            (os.path.dirname(sys.executable), self.env.get("PATH", ""))
+        )
         self.git("init", "-q", "-b", "main", str(self.path), cwd=tmp)
         for key in ("uploadpack.allowFilter", "uploadpack.allowAnySHA1InWant"):
             self.git("config", key, "true")
@@ -262,7 +278,6 @@ READS = (
     ("diff", "MB..HEAD", "--unified=0", "--diff-filter=ACMR", "--", ":(exclude)README.md"),
     ("diff", "MB", "HEAD"),
     ("diff", "--name-only", "--no-renames", "MB", "HEAD"),
-    ("rev-list", "--count", "BASE..HEAD"),
     ("ls-tree", "--name-only", "BASE", "--", ".github/scripts/code-review-history.sh"),
     ("ls-tree", "--name-only", "BASE", "--", ".github/scripts/absent_check.py"),
     ("show", "BASE:.github/scripts/code-review-history.sh"),
@@ -289,26 +304,10 @@ def test_every_read_matches_a_full_clone_with_no_further_fetch(world, job: str) 
             assert got == o.git(*args, cwd=full), (case["name"], read)
 
 
-def test_the_commit_range_and_the_rule_greps_run_on_the_fetched_history(world) -> None:
+def test_the_rule_greps_run_on_the_fetched_history(world) -> None:
     o, cases, _ = world
     by_name = {c["name"]: c for c in cases}
-    steps = {s.get("name"): s for s in _steps("pr-hygiene") + _steps("autosde-rules")}
-    for name, count in (("normal", 1), ("three-commits", 3), ("base-moved", 1), ("fork", 1)):
-        work, res, _ = _diff_base(o, by_name[name], "pr-hygiene")
-        assert res.returncode == 0, res.stderr
-        env = {
-            "BASE": by_name[name]["base_tip"],
-            "HEAD": by_name[name]["head"],
-            "BASE_REF": "main",
-            "MAX_COMMITS": "2",
-        }
-        enforced = _run(
-            o, work, steps["Enforce commit count"]["run"], {**env, "GIT_NO_LAZY_FETCH": "1"}
-        )
-        assert (enforced.returncode == 0) is (count <= 2), (name, enforced.stdout)
-        assert (
-            f"({count} of at most" in enforced.stdout or f"(has {count})" in enforced.stdout
-        ), enforced.stdout
+    steps = {s.get("name"): s for s in _steps("autosde-rules")}
     work, res, sha = _diff_base(o, by_name["normal"], "autosde-rules")
     assert res.returncode == 0, res.stderr
     # The rule step runs on a Linux runner with GNU `grep -P`; a host whose

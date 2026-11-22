@@ -23,7 +23,7 @@ import ipaddress
 import logging
 import re
 
-# ``socket`` is not used directly here anymore (the hostname helpers moved to
+# ``socket`` is not used directly here (the hostname helpers live in
 # ``urls``), but it is re-exported on purpose: callers and tests patch
 # ``origin.socket.gethostname`` / ``.gethostbyname``, and because this is the one
 # shared stdlib module object, patching it through this name still reaches the
@@ -134,6 +134,39 @@ def is_direct_local_request(request: web.Request) -> bool:
     if is_ssm_request(request) or not is_loopback(request.remote or ""):
         return False
     return not any(h in request.headers for h in _PROXY_FORWARD_HEADERS)
+
+
+def is_host_forwarded_request(request: web.Request) -> bool:
+    """Return ``True`` for a port forward the container's host delivered to loopback.
+
+    Some development containers run their SSH server on the host rather than in
+    the container. An ``ssh -L`` forward to the container's ``127.0.0.1`` then
+    arrives from the host's end of the container's link-local link (a peer such
+    as ``169.254.255.193``), not from loopback, so :func:`is_direct_local_request`
+    refuses it although it is the same SSH forward that arrives from loopback
+    on an ordinary host.
+
+    Admitted only when the socket's own address is loopback and the peer is
+    link-local. The kernel drops a packet for ``127.0.0.0/8`` that arrives on a
+    real interface, so a non-loopback peer on a loopback socket exists only where
+    the host itself routes into the container's loopback: the same host-level
+    position as SSH to this machine, which :func:`is_direct_local_request`
+    already accepts. Forwarding headers and the Session Manager listener are
+    refused exactly as there.
+
+    For app web origins only. The secret-reveal and config-write gates keep
+    :func:`is_direct_local_request`.
+    """
+    if is_ssm_request(request) or any(h in request.headers for h in _PROXY_FORWARD_HEADERS):
+        return False
+    transport = request.transport
+    sockname = transport.get_extra_info("sockname") if transport is not None else None
+    if not isinstance(sockname, tuple) or not sockname or not is_loopback(str(sockname[0])):
+        return False
+    try:
+        return ipaddress.ip_address(request.remote or "").is_link_local
+    except ValueError:
+        return False
 
 
 def is_proxied_request(request: web.Request) -> bool:
@@ -483,14 +516,14 @@ def check_origin(
     canon = _canonical_origin(origin_base)
     if canon is not None:
         _scheme, canon_host, canon_port = canon
-        # An enterprise build matches a non-loopback origin exactly as listed
+        # An LTS build matches a non-loopback origin exactly as listed
         # (``dashboard_origins`` is an exact-origin list): no other spelling passes.
         # Each approved origin is stored in ``urls.stored_origin`` form (the
         # ``origin_policy_item`` spelling a browser sends), so the exact
         # ``origin_base in allowed`` test above is the comparison in that form.
         from kiro_crew import edition
 
-        exact_only = edition.is_enterprise() and not is_loopback(canon_host)
+        exact_only = edition.is_lts() and not is_loopback(canon_host)
         if not exact_only and any(_canonical_origin(a) == canon for a in allowed):
             return True
         if is_loopback(canon_host):
@@ -594,7 +627,13 @@ def withdraw_refused_origins(app: web.Application, loop: asyncio.AbstractEventLo
     from kiro_crew.dashboard.tailnet import running_tailnet_origin
 
     def kept() -> set[str]:
-        floor = origin_floor(app["port"], running_tailnet_origin(app)[0])
+        tailnet_origin = running_tailnet_origin(app)[0]
+        floor = origin_floor(app["port"], tailnet_origin)
+        # Under --port auto app["port"] is the requested 0 and served_port the bound
+        # one; the start-time set floors both, so the refresh keeps both.
+        served = app.get("served_port")
+        if served and served != app["port"]:
+            floor |= origin_floor(served, tailnet_origin)
         return floor | {dashboard_origin(url) for url in access.tailnet_direct().urls}
 
     allowed: set[str] = app["allowed_origins"]

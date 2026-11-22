@@ -21,11 +21,14 @@ import { useAppDispatch, useAppStore } from '../store'
 import { setHostModel, type HostModel } from '../store/instancesSlice'
 import { isEmbeddedPane } from '../lib/embedded'
 import { setFocusModeEnabled } from '../hooks/useFocusMode'
+import { noteChatCompleteChanged, setChatCompleteHostReader } from '../hooks/chatCompleteNotify'
 import { noteClipboardRelayHost, PANE_CLIPBOARD_VERSION } from '../lib/paneClipboardRelay'
 import { noteHostOrigin, setHostElectronReader } from '../lib/hostRelay'
+import { parsePaneRelayCrews } from '../lib/paneRelayCrews'
 
 const MAC_INSET_CLASS = 'embedded-mac-inset'
 const WIN_INSET_CLASS = 'embedded-win-inset'
+const LINUX_INSET_CLASS = 'embedded-linux-inset'
 const WIN_CAPTION_RESERVE_PROP = '--mc-win-caption-reserve'
 // Whole-pixel lengths only: the value crosses a postMessage boundary and is
 // written into this document's inline style.
@@ -81,6 +84,10 @@ export function parseHostModel(data: unknown): HostModel | null {
       // and have nothing to say about it. Absent is legitimate -- an older host,
       // and a healthy chain -- so the label falls back to the bare word.
       brokenAt: typeof t.brokenAt === 'string' ? t.brokenAt : undefined,
+      // One of three words or nothing: an unknown value shows the host alone.
+      transport: t.transport === 'ssh' || t.transport === 'ssm' || t.transport === 'fargate'
+        ? t.transport as 'ssh' | 'ssm' | 'fargate'
+        : undefined,
     }))
     .filter(t => t.id)
   const rawSelf = d.self && typeof d.self === 'object' ? (d.self as Record<string, unknown>) : null
@@ -102,6 +109,8 @@ export function parseHostModel(data: unknown): HostModel | null {
     winCaptionReserve: typeof d.winCaptionReserve === 'string' && WIN_CAPTION_RESERVE_RE.test(d.winCaptionReserve)
       ? d.winCaptionReserve
       : undefined,
+    // Same absence rule as `winInset`: an older host has nothing to relay.
+    linuxInset: !!d.linuxInset,
     // Tri-state on purpose: `false` and "the host never sent the field" must
     // not collapse. An older host omits it AND ignores the pane's echoed
     // `mc-set-focus-mode`, so coercing absence to `false` would revert a
@@ -114,12 +123,18 @@ export function parseHostModel(data: unknown): HostModel | null {
     pinnedCrews: Array.isArray(d.pinnedCrews)
       ? d.pinnedCrews.filter((id): id is string => typeof id === 'string')
       : [],
+    relayCrews: parsePaneRelayCrews(d.relayCrews),
+    // Absence -> false: an older host sends no failure, and the group shows as before.
+    relayCrewsFailed: d.relayCrewsFailed === true,
     // Tri-state, mirroring `focusMode` above: a non-boolean (typically absent)
     // means the host predates this relay, so it has no `mc-set-stable-order`
     // handler either. `null` records "no opinion" so the bar can order by the
     // pre-relay default AND withhold a toggle that host could never honor;
     // coercing to `false` would make the two cases indistinguishable.
     stableOrder: typeof d.stableOrder === 'boolean' ? d.stableOrder : null,
+    // Absence -> false, like `winInset`: an older host relays no opt-in, and
+    // the pane's own storage then decides, as it always did.
+    chatCompleteNotify: d.chatCompleteNotify === true,
   }
 }
 
@@ -133,6 +148,8 @@ export default function EmbeddedHostBridge() {
     // The pop-out controls ask whether the hub is the desktop app. They read
     // the stored host model through this getter, so the value has one home.
     setHostElectronReader(() => store.getState().instances.host?.electron === true)
+    // Same for the hub's "a background chat finished" toast opt-in.
+    setChatCompleteHostReader(() => store.getState().instances.host?.chatCompleteNotify === true)
 
     // Stop re-announcing ONLY on the parent's distinct `mc-embedded-ack`, not on
     // a host model. The parent broadcasts its model to every warm pane on any
@@ -183,6 +200,7 @@ export default function EmbeddedHostBridge() {
       const model = parseHostModel(e.data)
       if (!model) return
       dispatch(setHostModel(model))
+      noteChatCompleteChanged()
       // Where the tab bar's switch / pin / stable-order relays go: exactly the
       // origin this model came from, never '*'.
       noteHostOrigin(e.origin)
@@ -194,6 +212,7 @@ export default function EmbeddedHostBridge() {
       )
       document.documentElement.classList.toggle(MAC_INSET_CLASS, model.macInset)
       document.documentElement.classList.toggle(WIN_INSET_CLASS, model.winInset)
+      document.documentElement.classList.toggle(LINUX_INSET_CLASS, model.linuxInset)
       // Adopt the host's zoom-aware reserve; without one the pane's own :root
       // default (142px) applies.
       if (model.winInset && model.winCaptionReserve) {
@@ -227,10 +246,12 @@ export default function EmbeddedHostBridge() {
       for (const t of retryTimers) window.clearTimeout(t)
       document.documentElement.classList.remove(MAC_INSET_CLASS)
       document.documentElement.classList.remove(WIN_INSET_CLASS)
+      document.documentElement.classList.remove(LINUX_INSET_CLASS)
       document.documentElement.style.removeProperty(WIN_CAPTION_RESERVE_PROP)
       setFocusModeEnabled(false, { echo: false })
       noteClipboardRelayHost(null, false)
       setHostElectronReader(null)
+      setChatCompleteHostReader(null)
       dispatch(setHostModel(null))
     }
   }, [dispatch, store])

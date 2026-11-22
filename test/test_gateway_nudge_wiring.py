@@ -140,6 +140,28 @@ async def test_the_monitor_tick_reaches_the_controller() -> None:
     assert wired.controller.tick.await_args.args == (loop,)
 
 
+@pytest.mark.asyncio
+async def test_work_ledger_patrol_reads_session_owned_work() -> None:
+    orch = _orchestrator()
+    slot = SimpleNamespace(
+        key="worker",
+        linked_session_key="",
+        turn_running=False,
+        running=False,
+    )
+    workflow = SimpleNamespace(
+        registry=SimpleNamespace(has_pending_work_for=lambda key: key == "dashboard:worker")
+    )
+    orch.dashboard_state = SimpleNamespace(
+        get_slot=lambda key: slot if key == "worker" else None,
+        subagents=None,
+        workflow_service=workflow,
+    )
+    wired = await _wire(orch)
+
+    assert wired.service_kwargs["worker_running"]("worker") is True
+
+
 # ── the wake judge's evidence collector ──────────────────────────────────────
 
 
@@ -220,6 +242,33 @@ async def test_the_collector_reads_the_session_page_the_judge_retains(
     ]
     # The pull-request reading is the monitor's own, aged by its sibling field.
     assert seen["pr"] == {"status": "open", "observed_at": 120.5}
+
+
+@pytest.mark.asyncio
+async def test_the_collector_primes_app_reach_before_it_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The read gate reads only primed app verdicts, so each read follows a prime."""
+    orch = _orchestrator()
+    orch.dashboard_state = MagicMock()
+    order: list[str] = []
+
+    async def _prime(state: Any) -> None:
+        assert state is orch.dashboard_state
+        order.append("prime")
+
+    def _read_messages(state: Any, **kwargs: Any) -> dict[str, Any]:
+        order.append("read")
+        return {"messages": [], "next_since": None}
+
+    monkeypatch.setattr(session_control, "prewarm_app_reach", _prime)
+    monkeypatch.setattr(session_control, "read_messages", _read_messages)
+    _judge_seams(monkeypatch)
+    wired = await _wire(orch)
+
+    await wired.service_kwargs["collect_judge_evidence"](_loop("chat-1"))
+
+    assert order == ["prime", "read"]
 
 
 @pytest.mark.parametrize(

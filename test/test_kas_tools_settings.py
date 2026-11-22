@@ -8,6 +8,9 @@ names only what the translation cannot carry.
 
 from __future__ import annotations
 
+import os
+import sys
+
 import pytest
 
 from kiro_crew.acp import kas_agents
@@ -28,6 +31,15 @@ def _spec(**over):
     base = {"name": "a1", "prompt": "p", "tools": ["*"], "includeMcpJson": False}
     base.update(over)
     return base
+
+
+@pytest.fixture
+def fail_closed_web_fetch(monkeypatch):
+    """``agent.kas_fail_closed_web_fetch_blocked`` on, at both readers."""
+    from kiro_crew.acp import kas_permissions, kas_unread_commands
+
+    monkeypatch.setattr(kas_permissions, "fails_closed_on_uncarried_blocked", lambda: True)
+    monkeypatch.setattr(kas_unread_commands, "fails_closed_on_uncarried_blocked", lambda: True)
 
 
 class TestRegexToGlob:
@@ -154,9 +166,16 @@ class TestTranslation:
             "write": {"allowedPaths": ["./out/**"]},
         }
         assert _rules(settings) == []
-        # allowedCommands is answered by Crew at the gate, not by a rule
-        # (`test_kas_allowed_commands.py`), so only the path allows are named.
-        assert _lost(settings) == ["read.allowedPaths", "write.allowedPaths"]
+        # allowedCommands and both allowedPaths are answered by Crew at the gate,
+        # not by a rule (`test_kas_allowed_commands.py`,
+        # `test_kas_tools_settings_grants.py`), so nothing is named.
+        assert _lost(settings) == []
+
+    def test_grep_and_glob_allowed_paths_are_still_named(self):
+        """kiro-cli reads them apart from the read tool's; Crew does not answer them."""
+        settings = {"grep": {"allowedPaths": ["./src/**"]}, "glob": {"allowedPaths": ["x"]}}
+        assert _rules(settings) == []
+        assert _lost(settings) == ["glob.allowedPaths", "grep.allowedPaths"]
 
     def test_deny_by_default_is_carried_as_no_rule(self):
         """Crew's gate enforces it (``spec_shell_allowlist``), so the notice does not
@@ -167,21 +186,69 @@ class TestTranslation:
 
     def test_write_fallback_deny_is_carried_as_no_rule(self):
         """Crew's gate enforces it (``spec_write_allowlist``), so the notice does not
-        name it; the engine still gets no rule for it, and ``allowedPaths`` stays
-        named because a covered write still prompts on KAS."""
+        name it; the engine still gets no rule for it, and ``allowedPaths`` is not
+        named either: Crew's gate answers a covered write."""
         settings = {"fs_write": {"allowedPaths": ["./out/**"], "fallbackAction": "deny"}}
         assert _rules(settings) == []
-        assert _lost(settings) == ["fs_write.allowedPaths"]
+        assert _lost(settings) == []
         assert _lost({"fs_write": {"fallbackAction": "interactive"}}) == []
         # A value the gate does not read as deny is still named.
         assert _lost({"fs_write": {"fallbackAction": "ask-me"}}) == ["fs_write.fallbackAction"]
 
     def test_web_fetch_blocked_matches_the_host_only(self):
-        settings = {"web_fetch": {"blocked": [r".*pastebin\.com.*", r"https://evil\.com/.*"]}}
+        settings = {"web_fetch": {"blocked": [r".*pastebin\.com.*", r".*evil\.com.*"]}}
+        assert _rules(settings) == [
+            {
+                "capability": "web_fetch",
+                "match": ["*pastebin.com*", "*evil.com*"],
+                "effect": "deny",
+            }
+        ]
+        assert _lost(settings) == []
+
+    @pytest.mark.parametrize(
+        "uncarried",
+        [r"https://evil\.com/.*", r"evil\.(com|net)", "x" * 2000],
+        ids=["whole-url", "regex-syntax", "over-long"],
+    )
+    def test_by_default_an_uncarried_blocked_entry_adds_no_rule(self, uncarried):
+        """Off by default: the entry is named, the carried host deny still travels."""
+        settings = {"web_fetch": {"blocked": [r".*pastebin\.com.*", uncarried]}}
         assert _rules(settings) == [
             {"capability": "web_fetch", "match": ["*pastebin.com*"], "effect": "deny"}
         ]
         assert _lost(settings) == ["web_fetch.blocked"]
+
+    @pytest.mark.parametrize(
+        "uncarried",
+        [r"https://evil\.com/.*", r"evil\.(com|net)", "x" * 2000],
+        ids=["whole-url", "regex-syntax", "over-long"],
+    )
+    def test_opted_in_an_uncarried_blocked_entry_denies_every_fetch(
+        self, uncarried, fail_closed_web_fetch
+    ):
+        """``agent.kas_fail_closed_web_fetch_blocked`` on: one deny over "*"."""
+        settings = {"web_fetch": {"blocked": [r".*pastebin\.com.*", uncarried]}}
+        assert _rules(settings) == [{"capability": "web_fetch", "match": ["*"], "effect": "deny"}]
+        assert _lost(settings) == ["web_fetch.blocked"]
+
+    def test_an_allow_list_past_the_rule_bound_never_sinks_the_denies(self):
+        """Allows are added last and only when they fit, so a long trustedAgents
+        list is named and dropped while every deny still travels."""
+        settings = {
+            "web_fetch": {"blocked": [r".*evil\.com.*"]},
+            "subagent": {"trustedAgents": [f"agent-{i}" for i in range(64 * 201)]},
+        }
+        assert _rules(settings) == [
+            {"capability": "web_fetch", "match": ["*evil.com*"], "effect": "deny"}
+        ]
+        assert "subagent.trustedAgents" in _lost(settings)
+
+    def test_denies_past_the_rule_bound_send_no_block_and_are_named(self):
+        settings = {"read": {"deniedPaths": [f"/d{i}/**" for i in range(64 * 201)]}}
+        block, lost = tools_settings_to_permissions(settings)
+        assert block is None
+        assert "(all: too many rules)" in lost
 
     def test_available_agents_deny_every_other_sub_agent(self):
         # The shape run live: a deny over "*" with the listed names in
@@ -252,17 +319,20 @@ class TestTranslation:
     def test_unknown_and_unsupported_entries_are_reported(self):
         settings = {
             "use_aws": {"allowedServices": ["s3"]},
-            "shell": {"autoAllowReadonly": True},
+            "shell": {"autoAllowReadonly": "yes"},
             "grep": {"allowReadOnly": True},
             "empty": {},
             "off": {"autoAllowReadonly": False},
         }
         assert _rules(settings) == []
+        # A boolean `autoAllowReadonly` is carried by Crew's read-only row; only a
+        # value it cannot read is named.
         assert _lost(settings) == [
             "grep.allowReadOnly",
             "shell.autoAllowReadonly",
             "use_aws.allowedServices",
         ]
+        assert _lost({"shell": {"autoAllowReadonly": True}}) == []
 
     def test_large_lists_are_split_not_refused(self):
         rules = _rules({"read": {"deniedPaths": [f"/p{i}/**" for i in range(130)]}})
@@ -288,7 +358,8 @@ class TestWireProjection:
         allow = {"capability": "subagent", "match": ["reviewer"], "effect": "allow"}
 
         def rules(permits):
-            monkeypatch.setattr(kas_agents, "may_skip_gate_now", permits)
+            # The session's own predicate, which the translated merge asks.
+            monkeypatch.setattr(kas_agents, "may_skip_gate_for_session", lambda *_a: permits)
             return to_client_custom_agent("a1", spec, "p").get("permissions", {}).get("rules", [])
 
         asked: list[str] = []
@@ -337,14 +408,100 @@ class TestNotice:
             toolsSettings={
                 "read": {"deniedPaths": ["x"]},
                 "shell": {"autoAllowReadonly": True},
+                "grep": {"allowReadOnly": True},
             },
         )
         assert spec_keys_without_carrier(spec, translates_tools_settings=True) == [
             "slashCommand",
-            "toolsSettings.shell.autoAllowReadonly",
+            "toolsSettings.grep.allowReadOnly",
         ]
 
     def test_a_backend_without_the_translation_names_the_whole_key(self):
         """goose and opencode fire spec hooks too, but never receive the rules."""
         spec = _spec(toolsSettings={"read": {"deniedPaths": ["x"]}})
         assert spec_keys_without_carrier(spec) == ["toolsSettings"]
+
+
+@pytest.mark.parametrize(
+    ("stored", "on"), [(True, True), (False, False), ("true", False), (None, False)]
+)
+def test_fail_closed_is_read_from_the_agent_config(tmp_path, _floor_monkeypatch, stored, on):
+    """Only a JSON ``true`` under ``agent`` turns the fail-closed deny on."""
+    import json
+
+    from kiro_crew.acp.kas_unread_commands import fails_closed_on_uncarried_blocked
+
+    _floor_monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    agent = {} if stored is None else {"kas_fail_closed_web_fetch_blocked": stored}
+    (tmp_path / "config.json").write_text(json.dumps({"agent": agent}), encoding="utf-8")
+    assert fails_closed_on_uncarried_blocked() is on
+
+
+_FLAG_ON = '{"agent": {"kas_fail_closed_web_fetch_blocked": true}}'
+
+
+@pytest.mark.parametrize(
+    ("text", "on"),
+    [
+        # Nothing to say the owner turned it on: off, as before.
+        (None, False),
+        ("{}", False),
+        ('{"agent": {"kas_fail_closed_web_fetch_blocked": false}}', False),
+        ('{"memory": 5}', False),
+        ('{"memory": 5, "agent": {"kas_fail_closed_web_fetch_blocked": true}}', True),
+        # The read cannot say what the owner chose: the fence stays on.
+        (_FLAG_ON[:30], True),
+        ('{"agent": "oops"}', True),
+    ],
+    ids=[
+        "absent",
+        "empty",
+        "false",
+        "other-section-bad",
+        "other-section-bad-on",
+        "torn",
+        "agent-bad",
+    ],
+)
+def test_fail_closed_stays_on_when_the_config_cannot_be_read(
+    tmp_path, _floor_monkeypatch, text, on
+):
+    """A broken config never drops the owner's choice; a fresh install stays off."""
+    from kiro_crew.acp.kas_unread_commands import fails_closed_on_uncarried_blocked
+
+    _floor_monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    if text is not None:
+        (tmp_path / "config.json").write_text(text, encoding="utf-8")
+    assert fails_closed_on_uncarried_blocked() is on
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="needs a POSIX mode bit the user cannot read past",
+)
+def test_fail_closed_stays_on_when_the_config_is_unreadable(tmp_path, _floor_monkeypatch):
+    from kiro_crew.acp.kas_unread_commands import fails_closed_on_uncarried_blocked
+
+    _floor_monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    path = tmp_path / "config.json"
+    path.write_text(_FLAG_ON, encoding="utf-8")
+    path.chmod(0)
+    try:
+        assert fails_closed_on_uncarried_blocked() is True
+    finally:
+        path.chmod(0o600)
+
+
+def test_fail_closed_reads_the_gateways_last_applied_config(tmp_path, _floor_monkeypatch):
+    """The live snapshot wins over a torn file on disk, so a bad write does not flip it."""
+    from kiro_crew.acp.kas_unread_commands import fails_closed_on_uncarried_blocked
+    from kiro_crew.config import live
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    _floor_monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    path = tmp_path / "config.json"
+    path.write_text('{"agent": {"kas_fail_closed_web_fetch_blocked": false}}', encoding="utf-8")
+    applied = KiroCrewConfig.load()
+    path.write_text(_FLAG_ON[:30], encoding="utf-8")
+    _floor_monkeypatch.setattr(live, "snapshot", lambda: applied)
+    assert fails_closed_on_uncarried_blocked() is False

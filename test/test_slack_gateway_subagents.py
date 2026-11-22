@@ -11,6 +11,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from real_session_manager import open_session, real_sessions
 from slack_gateway_helpers import _restore_update_check_cache  # noqa: F401
 from slack_gateway_helpers import (
     _make_orchestrator,
@@ -227,6 +228,36 @@ class TestInitSubagents:
         await self._await_patch_pushes(orch, 1)
         assert orch.dashboard_state.push_slots_update.call_count == 0
 
+    @pytest.mark.asyncio
+    async def test_a_nested_runs_frames_carry_its_root_chats_slot(self):
+        """A run whose parent is a sub-agent draws in the tab of the chat its tree
+        started from (``root_session_key``), not on ``subagent:<id>``, which no tab
+        reads. Its parent's queued depth and wave start stay on the parent's key."""
+        from kiro_crew.subagent import SubagentInfo
+
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = _mock_context_builder()
+        orch.ctx_builder.hooks = MagicMock()
+        orch.dashboard_state = _mock_dashboard_state()
+        on_event = self._capture_on_event(orch)
+        orch.subagent_mgr.published_queued_depths = lambda: {"subagent:b": 1}
+        grandchild = SubagentInfo(id="c", task="t", parent_session_key="subagent:b")
+        grandchild.root_session_key = "dashboard:chat1"
+
+        await on_event("subagent_spawn", grandchild, {"task": "t"})
+        await on_event("subagent_tool", grandchild, {"tool": "grep"})
+        await on_event("subagent_queued", grandchild, {"queued": 1})
+        await on_event("spawn_batch_started", grandchild, {"batch_id": "w1", "count": 2})
+
+        broadcast = orch.dashboard_state.broadcast_ws.call_args_list
+        assert [(c.args[0], c.args[1]["slot"]) for c in broadcast] == [
+            ("subagent_spawn", "chat1"),
+            ("subagent_tool", "chat1"),
+            ("subagent_queued", "subagent:b"),
+            ("spawn_batch_started", "subagent:b"),
+        ]
+
 
 class TestSubagentDoneStoppedClassification:
     """A user-stopped subagent (error-free record) must never be classified as
@@ -257,8 +288,8 @@ class TestSubagentDoneStoppedClassification:
 
     @pytest.mark.asyncio
     async def test_stopped_agent_notification_says_stopped_not_completed(self):
-        """Slot-gone path: title carries ⏹ and body frames a stop with partial
-        output — never 'completed ✅'."""
+        """Slot-gone path: title says stopped and body frames a stop with partial
+        output — never completed."""
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
         orch.ctx_builder = _mock_context_builder()
@@ -272,8 +303,8 @@ class TestSubagentDoneStoppedClassification:
         orch.dashboard_state.notify.assert_called_once()
         args = orch.dashboard_state.notify.call_args
         title, body = args.args[1], args.args[2]
-        assert "⏹" in title
-        assert "✅" not in title
+        assert title.endswith(" stopped")
+        assert "completed" not in title
         assert "Stopped by the user" in body
         assert "partial notes so far" in body
 
@@ -296,7 +327,7 @@ class TestSubagentDoneStoppedClassification:
 
         orch.dashboard_state.notify.assert_called_once()
         title, body = orch.dashboard_state.notify.call_args.args[1:3]
-        assert "⏹" in title
+        assert title.endswith(" stopped")
         assert "parent conversation ended (retire_kiro_identity_sessions)" in body
         assert "Stopped by the user" not in body
         assert "stopped by user" not in body
@@ -373,6 +404,82 @@ class TestSubagentFinalSummaryDirective:
         assert slot._pending_synthesis is True
         # Delivery counter must be balanced back to 0 (no leak → gate not stuck).
         assert slot._subagent_deliveries_inflight == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("close_subagent_managers")
+    async def test_report_waiting_sibling_does_not_block_last_completion(self, monkeypatch):
+        """Report-waiting outer tasks stay active without blocking the last armer."""
+        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.subagent import SubagentInfo, SubagentManager
+
+        cfg = KiroCrewConfig()
+        cfg.agent.task_queue_enabled = False
+        monkeypatch.setattr(KiroCrewConfig, "load", lambda: cfg)
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = _mock_context_builder()
+        orch.ctx_builder.hooks = MagicMock()
+        state = _mock_dashboard_state()
+        slot = MagicMock(key="s1", task=None, running=False)
+        slot._pending_synthesis = False
+        slot._synthesis_armers = set()
+        slot._subagent_deliveries_inflight = 0
+        slot._subagents_inline_collected = set()
+        _admit_drains(slot)
+        state.get_slot = MagicMock(return_value=slot)
+        orch.dashboard_state = state
+        on_done = self._capture_on_done(orch)
+        manager = SubagentManager(sessions=orch.sessions, ctx_builder=orch.ctx_builder)
+        orch.subagent_mgr = manager
+        parent = "dashboard:s1"
+        infos = [SubagentInfo(id=aid, task="t", parent_session_key=parent) for aid in ("a1", "b1")]
+        manager._agents.update((info.id, info) for info in infos)
+        manager._running_count = len(infos)
+        delivered = {info.id: asyncio.Event() for info in infos}
+        release = asyncio.Event()
+
+        async def inner(info, _key):
+            info.done = True
+
+        async def report(info, **_kwargs):
+            await on_done(info)
+            delivered[info.id].set()
+            await await_until(release, what="the report delivery to settle")
+            return True
+
+        monkeypatch.setattr(manager, "_run_inner", inner)
+        monkeypatch.setattr(manager, "_report_terminal", report)
+        monkeypatch.setattr(type(manager._run_events), "_cap_unclaimed_result_impl", AsyncMock())
+        monkeypatch.setattr(manager, "_teardown_run_session", AsyncMock())
+        monkeypatch.setattr(manager, "_record_cost", lambda _info: None)
+        monkeypatch.setattr(manager, "_drain_queue", lambda: None)
+        tasks = []
+        try:
+            with patch("kiro_crew.slack.gateway._start_next_queued_turn", new=AsyncMock()):
+                for info in infos:
+                    outer = asyncio.create_task(manager._run(info))
+                    tasks.append(outer)
+                    manager._tasks[info.id] = outer
+                    await await_until(delivered[info.id], what=f"the {info.id} completion")
+                    assert info.id not in manager._tasks
+                    assert not outer.done(), "the report still holds its outer task"
+                    assert manager.has_current_execution_for(parent)
+                    assert slot._pending_synthesis is (info.id == "b1")
+                assert manager.has_in_memory_pending_work_for(parent) is False
+                assert slot._synthesis_armers == {"b1"}
+                assert slot._subagent_deliveries_inflight == 0
+        finally:
+            manager._shutting_down = True
+            release.set()
+            await await_until(
+                asyncio.gather(*tasks, return_exceptions=True), what="both outer runs to drain"
+            )
+            await await_until(
+                asyncio.create_task(manager.cancel_all()), what="the manager's reports to drain"
+            )
+            manager.close()
+        assert not manager.has_current_execution_for(parent)
+        assert not manager._run_task_owners
 
     @pytest.mark.asyncio
     async def test_pending_completion_does_not_arm(self):
@@ -645,10 +752,10 @@ class TestSynthesisAfterAOneTurnBatch:
 class TestSubagentDone:
     """Subagent completion routing."""
 
-    def _setup_orch_with_subagent_mgr(self):
+    def _setup_orch_with_subagent_mgr(self, sessions=None):
         """Create orchestrator with subagent manager initialized."""
         orch = _make_orchestrator()
-        orch.sessions = _mock_sessions()
+        orch.sessions = _mock_sessions() if sessions is None else sessions
         orch.ctx_builder = _mock_context_builder()
         orch.ctx_builder.hooks = MagicMock()
         orch.ctx_builder.build_message = MagicMock(return_value=("msg", None))
@@ -761,7 +868,9 @@ class TestSubagentDone:
     @pytest.mark.asyncio
     async def test_cron_parent_injects_result(self):
         """Subagent done → cron parent → injects into session."""
-        orch, mock_sm = self._setup_orch_with_subagent_mgr()
+        orch, mock_sm = self._setup_orch_with_subagent_mgr(real_sessions())
+        # The cron run's live session: a completion continues it.
+        await open_session(orch.sessions, "cron:job1")
         on_done = mock_sm.call_args[1]["on_done"]
         orch.subagent_mgr.running = []
 
@@ -777,18 +886,22 @@ class TestSubagentDone:
         info.elapsed = 2.0
         info.started = 0.0
 
-        with patch(
-            "kiro_crew.slack.gateway.stream_and_collect",
-            new_callable=AsyncMock,
-            return_value="llm response",
-        ) as mock_stream:
+        reset = AsyncMock(wraps=orch.sessions.reset)
+        with (
+            patch(
+                "kiro_crew.slack.gateway.stream_and_collect",
+                new_callable=AsyncMock,
+                return_value="llm response",
+            ) as mock_stream,
+            patch.object(orch.sessions, "reset", reset),
+        ):
             await on_done(info)
 
         mock_stream.assert_awaited_once()
-        # The last sub-agent's cleanup never resets under a live turn.
-        orch.sessions.reset.assert_awaited_with(
-            "cron:job1", skip_if_busy=True, skip_if_injecting=True
-        )
+        # The last sub-agent's cleanup never resets under a live turn, and it
+        # retires the idle cron session.
+        reset.assert_awaited_with("cron:job1", skip_if_busy=True, skip_if_injecting=True)
+        assert not orch.sessions.has_session("cron:job1")
         orch.dashboard_state.notify.assert_called_once()
         assert orch.dashboard_state.notify.call_args.args[0] == "subagent"
         assert "llm response" in orch.dashboard_state.notify.call_args.args[2]

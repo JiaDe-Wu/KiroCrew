@@ -24,7 +24,9 @@ import { useGuideTrustRootAttrs } from '../guide/trustRoot'
  *   events a browser replays for a tap are ignored, decided by the tap's own
  *   pointer events so a real mouse on a touch device still hovers. On iOS a
  *   hint appearing mid-tap cost the click. A held outcome still opens, and an
- *   anchor may opt in (`openOnTap`) when its bubble outranks its click.
+ *   anchor may opt in (`openOnTap`) when its bubble outranks its click. An
+ *   anchor with no click at all may instead open on the touch release itself
+ *   (`openOnTouchRelease`), still ignoring the replayed mouse events.
  * - A scroll that can move the anchor hides while open: the position is
  *   captured at show time, so after such a scroll the bubble would sit
  *   detached from its anchor. Capture phase, because the strips that scroll
@@ -170,9 +172,10 @@ function flowFloor(el: HTMLElement): number | undefined {
 }
 
 /** Hover-intent window. Long enough that a pointer merely crossing the anchor
- *  paints nothing, short enough to read as instant. A module constant, not a
- *  hook parameter: both consumers want the same feel, and a per-site knob was
- *  surface with zero callers. Exported so tests advance exactly this. */
+ *  paints nothing, short enough to read as instant. The default for every
+ *  control's hint; `useInstantTip({ openDelayMs })` asks for a longer one where
+ *  the pointer crosses anchors far more often than it means to read them (a
+ *  link's address in running text). Exported so tests advance exactly this. */
 export const OPEN_DELAY_MS = 100
 
 /** How long after a touch pointer event on the anchor a `mouseenter` or
@@ -243,8 +246,19 @@ function resumeYieldedHints() {
  * and on iOS the action may then take a second tap, which is the pre-gate
  * behaviour that anchor had. Every other anchor keeps the default: its bubble
  * is a hint the click does not need, and the tap must land first time.
+ * `openOnTouchRelease`: open the hint on the touch pointerup itself, so a tap
+ * shows it without depending on the replayed mouseenter/focus, which stay
+ * ignored, or on a focus event at all (Safari need not focus a tapped button;
+ * a still-focused anchor gets no new one after a scroll). The hint survives
+ * the replay's trailing mouseleave and closes on blur, Escape, an
+ * anchor-moving scroll or a capture-phase pointerdown outside the anchor; a
+ * held outcome keeps its hold. For an anchor with no click action only
+ * (CrewModeMarks' read-only bolt): it does not change `openOnTap`, whose
+ * consumers keep opening from the replayed hover/focus before their click.
+ * `openDelayMs`: the pointer's intent window before the bubble opens
+ * (`OPEN_DELAY_MS` unless asked). Keyboard focus still shows at once.
  */
-export function useInstantTip({ hold = 0, placement = 'above', openOnTap = false }: { hold?: boolean | number; placement?: TipPlacementOption; openOnTap?: boolean } = {}) {
+export function useInstantTip({ hold = 0, placement = 'above', openOnTap = false, openOnTouchRelease = false, openDelayMs = OPEN_DELAY_MS }: { hold?: boolean | number; placement?: TipPlacementOption; openOnTap?: boolean; openOnTouchRelease?: boolean; openDelayMs?: number } = {}) {
   const [tip, setTip] = useState<TipPos | null>(null)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const anchorRef = useRef<HTMLElement | null>(null)
@@ -272,7 +286,8 @@ export function useInstantTip({ hold = 0, placement = 'above', openOnTap = false
   const notePointer = (e: React.PointerEvent) => {
     touchUntilRef.current = e.pointerType === 'touch' ? Date.now() + TOUCH_REPLAY_WINDOW_MS : 0
   }
-  const fromTouch = () => !openOnTap && Date.now() < touchUntilRef.current
+  // A release-opened hint has already shown, so its replay is ignored too.
+  const fromTouch = () => (openOnTouchRelease || !openOnTap) && Date.now() < touchUntilRef.current
   // Links the anchor to the bubble (`aria-describedby` -> `role="tooltip"`),
   // restoring what the native `title` gave screen readers for free. Applied
   // unconditionally: a described-by pointing at a not-yet-rendered id is
@@ -411,20 +426,37 @@ export function useInstantTip({ hold = 0, placement = 'above', openOnTap = false
     const onScroll = (e: Event) => {
       if (scrollMovesAnchor(e.target, anchorRef.current)) hide()
     }
+    const onPointerDown = (e: PointerEvent) => {
+      // Safari need not focus a tapped button, so blur alone cannot close a
+      // release-opened hint. Outcomes keep their hold; only hints dismiss.
+      if (!holdRef.current && !(e.target instanceof Node && anchorRef.current?.contains(e.target))) dismiss()
+    }
     window.addEventListener('keydown', onKeyDown)
     window.addEventListener('scroll', onScroll, { capture: true, passive: true })
+    if (openOnTouchRelease) window.addEventListener('pointerdown', onPointerDown, { capture: true, passive: true })
     return () => {
       window.removeEventListener('keydown', onKeyDown)
       window.removeEventListener('scroll', onScroll, { capture: true })
+      if (openOnTouchRelease) window.removeEventListener('pointerdown', onPointerDown, { capture: true })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tip !== null])
+  }, [tip !== null, openOnTouchRelease])
 
   const tipHandlers = {
     'aria-describedby': tipId,
     onPointerEnter: notePointer,
     onPointerDown: notePointer,
-    onPointerUp: notePointer,
+    onPointerUp: (e: React.PointerEvent) => {
+      notePointer(e)
+      if (!openOnTouchRelease || e.pointerType !== 'touch') return
+      cancelPending()
+      const el = e.currentTarget as HTMLElement
+      anchorRef.current = el
+      lastAnchorRef.current = el
+      pointerInRef.current = false
+      keyboardFocusRef.current = false
+      showFor(el)
+    },
     onMouseEnter: (e: React.MouseEvent) => {
       // A tap's replayed enter: no bubble, and no "pointer is here" either,
       // since a finger that lifted has left.
@@ -439,10 +471,13 @@ export function useInstantTip({ hold = 0, placement = 'above', openOnTap = false
       timerRef.current = setTimeout(() => {
         timerRef.current = null
         if (anchorRef.current === el && el.isConnected) showFor(el)
-      }, OPEN_DELAY_MS)
+      }, openDelayMs)
     },
     onMouseLeave: () => {
       pointerInRef.current = false
+      // A touch browser can replay mouseleave as the finger lifts. The
+      // release-opened hint stays until blur, Escape, scroll or an outside press.
+      if (openOnTouchRelease && fromTouch()) { cancelPending(); return }
       // Held: the bubble carries an outcome the user must still be able to
       // read; only a pending intent open is dropped. It closes when the hold
       // ends (effect above).
@@ -469,11 +504,14 @@ export function useInstantTip({ hold = 0, placement = 'above', openOnTap = false
 /** The bubble. Shared chrome here; the caller passes only content and a
  *  variant class for width/wrap (`whitespace-nowrap` for a short two-liner,
  *  `max-w-[26rem] whitespace-pre-wrap break-words` for prose). Pass the
- *  hook's `tipId` so the anchor's `aria-describedby` resolves. */
-export function InstantTip({ tip, tipId, className = '', children }: {
+ *  hook's `tipId` so the anchor's `aria-describedby` resolves. `arrow` draws
+ *  the flow bubble's pointer for any anchor: in a stacked list a bubble with
+ *  none reads as the row it covers. */
+export function InstantTip({ tip, tipId, className = '', arrow = false, children }: {
   tip: TipPos | null
   tipId?: string
   className?: string
+  arrow?: boolean
   children: React.ReactNode
 }) {
   const trustRoot = useGuideTrustRootAttrs()
@@ -494,10 +532,12 @@ export function InstantTip({ tip, tipId, className = '', children }: {
   // its `below` candidate if that side has more room. If neither side fits,
   // clamp on the roomier side, keeping the text's start at least 8px from the
   // viewport top even when the bubble is taller than the viewport. Flow keeps
-  // its prose-aware placement. Vertically for `below`: a chip on the last line
-  // of a full-height pane would open the bubble off the bottom; a flow anchor
-  // goes above after all (its `flip`), an explicit `below` is clamped to the bottom edge.
-  // A flow bubble's arrow (`nub`, its offset from the bubble's left) moves the
+  // its prose-aware side: a bubble that starts above, or flips above because
+  // below crosses its floor or the viewport bottom, clamps at the viewport top
+  // instead of opening below over the following prose. An explicit `below` that
+  // would cross the viewport bottom opens above when the whole bubble fits
+  // there, and is otherwise clamped to the bottom edge.
+  // The arrow (`nub`, its offset from the bubble's left) moves the
   // other way when the clamp moves the bubble, so it stays on the anchor.
   useLayoutEffect(() => {
     setFit(null)
@@ -527,6 +567,9 @@ export function InstantTip({ tip, tipId, className = '', children }: {
         left = tip.flip.left
       } else top = el.offsetHeight + 8
     }
+    if (placement === 'above' && tip.flow && top - el.offsetHeight < 8) {
+      top = el.offsetHeight + 8
+    }
     const anchorLeft = left
     const maxLeft = window.innerWidth - 8 - el.offsetWidth
     left = Math.max(8, Math.min(left, maxLeft))
@@ -551,7 +594,7 @@ export function InstantTip({ tip, tipId, className = '', children }: {
       {children}
       {/* A rotated square astride the edge that faces the anchor, painted in
           the bubble's own border and fill so it reads as part of it. */}
-      {tip.flow && <span
+      {(tip.flow || arrow) && <span
         aria-hidden="true"
         data-testid="instant-tip-arrow"
         className={`absolute h-2 w-2 rotate-45 border-border-strong bg-bg-elevated ${placement === 'below' ? '-top-[5px] border-l border-t' : '-bottom-[5px] border-b border-r'}`}
@@ -576,7 +619,7 @@ type LabelTipHandlers = {
  *  pick. A hint painted on that returned focus would float over a button the
  *  mouse user already left. Where the selector is unsupported, every focus
  *  counts. */
-function keyboardFocused(el: Element): boolean {
+export function keyboardFocused(el: Element): boolean {
   try { return el.matches(':focus-visible') } catch { return true }
 }
 

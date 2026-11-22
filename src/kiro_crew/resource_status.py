@@ -50,6 +50,7 @@ reader (``docs/system-specs/modules/subagent.md``).
 from __future__ import annotations
 
 import logging
+import math
 import os
 import shutil
 import sys
@@ -1148,9 +1149,10 @@ class SpawnFloorReading:
             return f"{head}; {self.unknown_note} — BLOCKED: {_BLOCKED_NOTE}"
         if self.available_gb < 0:
             return f"{head}; the gate's memory figure is unreadable here, so starts are not held"
+        figure, bar = self._figure_and_bar_text()
         line = (
-            f"{head}; the gate reads {self.available_gb:.1f} GB, a top-level start needs at least "
-            f"{self.min_start_gb:.2f} GB (more for a dedicated one or while other "
+            f"{head}; the gate reads {figure} GB, a top-level start needs at least "
+            f"{bar} GB (more for a dedicated one or while other "
             "starts are warming)"
         )
         if self.blocked:
@@ -1166,11 +1168,26 @@ class SpawnFloorReading:
                 f"new top-level subagents cannot start now ({self.unknown_note}); "
                 "they wait in the queue"
             )
+        figure, bar = self._figure_and_bar_text()
         return (
             f"new top-level subagents cannot start now — the gate reads "
-            f"{self.available_gb:.1f} GB and one needs at least {self.min_start_gb:.2f} GB; "
+            f"{figure} GB and one needs at least {bar} GB; "
             "they wait in the queue until memory frees"
         )
+
+    def _figure_and_bar_text(self) -> tuple[str, str]:
+        """The gate figure and the start bar at two decimals, ordered as the gate compares them.
+
+        Rounding both to nearest can print a held figure equal to or above its bar,
+        so a blocked reading rounds the figure down and the bar up.
+        """
+        if not self.blocked:
+            return f"{self.available_gb:.2f}", f"{self.min_start_gb:.2f}"
+        cents_figure = math.floor(round(self.available_gb * 100, 6))
+        cents_bar = math.ceil(round(self.min_start_gb * 100, 6))
+        if cents_figure >= cents_bar:
+            cents_figure = cents_bar - 1
+        return f"{cents_figure / 100:.2f}", f"{cents_bar / 100:.2f}"
 
 
 def _read_spawn_floor_figure(min_gb: float) -> tuple[float, str]:
@@ -1317,14 +1334,15 @@ def probe(cfg: object | None = None) -> ResourceStatus:
 XDIST_AUTO_ENV = "PYTEST_XDIST_AUTO_NUM_WORKERS"
 
 #: Platform-aware assumed steady-state memory of one xdist worker (GB). A
-#: full-suite worker holds ~1.5 GB on Linux but 14.9-16.1 GB on macOS, so no
-#: single fixed number is correct for every host. macOS is sized to that
-#: footprint; Linux/Windows to the collection floor plus headroom. Deliberately
+#: Linux worker running a long suite was measured at ~4.5 GB anonymous RSS (a
+#: host OOM's process table), a macOS one at 14.9-16.1 GB, so no single fixed
+#: number is correct for every host. macOS is sized to that footprint;
+#: Linux/Windows to the measured Linux worker plus headroom. Deliberately
 #: a constant, not a config key -- ``xdist_auto_cap`` is the single operator
 #: knob. Sized identically to the local ``-n auto`` budget (``xdist_budget``)
 #: so the two never disagree.
 _MACOS_XDIST_PER_WORKER_GB = 16.0
-_DEFAULT_XDIST_PER_WORKER_GB = 3.0
+_DEFAULT_XDIST_PER_WORKER_GB = 5.0
 
 
 def _resolve_xdist_per_worker_gb() -> float:
@@ -1512,7 +1530,7 @@ def admission_check(cfg: object | None = None) -> AdmissionDecision:
 #
 # The macOS kernel memory-pressure hold is NOT applied here: it is the subagent
 # gate's rule, and the eager-spawn ADMISSION reads it from the manager
-# (``chat_runner._admit_prefetch``'s caller), never the re-probe after a
+# (``chat_turn.eager_spawn._admit_prefetch``'s caller), never the re-probe after a
 # pre-warm registered.
 PREWARM_MAX_LIVE = 3
 _PREWARM_BY_POSTURE: dict[str, int] = {

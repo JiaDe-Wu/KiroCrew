@@ -28,12 +28,14 @@ from kiro_crew.cron_service.model import (
     CronSchedule,
     validate_alert_after_failures,
     validate_auto_pause_after_failures,
+    validate_on_tab_close,
 )
 from kiro_crew.cron_service.schedule import (
     LOCAL_TIMEZONE,
     is_local_timezone,
     is_valid_skip_date,
     is_valid_timezone,
+    pin_random_cron_fields,
     runs_more_than_once_a_day,
     validate_cron_expr,
 )
@@ -144,6 +146,8 @@ _CRON_STRING_FIELD_CAPS: tuple[tuple[str, int], ...] = (
     ("message", MAX_CRON_MESSAGE),
     ("channel", CHANNEL_MAX_LEN),
     ("thread_ts", 30),
+    ("channel_type", MAX_SHORT_STRING),
+    ("target_id", MAX_SHORT_STRING),
     ("agent_id", MAX_SHORT_STRING),
     ("member_id", MAX_SHORT_STRING),
     ("created_by", MAX_SHORT_STRING),
@@ -167,6 +171,7 @@ _CRON_STRING_FIELD_CAPS: tuple[tuple[str, int], ...] = (
     # this length gate). Per the no-schema convention they use the general ID cap.
     ("secret_env_pin", MAX_SHORT_STRING),
     ("secret_env_pending_pin", MAX_SHORT_STRING),
+    ("secret_env_resurfaced_pin", MAX_SHORT_STRING),
 )
 
 
@@ -186,6 +191,24 @@ def validate_managed_by(key: str) -> str:
             "and start with a letter or digit"
         )
     return key
+
+
+def check_delivery_pin(channel: str | None, channel_type: str, target_id: str) -> None:
+    """Refuse a job left with two pinned destinations, or half of the channel pair.
+
+    ``channel_type`` and ``target_id`` name one destination together, as in
+    ``send_message``; ``channel`` names a Slack one. Both at once would leave
+    delivery to guess which one the user meant. A ``thread_ts`` is not judged:
+    it names a thread only inside ``channel``, and nothing on the Schedule page
+    can clear one left by a job made in a Slack thread.
+    """
+    if bool(channel_type) != bool(target_id):
+        raise ValueError("channel_type and target_id are set together")
+    if channel_type and channel:
+        raise ValueError(
+            "a job delivers to one destination: a Slack channel, or "
+            "channel_type and target_id, not both"
+        )
 
 
 def _validate_cron_string_fields(
@@ -303,6 +326,7 @@ def build_job(
     strict_schedule: bool = False,
     hide_in_chat: bool = False,
     new_chat_per_run: bool = False,
+    on_tab_close: str = "resume",
     folder_id: str = "",
     chat_folder_id: str = "",
     project_path: str = "",
@@ -345,6 +369,7 @@ def build_job(
     valid_approval_modes = ("", "auto")
     if approval_mode not in valid_approval_modes:
         raise ValueError(f"Invalid approval_mode: {approval_mode!r}")
+    refuse_policy_denied_auto(approval_mode)
     # Writer mirror of _job_from_record's representable-number type-shape
     # check: the reader may skip a record with a non-representable
     # schedule numeric (NaN/Infinity/bignum) precisely BECAUSE no write
@@ -386,6 +411,7 @@ def build_job(
         raise ValueError(_CHAT_FOLDER_NEEDS_PERSISTENT)
     if new_chat_per_run and persistent_session:
         raise ValueError(_NEW_CHAT_PER_RUN_NEEDS_STATELESS)
+    on_tab_close = validate_on_tab_close(on_tab_close)
     if new_chat_per_run and (command or script or agent_sequence_dispatches(agent_sequence or [])):
         raise ValueError(_NEW_CHAT_PER_RUN_AGENT_ONLY)
     if project_path and (command or script):
@@ -409,10 +435,11 @@ def build_job(
     for _d in skip_dates:
         if not is_valid_skip_date(_d):
             raise ValueError(f"Invalid skip_date: {_d!r} (expected YYYY-MM-DD)")
+    job_id = uuid.uuid4().hex[:8]
     if cron_expr:
         if not validate_cron_expr(cron_expr):
             raise ValueError(f"Invalid cron expression: {cron_expr}")
-        schedule = CronSchedule(kind="cron", cron_expr=cron_expr)
+        schedule = CronSchedule(kind="cron", cron_expr=pin_random_cron_fields(cron_expr, job_id))
     elif every_secs:
         schedule = CronSchedule(kind="every", every_secs=max(every_secs, _MIN_INTERVAL_SECS))
     elif at_ts:
@@ -423,7 +450,7 @@ def build_job(
         raise ValueError(_NEW_CHAT_PER_RUN_TOO_OFTEN)
 
     return CronJob(
-        id=uuid.uuid4().hex[:8],
+        id=job_id,
         name=name,
         message=message,
         schedule=schedule,
@@ -431,6 +458,7 @@ def build_job(
         thread_ts=thread_ts,
         enabled=enabled,
         user_paused=not enabled,
+        user_pause_requested=not enabled,
         created_ts=time.time(),
         delete_after_run=delete_after_run,
         created_by=created_by,
@@ -444,6 +472,7 @@ def build_job(
         strict_schedule=strict_schedule,
         hide_in_chat=hide_in_chat,
         new_chat_per_run=bool(new_chat_per_run),
+        on_tab_close=on_tab_close,
         folder_id=folder_id,
         chat_folder_id=chat_folder_id,
         project_path=project_path,
@@ -463,7 +492,10 @@ def build_job(
 
 
 def apply_job_update(
-    job: CronJob, kwargs: dict[str, Any], chat_folder_out: dict[str, str] | None
+    job: CronJob,
+    kwargs: dict[str, Any],
+    chat_folder_out: dict[str, str] | None,
+    resolved_project_path: str | None = None,
 ) -> None:
     """Validate the update ``kwargs`` against ``job``, then apply it.
 
@@ -471,12 +503,19 @@ def apply_job_update(
     ``ValueError`` with ``job`` untouched. ``chat_folder_out`` is the caller's
     transition sink (see :meth:`CronService._update_job_locked`): filled with the
     prior ``chat_folder_id`` only when this update actually changes it.
+    ``resolved_project_path`` is ``resolve_project_path(kwargs["project_path"])``
+    as the caller ran it before taking the store lock, so the filesystem probe
+    stays outside that lock; ``None`` resolves it here.
     """
     # Validate approval_mode if provided
     if "approval_mode" in kwargs:
         valid_approval_modes = ("", "auto")
         if kwargs["approval_mode"] not in valid_approval_modes:
             raise ValueError(f"Invalid approval_mode: {kwargs['approval_mode']!r}")
+        if job.approval_mode != "auto":
+            # Refuse only a NEW ``auto``: an edit that resends the stored value must
+            # still save; the fire path already runs it as asking.
+            refuse_policy_denied_auto(kwargs["approval_mode"])
     # Validate before any mutations
     # Table-driven type+length gate for every updatable string
     # field. Falsy values are intentional no-ops (the assignment
@@ -507,6 +546,8 @@ def apply_job_update(
         job.command or job.script or agent_sequence_dispatches(job.agent_sequence)
     ):
         raise ValueError(_NEW_CHAT_PER_RUN_AGENT_ONLY)
+    if "on_tab_close" in kwargs:
+        validate_on_tab_close(kwargs["on_tab_close"])
     if (
         "cron_expr" in kwargs
         and kwargs["cron_expr"]
@@ -536,7 +577,9 @@ def apply_job_update(
     # leaves; only a request that names either one is checked.
     _schedule = job.schedule
     if kwargs.get("cron_expr"):
-        _schedule = CronSchedule(kind="cron", cron_expr=kwargs["cron_expr"])
+        _schedule = CronSchedule(
+            kind="cron", cron_expr=pin_random_cron_fields(kwargs["cron_expr"], job.id)
+        )
     elif kwargs.get("every_secs"):
         _schedule = CronSchedule(kind="every", every_secs=int(kwargs["every_secs"]))
     _per_run = (
@@ -658,9 +701,18 @@ def apply_job_update(
     # job untouched. ``""`` clears it (back to today's cwd).
     _project_path: str | None = None
     if "project_path" in kwargs:
-        _project_path = resolve_project_path(kwargs["project_path"] or "")
+        _project_path = resolved_project_path
+        if _project_path is None:
+            _project_path = resolve_project_path(kwargs["project_path"] or "")
         if _project_path and (job.command or job.script):
             raise ValueError(_PROJECT_PATH_AGENT_ONLY)
+    # Judged on the destination this update leaves, and only when it names one.
+    if {"channel", "channel_type", "target_id"} & kwargs.keys():
+        check_delivery_pin(
+            kwargs.get("channel", job.channel),
+            kwargs.get("channel_type", job.channel_type),
+            kwargs.get("target_id", job.target_id),
+        )
     # Resolved here, before the first assignment, because a member schedule
     # re-resolves its member's template and that can refuse: the job must be
     # left untouched when it does.
@@ -678,7 +730,10 @@ def apply_job_update(
         if recaptured is not None:
             job.execution_context = recaptured
     if "channel" in kwargs:
-        job.channel = kwargs["channel"] or None
+        channel = kwargs["channel"] or None
+        if "thread_ts" not in kwargs and job.channel != channel:
+            job.thread_ts = None
+        job.channel = channel
     if "thread_ts" in kwargs:
         # With ``channel``, decides where a run's output lands. Falsy clears,
         # as for ``channel`` and mcp_cron's blank-to-None. A granted script
@@ -686,6 +741,11 @@ def apply_job_update(
         # thread_ts is in the grant's delivery fingerprint
         # (cron_script.delivery_fingerprint) until the operator re-approves.
         job.thread_ts = kwargs["thread_ts"] or None
+    if "channel_type" in kwargs:
+        job.channel_type = kwargs["channel_type"] or ""
+    if "target_id" in kwargs:
+        # In the grant's delivery fingerprint too, like ``thread_ts``.
+        job.target_id = kwargs["target_id"] or ""
     if "approval_mode" in kwargs:
         job.approval_mode = kwargs["approval_mode"] or ""
     if "silent" in kwargs:
@@ -709,6 +769,8 @@ def apply_job_update(
     elif job.persistent_session:
         # One shared session again: every run lands in the job's one tab.
         job.new_chat_per_run = False
+    if "on_tab_close" in kwargs:
+        job.on_tab_close = kwargs["on_tab_close"]
     if "folder_id" in kwargs:
         job.folder_id = kwargs["folder_id"] or ""
     if "chat_folder_id" in kwargs:
@@ -753,6 +815,8 @@ def apply_job_update(
             # Withdraw/deny clears the whole request record.
             job.secret_env_pending_pin = ""
             job.secret_env_pending_ts = 0.0
+    if "secret_env_resurfaced_pin" in kwargs and kwargs["secret_env_resurfaced_pin"] is not None:
+        job.secret_env_resurfaced_pin = str(kwargs["secret_env_resurfaced_pin"])
     # Per-wake budget (the asyncio.wait_for deadline in
     # _execute_with_timeout). Distinct from ``timeout``, which
     # bounds only script/command subprocesses. This is the only
@@ -775,8 +839,74 @@ def apply_job_update(
     # deleted after its first run, so a one-shot made recurring clears
     # ``delete_after_run``.
     if "cron_expr" in kwargs and kwargs["cron_expr"]:
-        job.schedule = CronSchedule(kind="cron", cron_expr=kwargs["cron_expr"])
+        job.schedule = CronSchedule(
+            kind="cron", cron_expr=pin_random_cron_fields(kwargs["cron_expr"], job.id)
+        )
         job.delete_after_run = False
     elif "every_secs" in kwargs and kwargs["every_secs"]:
         job.schedule = CronSchedule(kind="every", every_secs=int(kwargs["every_secs"]))
         job.delete_after_run = False
+
+
+def refuse_policy_denied_auto(approval_mode: str) -> None:
+    """Refuse a job's ``auto`` when the ``permission_mode`` policy denies ``trust``.
+
+    ``auto`` approves every tool of the job's own session without asking, which is a
+    session Trust. The fire path re-checks (:func:`effective_job_approval_mode`), so a
+    job saved before the policy landed asks instead of auto-approving.
+
+    The refusal is a governance decision, not input validation, so it is audited
+    here, once, for every writer (CLI, apps SDK, dashboard, import). The audit is
+    best-effort: the refusal outranks it, as in ``mcp_cron._log_cron_denial``.
+    """
+    if approval_mode == "auto" and not cron_job_auto_permitted():
+        msg = "approval_mode 'auto' is disabled by your organization's policy"
+        try:
+            from kiro_crew import cron as seams  # the facade holds the patched names
+
+            seams.sel.sel().log_api_access(
+                caller="cron",
+                operation="cron.approval_mode",
+                outcome="denied",
+                source="cron",
+                resources="approval_mode=auto",
+                error=msg,
+            )
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).debug("approval_mode denial audit failed", exc_info=True)
+        raise ValueError(msg)
+
+
+def cron_job_auto_permitted() -> bool:
+    """Whether a job's ``approval_mode="auto"`` may auto-approve now. From memory."""
+    from kiro_crew.approval_mode_policy import session_mode_permitted
+
+    return session_mode_permitted("trust")
+
+
+def effective_job_approval_mode(approval_mode: str) -> str:
+    """The mode a job fires with: its own, minus an ``auto`` the policy now denies."""
+    if approval_mode == "auto" and not cron_job_auto_permitted():
+        return ""
+    return approval_mode
+
+
+def auto_job_approver(fallback: Any) -> Any:
+    """The approver an ``auto`` job's turn runs with: approve while ``auto`` holds.
+
+    The turn's ``AUTO_APPROVE`` policy is fixed when it starts, so a deny that lands
+    mid-turn is honoured here, per request: the call goes to *fallback* (the cron's
+    interactive approval) instead.
+    """
+
+    async def _approve(event: Any) -> bool:
+        from kiro_crew.mate_held_rules import call_is_held
+
+        # A call under a Bot limit held for a person always reaches the card.
+        if cron_job_auto_permitted() and not call_is_held():
+            return True
+        return bool(await fallback(event))
+
+    return _approve

@@ -1,11 +1,15 @@
 import { describe, it, expect, vi, afterEach, beforeEach, onTestFinished } from 'vitest'
 import { render, screen, fireEvent, act } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import UserMessage from '../pages/chat/UserMessage'
 
 vi.mock('../utils/clipboard', () => ({ copyToClipboard: vi.fn().mockResolvedValue(undefined) }))
 vi.mock('../utils/shareUrl', () => ({ copySessionLink: vi.fn().mockResolvedValue(undefined) }))
+const phone = vi.hoisted(() => ({ on: false }))
+vi.mock('../hooks/useIsMobile', () => ({ useIsMobile: () => phone.on }))
+vi.mock('../hooks/useIsTouchDevice', () => ({ useIsTouchDevice: () => phone.on }))
 
-beforeEach(() => { vi.useFakeTimers() })
+beforeEach(() => { vi.useFakeTimers(); phone.on = false })
 afterEach(() => { act(() => { vi.runAllTimers() }); vi.useRealTimers() })
 import { copyToClipboard } from '../utils/clipboard'
 import { copySessionLink } from '../utils/shareUrl'
@@ -170,6 +174,18 @@ describe('UserMessage', () => {
     expect(onEditResend).toHaveBeenCalledWith(0, 'ts1', 'new msg')
   })
 
+  it('on a phone, Return starts a new line and only Send resends', () => {
+    phone.on = true
+    const onEditResend = vi.fn()
+    render(<UserMessage content="original" renderContent={renderContent} canEdit messageIndex={0} messageTs="ts1" onEditResend={onEditResend} />)
+    fireEvent.click(screen.getByTitle('Edit & Resend'))
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'new msg' } })
+    expect(fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })).toBe(true)
+    expect(onEditResend).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByText('Send'))
+    expect(onEditResend).toHaveBeenCalledWith(0, 'ts1', 'new msg')
+  })
+
   it('does not submit on Shift+Enter (allows newline)', () => {
     const onEditResend = vi.fn()
     render(<UserMessage content="original" renderContent={renderContent} canEdit messageIndex={0} messageTs="ts1" onEditResend={onEditResend} />)
@@ -275,6 +291,20 @@ describe('UserMessage', () => {
   it('renders the steer badge once the backend confirms consumption', () => {
     render(<UserMessage content="go north" meta={{ steer: true, steerState: 'consumed' }} messageTs="steer-consumed" renderContent={renderContent} />)
     expect(screen.getByText('Steered into the running turn')).toBeInTheDocument()
+  })
+
+  // An app's answer steered into the running turn takes this branch, which skips
+  // the person byline; it must still name the app, not read as the owner's typing.
+  it('names the app on a steered row an app sent', () => {
+    const qc = new QueryClient()
+    qc.setQueryData(['apps'], [])
+    render(
+      <QueryClientProvider client={qc}>
+        <UserMessage content="Approved" meta={{ steer: true, steerState: 'consumed', turnActor: 'app', appLabel: 'notes-app' }} messageTs="steer-app" renderContent={renderContent} />
+      </QueryClientProvider>,
+    )
+    expect(screen.getByText('Steered into the running turn')).toBeInTheDocument()
+    expect(screen.getByTestId('message-app-sender')).toHaveTextContent('Sent by the notes-app app')
   })
 
   // The client mints its own bubble as `{ steer: true, optimistic: true }` with no
@@ -403,6 +433,14 @@ describe('steer pending / requeued treatments', () => {
 
   it('renders the requeued line only for a requeued steer', () => {
     render(<UserMessage content="go north" meta={{ steer: true, steerState: 'requeued' }} messageTs="req-only" slotRunning renderContent={renderContent} />)
+    expect(screen.getByText(REQUEUED)).toBeInTheDocument()
+    expect(screen.queryByText(BADGE)).not.toBeInTheDocument()
+  })
+
+  // A surface without the shared turn grouping still draws a superseded row, so
+  // it must keep the requeued line rather than read as a plain second send.
+  it('keeps the requeued line on a superseded steer row', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, steerState: 'superseded' }} messageTs="req-superseded" renderContent={renderContent} />)
     expect(screen.getByText(REQUEUED)).toBeInTheDocument()
     expect(screen.queryByText(BADGE)).not.toBeInTheDocument()
   })

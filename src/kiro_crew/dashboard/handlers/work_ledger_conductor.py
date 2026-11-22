@@ -12,6 +12,7 @@ import and patch; this module never imports it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import logging
 from collections.abc import Awaitable, Callable
@@ -23,9 +24,17 @@ from kiro_crew import conductor_patrol, session_ledger, work_ledger
 from kiro_crew.constants import env_file_display
 from kiro_crew.crew_log import emit as crew_log_emit
 from kiro_crew.crew_log.errors import CrewLogError
-from kiro_crew.dashboard import session_control
-from kiro_crew.dashboard.handlers.work_ledger_caller import _caller_key, _own_ledger
-from kiro_crew.dashboard.handlers.work_ledger_read import worker_holds_open_item
+from kiro_crew.dashboard import session_control, session_managers, trace_binding
+from kiro_crew.dashboard.handlers.work_ledger_caller import (
+    _caller_key,
+    _code_channel_caller,
+    _own_ledger,
+)
+from kiro_crew.dashboard.handlers.work_ledger_read import (
+    _MAX_EVENT_TAIL,
+    _published_payload,
+    worker_holds_open_item,
+)
 from kiro_crew.dashboard.handlers.work_ledger_recording import (
     _WIDEST_COUNTER,
     _WIDEST_EVENT_TEXT,
@@ -61,12 +70,14 @@ from kiro_crew.dashboard.handlers.work_ledger_refusals import (
 )
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.metrics import work as work_metrics
+from kiro_crew.tracing import work as trace_work
 from kiro_crew.validation import WORK_LEDGER_RECORD_SCHEMA, ValidationError, validate_tool_args
 from kiro_crew.work_ledger import WorkLedgerError
 from kiro_crew.work_vocab import (
     WORK_CONDUCTOR_FIELDS,
     WORK_MAX_ARTIFACT_VALUE_CHARS,
     WORK_MAX_DEPTH_MAX,
+    WORK_MAX_DEPTH_MIN,
     WORK_MAX_RETIRE_REASON_CHARS,
 )
 
@@ -77,8 +88,10 @@ logger = logging.getLogger("kiro_crew.dashboard.handlers.work_ledger")
 #: :data:`work_ledger.CONDUCTOR_ACTIONS`: ``accept`` promotes a worker's claimed
 #: ``pr`` into the item's ``acceptance`` and is served by
 #: :func:`work_ledger.apply_acceptance_update`, which is deliberately not a
-#: seventh member of that frozenset (see its docstring).
-RECORD_ACTIONS: frozenset[str] = work_ledger.CONDUCTOR_ACTIONS | {"accept"}
+#: seventh member of that frozenset (see its docstring). ``ask`` records what an
+#: item needs from the person (:func:`work_ledger.apply_ask_record`). ``retire``
+#: moves a crew-bound item off its crew (:func:`_record_conductor_retire`).
+RECORD_ACTIONS: frozenset[str] = work_ledger.CONDUCTOR_ACTIONS | {"accept", "ask", "retire"}
 
 
 def _count_recorded(action: str, item: Any, header: Any) -> None:
@@ -144,6 +157,8 @@ async def _record_conductor_write(
     before_write: Callable[[], Awaitable[web.Response | None]] | None = None,
     dispatch: bool = False,
     attested_caller: str = "",
+    code_channel: bool = False,
+    caller_sk: str = "",
 ) -> web.Response:
     """Probe, commit and record one conductor-owned write on *key*'s board.
 
@@ -157,6 +172,11 @@ async def _record_conductor_write(
     one, and refused ``no_ledger`` when the caller owns none. *attested_caller*
     is ``conductor_patrol.attested_caller_slot`` for the request, passed on to a
     bind's default patrol; callers with no request leave it blank.
+
+    *code_channel* is :func:`_code_channel_caller` of the record route's request
+    and *caller_sk* its ``X-Session-Key``: the goal/create bootstrap and the
+    published-fields reply read them. The hand-back keeps the defaults, since its
+    reply is only a status and never reaches a channel.
     """
     # Refused BEFORE the ledger is even bootstrapped: the widest entry this action
     # can produce,
@@ -200,6 +220,19 @@ async def _record_conductor_write(
         closed_at=_WIDEST_STAMP,
         decided_at=_WIDEST_STAMP,
         pending_since=_WIDEST_STAMP,
+        # The record this request would commit, at its widest stamp.
+        ask=(
+            {
+                "what": cleaned.get("what") or "",
+                "why": cleaned.get("why") or "",
+                "options": cleaned.get("options") or [],
+                "pick": cleaned.get("pick") or "",
+                "pick_why": cleaned.get("pick_why") or "",
+                "written_at": _WIDEST_STAMP,
+            }
+            if action == "ask"
+            else None
+        ),
     )
     if invalid is not None:
         return invalid
@@ -235,6 +268,10 @@ async def _record_conductor_write(
             "the action's crew-log record does not fit one log line; shorten it",
         )
 
+    # The goal/create bootstrap asks whether the caller is a code channel's worker
+    # from the code-channel store's loaded snapshot; load it off the loop first.
+    await session_control.load_code_channel_lineage()
+
     async def _under_board() -> web.Response:
         # Re-checked under the lock, for the same reason the report route does.
         dirty = await _refuse_if_dirty(key, key, operation)
@@ -244,6 +281,8 @@ async def _record_conductor_write(
             stop = await before_write()
             if stop is not None:
                 return stop
+        # What the header held before this write, when it may open a round (tracing).
+        before = await trace_work.header_before(key, action)
         # The worker key is folded through ``session_ledger.ledger_key`` before the
         # store writes the binding (see the ``handlers.work_ledger`` note); the snapshot names the
         # same path, or a failed bind's binding would escape the undo.
@@ -262,13 +301,24 @@ async def _record_conductor_write(
             )
         )
         if dispatch:
+            # A code channel's worker never conducts, so it is refused before any
+            # ledger it may hold is let through, as at a goal or create.
+            drefusal = _refuse_code_channel_worker(
+                key, _is_code_channel_worker(state, caller_sk), "dispatch"
+            )
+            if drefusal is not None:
+                return drefusal
             # Under the lock, so a purge cannot land between this read and the
             # write; the store's own header check refuses one that lands later.
             drefusal = await _refuse_dispatch_without_ledger(key)
             if drefusal is not None:
                 return drefusal
         elif action in ("goal", "create"):
-            bootstrapped = await _bootstrap(key)
+            bootstrapped = await _bootstrap(
+                key,
+                code_channel=code_channel,
+                code_channel_worker=_is_code_channel_worker(state, caller_sk),
+            )
             if isinstance(bootstrapped, web.Response):
                 return bootstrapped
         else:
@@ -355,6 +405,7 @@ async def _record_conductor_write(
                 pending_since=(
                     getattr(item, "pending_since", None) if action == "verdict" else None
                 ),
+                ask=getattr(item, "ask", None) if "ask" in sets else None,
             ),
         )
         if not landed:
@@ -385,6 +436,17 @@ async def _record_conductor_write(
         # write whose record did not land is undone above, so this point is
         # reached once per write the route reports as successful.
         _count_recorded(action, item, header)
+        await trace_work.recorded(
+            unit,
+            key,
+            action,
+            actor="conductor",
+            item=item,
+            header=header,
+            event_id=getattr(event, "id", None),
+            before=before,
+            root_kind=lambda: trace_binding.root_kind(state, key),
+        )
         if action == "close" and item is not None:
             await _count_crew_mode_run(state, key, item)
         # A remote bind names a PEER's slot, which no local crew record can resolve.
@@ -433,6 +495,15 @@ async def _record_conductor_write(
         conductor = result.get("conductor")
         if conductor is not None:
             payload["conductor"] = conductor.to_dict()
+        if code_channel:
+            # The reply is the conductor's next words in its code channel: the same
+            # published fields a read returns, never the stored item whole.
+            published = _published_payload(conductor or header, [(item, False)] if item else [])
+            payload.pop("item", None)
+            payload["conductor"] = published["conductor"]
+            if published["items"]:
+                payload["item"] = published["items"][0]
+            payload["published_fields_only"] = True
         return web.json_response(payload)
 
     # Shielding alone detaches this transaction when the handler is cancelled.
@@ -494,34 +565,145 @@ async def api_work_ledger_record(request: web.Request) -> web.Response:
         return dirty
     assert unit is not None
 
-    if action == "bind":
-        refusal = _refuse_unowned_worker(request, key, cleaned.get("worker_session_key"))
-        if refusal is None:
-            refusal = await _refuse_dispatched_worker(key, cleaned.get("worker_session_key"))
-        if refusal is not None:
-            return refusal
+    if action == "retire":
+        return await _record_conductor_retire(state, key, cleaned, request)
 
-    # Read from THIS request before the write: only a bind arms a patrol, and only
-    # an attested member thread's own bind may take one (``conductor_patrol``).
-    attested = (
-        await conductor_patrol.attested_caller_slot(request, state) if action == "bind" else ""
+    # A bind is admitted by who holds the right to bind the worker, which a handoff
+    # moves under HANDOFF_LOCK. Held from the admission through the write, so a
+    # handoff never lands between them; the board lock is always taken inside it.
+    # A goal or create that opens the caller's first ledger holds it too: that
+    # ledger's depth comes from the caller's binding, which such a bind rewrites
+    # after judging the caller by its having no ledger.
+    if action == "bind":
+        await asyncio.to_thread(session_managers.load)
+    opens_ledger = action in ("goal", "create") and (
+        await asyncio.to_thread(work_ledger.read_conductor, key) is None
     )
-    # A dispatch never opens a ledger: only ``kirocrew-work``'s own
-    # ``work_ledger_record`` does, so a session without that server is refused,
-    # whatever its backend.
-    resp = await _record_conductor_write(
-        state,
-        key,
-        unit,
-        action,
-        cleaned,
-        operation="work_ledger_record",
-        dispatch=dispatch,
-        attested_caller=attested,
+    guard: contextlib.AbstractAsyncContextManager[Any] = (
+        session_managers.HANDOFF_LOCK
+        if action == "bind" or opens_ledger
+        else contextlib.nullcontext()
     )
+    async with guard:
+        if action == "bind":
+            worker = cleaned.get("worker_session_key")
+            refusal = _refuse_unowned_worker(request, key, worker)
+            if refusal is None:
+                refusal = await _refuse_granted_bind_too_deep(state, key, worker)
+            if refusal is None:
+                refusal = await _refuse_dispatched_worker(key, worker)
+            if refusal is not None:
+                return refusal
+
+        # Read from THIS request before the write: only a bind arms a patrol, and only
+        # an attested member thread's own bind may take one (``conductor_patrol``).
+        attested = (
+            await conductor_patrol.attested_caller_slot(request, state) if action == "bind" else ""
+        )
+        # A dispatch never opens a ledger: only ``kirocrew-work``'s own
+        # ``work_ledger_record`` does, so a session without that server is refused,
+        # whatever its backend.
+        resp = await _record_conductor_write(
+            state,
+            key,
+            unit,
+            action,
+            cleaned,
+            operation="work_ledger_record",
+            code_channel=_code_channel_caller(request),
+            caller_sk=request.headers.get("X-Session-Key", ""),
+            dispatch=dispatch,
+            attested_caller=attested,
+        )
     if action == "decide" and resp.status == 200:
         resp = await _forward_remote_decide(state, key, cleaned, resp)
+    elif resp.status == 200 and cleaned.get("item_id"):
+        await _close_remote_item(state, key, str(cleaned["item_id"]), request)
     return resp
+
+
+async def _record_conductor_retire(
+    state: DashboardState, key: str, cleaned: dict[str, Any], request: web.Request
+) -> web.Response:
+    """``action=retire``: the caller's own crew-bound item leaves its crew (RFC §5b).
+
+    Refused ``remote_dispatch_disabled`` while the switch is off, as every crew
+    verb is. The retire closes a live peer slot, so before anything is written it
+    passes the gate ``session_close(crew=)`` does: ``agent.session_control`` and
+    :func:`remote_dispatch_routes.authorize_remote_dispatch`, whose last arm admits
+    only a turn the owner sent. A wake or ``session_send`` turn is refused with the
+    item and the peer slot untouched. The write itself is the hub's own retire,
+    with the conductor's reason; a code channel's conductor gets the published
+    fields only, as on every write.
+    """
+    from kiro_crew.dashboard import session_control as sc
+    from kiro_crew.dashboard.handlers import remote_dispatch_routes, remote_ingest
+
+    refusal = await remote_dispatch_routes.refuse_if_disabled(key, "work_ledger_record.retire")
+    if refusal is not None:
+        return refusal
+    if not await asyncio.to_thread(sc.session_control_enabled):
+        return web.json_response(
+            {
+                "error": "session control is disabled (agent.session_control)",
+                "code": "session_control_disabled",
+            },
+            status=403,
+        )
+    try:
+        await remote_dispatch_routes.authorize_remote_dispatch(request, "retire")
+    except remote_dispatch_routes.CrewCallError as exc:
+        if exc.code == remote_dispatch_routes.OWNER_UNVERIFIABLE:
+            exc.message = (
+                "retire needs a turn the owner sent; nothing was changed. Leave the "
+                f"item as it is and let the owner retire it from their own turn ({exc.message})"
+            )
+        return remote_dispatch_routes._response(exc)
+    for name in ("item_id", "reason"):
+        if not cleaned.get(name):
+            return _refuse_400(work_ledger.CODE_INVALID_VALUE, f"retire needs {name}", name)
+    return await remote_ingest.retire_by_conductor(
+        state,
+        key,
+        str(cleaned["item_id"]),
+        str(cleaned["reason"]),
+        code_channel=_code_channel_caller(request),
+        caller_sk=request.headers.get("X-Session-Key", ""),
+    )
+
+
+async def _close_remote_item(
+    state: DashboardState, key: str, item_id: str, request: web.Request
+) -> None:
+    """A write that closed a REMOTE item ends its worker's grant and leaves its slot to close.
+
+    RFC §5c (:func:`remote_ingest.close_remote_item`). Whether the peer slot may be
+    DELETEd at once is the gate ``session_close(crew=)`` and ``action=retire``
+    pass (``agent.session_control`` and
+    :func:`remote_dispatch_routes.authorize_remote_dispatch`): only a turn the owner
+    sent. Any other turn, a patrol wake included, only ends the grant and records
+    the close as pending, so it never kills a worker that is still running.
+    Asked only for a closed item still bound to a crew, so no other write pays
+    for the gate or leaves its audit row. Never raises past the write.
+    """
+    from kiro_crew.dashboard.handlers.work_ledger_read import _remote_dispatch_on
+
+    if not await asyncio.to_thread(_remote_dispatch_on):
+        return
+    from kiro_crew.dashboard import session_control as sc
+    from kiro_crew.dashboard.handlers import remote_dispatch_routes, remote_ingest
+
+    item = await remote_ingest.settled_item(key, item_id)
+    if item is None or not item.is_terminal or not item.worker_instance_id:
+        return
+    owner_turn = False
+    try:
+        if await asyncio.to_thread(sc.session_control_enabled):
+            await remote_dispatch_routes.authorize_remote_dispatch(request, "item_close")
+            owner_turn = True
+    except Exception:  # noqa: BLE001 - any doubt is not an owner turn (fail closed)
+        owner_turn = False
+    await remote_ingest.close_remote_item(state, key, item_id, owner_turn=owner_turn)
 
 
 async def _forward_remote_decide(
@@ -577,7 +759,18 @@ async def _refuse_dispatch_without_ledger(key: str) -> web.Response | None:
     The one remedy is ``action=goal``: unlike ``_own_ledger``'s text, it does not
     suggest ``action=create``, which ``work_dispatch`` would send marked again.
     """
-    record = await asyncio.to_thread(work_ledger.read_conductor, key)
+    # Strict, as in ``_own_ledger``: an I/O fault on conductor.json is a
+    # transient 503, never a false "no ledger, open one with action=goal".
+    try:
+        record = await asyncio.to_thread(work_ledger.read_conductor, key, strict=True)
+    except OSError:
+        _audit(key, "work_dispatch", "denied", error="ledger_unreadable")
+        return _refuse_503(
+            "ledger_unreadable",
+            "This session's work ledger could not be read right now (a transient "
+            "I/O error). Retry; it was not interpreted as having no ledger. "
+            "Nothing was created.",
+        )
     if record is not None:
         return None
     _audit(key, "work_dispatch", "denied", error=work_ledger.CODE_NO_LEDGER)
@@ -694,7 +887,9 @@ def _refuse_unowned_worker(
     and it is the only entry point that does — a person's own tab stays
     unattributed. So a bind is admitted only for a live slot this conductor
     created, in the conductor's own workspace (the memory boundary
-    ``authorize_target`` already refuses across).
+    ``authorize_target`` already refuses across). A ``session_handoff`` with
+    ``bind=true`` moves that right: while it stands, the manager it named is the
+    only conductor admitted (:func:`session_managers.bind_holder`), the creator not.
 
     Returns a refusal, or ``None`` when the bind may proceed.
     """
@@ -726,8 +921,8 @@ def _refuse_unowned_worker(
     # to the ledger spelling only when no open slot answers to the key, which is
     # what a dashboard conductor without a live tab has always compared as.
     conductor_slot_key = session_control.caller_slot_key(state, conductor_key) or conductor_key
-    creator = session_ledger.ledger_key(str(getattr(slot, "_created_by", "") or ""))
-    if creator != session_ledger.ledger_key(conductor_slot_key):
+    holder = session_ledger.ledger_key(session_managers.bind_holder(slot))
+    if not holder or holder != session_ledger.ledger_key(conductor_slot_key):
         _audit(
             conductor_key,
             "work_ledger_record",
@@ -737,9 +932,9 @@ def _refuse_unowned_worker(
         )
         return _refuse_403(
             "worker_not_owned",
-            "That worker session was not created by this conductor, so it cannot "
-            "be bound to one of its items. A conductor binds only the sessions it "
-            "dispatched.",
+            "This conductor does not hold the right to bind that worker session: "
+            "only the session that created it may, unless a session_handoff with "
+            "bind=true gave that right to another session.",
         )
     conductor_slot = None
     for candidate in (conductor_slot_key, conductor_key, f"dashboard_{conductor_key}"):
@@ -766,6 +961,137 @@ def _refuse_unowned_worker(
                 "memory boundary, and a conductor cannot bind across it.",
             )
     return None
+
+
+def nests_too_deep(manager_key: str, worker_key: str) -> bool:
+    """Whether a conducting *worker_key* would nest too deep under *manager_key*.
+
+    A session that conducts keeps the depth it opened its ledger at, so it may move
+    only under a manager whose own ledger sits at least one level above it; a manager
+    with no ledger cannot take it. ``False`` when *worker_key* conducts nothing.
+    Blocking; an unreadable header raises ``OSError``.
+    """
+    worker = work_ledger.read_conductor(session_ledger.ledger_key(worker_key), strict=True)
+    if worker is None:
+        return False
+    manager = work_ledger.read_conductor(session_ledger.ledger_key(manager_key), strict=True)
+    return manager is None or manager.depth + 1 > worker.depth
+
+
+async def _refuse_granted_bind_too_deep(
+    state: DashboardState, conductor_key: str, worker_session_key: Any
+) -> web.Response | None:
+    """Refuse a bind a handoff admitted when the worker's own ledger would nest too deep.
+
+    Only a bind admitted through a moved right reaches the check: a creator's bind
+    is judged as it always was.
+    """
+    if not isinstance(worker_session_key, str) or not worker_session_key:
+        return None
+    slot = _worker_slot(state, worker_session_key)
+    if slot is None or not session_managers.bind_granted(slot):
+        return None
+    try:
+        too_deep = await asyncio.to_thread(nests_too_deep, conductor_key, worker_session_key)
+    except OSError:
+        too_deep = True
+    if not too_deep:
+        return None
+    _audit(conductor_key, "work_ledger_record", "denied", resources="bind", error="depth_exceeded")
+    return _refuse_409(
+        "depth_exceeded",
+        "That worker session conducts its own ledger at a depth this conductor's "
+        "ledger is not above, so binding it here would nest its workers past the cap.",
+    )
+
+
+async def release_on_handoff(
+    state: DashboardState, caller_session_key: str, worker_key: str, manager_key: str
+) -> tuple[str, str]:
+    """Close the caller's open item for *worker_key* once a handoff moved the right to bind it.
+
+    The write lands on the CALLER's own board, through the same commit-and-record
+    path as every conductor write, as an ``abandoned`` close whose ``decision`` tells
+    the worker to stop reporting here and wait for *manager_key*. An item that waits
+    on a person (an open ``ask``, or the Board's ``names_person`` over its event
+    tail) is left open. Returns ``(item id or "", note)``; never raises, because the
+    handoff itself has already been saved.
+    """
+    conductor_key = session_ledger.ledger_key(caller_session_key)
+    worker = session_ledger.ledger_key(worker_key)
+    item_id, kept = "", ""
+
+    async def _kept() -> str:
+        # Why the item stays open: "gone" (not this worker's open item), "person", or "".
+        from kiro_crew.dashboard.handlers.work_ledger_board import names_person
+
+        item = await asyncio.to_thread(work_ledger.read_work_item, conductor_key, item_id)
+        if item is None or item.is_terminal or item.worker_session_key != worker:
+            return "gone"
+        if item.ask:
+            return "person"
+        tail = await asyncio.to_thread(
+            work_ledger.read_events, conductor_key, item_id, limit=_MAX_EVENT_TAIL
+        )
+        return "person" if names_person(item, [e.to_dict() for e in tail]) else ""
+
+    async def _still_releasable() -> web.Response | None:
+        # Judged again under the board lock every report also holds, so a report that
+        # landed after the first read and asked a person keeps its item open.
+        nonlocal kept
+        kept = await _kept()
+        return _refuse_409("release_skipped", "the item changed") if kept else None
+
+    try:
+        binding = await asyncio.to_thread(work_ledger.read_binding, worker)
+        if binding is None or binding[0] != conductor_key:
+            return "", ""
+        item_id = binding[1]
+        kept = await _kept()
+        unit, refusal = (
+            (None, None)
+            if kept
+            else _acting_unit(state, conductor_key, "session_handoff_release", item_id)
+        )
+        if refusal is None and unit is not None:
+            cleaned = crew_log_emit.safe_work_fields(
+                {
+                    "action": "close",
+                    "item_id": item_id,
+                    "state": "abandoned",
+                    "decision": (
+                        f"Handed to {manager_key}; stop reporting here and wait for "
+                        f"{manager_key} to bind you to its item and send you a brief."
+                    ),
+                }
+            )
+            resp = await _record_conductor_write(
+                state,
+                conductor_key,
+                unit,
+                "close",
+                cleaned,
+                operation="session_handoff_release",
+                before_write=_still_releasable,
+            )
+            if resp.status == 200:
+                return item_id, (
+                    f"Closed item {item_id} as abandoned; {manager_key} binds it and "
+                    "sends it a brief."
+                )
+    except Exception:  # noqa: BLE001 - the handoff is saved; the release is best-effort
+        logger.warning("session_handoff release failed for %s", worker, exc_info=True)
+    if kept == "person":
+        return "", (
+            f"Item {item_id} waits on a person, so it stays open: {manager_key} can "
+            f"bind {worker_key} once the person answers and you close item {item_id}."
+        )
+    if not item_id or kept:
+        return "", ""
+    return (
+        "",
+        f"Item {item_id} is still open and bound to {worker_key}: close item {item_id} yourself.",
+    )
 
 
 async def _refuse_dispatched_worker(
@@ -810,7 +1136,52 @@ async def _refuse_dispatched_worker(
     return None
 
 
-async def _bootstrap(key: str) -> None | web.Response:
+def _is_code_channel_worker(state: DashboardState, sk: str) -> str:
+    """The code-channel session that created *sk*, ``""`` when none.
+
+    ``session_control.code_channel_root`` -- read from persisted facts, so it holds
+    whether or not the worker is bound yet and whether or not its conductor is
+    still open. ``session_control.LINEAGE_UNAVAILABLE`` when the code-channel
+    store could not be read, which no session can be shown not to be.
+    """
+    slot_key = session_control.caller_slot_key(state, sk)
+    slot = state.get_slot(slot_key) if slot_key else None
+    return session_control.code_channel_root(state, slot) if slot is not None else ""
+
+
+def _refuse_code_channel_worker(
+    key: str, code_channel_worker: str, resources: str
+) -> web.Response | None:
+    """``depth_exceeded`` for a code channel's worker (or an unknowable lineage)."""
+    if code_channel_worker == session_control.LINEAGE_UNAVAILABLE:
+        _audit(
+            key,
+            "work_ledger_record",
+            "denied",
+            resources=resources,
+            error="code_channel_lineage_unavailable",
+        )
+        return _refuse_409(
+            work_ledger.CODE_DEPTH_EXCEEDED,
+            "The Slack code-channel store (slack-code-channels.json) could not be read, "
+            "so this session cannot be shown not to be a code-channel worker. Repair "
+            "the file and restart the gateway.",
+        )
+    if code_channel_worker:
+        _audit(
+            key, "work_ledger_record", "denied", resources=resources, error="code_channel_worker"
+        )
+        return _refuse_409(
+            work_ledger.CODE_DEPTH_EXCEEDED,
+            "This session was dispatched from a Slack code channel, and code-channel "
+            "dispatch is one level deep: it may work and report, never conduct.",
+        )
+    return None
+
+
+async def _bootstrap(
+    key: str, *, code_channel: bool = False, code_channel_worker: str = ""
+) -> None | web.Response:
     """Open this session's ledger if it has none, deriving depth from its parent.
 
     A session that is ITSELF bound to an item is a second-level conductor, so its
@@ -820,7 +1191,23 @@ async def _bootstrap(key: str) -> None | web.Response:
     is how a grandchild is stopped from conducting — the refusal surfaces as
     ``depth_exceeded`` (409) at the moment the child tries to open a ledger,
     rather than later when it tries to create an item.
+
+    A Slack code channel's conductor (*code_channel*, admitted through the
+    dispatch exemption) opens its ledger at ``WORK_MAX_DEPTH_MIN - 1``, the last
+    conducting level under the LOWEST cap ``work_ledger.max_depth`` allows, so
+    no later lowering of the cap leaves the channel unable to dispatch.
+    ``ensure_conductor`` never rewrites an existing depth, and such a slot could
+    not have opened a ledger before the exemption existed.
+
+    The depth is not what keeps its workers from conducting (a raised cap would
+    admit one more level): their lineage is. A session a code channel's session
+    created (*code_channel_worker*) may not conduct at all, bound or not, at any
+    cap: it is refused ``depth_exceeded`` here, at the first goal or create, and
+    before an existing ledger is let through.
     """
+    worker_refusal = _refuse_code_channel_worker(key, code_channel_worker, "bootstrap")
+    if worker_refusal is not None:
+        return worker_refusal
     # A ledger that already exists keeps working whatever the cap has become since it
     # opened: lowering ``work_ledger.max_depth`` refuses NEW ledgers and new items past
     # the cap (``child_depth`` below, ``create`` in the store), never a ``goal`` update
@@ -828,7 +1215,7 @@ async def _bootstrap(key: str) -> None | web.Response:
     # falls through to the normal path and its strict re-read.
     if await asyncio.to_thread(work_ledger.read_conductor, key) is not None:
         return None
-    depth = 0
+    depth = WORK_MAX_DEPTH_MIN - 1 if code_channel else 0
     parent_item: str | None = None
     binding = await asyncio.to_thread(work_ledger.read_binding, key)
     if binding is not None:
@@ -910,8 +1297,9 @@ def _write(key: str, action: str, cleaned: dict[str, Any]) -> dict[str, Any]:
             worker_instance_id=cleaned.get("worker_instance_id"),
         )
     if action == "retire":
-        # Reached only from the hub's own remote ingest (wave 8), never from the
-        # record route: its schema has no ``retire`` action.
+        # Reached only through ``remote_ingest._commit_retire``: the hub's own
+        # ingest (wave 8) and the conductor's ``action=retire``, which the record
+        # route hands there before any write, so the pair always comes from the item.
         return work_ledger.apply_remote_retire(
             key,
             str(cleaned.get("item_id") or ""),
@@ -928,6 +1316,16 @@ def _write(key: str, action: str, cleaned: dict[str, Any]) -> dict[str, Any]:
             str(cleaned.get("item_id") or ""),
             worker_session_key=cleaned.get("worker_session_key"),
             worker_instance_id=cleaned.get("worker_instance_id"),
+        )
+    if action == "ask":
+        return work_ledger.apply_ask_record(
+            key,
+            str(cleaned.get("item_id") or ""),
+            what=cleaned.get("what"),
+            why=cleaned.get("why"),
+            options=cleaned.get("options"),
+            pick=cleaned.get("pick"),
+            pick_why=cleaned.get("pick_why"),
         )
     if action == "accept":
         return work_ledger.apply_acceptance_update(
@@ -953,7 +1351,6 @@ def _write(key: str, action: str, cleaned: dict[str, Any]) -> dict[str, Any]:
         goal=cleaned.get("goal"),
         round_number=cleaned.get("round"),
         fails=cleaned.get("fails"),
-        item_cap=cleaned.get("item_cap"),
         concurrency_cap=cleaned.get("concurrency_cap"),
         new_goal=cleaned.get("new_goal"),
     )

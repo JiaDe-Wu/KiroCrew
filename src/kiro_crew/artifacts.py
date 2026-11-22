@@ -94,6 +94,9 @@ from kiro_crew import hooks, pinned_fs, platform_compat  # noqa: F401 - facade s
 from kiro_crew.artifact_source import is_verifiable_root  # noqa: F401 - facade surface
 from kiro_crew.artifact_store import comments as _threads  # noqa: F401 - facade surface
 from kiro_crew.artifact_store import dashboard_package as _dashboard  # noqa: F401 - facade surface
+from kiro_crew.artifact_store import (  # noqa: F401 - loads owner
+    dashboard_widgets as _dashboard_widgets,
+)
 from kiro_crew.artifact_store import records as _records
 from kiro_crew.artifact_store import rules as _rules  # noqa: F401 - facade surface
 from kiro_crew.artifact_store.comments import (  # noqa: F401 - facade surface
@@ -420,6 +423,7 @@ class ArtifactStore:
 
     # Content writes: ``kiro_crew.artifacts_writes``.
     create = _artifacts_writes.create
+    check_create = _artifacts_writes.check_create
     create_image = _artifacts_writes.create_image
     update = _artifacts_writes.update
     settle_blank = _artifacts_writes.settle_blank

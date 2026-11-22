@@ -223,13 +223,25 @@ def _start_kas_cli_floor(cfg: KiroCrewConfig) -> "asyncio.Task[None]":
     explicit choices before probing. Defaulted roles wait for the verdict
     (bounded) instead of starting KAS on a kiro-cli that rejects it. Boot itself
     never waits for either the declaration read or the probe.
+
+    A stored Kiro CLI pick whose verdict stayed unknown is asked about again after
+    each ``kas_floor_wait.KIRO_PICK_VERDICT_RETRY_SECS`` delay, until the verdict is
+    known or the stored pick changes. The first verdict releases the spawn
+    gate, so no spawn waits for those asks; the task ends when they do.
     """
     global _KAS_CLI_FLOOR_TASK
     from kiro_crew.acp_backends import ACP_BACKEND_KAS, ACP_BACKEND_KIRO
     from kiro_crew.agent_sdk import kas_floor_wait
+    from kiro_crew.agent_sdk.backends import kiro_cli_pick_verdict_open
 
     async def _run() -> None:
         try:
+            # A kiro-cli found only through PATH has its version read inside the
+            # sandbox, on a thread of its own. Started here, with the other
+            # boot-time kiro-cli probes, so the first session finds the answer.
+            from kiro_crew import kiro_cli_path_probe
+
+            kiro_cli_path_probe.warm()
             main_default, member_default = await asyncio.to_thread(_kas_floor_gates_spawns, cfg)
             kas_floor_wait.release_kas_floor_wait(
                 task, main=not main_default, member=not member_default
@@ -247,6 +259,21 @@ def _start_kas_cli_floor(cfg: KiroCrewConfig) -> "asyncio.Task[None]":
                 kiro_selected=kiro_selected,
             )
             await _reconcile_live_config_with_kiro_verdict()
+            # An unknown verdict (a probe that timed out on a busy host, a run the
+            # sandbox launcher ended) says nothing about kiro-cli, so the floor
+            # asks again while a Kiro CLI pick still runs the v2 launch.
+            for delay in kas_floor_wait.KIRO_PICK_VERDICT_RETRY_SECS if kiro_selected else ():
+                if not kiro_cli_pick_verdict_open():
+                    break
+                # This boot's verdict has landed: no spawn waits for a later ask.
+                kas_floor_wait.release_kas_floor_wait(task, main=True, member=True)
+                await asyncio.sleep(delay)
+                if not await asyncio.to_thread(_main_stored_as_kiro):
+                    break
+                await asyncio.to_thread(
+                    apply_kas_cli_floor, cfg, kas_defaulted=kas_defaulted, kiro_selected=True
+                )
+                await _reconcile_live_config_with_kiro_verdict()
         except Exception:
             logging.getLogger(__name__).warning(
                 "KAS kiro-cli floor check failed; continuing", exc_info=True
@@ -261,7 +288,12 @@ def _start_kas_cli_floor(cfg: KiroCrewConfig) -> "asyncio.Task[None]":
     member = not bundle and getattr(agent, "member_acp_backend", None) == ACP_BACKEND_KAS
     task = asyncio.create_task(_run(), name="kas-cli-floor")
     _KAS_CLI_FLOOR_TASK = task
-    kas_floor_wait.arm_kas_floor_wait(task, main=kas_main or kiro_main, member=member)
+    # A Bot can land on KAS with neither field naming it (an inherited member harness
+    # its worker spec cannot use, or a pin that runs on KAS). Judging that scans the
+    # roster, which stays off the boot path: the member wait is armed on every
+    # non-bundle route here, and ``_kas_floor_gates_spawns`` (off the loop) releases
+    # it at once unless a Bot may land on KAS.
+    kas_floor_wait.arm_kas_floor_wait(task, main=kas_main or kiro_main, member=not bundle)
     return _KAS_CLI_FLOOR_TASK
 
 
@@ -280,7 +312,11 @@ def _kas_floor_gates_spawns(cfg: KiroCrewConfig) -> tuple[bool, bool]:
     kas_main = getattr(agent, "acp_backend", None) == ACP_BACKEND_KAS
     kiro_main = getattr(agent, "acp_backend", None) == ACP_BACKEND_KIRO
     kas_member = getattr(agent, "member_acp_backend", None) == ACP_BACKEND_KAS
-    if not (kas_main or kiro_main or kas_member):
+    # A Bot's KAS fallback is nobody's stored choice, so it waits for the verdict.
+    from kiro_crew.crewmate_harness import bots_may_run_on_kas
+
+    bot_kas = bots_may_run_on_kas(cfg)
+    if not (kas_main or kiro_main or kas_member or bot_kas):
         return False, False
     try:
         from kiro_crew.config.loader import acp_backend_declared, member_acp_backend_declared
@@ -292,7 +328,7 @@ def _kas_floor_gates_spawns(cfg: KiroCrewConfig) -> tuple[bool, bool]:
         return (
             (kas_main and not acp_backend_declared())
             or (kiro_main and acp_backend_stored_as_kiro()),
-            kas_member and not member_acp_backend_declared(),
+            (kas_member and not member_acp_backend_declared()) or bot_kas,
         )
     except Exception:
         logging.getLogger(__name__).debug("backend declared-check failed", exc_info=True)
@@ -442,6 +478,13 @@ async def run_gateway(
     # to this gateway.  Must run BEFORE any to_thread offload.
     configure_default_executor()
 
+    # ── Inherited agent scratch temp ──
+    # Started from inside an agent session, the gateway inherits that session's
+    # scratch exports: a directory another pid owns, which the hourly sweep
+    # reclaims while this gateway still names it as its temp. Off the loop: it
+    # resolves paths and probes the temp directory.
+    await asyncio.to_thread(agent_scratch.drop_own_inherited_scratch_env)
+
     # ── Publish surface, pinned for the process ──
     # Recorded BEFORE any service spins up, because both doors out are opened by
     # services started below: the dashboard's boot-time ``setup_tunnel`` and the
@@ -459,8 +502,8 @@ async def run_gateway(
     try:
         boot_platform(cfg)
     except Exception as exc:
-        # Enterprise build: failed governance rules exit with the fix named.
-        from kiro_crew.enterprise_boot import refuse_policy_boot
+        # LTS build: failed governance rules exit with the fix named.
+        from kiro_crew.lts_boot import refuse_policy_boot
 
         refuse_policy_boot(exc)
         raise
@@ -472,6 +515,14 @@ async def run_gateway(
     from kiro_crew.config.plaintext_credentials import start_plaintext_credentials_notice
 
     start_plaintext_credentials_notice()
+
+    # ── Container memory limit notice ──
+    # One WARNING when the container's memory limit is at or under
+    # agent.resource_critical_gb, naming the settings to lower. Read-only cgroup
+    # read, scheduled in the background and never awaited.
+    from kiro_crew.resource_status_container_limit import start_container_limit_notice
+
+    start_container_limit_notice(cfg)
 
     # ── KAS kiro-cli floor ──
     # A configured KAS on a kiro-cli that cannot select the KAS engine falls back
@@ -620,6 +671,16 @@ async def run_gateway(
                     await asyncio.to_thread(staging.sweep_staging)
                 except Exception:
                     logging.getLogger(__name__).debug("staging sweep failed", exc_info=True)
+                # The dashboard import extracts under its own sandbox-hidden leaf;
+                # the same idle sweep reclaims a tree that a killed import left there.
+                try:
+                    from kiro_crew import staging
+
+                    await asyncio.to_thread(
+                        staging.sweep_staging, leaf=staging.IMPORT_STAGING_DIRNAME
+                    )
+                except Exception:
+                    logging.getLogger(__name__).debug("import staging sweep failed", exc_info=True)
                 # The per-run work directories of subagent and stateless cron
                 # sessions ride the same wake. The ordinary end of a run reclaims
                 # its own (AcpProvider.shutdown); the boot sweep took what a dead
@@ -687,25 +748,25 @@ async def run_gateway(
     # reasoning in embeddings_download.py). Errors are swallowed inside ``send``; a failed
     # heartbeat is invisible by design. ``test_mode`` skips it entirely so the
     # offline E2E gate can never make an outbound request.
-    #
-    # ``acked`` withholds the FIRST heartbeat until the user has actually been
-    # shown the disclosure and its opt-out. Boot runs before the dashboard has
-    # ever rendered, so on a fresh install this thread would otherwise ping
-    # before the user could possibly decline, making the opt-out an offer
-    # arriving after the fact. Established installs are unaffected: the gate
-    # applies only while `is_first_send()` holds.
     if not test_mode:
         with contextlib.suppress(Exception):
             threading.Thread(
                 target=beacon.send,
                 args=(cfg.telemetry.beacon_endpoint, kiro_crew.__version__),
-                kwargs={
-                    "enabled": cfg.telemetry.beacon_enabled,
-                    "acked": cfg.dashboard.privacy_acked,
-                },
+                kwargs={"enabled": cfg.telemetry.beacon_enabled},
                 name="kirocrew-beacon",
                 daemon=True,
             ).start()
+
+    # ── Installed apps (kirocrew.app.present, once per app per UTC day) ──
+    # A background task, never a request path: the first pass waits ten minutes,
+    # then the task re-checks hourly and just after each UTC midnight. The day
+    # it last recorded is stamped next to the beacon's, so restarts the same day
+    # record once. Skipped in test_mode like the beacon.
+    if not test_mode:
+        from kiro_crew.metrics import app_present
+
+        app_present.start()
 
     # Off-loop: resolving a secret:// channel reference reads and decrypts the vault.
     credentials = await asyncio.to_thread(cfg.load_credentials)

@@ -24,7 +24,7 @@ from slot_close_recreation_race_helpers import (
 )
 
 from kiro_crew.dashboard import chat_handlers as handlers
-from kiro_crew.testing.wait import async_wait_until
+from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS, async_wait_until
 
 
 class _TombstoneClock:
@@ -567,6 +567,19 @@ async def test_a_taker_refused_after_registering_its_slot_still_leaves_the_tab_d
         raise asyncio.CancelledError()
 
     monkeypatch.setattr(chat_persistence, "_load_rehydrated_window", _failing_load)
+    # The taker's read is held until the close has answered, so the close's
+    # hand-over finds it still standing and leaves the marker owed. Unheld, the
+    # taker can retract during the close's drain and the close writes the marker
+    # itself -- the schedule ``_close_whose_taker_gives_up_during_its_drain`` covers.
+    read_release = threading.Event()
+    real_prefetch = chat_persistence._prefetch_rehydrate_inputs
+
+    def _held_prefetch(*args, **kwargs):
+        if not read_release.wait(10.0):
+            raise AssertionError("the held rehydrate read was never released by the test")
+        return real_prefetch(*args, **kwargs)
+
+    monkeypatch.setattr(chat_persistence, "_prefetch_rehydrate_inputs", _held_prefetch)
 
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -578,9 +591,13 @@ async def test_a_taker_refused_after_registering_its_slot_still_leaves_the_tab_d
     )
     assert await _event_fired(waiting, 10.0), "the rehydrate never reached its wait"
     release.set()
-    resp = await close
+    try:
+        resp = await close
+        meta_at_close = state.conversation_log.get_metadata(key)
+    finally:
+        read_release.set()
     assert resp.status == 200, resp.text
-    assert "closed" not in state.conversation_log.get_metadata(key)
+    assert "closed" not in meta_at_close
     # The taker registers its slot, then gives up.
     if exit_shape == "refused":
         with pytest.raises(OSError):
@@ -830,6 +847,49 @@ async def test_cleanup_keeps_its_dismissal_owed_when_the_taker_gives_up_later(
     )
     assert NAME not in state._slots
     assert state._takeover_watches == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close", ["delete", "cleanup"])
+async def test_a_late_save_of_the_popped_original_keeps_its_owed_close(
+    tmp_path, monkeypatch, close
+):
+    """The closed marker an owed dismissal wrote survives the original's late full save.
+
+    A turn that outlived the hand-over close still saves its popped slot when it
+    ends. That slot reads open only because it is stale, so rebuilding the line from
+    it would erase the marker and the restore would bring the dismissed tab back.
+    """
+    state = _make_state(tmp_path)
+    # The stage reuses the slot already on the key, so this is the popped original.
+    original = state.get_or_create_slot(NAME)
+    key, rehydrate, read_release, _unpark = await _close_handed_over_to_a_parked_taker(
+        state, monkeypatch, close=close
+    )
+    rehydrate.cancel()
+    read_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(rehydrate, FALLBACK_TIMEOUT_SECS)
+    owed = state.conversation_log.get_metadata(key)
+    assert owed.get("closed") is True, "the owed dismissal was not written"
+
+    original.append("assistant", "LATE-1")
+    original.drain()
+    assert await handlers.save_slot_off_loop(state, original, best_effort=False)
+
+    meta = state.conversation_log.get_metadata(key)
+    assert meta.get("closed") is True, "a stale save of the popped original reopened its tab"
+    assert meta.get("closed_id") == owed.get("closed_id")
+    rows = [m["content"] for m in state.conversation_log.read_messages_chained(key)]
+    assert rows[-1] == "LATE-1", "the late save did not keep its row"
+
+    # A reopen is a new slot object: its save opens the line as before.
+    reopened = state.get_or_create_slot(NAME)
+    assert reopened is not original
+    reopened.append("user", "back again")
+    reopened.drain()
+    assert await handlers.save_slot_off_loop(state, reopened, best_effort=False)
+    assert "closed" not in state.conversation_log.get_metadata(key)
 
 
 @pytest.mark.asyncio

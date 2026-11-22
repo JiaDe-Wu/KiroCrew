@@ -18,7 +18,7 @@ no other.
 
 The manager fields this module uses. Writes: ``_completion_keep``,
 ``_completion_keep_chars``, ``_process_handles``, ``_published_depths``, ``_running_count``,
-``_tasks``, ``_teardown_gates``. Reads: ``_admission``, ``_await_report``,
+``_run_task_owners``, ``_tasks``, ``_teardown_gates``. Reads: ``_admission``, ``_await_report``,
 ``_claim_finalize``, ``_default_timeout``, ``_default_turn_limit``, ``_drain_queue``,
 ``_effective_turn_limit``, ``_fire_event``, ``_on_event``, ``_record_cost``,
 ``_release_slot``, ``_retain_process_handles``, ``_run_inner``,
@@ -378,6 +378,18 @@ def _leave_for_next_start_impl(
 
 async def _run_impl(self: RunEventCoordinator, info: SubagentInfo) -> None:
     """Execute a subagent task in its own session."""
+    # The approval wrapper reaches here only once the start is admitted. Hold
+    # the actual task through every await, even after its record is evicted or
+    # teardown removes the run-id index. A completion callback covers all exits.
+    task = asyncio.current_task()
+    if task is not None:
+        owners = self._manager._run_task_owners
+        owners[task] = (info.id, info.parent_session_key)
+
+        def forget_owner(completed: asyncio.Task[None]) -> None:
+            owners.pop(completed, None)
+
+        task.add_done_callback(forget_owner)
     session_key = info.conversation_key or f"subagent:{info.id}"
     # Set by the reap-echo arm below: the run ended because a reap in
     # flight tore its runtime down, and that reap publishes the terminal
@@ -389,9 +401,18 @@ async def _run_impl(self: RunEventCoordinator, info: SubagentInfo) -> None:
         # config reload between the two attempts cannot move it.
         if info.timeout_secs == 0:
             info.timeout_secs = self._manager._default_timeout
-        await asyncio.wait_for(
-            self._manager._run_inner(info, session_key), timeout=info.timeout_secs
-        )
+        # This run's turns sit under the spawn that admitted it, in the parent's
+        # trace (tracing/subagents.py). ``wait_for`` runs the body in this task.
+        from kiro_crew.tracing import subagents as trace_subagents
+        from kiro_crew.tracing import turns as trace_turns
+
+        _trace_root = trace_subagents.bind_child(info)
+        try:
+            await asyncio.wait_for(
+                self._manager._run_inner(info, session_key), timeout=info.timeout_secs
+            )
+        finally:
+            trace_turns.release_turn_root(_trace_root)
         if info._reap_started and not info.done:
             # Returned with no ending while a reap is in flight -- the tail
             # records nothing for a whole answer a reap got to first: the
@@ -789,7 +810,16 @@ async def _fire_event_impl(
     # Recorded before the frame goes out, so a slots push serialized after
     # this frame can never carry an older depth than the frame did.
     if etype == "subagent_queued":
-        self._manager._published_depths.record(info.parent_session_key, (extra or {}).get("queued"))
+        frame = extra or {}
+        label = {k: v for k, v in frame.items() if k != "queued"} if "reason" in frame else None
+        self._manager._published_depths.record(info.parent_session_key, frame.get("queued"), label)
+    # A retry or recovery is the newer health state, so it ends a stall here
+    # as it does on the card: a reconnect snapshot replays `info.stalled` and
+    # must not bring the older stall back over the retry. The suspicion also
+    # restarts, so the reaper needs two fresh sweeps to flag it again.
+    if etype in ("subagent_retrying", "subagent_recovering"):
+        info.stalled = False
+        info._stall_suspect_at = 0.0
     if self._manager._on_event:
         try:
             await self._manager._on_event(etype, info, extra or {})

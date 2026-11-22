@@ -37,7 +37,7 @@ serves carries no relay header, so the strip passes it through as the same objec
 and cannot clone away the identity set here (a clone would reset ``request.remote``
 to the socket's peer).
 
-Off by default. With ``tunnel.relay_enabled`` false no :class:`RelayIngress` accepts a
+Off unless the relay is selected (``edition_locks.relay_selected``). Otherwise no :class:`RelayIngress` accepts a
 stamp, so the only behaviour left is the strip.
 """
 
@@ -107,14 +107,20 @@ class RelayIngress:
     loop; the binding is an immutable value swapped in one assignment.
     """
 
-    def __init__(self, *, enabled: bool) -> None:
+    def __init__(self, *, enabled: bool, handle_email_domains: Iterable[str] = ()) -> None:
         self._enabled = bool(enabled)
         self._handover = secrets.token_urlsafe(32) if self._enabled else ""
         self._binding: HostBinding | None = None
+        self._handle_email_domains = frozenset(handle_email_domains)
 
     @property
     def enabled(self) -> bool:
         return self._enabled
+
+    @property
+    def handle_email_domains(self) -> frozenset[str]:
+        """``tunnel.relay_handle_email_domains``: labels only, read at gateway start."""
+        return self._handle_email_domains
 
     @property
     def binding(self) -> HostBinding | None:

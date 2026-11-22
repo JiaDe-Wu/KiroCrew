@@ -287,8 +287,9 @@ describe('ComputerUsePanel', () => {
       }),
     )
     expect(
-      await screen.findByText('the Linux AT-SPI driver is not implemented yet'),
+      await screen.findByText("Computer Use isn't available on Linux in this release."),
     ).toBeInTheDocument()
+    expect(screen.queryByText(/AT-SPI/)).not.toBeInTheDocument()
     expect(screen.queryByRole('switch', { name: ENABLE_LABEL })).not.toBeInTheDocument()
     // **No badge on an unsupported host**, and specifically not "macOS only": on
     // Linux that is a claim about a different platform sitting beside a reason that
@@ -300,6 +301,11 @@ describe('ComputerUsePanel', () => {
   })
 
 
+
+  it('keeps the driver reason on another unsupported platform', async () => {
+    await renderPanel(snapshot({ supported: false, platform: 'windows', reason: 'the Windows UI Automation driver could not be loaded on this host' }))
+    expect(await screen.findByText('the Windows UI Automation driver could not be loaded on this host')).toBeInTheDocument()
+  })
 
   /* ── the real-pointer opt-in ────────────────────────────────────────────── */
 
@@ -362,8 +368,7 @@ describe('ComputerUsePanel', () => {
       // The panel must stop polling on the shapes the backend itself returns as
       // normal: `unknown` (the probe could not run) and `unsupported` (no TCC on
       // this platform). Re-polling while accessibility !== 'granted' never
-      // terminates on those. Each tick shells out to a `kirocrew computer
-      // doctor --json` child.
+      // terminates on those. Each tick spawns a permission-probe child process.
       expect(permissionPollInterval('granted', t0, t0)).toBe(false)
       expect(permissionPollInterval('unknown', t0, t0)).toBe(false)
       expect(permissionPollInterval('unsupported', t0, t0)).toBe(false)

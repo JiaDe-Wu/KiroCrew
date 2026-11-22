@@ -309,7 +309,7 @@ via `monitor_update`, see "Live steering"):
 > LEDGER FIRST: one `session_ledger_read` — the injected `[work ledger]` block
 > is a truncated teaser, and every disposition below is a comparison against the
 > recorded item state.
-> THEN PROBE: one `fleet_probe.py --config <path>` call. Act only on 🔔/BANNED
+> THEN PROBE: one `fleet_probe.py --config <path>` call. Act only on ALERT/BANNED
 > lines: ERR → batch resume; PR → record; GREEN → verify independently then
 > digest + backfill; STANDDOWN/PROPOSAL → disposition + backfill; TERMINAL →
 > close it out, never nudge; BLOCKED → adjudicate; IDLE → intervention ladder;
@@ -536,7 +536,9 @@ Then **claim atomically** — the lock label and the assignee in ONE call, never
 two. The forge is the cross-operator lock and your ledger is only a cache of
 it; a claim written as two calls is a window another operator dispatches into.
 Only after the claim lands: `session_create` (titled `{id}: {item}`), seed it with the work-order brief, record
-`{state: dispatched, session, ts}` in the ledger.
+`{state: dispatched, session, ts}` in the ledger. The seed is a `session_send`
+when your prompt carries this line: "`session_create`'s `message` is refused
+for this agent (`message_needs_send_approval`): create, then `session_send`."
 
 **The claim is only valid while a worker holds it.** If ANY post-claim step
 fails — session create refused, create rate limit hit, seed rejected, trust grant
@@ -1038,6 +1040,13 @@ Fill `{...}` from the spec; keep every clause — each one closes a failure mode
 
 ### Sending an order to a worker
 
+**Every order to an existing worker uses `session_send` with `steer: true`.**
+That includes rulings, corrections, nudges, resume requests and follow-ups. It
+joins a busy worker's running turn instead of queueing behind it, and starts an
+idle worker like a plain send. The initial seed stays plain because the new
+session has no turn to steer. Name any older queued instruction the steer
+supersedes.
+
 Every rule here closes a way an order fails SILENTLY, and silence is the failure
 mode you are least able to detect.
 
@@ -1101,7 +1110,7 @@ with the ledger's open sessions (add on dispatch, drop on close). Fired lines
 carry **metadata only** — the probe never emits transcript text:
 
 ```
-🔔 <key>  <age>s <TAG> i=<index> d=<digest12>
+ALERT <key>  <age>s <TAG> i=<index> d=<digest12>
 BANNED pid=<pid> rule=<regex|argv:<shape>> cwd=fleet|unknown age=<secs|?>s scope=suite|paths|unknown cmd=<program,flags,+withheld>
 OK <n> watched, <m> fired | load/cpu <x> (ok|hot)|n/a | mem <n>G|n/a | banned <n>|n/a | foreign <n>|n/a | deliver init-timeout <a>, watchdog <b>
 ```
@@ -1204,10 +1213,10 @@ digest keying, not a defect, and it does not recur.
 
 | Line | Action |
 | --- | --- |
-| `ERR` | Batch-resume the affected workers (`session_send`: "resume; re-state your protocol prefix"). |
+| `ERR` | Batch-resume the affected workers with `session_send`, `steer: true`: "resume; re-state your protocol prefix". |
 | `PR` | Record PR number + head in the ledger. |
-| `GREEN` | Verify independently (below). Pass → digest + mark item `green_verified`, backfill a queued item. Fail → send the worker the delta. |
-| `BLOCKED` | Adjudicate (below). Record it in `open_rulings` and clear that entry only once the ruling is delivered via `session_send`. |
+| `GREEN` | Verify independently (below). Pass → digest + mark item `green_verified`, backfill a queued item. Fail → send the worker the delta with `session_send` and `steer: true`. |
+| `BLOCKED` | Adjudicate (below). Record it in `open_rulings` and clear that entry only once the ruling is delivered via `session_send` with `steer: true`. |
 | `STANDDOWN` / `PROPOSAL` | Verify the evidence is stated; record the disposition; unclaim with an evidence comment; close or re-queue; backfill. |
 | `TERMINAL` | The last dispositioned protocol report was terminal and the session has gone quiet since. **Close it out** — confirm the disposition landed, release the claim, `session_close`. Do NOT nudge: a finished worker has nothing to re-arm, and a monitor loop is only correct while something EXTERNAL can still change. |
 | `IDLE` | Intervention ladder (below). |
@@ -1268,7 +1277,7 @@ is what keeps a large merge queue reviewable at a glance — never skip it.
 Signals: `IDLE` twice in a row; same tag across ~5 cycles with rising turn
 count; credit burn with no ledger transition; ERR recurring after resume.
 
-1. **Nudge** (`session_send`): restate the next step + protocol requirement.
+1. **Nudge** (`session_send`, `steer: true`): restate the next step + protocol requirement.
 2. **Inspect** — `spawn_run` ONE bounded inspector and bound it in the TASK
    TEXT. `spawn_run` takes no `allowed_tools` parameter, and the underlying
    field is ignored for ACP-backed agents, so read-only cannot be a property of
@@ -1465,9 +1474,9 @@ same read, expects it to fail, and declines to guess an owner when it does.
 
 What the pytest rule flags is **a run whose worker pool bypasses the budget**:
 an explicit numeric `-n` of two or more (`-n 4`, `-n=4`, `-n4`, `-n 32`,
-`--numprocesses 2`), because `xdist_budget.py`'s hook only ever sizes `auto`, so
-a number is a count the host's memory and the other runs on it are never
-consulted about. `-n auto`, `-n logical` and a bare `pytest` are quiet: the
+`--numprocesses 2`), because `xdist_budget.py`'s memory hook only ever sizes
+`auto`: a number still claims the host's shared slots, but the host's live free
+memory is never consulted about it. `-n auto`, `-n logical` and a bare `pytest` are quiet: the
 bare form inherits the project's `addopts`, which supply `-n auto`, so its pool
 is budgeted by the same hook. `-n0` and `-n 1` are quiet too, as single-process
 runs with xdist inactive. Where `-n` is given twice the last one wins, as pytest
@@ -1571,12 +1580,12 @@ new work": edit the instruction to `DRAIN MODE: no backfill, no new
 dispatches; patrol until in-flight items resolve; then final tally +
 autonudge_stop.`
 
-When that mode change invalidates what an in-flight worker is doing right now,
-forward it with `session_send` and `steer: true` so it lands in the worker's
-running turn rather than after it; a plain send waits out the whole turn. Keep
-`steer` off for rulings, nudges and anything that can wait for the turn
-boundary. A steer does not withdraw messages already queued (`queue_depth` from
-`session_read_message`), so name the instruction it supersedes.
+Every direct message to an existing worker uses `session_send` with
+`steer: true`, including mode changes, rulings and nudges. It lands in a busy
+worker's running turn rather than queueing behind it, and starts an idle worker
+like a plain send. The initial seed stays plain because the new session has no
+turn to steer. A steer does not withdraw messages already queued (`queue_depth`
+from `session_read_message`), so name the instruction it supersedes.
 
 ## Merge, cleanup, reconcile
 

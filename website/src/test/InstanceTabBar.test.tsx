@@ -1,5 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, onTestFinished } from 'vitest'
 import { act, screen, waitFor, within } from '@testing-library/react'
+import { relayPaneOpened } from '../store/instancesSlice'
+import { setGatewayConnected } from '../utils/errorReport'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders, createTestStore } from './helpers'
 import InstanceTabBar, {
@@ -411,6 +413,73 @@ describe('InstanceTabBar', () => {
     expect(api.connectInstance).not.toHaveBeenCalled()
   })
 
+  it('opens the crew menu from the active chip instead of re-selecting the crew', async () => {
+    vi.mocked(api.listInstances).mockResolvedValue(listResp([conn()]))
+    const store = createTestStore({
+      instances: { warm: { 'cd-1': { port: 7778, token: 't' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {} },
+    })
+    const u = userEvent.setup()
+    renderWithProviders(<InstanceTabBar />, { store })
+
+    const chip = await screen.findByRole('button', { name: /Cloud One/i })
+    expect(chip).toHaveAttribute('aria-haspopup', 'menu')
+    expect(chip).toHaveAttribute('aria-expanded', 'false')
+
+    await u.click(chip)
+    expect(await screen.findByRole('menuitemradio', { name: /Local/i })).toBeInTheDocument()
+    expect(chip).toHaveAttribute('aria-expanded', 'true')
+    expect(store.getState().instances.activeId).toBe('cd-1')
+  })
+
+  it('closes a non-modal menu on a second click of the active chip instead of reopening it', async () => {
+    // A touch device gets a non-modal menu, so a mouse press reaches the chip.
+    const media = vi.spyOn(window, 'matchMedia').mockImplementation((query: string) => ({
+      matches: query === '(pointer: coarse)' || query === '(hover: none)',
+      media: query, onchange: null,
+      addListener: () => {}, removeListener: () => {},
+      addEventListener: () => {}, removeEventListener: () => {}, dispatchEvent: () => false,
+    }) as MediaQueryList)
+    onTestFinished(() => media.mockRestore())
+    vi.mocked(api.listInstances).mockResolvedValue(listResp([conn()]))
+    const store = createTestStore({
+      instances: { warm: { 'cd-1': { port: 7778, token: 't' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {} },
+    })
+    const u = userEvent.setup()
+    renderWithProviders(<InstanceTabBar />, { store })
+
+    const chip = await screen.findByRole('button', { name: /Cloud One/i })
+    await u.click(chip)
+    await screen.findByRole('menu')
+    // Radix arms its outside-press listener in a zero-delay timeout after the
+    // menu mounts; flush it so the second press meets it, as a person's would.
+    await act(() => new Promise(r => setTimeout(r, 0)))
+    // A close-then-reopen on the same press would flip aria-expanded three times.
+    const flips: MutationRecord[] = []
+    const watch = new MutationObserver(records => flips.push(...records))
+    watch.observe(chip, { attributes: true, attributeFilter: ['aria-expanded'] })
+    onTestFinished(() => watch.disconnect())
+    await u.click(chip)
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull())
+    expect(chip).toHaveAttribute('aria-expanded', 'false')
+    expect(flips).toHaveLength(1)
+  })
+
+  it('returns focus to the active chip when the menu it opened closes on Escape', async () => {
+    vi.mocked(api.listInstances).mockResolvedValue(listResp([conn()]))
+    const store = createTestStore({
+      instances: { warm: { 'cd-1': { port: 7778, token: 't' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {} },
+    })
+    const u = userEvent.setup()
+    renderWithProviders(<InstanceTabBar />, { store })
+
+    const chip = await screen.findByRole('button', { name: /Cloud One/i })
+    await u.click(chip)
+    await screen.findByRole('menu')
+    await u.keyboard('{Escape}')
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull())
+    await waitFor(() => expect(chip).toHaveFocus())
+  })
+
   it('leads with the active crew and keeps it out of the pinned row', async () => {
     // Both destinations pinned, Local active: the chip row carries only the crew.
     setCrewPins(['__local__', 'cd-1'])
@@ -498,6 +567,36 @@ describe('InstanceTabBar', () => {
     // No `break-all`: the span's own `overflow-wrap: anywhere` breaks the unbreakable
     // token AND prefers word boundaries, so prose does not get cut mid-word.
     expect(msg.className).not.toMatch(/break-all/)
+  })
+
+  it("stays quiet when the relay answers that the Crew's host is offline", async () => {
+    // The relay window's reconnecting cover says it; the bar must not add the
+    // relay's raw sentence in red beside the crew pill.
+    const offline = Object.assign(new Error('The Crew is not connected to the relay.'), {
+      status: 503, body: '{"reason":"crew_not_connected","message":"The Crew is not connected to the relay."}',
+    })
+    vi.mocked(api.listInstances).mockRejectedValue(offline)
+    renderWithProviders(<InstanceTabBar variant="inline" />)
+    await waitFor(() => expect(api.listInstances).toHaveBeenCalled())
+    await new Promise(r => setTimeout(r, 0))
+    expect(screen.queryByTestId('instance-tab-bar-list-error')).toBeNull()
+  })
+
+  it('stays quiet while the gateway is offline, then re-reads once it is back (Bug Bash row 50)', async () => {
+    // The header's offline status says it; the bar must not add the browser's
+    // raw "Failed to fetch" in red beside it, nor keep it after the gateway returns.
+    setGatewayConnected(false)
+    onTestFinished(() => setGatewayConnected(true))
+    vi.mocked(api.listInstances).mockRejectedValue(new TypeError('Failed to fetch'))
+    renderWithProviders(<InstanceTabBar variant="inline" />)
+    await waitFor(() => expect(api.listInstances).toHaveBeenCalled())
+    await act(async () => { await new Promise(r => setTimeout(r, 0)) })
+    expect(screen.queryByTestId('instance-tab-bar-list-error')).toBeNull()
+    const reads = vi.mocked(api.listInstances).mock.calls.length
+    vi.mocked(api.listInstances).mockResolvedValue({ active: true, instances: [] } as never)
+    act(() => setGatewayConnected(true))
+    await waitFor(() => expect(vi.mocked(api.listInstances).mock.calls.length).toBeGreaterThan(reads))
+    expect(screen.queryByText('Failed to fetch')).toBeNull()
   })
 
   it('marks the list-failure notice so the desktop top bar gives it only spare room', async () => {
@@ -608,5 +707,78 @@ describe('clippedChipIds', () => {
 
   it('handles an empty row', () => {
     expect(clippedChipIds([], 300).size).toBe(0)
+  })
+})
+
+describe('InstanceTabBar — relay Crew tabs', () => {
+  const relayStore = () => createTestStore({
+    instances: {
+      warm: {}, activeId: null, mru: [], unread: {},
+      relayTabs: [{ id: 'r1', name: 'Team One' }], relayLive: ['r1'], relayActive: null,
+    },
+  })
+  const installBridge = () => {
+    const api = {
+      openPane: vi.fn(async () => ({ ok: true })),
+      closePane: vi.fn(async () => undefined),
+      onPaneEvent: vi.fn(() => () => {}),
+    }
+    ;(window as unknown as { relayCrewAPI?: unknown }).relayCrewAPI = api
+    onTestFinished(() => { delete (window as unknown as { relayCrewAPI?: unknown }).relayCrewAPI })
+    return api
+  }
+
+  it('gives an open relay Crew no row of its own while the Remote Crews group lists it', async () => {
+    installBridge()
+    vi.mocked(api.listInstances).mockResolvedValue(listResp([conn()]))
+    renderWithProviders(<InstanceTabBar listedRelayCrews={new Set(['r1'])} />, { store: relayStore() })
+    const u = userEvent.setup()
+    await openSwitcher(u, /Cloud One/)
+    const rows = screen.getAllByRole('menuitemradio').map(r => r.textContent ?? '')
+    expect(rows.some(t => t.includes('Team One'))).toBe(false)
+    expect(screen.queryByTestId('crew-close-relay:r1')).toBeNull()
+  })
+
+  it('keeps an open relay Crew its own row and × while no group lists it (a failed list read)', async () => {
+    const bridge = installBridge()
+    vi.mocked(api.listInstances).mockResolvedValue(listResp([conn()]))
+    renderWithProviders(<InstanceTabBar listedRelayCrews={new Set()} />, { store: relayStore() })
+    const u = userEvent.setup()
+    await openSwitcher(u, /Cloud One/)
+    const rows = screen.getAllByRole('menuitemradio').map(r => r.textContent ?? '')
+    expect(rows.some(t => t.includes('Team One'))).toBe(true)
+    await u.click(screen.getByTestId('crew-close-relay:r1'))
+    expect(bridge.closePane).toHaveBeenCalledWith('r1')
+  })
+
+  it('names the relay Crew in front in the bar', async () => {
+    installBridge()
+    vi.mocked(api.listInstances).mockResolvedValue(listResp([]))
+    const store = relayStore()
+    act(() => { store.dispatch(relayPaneOpened({ id: 'r1', name: 'Team One' })) })
+    renderWithProviders(<InstanceTabBar />, { store })
+    expect((await screen.findAllByText('Team One')).length).toBeGreaterThan(0)
+  })
+})
+
+describe('InstanceTabBar — a crew turned Off', () => {
+  it('lists no row and no tunnel error for a crew turned Off in Remote Crew', async () => {
+    // Off keeps `was_connected`, and the refused connect leaves an error status.
+    const main = conn({ id: 'main', name: 'Main Crew', was_connected: true })
+    const off = conn({
+      id: 'demo',
+      name: 'Demo Crew',
+      via_instance_id: 'main',
+      was_connected: true,
+      disabled: true,
+      status: { instance_id: 'demo', state: 'error', error: 'instance is disabled' },
+    })
+    vi.mocked(api.listInstances).mockResolvedValue(listResp([main, off]))
+    const u = userEvent.setup()
+    renderWithProviders(<InstanceTabBar />)
+
+    await openSwitcher(u, /Main Crew/i)
+    expect(screen.queryByRole('menuitemradio', { name: /Demo Crew/i })).toBeNull()
+    expect(screen.queryByText(/tunnel error/i)).toBeNull()
   })
 })

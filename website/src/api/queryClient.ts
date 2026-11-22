@@ -1,5 +1,6 @@
 import { QueryClient } from '@tanstack/react-query'
 import { isEdgeChallengeError, isPermissionRefusal } from './apiError'
+import { edgeThrottleDelayMs } from './edgeThrottleRetry'
 
 /**
  * True when the error is an HTTP 429 (edge/proxy rate limit). When the
@@ -47,7 +48,7 @@ export const retryPolicy = (failureCount: number, error: unknown): boolean =>
 /** A failure the gateway's own handler did not answer: a fetch rejection
  *  (`TypeError: Failed to fetch` -- a restart, a dropped forwarded link) or a
  *  fronting proxy's 502/504, plus the gateway's own "retry shortly" 503. */
-const isUnansweredRead = (error: unknown): boolean => {
+export const isUnansweredRead = (error: unknown): boolean => {
   if (error instanceof TypeError) return true
   const status = typeof error === 'object' && error !== null ? (error as { status?: unknown }).status : undefined
   return status === 502 || status === 503 || status === 504
@@ -67,9 +68,14 @@ export const retryThroughRestart = (failureCount: number, error: unknown): boole
  * every 30s while it is failed, never while it holds an answer. With the
  * socket still up no reconnect re-reads it, and an idle page fires nothing
  * else, so without this the notice outlived the blip that caused it.
+ *
+ * A permission refusal (`isPermissionRefusal`: a guest session asking for an
+ * owner-only read) is never re-read. It gives the same answer every time, the
+ * reader already shows it as "nothing here", and each ask writes another
+ * denial row to the gateway's security event log.
  */
-export const refetchWhileFailed = (query: { state: { status: string } }): number | false =>
-  query.state.status === 'error' ? 30_000 : false
+export const refetchWhileFailed = (query: { state: { status: string; error?: unknown } }): number | false =>
+  query.state.status === 'error' && !isPermissionRefusal(query.state.error) ? 30_000 : false
 
 /**
  * Jittered exponential backoff for throttles (1s → 2s → 4s → 8s, ±500ms so
@@ -78,7 +84,7 @@ export const refetchWhileFailed = (query: { state: { status: string } }): number
  */
 export const retryDelayPolicy = (attempt: number, error: unknown): number =>
   isThrottleError(error)
-    ? Math.min(1_000 * 2 ** attempt, 15_000) + Math.random() * 500
+    ? edgeThrottleDelayMs(attempt)
     : Math.min(1_000 * 2 ** attempt, 30_000)
 
 /**

@@ -35,6 +35,14 @@ describe('ProjectPicker favourites', () => {
     expect(screen.queryByRole('option', { name: /projA/ })).not.toBeInTheDocument()
   })
 
+  it('titles a favourite row with its folder name on a native Windows path', async () => {
+    vi.mocked(api.favoriteProjects).mockResolvedValue({ dirs: ['D:\\work\\proj'] })
+    open()
+    const list = await screen.findByRole('listbox', { name: 'Favorite projects' })
+    const row = (await within(list).findByText('proj')).closest('[role="option"]') as HTMLElement
+    expect(within(row).getByText('D:\\work\\proj')).toBeInTheDocument()
+  })
+
   it('falls back to Recent when there are no favourites', async () => {
     vi.mocked(api.favoriteProjects).mockResolvedValue({ dirs: [] })
     open()
@@ -142,9 +150,12 @@ describe('ProjectPicker favourites', () => {
     fireEvent.mouseDown(await screen.findByText('Recent'))
     fireEvent.mouseDown(await screen.findByTestId('pp-recent-star-0'))
     await waitFor(() => expect(screen.getByTestId('pp-recent-star-0')).toHaveAttribute('aria-pressed', 'true'))
-    // The read started before the write and holds the older list. It still settles the
-    // landing tab (Favorites, since it has rows), but the rows shown are the write's.
+    // The read started before the write and holds the older list, so the rows it would paint
+    // are stale. It no longer moves the tab either: the user chose Recent, and that choice
+    // now holds against a late read (ProjectPicker.holdLandingTab.test.tsx), so reach the
+    // favourites list by asking for it.
     await act(async () => { answerRead({ dirs: ['/home/u/projB'] }) })
+    fireEvent.mouseDown(screen.getByText('Favorites'))
     const favs = await screen.findByRole('listbox', { name: 'Favorite projects' })
     expect(within(favs).getByRole('option', { name: /projA/ })).toBeInTheDocument()
     expect(within(favs).queryByRole('option', { name: /projB/ })).toBeNull()

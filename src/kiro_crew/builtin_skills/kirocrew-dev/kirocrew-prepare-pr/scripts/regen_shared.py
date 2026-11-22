@@ -32,11 +32,26 @@ Stdlib only; Python 3.10+.
 """
 
 import fnmatch
+import importlib.util
 import os
 import shlex
-import shutil
 import subprocess
 import sys
+
+# argv[0] resolution and the batch-launcher guard ``run`` applies, from
+# _tool_argv.py beside this script, by path and without writing bytecode.
+_SPEC = importlib.util.spec_from_file_location(
+    "_prepare_pr_regen_tool_argv",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tool_argv.py"),
+)
+if _SPEC is None or _SPEC.loader is None:  # pragma: no cover - defensive
+    raise ImportError("cannot import kirocrew-prepare-pr sibling _tool_argv.py")
+_tool_argv = importlib.util.module_from_spec(_SPEC)
+_WRITES_BYTECODE, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+try:
+    _SPEC.loader.exec_module(_tool_argv)
+finally:
+    sys.dont_write_bytecode = _WRITES_BYTECODE
 
 # One entry per generator that exists today. ``files`` are the repo-relative paths it
 # writes (and the only ones it may write); ``requires`` are paths that must exist for
@@ -102,9 +117,12 @@ def err(msg):
 
 
 def run(args, cwd=None):
+    argv, refused = _tool_argv.resolve(args)
+    if refused:
+        return refused
     try:
         p = subprocess.run(
-            args, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace"
+            argv, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace"
         )
         return p.returncode, p.stdout, p.stderr
     except OSError as exc:
@@ -114,6 +132,13 @@ def run(args, cwd=None):
 def _git_lines(root, *args):
     rc, out, _ = run(["git", "-C", root, *args])
     return None if rc != 0 else [line for line in out.splitlines() if line.strip()]
+
+
+def _git_paths(root, *args):
+    """Paths from a ``git diff --name-only`` run with ``-z``. Line output C-quotes a
+    non-ASCII name, and the quoted spelling matches no input pattern."""
+    rc, out, _ = run(["git", "-C", root, *args, "-z"])
+    return None if rc != 0 else [path for path in out.split("\0") if path.strip()]
 
 
 def baseline_paths(root, relpath):
@@ -178,15 +203,14 @@ def _argv(entry):
 
 def run_entry(root, entry):
     """Run one generator. Returns (error message or None, files it rewrote)."""
-    argv = _argv(entry)
-    # Launch the path `which` found, not the bare name: with no shell, Windows only
-    # finds `npm.cmd` through the full path (`npm` alone is WinError 2).
-    tool = shutil.which(argv[0])
-    if tool is None and os.path.isfile(argv[0]):
-        tool = argv[0]
-    if tool is None:
+    # Launch the full path PATH's absolute entries give, not the bare name: with no
+    # shell, Windows only finds `npm.cmd` through the full path (`npm` alone is
+    # WinError 2), and a bare `shutil.which` would also search the current directory.
+    argv, refused = _tool_argv.resolve(_argv(entry))
+    if refused and refused[0] == _tool_argv.RC_NOT_FOUND:
         return "{}: tool `{}` not found on PATH".format(entry["name"], entry["argv"][0]), []
-    argv[0] = tool
+    if refused:
+        return "{}: {}".format(entry["name"], refused[2]), []
     before = untracked_or_modified(root)
     if before is None:
         return "git status failed in {}".format(root), []
@@ -236,18 +260,26 @@ def regen(root, base, entries):
     if _git_lines(root, "rev-parse", "--is-inside-work-tree") is None:
         return 2, ["ERROR: not inside a git repository (or git not found)."]
     if _git_lines(root, "rev-parse", "--verify", "--quiet", "origin/" + base) is None:
+        remote, _, branch = base.partition("/")
+        if branch and _git_lines(root, "rev-parse", "--verify", "--quiet", "refs/remotes/" + base):
+            # A remote ref (upstream/main from a fork clone): no fetch from origin brings it.
+            return 2, [
+                "ERROR: {0} is a ref of the remote {1}; pass the branch name instead: {2}. "
+                "The base is always read from origin/{2}, so in a fork clone sync your "
+                "fork's {2} with upstream first (CONTRIBUTING.md).".format(base, remote, branch)
+            ]
         return 2, ["ERROR: origin/{0} not found - run: git fetch origin {0}".format(base)]
     merge_base = _git_lines(root, "merge-base", "origin/" + base, "HEAD")
     if not merge_base:
         return 2, ["ERROR: no merge base between origin/{} and HEAD".format(base)]
     mb = merge_base[0]
     # --no-renames lists both sides of a rename, so a baseline row for the old path is found.
-    mine = _git_lines(root, "diff", "--name-only", "--no-renames", mb + "..HEAD")
-    theirs = _git_lines(root, "diff", "--name-only", "--no-renames", mb + "..origin/" + base)
+    mine = _git_paths(root, "diff", "--name-only", "--no-renames", mb + "..HEAD")
+    theirs = _git_paths(root, "diff", "--name-only", "--no-renames", mb + "..origin/" + base)
     if mine is None or theirs is None:
         return 2, ["ERROR: git diff failed"]
     # A worktree edit counts as this branch's: the author may regenerate before committing.
-    dirty = _git_lines(root, "diff", "--name-only", "--no-renames", "HEAD") or []
+    dirty = _git_paths(root, "diff", "--name-only", "--no-renames", "HEAD") or []
     mine = sorted(set(mine) | set(dirty))
 
     applicable = []

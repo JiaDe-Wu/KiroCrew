@@ -1,9 +1,10 @@
 """Assistant-role system notices the gateway injects into a slot's feed.
 
 Status reports -- the auto-compaction notices, the session-reload
-confirmation and the session-switch boundary rows -- not real turns. Every scan that walks for "the last real
-message" (the conversation floor, the sidebar preview, backfill replay) must
-skip them, and the frontend keeps a twin of this set
+confirmation, the session-switch boundary rows and the Task Runner notices a
+run sends back to the conversation it was started from -- not real turns.
+Every scan that walks for "the last real message" (the conversation floor, the
+sidebar preview, backfill replay) must skip them, and the frontend keeps a twin of this set
 (``website/src/lib/systemNotice.ts``): a kind skipped on one side but not the
 other leaves the sidebar showing notice boilerplate while the chat pane shows
 the real turn, or vice versa.
@@ -20,15 +21,50 @@ from kiro_crew.constants import (
 from kiro_crew.preview_text import drop_format_chars
 
 SESSION_RELOAD_KIND = "session_reload"
+#: The rows a reload appends once the respawn it armed has ended, under the same
+#: ``SESSION_RELOAD_KIND`` as its notice: the agent came back, or it starts with
+#: the next message (eager spawn is off, or the respawn stood down). A respawn
+#: that failed reads ``session_reload_failed_notice``.
+SESSION_RELOAD_READY_TEXT = "The reloaded agent is ready."
+SESSION_RELOAD_DEFERRED_TEXT = "The reloaded agent starts with the next message."
+#: Bound on the error text the failed-respawn row carries into the chat.
+_SESSION_RELOAD_ERROR_MAX_CHARS = 500
 #: The boundary row a mid-conversation agent, model, reasoning-effort or
 #: workspace switch leaves when it resets the slot's agent session.
 SESSION_SWITCH_KIND = "session_switch"
 #: A Shared Crew notice naming who replaced a preference or lessons
 #: (``shared_crew.memory_changes.NOTICE_KIND``).
 MEMORY_CHANGE_KIND = "memory_change"
+#: A Task Runner notice in the conversation that started the run
+#: (``dashboard.task_run_notices``).
+TASKRUNNER_NOTICE_KIND = "taskrunner_notice"
+
+#: ``meta.kind`` of the notice row an agent harness's advisory is shown as
+#: (``dashboard.harness_notice_rows``): text the harness sends in place of reply
+#: text, such as a hook's block reason, so it answers the turn as reply text does.
+#: ``HARNESS_ADVISORY_KIND`` in ``website/src/store/chat/selectors.ts`` is the twin;
+#: ``state_parts.transcript_rows.is_turn_interrupted`` reads it.
+HARNESS_ADVISORY_KIND = "harness_advisory"
+
+
+def is_harness_advisory_row(m: dict) -> bool:
+    """True when *m* is the notice row of a harness's advisory."""
+    meta = m.get("meta")
+    return (
+        m.get("role") == "notice"
+        and isinstance(meta, dict)
+        and meta.get("kind") == HARNESS_ADVISORY_KIND
+    )
+
 
 SYSTEM_NOTICE_KINDS: frozenset[str] = frozenset(
-    {"compaction", SESSION_RELOAD_KIND, SESSION_SWITCH_KIND, MEMORY_CHANGE_KIND}
+    {
+        "compaction",
+        SESSION_RELOAD_KIND,
+        SESSION_SWITCH_KIND,
+        MEMORY_CHANGE_KIND,
+        TASKRUNNER_NOTICE_KIND,
+    }
 )
 
 #: What a switch notice names, per switch. The agent switch has no entry: it
@@ -64,6 +100,24 @@ def session_switch_notice(switch: str, value: str) -> str:
     if switch == "agent":
         return switch_announcement(shown)
     return _SESSION_SWITCH_TEXT[switch].format(value=shown)
+
+
+def session_reload_failed_notice(error: BaseException) -> str:
+    """The row a reload appends when its respawn failed to start the agent.
+
+    Led by the warning glyph the chat's notice card reads as its warn tone. The
+    error is redacted over its whole text, then bounded: an agent error can carry
+    a near-frame-limit payload, and this row is retained and broadcast.
+    """
+    # Call-time import: the history readers load this module, and the redaction
+    # stack imports much of the package.
+    from kiro_crew.security import redact_and_truncate
+
+    detail = redact_and_truncate(str(error), _SESSION_RELOAD_ERROR_MAX_CHARS)
+    return (
+        "Warning: The reloaded agent did not start. The next message starts it again. "
+        f"Last error: {detail or type(error).__name__}"
+    )
 
 
 def is_system_notice(role: object, meta: object) -> bool:
@@ -104,10 +158,15 @@ _SUBAGENT_AGENT_HEADER_RE = re.compile(r"^Agent `[^`\n]+`(?: \([^)\n]*\))?([^\n]
 #: The card refuses a per-agent header with no outcome glyph beside the id
 #: ("degrade to normal rendering rather than guessing an outcome"), so a user who
 #: pastes `[Subagent completion event]\nAgent \`demo\`` back into the chat is
-#: drawn -- and must be quoted here too. Same glyph set as the frontend.
-_SUBAGENT_OUTCOME_GLYPH_RE = re.compile("[✅❌⏹⚠]")
+#: drawn -- and must be quoted here too. Same glyph set as the frontend: the
+#: glyphs are what saved history carries, the leading outcome word what current
+#: gateways write.
+_SUBAGENT_OUTCOME_GLYPH_RE = re.compile("[\u2705\u274c\u23f9\u26a0]")  # emoji-ok: old saved lead
+_SUBAGENT_OUTCOME_WORD_RE = re.compile(r"^\s*(?:completed|failed|stopped|interrupted)\b")
 _SUBAGENT_WAVE_RE = re.compile(
-    r"^Batch results \d+/\d+ — wave finished: \d+ ✅ · \d+ ❌ · \d+ ⏹ of \d+ agents\.", re.M
+    r"^Batch results \d+/\d+ — wave finished: \d+ (?:\u2705|completed) · \d+ (?:\u274c|failed)"
+    r" · \d+ (?:\u23f9|stopped) of \d+ agents\.",
+    re.M,
 )
 _SUBAGENT_CHUNK_RE = re.compile(
     r"^Batch results \d+/\d+ — \d+ of \d+ delivered, \d+ still running\.", re.M
@@ -144,7 +203,12 @@ def is_subagent_completion_row(content: object, meta: object) -> bool:
     if batch:
         return bool(_SUBAGENT_WAVE_RE.search(head) or _SUBAGENT_CHUNK_RE.search(head))
     header = _SUBAGENT_AGENT_HEADER_RE.search(head)
-    return header is not None and _SUBAGENT_OUTCOME_GLYPH_RE.search(header.group(1)) is not None
+    if header is None:
+        return False
+    status = header.group(1)
+    return bool(
+        _SUBAGENT_OUTCOME_GLYPH_RE.search(status) or _SUBAGENT_OUTCOME_WORD_RE.match(status)
+    )
 
 
 #: Roles whose text is something a person or the agent SAID to the other.
@@ -171,7 +235,14 @@ def is_speech_row(role: object, content: object, meta: object) -> bool:
         return False
     # The say-nothing reply a quiet patrol ends on is a bare U+200B: format
     # characters only, truthy as a string, invisible on screen. Not speech.
-    if not (isinstance(content, str) and drop_format_chars(content).strip()):
+    # Nor is a reply that is only kiro-cli's [STEERING steer-…] ack: the chat
+    # strips it and draws no Steered chip there.
+    if not isinstance(content, str):
+        return False
+    from kiro_crew.messaging.driver import strip_steering_markers
+
+    visible = strip_steering_markers(content) if role == "assistant" else content
+    if not drop_format_chars(visible).strip():
         return False
     if is_subagent_completion_row(content, meta):
         return False

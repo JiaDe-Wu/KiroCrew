@@ -83,7 +83,6 @@ SHARE_ROWS = (
     ("_LESSONS_CAP", ctx._LESSONS_CAP),
     ("_SEMANTIC_MEMORY_CAP", ctx._SEMANTIC_MEMORY_CAP),
     ("_SKILLS_CAP", ctx._SKILLS_CAP),
-    ("_STEERING_CAP", ctx._STEERING_CAP),
     ("_PREAMBLE_HEADROOM", ctx._PREAMBLE_HEADROOM),
 )
 
@@ -337,6 +336,7 @@ _BLOCK_ORDER_OMITTED = {
     "working_folder": "§2 per-turn table",
     "folder_path": "§2 per-turn table",
     "resource_advisory": "§2 per-turn table",
+    "mcp_servers": "§2 per-turn table",
     "user_display": "§2 per-turn table",
     "reply_format_rules": "§2 per-turn table",
     "request_header": "§2 per-turn table",

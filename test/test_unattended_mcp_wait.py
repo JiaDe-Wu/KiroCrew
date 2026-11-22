@@ -3,14 +3,15 @@
 The session's own init drain stops about a second after the first server reports,
 so a slow server (a ``node``-launched one, say) can still be booting when the first
 prompt goes out, and that turn runs without its tools. In chat a person notices and
-retries; in a webhook or cron run nobody does. So an unattended run holds its first
-prompt, bounded, until every server the agent spec declares has reported, and a run
-that still lacks one says which, with a distinct webhook outcome.
+retries; in a webhook, cron, workflow or heartbeat run nobody does. So an unattended
+run holds its first prompt, bounded, until every server the agent spec declares has
+reported, and a run that still lacks one says which, with a distinct webhook outcome.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,10 +19,13 @@ import pytest
 from acp_runtime_helpers import _bounded, _make_runtime, _register
 
 from kiro_crew import webhooks
+from kiro_crew.acp import client as client_mod
+from kiro_crew.acp import runtime as runtime_mod
 from kiro_crew.acp.client import AcpClient
 from kiro_crew.acp.mcp_session_report import McpSessionReport
 from kiro_crew.acp.runtime import AcpSessionHandle
 from kiro_crew.acp.types import (
+    ACP_BACKEND_KIRO,
     EVENT_COMPLETE,
     EVENT_MCP_SERVER_INIT_FAILURE,
     EVENT_MCP_SERVER_INITIALIZED,
@@ -69,13 +73,13 @@ def test_declared_servers_skip_disabled_ones_and_survive_until_the_next_session(
 
 
 def test_servers_past_the_cap_are_counted_and_never_read_as_ready():
-    from kiro_crew.acp.mcp_session_report import BUCKET_CAP
+    from kiro_crew.acp.mcp_session_report import STATUS_CAP
 
     report = McpSessionReport()
     report.begin_session([])
-    names = [f"s{i}" for i in range(BUCKET_CAP + 1)]
+    names = [f"s{i}" for i in range(STATUS_CAP + 1)]
     report.record_declared({"mcpServers": {name: {} for name in names}})
-    for name in names[:BUCKET_CAP]:
+    for name in names[:STATUS_CAP]:
         report.record_event(EVENT_MCP_SERVER_INITIALIZED, name)
 
     assert report.declared_omitted == 1
@@ -83,6 +87,20 @@ def test_servers_past_the_cap_are_counted_and_never_read_as_ready():
 
     report.begin_session([])
     assert report.declared_omitted == 0
+
+
+def test_65_declared_servers_that_all_connected_leave_nothing_not_ready():
+    """One bound for every reader: the wait, the notice and the live reading agree."""
+    report = McpSessionReport()
+    report.begin_session([])
+    names = [f"s{i}" for i in range(65)]
+    report.record_declared({"mcpServers": {name: {} for name in names}})
+    for name in names:
+        report.record_event(EVENT_MCP_SERVER_INITIALIZED, name)
+
+    assert report.declared_not_ready() == ()
+    assert report.declared_never_reported() == ()
+    assert report.not_ready() == {}
 
 
 def test_a_server_muted_with_a_non_boolean_disabled_is_not_waited_for():
@@ -110,6 +128,44 @@ def test_the_runtime_records_the_spec_servers_on_a_host_that_reports_them():
     rt._guard_unresolved_mcp_refs(handle, _SPEC, "kirocrew", [])
 
     assert handle.mcp_session_report().declared == ("atlassian", "azure-devops")
+
+
+def test_the_kas_runtime_declares_the_spec_servers_its_wire_array_carries():
+    """KAS reports each wire server in ``_kiro/mcp/status``, so a cron waits for
+    them; a spec server Crew held back never reports and is not waited for."""
+    from kiro_crew.acp.runtime import AcpRuntime
+    from kiro_crew.acp.types import ACP_BACKEND_KAS
+
+    rt = AcpRuntime(work_dir="/tmp", acp_backend=ACP_BACKEND_KAS)
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    handle.mcp_session_report().begin_session([])
+
+    rt._guard_unresolved_mcp_refs(handle, _SPEC, "kirocrew", [{"name": "azure-devops"}])
+
+    assert handle.mcp_session_report().declared == ("azure-devops",)
+
+
+def test_the_kas_runtime_declares_the_spec_servers_its_active_custom_agent_keeps():
+    """A third-party server stays in the active agent's ``mcpServers`` on
+    session/new rather than the wire array; KAS starts and reports it, so a cron
+    waits for it too. Another agent's block delivers nothing to this session."""
+    from kiro_crew.acp.runtime import AcpRuntime
+    from kiro_crew.acp.types import ACP_BACKEND_KAS
+
+    rt = AcpRuntime(work_dir="/tmp", acp_backend=ACP_BACKEND_KAS)
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    handle.mcp_session_report().begin_session([])
+    handle.kas_projected_agent = "kirocrew"
+    handle.kas_registered_agents = [
+        {"id": "other", "mcpServers": {"azure-devops": {}}},
+        {"id": "kirocrew", "mcpServers": {"atlassian": {"url": "x"}}},
+    ]
+
+    rt._guard_unresolved_mcp_refs(handle, _SPEC, "kirocrew", [])
+
+    assert handle.mcp_session_report().declared == ("atlassian",)
 
 
 def test_the_runtime_records_nothing_when_it_expects_no_mcp_reports():
@@ -141,7 +197,86 @@ def test_the_client_records_the_spec_servers_only_on_a_reporting_host(tmp_path):
     assert claude._mcp_report.declared == ()
 
 
+# ── Servers the spec mounts from mcp.json ───────────────────────────────────
+
+#: A spec that defines no server of its own and opts in to the user's mcp.json.
+_OPTED_IN = {"includeMcpJson": True, "mcpServers": {}}
+
+
+def _global_mcp_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, servers: dict) -> None:
+    """A kiro home of the test's own whose ``settings/mcp.json`` holds *servers*."""
+    home = tmp_path / "kiro-home"
+    (home / "settings").mkdir(parents=True)
+    (home / "settings" / "mcp.json").write_text(
+        json.dumps({"mcpServers": servers}), encoding="utf-8"
+    )
+    monkeypatch.setattr("kiro_crew.agent._KIRO_MCP_JSON", home / "settings" / "mcp.json")
+
+
+def test_the_report_also_waits_for_the_servers_named_from_mcp_json():
+    report = McpSessionReport()
+    report.begin_session([])
+    report.record_declared({"mcpServers": {"own": {}}}, mcp_json=("slow", "own"))
+
+    assert report.declared == ("own", "slow")
+    report.record_event(EVENT_MCP_SERVER_INITIALIZED, "own")
+    assert report.declared_unreported() == ("slow",)
+
+
+def test_the_client_waits_for_a_server_only_the_global_mcp_json_defines(tmp_path, monkeypatch):
+    _global_mcp_json(tmp_path, monkeypatch, {"slow": {"command": "npx"}})
+    monkeypatch.setattr(client_mod, "agent_spec_snapshot", lambda _a, **_k: dict(_OPTED_IN))
+    client = AcpClient(work_dir=tmp_path / "work", agent="kirocrew")
+
+    client._prepare_spawn_workspace()
+    client._mcp_report.begin_session([])
+    client._guard_unresolved_mcp_refs([])
+
+    assert client._mcp_report.declared_unreported() == ("slow",)
+    client._mcp_report.record_event(EVENT_MCP_SERVER_INITIALIZED, "slow")
+    assert client._mcp_report.declared_unreported() == ()
+
+
+def test_the_runtime_waits_for_a_server_only_the_global_mcp_json_defines(tmp_path, monkeypatch):
+    _global_mcp_json(tmp_path, monkeypatch, {"slow": {"command": "npx"}})
+    monkeypatch.setattr(runtime_mod, "agent_spec_snapshot", lambda _a, **_k: dict(_OPTED_IN))
+    monkeypatch.setattr(runtime_mod, "pooled_session_servers", lambda *_a, **_k: [])
+    servers, spec, mcp_json = runtime_mod._pooled_session_servers_and_ref_spec(
+        None, "kirocrew", ACP_BACKEND_KIRO, tmp_path / "work"
+    )
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    handle.mcp_session_report().begin_session(servers)
+
+    rt._guard_unresolved_mcp_refs(handle, spec, "kirocrew", servers, mcp_json)
+
+    assert handle.mcp_session_report().declared_unreported() == ("slow",)
+
+
+def test_without_the_opt_in_the_global_mcp_json_is_not_waited_for(tmp_path, monkeypatch):
+    _global_mcp_json(tmp_path, monkeypatch, {"slow": {"command": "npx"}})
+    monkeypatch.setattr(
+        client_mod,
+        "agent_spec_snapshot",
+        lambda _a, **_k: {**_OPTED_IN, "includeMcpJson": False},
+    )
+    client = AcpClient(work_dir=tmp_path / "work", agent="kirocrew")
+
+    client._prepare_spawn_workspace()
+    client._mcp_report.begin_session([])
+    client._guard_unresolved_mcp_refs([])
+
+    assert client._mcp_report.declared == ()
+
+
 # ── The shared-runtime session handle ───────────────────────────────────────
+
+
+def _deliver(handle: AcpSessionHandle, frame) -> None:
+    """Hand *frame* to the session as the runtime's reader does: report, then queue."""
+    handle.mcp_session_report().fold_frame(frame)
+    handle._queue.put_nowait(frame)
 
 
 @pytest.mark.asyncio
@@ -154,13 +289,13 @@ async def test_handle_holds_the_first_prompt_for_a_slow_declared_server():
     report.begin_session([])
     report.record_declared(_SPEC)
 
-    q["sA"].put_nowait(_initialized("sA", "atlassian"))
+    _deliver(handle, _initialized("sA", "atlassian"))
     await handle.drain_init(duration=0.2, idle_exit=0.01, no_report_ceiling=0.05)
     # The defect: the session would now prompt without the slow server.
     assert report.declared_unreported() == ("azure-devops",)
 
     waiter = asyncio.ensure_future(handle.wait_for_declared_mcp(60.0))
-    q["sA"].put_nowait(_initialized("sA", "azure-devops"))
+    _deliver(handle, _initialized("sA", "azure-devops"))
     missing = await await_until(waiter, what="the wait to end once the server reported")
 
     assert missing == ()
@@ -185,7 +320,7 @@ async def test_handle_declared_wait_counts_an_owed_compaction_terminal():
             params={"status": {"type": "failed"}},
         )
     )
-    q["sA"].put_nowait(_initialized("sA", "atlassian"))
+    _deliver(handle, _initialized("sA", "atlassian"))
 
     missing = await handle.wait_for_declared_mcp(1.0)
 
@@ -202,7 +337,7 @@ async def test_handle_wait_is_bounded_and_names_the_server_that_never_reported()
     report = handle.mcp_session_report()
     report.begin_session([])
     report.record_declared(_SPEC)
-    q["sA"].put_nowait(_initialized("sA", "atlassian"))
+    _deliver(handle, _initialized("sA", "atlassian"))
 
     missing = await _bounded(handle.wait_for_declared_mcp(0.05), what="the bounded wait")
 
@@ -421,10 +556,17 @@ def _cron_gateway(client: _FakeClient):
     return gw
 
 
-def _run_cron(client: _FakeClient, *, sequence: list[str] | None = None):
+def _run_cron(
+    client: _FakeClient,
+    *,
+    sequence: list[str] | None = None,
+    persistent: bool = True,
+    fail_call: int | None = None,
+    job=None,
+):
     from kiro_crew.cron import CronJob, CronSchedule
 
-    job = CronJob(
+    job = job or CronJob(
         id="j1",
         name="poller",
         message="go",
@@ -432,6 +574,7 @@ def _run_cron(client: _FakeClient, *, sequence: list[str] | None = None):
         approval_mode="auto",
         channel="C123",
         agent_sequence=sequence or [],
+        persistent_session=persistent,
     )
     gw = _cron_gateway(client)
 
@@ -439,6 +582,8 @@ def _run_cron(client: _FakeClient, *, sequence: list[str] | None = None):
 
     async def fake_stream(provider, msg, **kwargs):
         calls["n"] += 1
+        if calls["n"] == fail_call:
+            raise RuntimeError("the step failed")
         if sequence and calls["n"] == 2:
             # The server is up by the second step: only step 1 lacked it.
             provider.mcp_session_report().record_event(EVENT_MCP_SERVER_INITIALIZED, "azure-devops")
@@ -485,9 +630,366 @@ def test_a_cron_run_still_missing_a_server_names_it_in_the_result():
     assert job.last_result.endswith("the agent answer")
 
 
+def test_the_next_run_of_a_cron_missing_the_same_server_does_not_repeat_the_note():
+    first = _run_cron(_FakeClient(slow_reports=False))
+    second = _run_cron(_FakeClient(slow_reports=False))
+
+    assert "azure-devops" in first.last_result
+    assert second.last_result == "the agent answer"
+
+
+def test_a_cron_whose_note_drops_out_still_treats_the_same_answer_as_a_duplicate():
+    """The warning leads only the first run, so it must not be part of the dedup key."""
+    job = _run_cron(_FakeClient(slow_reports=False))
+    posted = job.last_posted_hash
+    _run_cron(_FakeClient(slow_reports=False), job=job)
+
+    assert posted
+    assert job.last_posted_hash == posted
+    assert job.consecutive_dupes == 1
+
+
+def test_a_cron_whose_server_goes_missing_posts_the_same_answer_with_the_warning():
+    """A changed missing set is news: the same answer is not a duplicate then."""
+    job = _run_cron(_FakeClient(slow_reports=True))
+    posted = job.last_posted_hash
+    _run_cron(_FakeClient(slow_reports=False), job=job)
+
+    assert posted
+    assert job.last_posted_hash != posted
+    assert job.consecutive_dupes == 0
+    assert "azure-devops" in job.last_result
+    assert job.last_result.endswith("the agent answer")
+
+
+def test_a_stateless_cron_missing_the_same_server_does_not_repeat_the_note():
+    """Each fire of a stateless job gets its own session key; the note is the job's."""
+    first = _run_cron(_FakeClient(slow_reports=False), persistent=False)
+    second = _run_cron(_FakeClient(slow_reports=False), persistent=False)
+
+    assert "azure-devops" in first.last_result
+    assert second.last_result == "the agent answer"
+
+
 def test_a_sequence_cron_keeps_an_early_steps_missing_server_note():
     """The next step's reply replaces result_text; the stored result keeps the note."""
     job = _run_cron(_FakeClient(slow_reports=False), sequence=["kirocrew", "kirocrew"])
 
     assert "azure-devops" in job.last_result
     assert job.last_result.endswith("the second answer")
+
+
+def test_a_sequence_cron_whose_later_step_fails_still_names_the_server_next_fire():
+    """A run that stored no result printed no note, so the next fire still prints it."""
+    with pytest.raises(RuntimeError, match="the step failed"):
+        _run_cron(_FakeClient(slow_reports=False), sequence=["kirocrew", "kirocrew"], fail_call=2)
+    job = _run_cron(_FakeClient(slow_reports=False), sequence=["kirocrew", "kirocrew"])
+    again = _run_cron(_FakeClient(slow_reports=False), sequence=["kirocrew", "kirocrew"])
+
+    assert "azure-devops" in job.last_result
+    assert job.last_result.endswith("the second answer")
+    assert again.last_result == "the second answer"
+
+
+def test_a_sequence_cron_repeating_an_agent_does_not_repeat_the_note_next_fire():
+    """Both steps share one session key; the later clean step must not clear the run's note."""
+    first = _run_cron(_FakeClient(slow_reports=False), sequence=["kirocrew", "kirocrew"])
+    second = _run_cron(_FakeClient(slow_reports=False), sequence=["kirocrew", "kirocrew"])
+
+    assert "azure-devops" in first.last_result
+    assert "azure-devops" not in second.last_result
+    assert second.last_result == "the second answer"
+
+
+# ── A workflow agent step ───────────────────────────────────────────────────
+
+
+class _WorkflowClient(_FakeClient):
+    """A step session; a reuse's fresh conversation starts its servers again."""
+
+    def __init__(self) -> None:
+        super().__init__(slow_reports=True)
+
+    async def new_conversation(self) -> None:
+        # A fresh session/new: the slow server has not reported to it yet.
+        self.__init__()
+
+    def is_process_alive(self) -> bool:
+        return True
+
+    def set_delete_delay(self, _seconds: float) -> None:
+        return None
+
+
+class _WorkflowSessions:
+    def __init__(self, client: _WorkflowClient) -> None:
+        self.client = client
+        self.seen: set[str] = set()
+
+    async def get_or_create(self, key, **_kw):
+        is_new = key not in self.seen
+        self.seen.add(key)
+        return self.client, is_new, False
+
+    async def run_identity_check(self):
+        return None
+
+    def is_retiring(self, key):
+        return False
+
+    def release(self, key, *, cleanup=False):
+        return None
+
+    async def destroy(self, key):
+        return None
+
+    async def recycle_if_sandbox_tightened(self, key):
+        # The sandbox tier never tightens in these tests.
+        return False
+
+
+@pytest.fixture()
+def workflow_stream(monkeypatch):
+    """Each prompt's view: the waits its session had made by then."""
+    waits: list[list[float]] = []
+
+    async def fake_stream(provider, _prompt, **_kw):
+        waits.append(list(provider.waits))
+        return "the agent answer"
+
+    monkeypatch.setattr("kiro_crew.workflows.agent_exec.stream_and_collect", fake_stream)
+    monkeypatch.setattr("kiro_crew.workflows.agent_pool.stream_and_collect", fake_stream)
+    return waits
+
+
+@pytest.mark.asyncio
+async def test_a_workflow_step_waits_on_a_new_session_only(workflow_stream):
+    from kiro_crew.workflows.agent_exec import build_agent_fn
+
+    client = _WorkflowClient()
+    agent_fn = build_agent_fn(_WorkflowSessions(client), run_id="wf1")
+    await agent_fn("first", {"session": "chain"})
+    await agent_fn("second", {"session": "chain"})
+
+    assert workflow_stream[0] == [mcp_problems.UNATTENDED_MCP_WAIT_SECS]
+    assert client.waits == [mcp_problems.UNATTENDED_MCP_WAIT_SECS]
+
+
+@pytest.mark.asyncio
+async def test_a_pooled_workflow_step_waits_on_each_fresh_conversation(workflow_stream):
+    from kiro_crew.workflows.agent_pool import build_pooled_agent_fn
+
+    client = _WorkflowClient()
+    agent_fn, pool = build_pooled_agent_fn(
+        _WorkflowSessions(client), run_id="wf2", max_workers=1, max_starting=1
+    )
+    try:
+        await agent_fn("first", {})
+        await agent_fn("second", {})
+    finally:
+        await pool.shutdown()
+
+    assert workflow_stream == [[mcp_problems.UNATTENDED_MCP_WAIT_SECS]] * 2
+
+
+@pytest.mark.asyncio
+async def test_an_unpooled_workflow_chain_waits_on_its_new_session_only(workflow_stream):
+    from kiro_crew.workflows.agent_pool import build_pooled_agent_fn
+
+    client = _WorkflowClient()
+    agent_fn, pool = build_pooled_agent_fn(_WorkflowSessions(client), run_id="wf3")
+    try:
+        await agent_fn("first", {"session": "chain"})
+        await agent_fn("second", {"session": "chain"})
+    finally:
+        await pool.shutdown()
+
+    assert workflow_stream[0] == [mcp_problems.UNATTENDED_MCP_WAIT_SECS]
+    assert client.waits == [mcp_problems.UNATTENDED_MCP_WAIT_SECS]
+
+
+# ── A heartbeat turn ────────────────────────────────────────────────────────
+
+
+async def _heartbeat_result(
+    client: _FakeClient,
+    monkeypatch,
+    *,
+    is_new: bool = True,
+    answer: str = "the agent answer",
+    deliver: str = "",
+) -> str:
+    import kiro_crew.slack.gateway as gw_mod
+
+    orch = gw_mod.GatewayOrchestrator.__new__(gw_mod.GatewayOrchestrator)
+    orch.sessions = MagicMock()
+    orch.sessions.get_or_create = AsyncMock(return_value=(client, is_new, False))
+    orch.ctx_builder = MagicMock(conversation_log=None)
+    orch.ctx_builder.build_message = MagicMock(return_value=("full message", None))
+    orch.consolidator = None
+    orch._heartbeat_approval = AsyncMock(return_value=True)
+    orch._deliver_result = AsyncMock()
+
+    async def fake_stream(provider, _message, **_kw):
+        provider.prompted_with_tools = not provider.mcp_session_report().declared_not_ready()
+        return answer
+
+    started = {}
+
+    async def fake_start(svc):
+        started["on_task"] = svc._on_task
+
+    monkeypatch.setattr(gw_mod, "stream_and_collect", fake_stream)
+    monkeypatch.setattr(gw_mod, "persist_token_record_async", AsyncMock())
+    monkeypatch.setattr(gw_mod.HeartbeatService, "start", fake_start)
+    await orch._init_heartbeat()
+    return await started["on_task"]("check the queue", deliver)
+
+
+@pytest.mark.asyncio
+async def test_a_heartbeat_turn_waits_for_its_slow_server_before_prompting(monkeypatch):
+    client = _FakeClient(slow_reports=True)
+    result = await _heartbeat_result(client, monkeypatch)
+
+    assert client.waits == [mcp_problems.UNATTENDED_MCP_WAIT_SECS]
+    assert client.prompted_with_tools is True
+    assert result == "the agent answer"
+
+
+@pytest.mark.asyncio
+async def test_a_heartbeat_still_missing_a_server_names_it_in_the_result(monkeypatch):
+    result = await _heartbeat_result(_FakeClient(slow_reports=False), monkeypatch)
+
+    assert "azure-devops" in result
+    assert result.endswith("the agent answer")
+
+
+@pytest.mark.asyncio
+async def test_the_next_heartbeat_missing_the_same_server_does_not_repeat_the_note(monkeypatch):
+    await _heartbeat_result(_FakeClient(slow_reports=False), monkeypatch)
+    result = await _heartbeat_result(_FakeClient(slow_reports=False), monkeypatch)
+
+    assert result == "the agent answer"
+
+
+@pytest.mark.asyncio
+async def test_same_text_heartbeats_for_two_channels_each_carry_the_note(monkeypatch):
+    first = await _heartbeat_result(
+        _FakeClient(slow_reports=False), monkeypatch, deliver="slack:C1"
+    )
+    second = await _heartbeat_result(
+        _FakeClient(slow_reports=False), monkeypatch, deliver="slack:C2"
+    )
+
+    assert "azure-devops" in first
+    assert "azure-devops" in second
+
+
+@pytest.mark.asyncio
+async def test_a_kept_heartbeat_does_not_use_up_the_note_for_the_next_delivered_one(monkeypatch):
+    """A HEARTBEAT_KEEP result is not delivered, so the next result still carries the note."""
+    await _heartbeat_result(
+        _FakeClient(slow_reports=False), monkeypatch, answer="not done yet HEARTBEAT_KEEP"
+    )
+    result = await _heartbeat_result(_FakeClient(slow_reports=False), monkeypatch)
+
+    assert "azure-devops" in result
+    assert result.endswith("the agent answer")
+
+
+@pytest.mark.asyncio
+async def test_a_reused_heartbeat_session_does_not_wait_again(monkeypatch):
+    client = _FakeClient(slow_reports=True)
+    await _heartbeat_result(client, monkeypatch, is_new=False)
+
+    assert client.waits == []
+
+
+# ── A sub-agent spawn ───────────────────────────────────────────────────────
+
+
+def _spawn_coordinator(client: _FakeClient, *, is_new: bool = True) -> MagicMock:
+    """A run coordinator whose manager hands *client* out on either arm."""
+    manager = MagicMock()
+    manager._create_shared_session = AsyncMock(return_value=client)
+    manager._ensure_dedicated_start_priced = AsyncMock()
+    manager._is_cc_provider = MagicMock(return_value=False)
+    manager._sessions.get_or_create = AsyncMock(return_value=(client, is_new, False))
+    return MagicMock(_manager=manager)
+
+
+@pytest.fixture()
+def spawn_facade(monkeypatch):
+    """The session re-checks ``acquire_session`` reads off ``kiro_crew.subagent``, inert."""
+    import kiro_crew.subagent as sa
+
+    async def keep(client, *_a, **_k):
+        return client
+
+    async def reproject(_sessions, _key, _agent, claimed, _claim):
+        return claimed
+
+    monkeypatch.setattr(sa, "replace_stale_shared_session", keep)
+    monkeypatch.setattr(sa, "invalidate_stale_kas_session", AsyncMock())
+    monkeypatch.setattr(sa, "reproject_claimed_session", reproject)
+
+
+async def _acquire(client: _FakeClient, *, shared: bool, is_new: bool = True) -> None:
+    from kiro_crew.subagent_manager import turn_session
+
+    info = MagicMock(id="sub1", parent_session_key="parent")
+    await turn_session.acquire_session(
+        _spawn_coordinator(client, is_new=is_new),
+        info,
+        "subagent:sub1",
+        "kirocrew",
+        parent_policy="auto",
+        extra_kwargs={},
+        use_session_sharing=shared,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [True, False], ids=["shared-runtime", "dedicated"])
+async def test_a_spawn_waits_for_its_slow_server_before_its_first_prompt(spawn_facade, shared):
+    """A spawn prompts as soon as its session opens, so the start's brief wait
+    left a routed server that takes a few seconds out of its first turn."""
+    client = _FakeClient(slow_reports=True)
+    await _acquire(client, shared=shared)
+
+    assert client.waits == [mcp_problems.UNATTENDED_MCP_WAIT_SECS]
+    assert client._report.declared_not_ready() == ()
+
+
+@pytest.mark.asyncio
+async def test_a_spawn_on_a_reused_session_does_not_wait_again(spawn_facade):
+    client = _FakeClient(slow_reports=True)
+    await _acquire(client, shared=False, is_new=False)
+
+    assert client.waits == []
+
+
+# ── The run's note: printed when it changes, not on every scheduled run ─────
+
+
+def test_a_scheduled_run_names_its_missing_servers_once_until_the_set_changes():
+    """A cron job runs on its own, so the same note led every result it sent."""
+    report = McpSessionReport()
+    provider = MagicMock(mcp_session_report=MagicMock(return_value=report))
+
+    def run(ready: tuple[str, ...], key: str = "cron:job-a") -> str:
+        report.begin_session([])
+        report.record_declared(_SPEC)
+        for name in ready:
+            report.record_event(EVENT_MCP_SERVER_INITIALIZED, name)
+        return mcp_problems.declared_mcp_not_ready_change(provider, key)
+
+    first = run(())
+    assert first.endswith("not ready in this run: atlassian, azure-devops")
+    assert run(()) == ""
+    # Another job is its own run: its first note is printed.
+    assert run((), key="cron:job-b") == first
+    assert run(("atlassian",)).endswith("not ready in this run: azure-devops")
+    assert run(("atlassian", "azure-devops")) == ""
+    # The servers fail again after a clean run: that is news, so it is printed.
+    assert run(()) == first

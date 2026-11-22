@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -488,6 +489,13 @@ class TestPlan:
             run = await runner.plan(input_text=_YAML_SPEC, source="yaml")
         dec.assert_not_awaited()
         assert [t.index for t in run.tasks] == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_yaml_plan_is_named_by_its_first_step(self, tmp_path: Path) -> None:
+        runner = _runner(tmp_path)
+        spec = "agents:\n  parser:\n    description: Build the parser\n    prompt: go\n"
+        run = await runner.plan(input_text=spec, source="yaml")
+        assert run.name == "Build the parser"
 
     @pytest.mark.asyncio
     async def test_decompose_timeout_becomes_value_error(self, tmp_path: Path) -> None:
@@ -1771,7 +1779,7 @@ class TestWatchdogLoop:
         assert runner._sessions.reset.await_args.args == ("taskrunner:plan_1:task4",)
         assert notify.sent == [
             (
-                "[demo] 💀 Watchdog: ACP process died",
+                "[demo] Error: Watchdog: ACP process died",
                 "Task 4 sub-agent is not running. Resetting session to trigger recovery.",
             )
         ]
@@ -1863,10 +1871,11 @@ class TestLoadRuns:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         (tmp_path / "runs.json").write_text("{not json", encoding="utf-8")
-        monkeypatch.setattr(Path, "replace", MagicMock(side_effect=OSError("cannot rename")))
+        monkeypatch.setattr(os, "replace", MagicMock(side_effect=OSError("cannot rename")))
         runner = _runner(tmp_path)
         assert runner._runs == {}
         assert (tmp_path / "runs.json").exists()
+        assert runner._snapshot_recovery_incomplete is True
 
     def test_running_run_recovers_as_resumable_without_trust(self, tmp_path: Path) -> None:
         (tmp_path / "runs.json").write_text(json.dumps([_registry_item()]), encoding="utf-8")

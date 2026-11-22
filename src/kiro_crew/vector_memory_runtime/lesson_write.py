@@ -2,9 +2,11 @@
 
 ``write_lesson`` refuses a volatile or inadmissible lesson, preflights the value it would
 store, resolves the exact-rule pass (``lessons.resolve_exact_rule``), runs the scope-local
-dedup scan behind its authority pre-pass, and queues every supersede until ``set_semantic``
+dedup scan behind its authority pre-pass (both over the candidate rows that
+``lesson_candidates`` nominates), and queues every supersede until ``set_semantic``
 has committed the submission; then it drains the queue and publishes the lesson's vector
-under ``_vector_commit``. The lesson value codec and the lesson readers live in
+under ``_vector_commit``. ``update_lesson_applies`` changes one stored lesson's tier in
+place. The lesson value codec and the lesson readers live in
 ``vector_memory_runtime.lessons``.
 
 The functions are bound on ``VectorMemoryStore`` as the class attributes of the same name
@@ -22,14 +24,20 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from kiro_crew import memory_schema
-from kiro_crew.embeddings import PRIORITY_BULK
 from kiro_crew.lesson_validation import (
+    LESSON_APPLIES_ON_TOPIC,
+    LESSON_APPLIES_VALUES,
     contains_volatile_lesson_fact,
     normalize_lesson_applies,
     utf8_encodable,
 )
-from kiro_crew.project_scope import canonical_scope, scope_is_admissible
+from kiro_crew.project_scope import (
+    canonical_scope,
+    scope_is_admissible,
+    scope_selector_is_inadmissible,
+)
 from kiro_crew.validation import normalize_lesson_category
+from kiro_crew.vector_memory_runtime import lesson_candidates as _lesson_candidates
 from kiro_crew.vector_memory_runtime import lessons as _lessons
 from kiro_crew.vector_memory_runtime.write_outcomes import LessonWriteOutcome, LessonWriteResult
 
@@ -74,11 +82,16 @@ def write_lesson(
     *,
     applies: str | None = None,
     rule_emb_resolved: bool = False,
-    defer_backfills: bool = False,
     facets: "memory_schema.MemoryFacets | None" = None,
     written_by: Mapping[str, str] | None = None,
+    source_ref: str | None = None,
 ) -> LessonWriteResult:
     """Write a lesson as a semantic entry with key lesson.<hash>.
+
+    *source_ref* is the record metadata ``source_ref`` the row is stamped with
+    (``memory_record_meta``), for a caller that knows which session produced the
+    lesson. It never enters ``source`` or the stored value, so every reader that
+    compares ``source`` sees what it saw before.
 
     Returns which outcome occurred (see :class:`LessonWriteOutcome`) rather than a
     bare ``bool``, whose ``False`` conflated "validation refused this", "a dedup
@@ -104,9 +117,16 @@ def write_lesson(
     decides on is QUEUED, and the queue drains only once ``set_semantic`` has
     committed the submission. So a ``deduped`` verdict from any branch, and a
     ``refused`` from the store's own validation, each preserve every live lesson
-    row and report an empty ``superseded``. They are not byte no-ops on the
-    database: a lazy embedding backfill for a row this call READ may already have
-    been flushed, which changes a vector and no lesson.
+    row and report an empty ``superseded``.
+
+    **Which rows it compares against.** Not every lesson: the rows that could trip a
+    containment, keyword-overlap or cosine check, nominated by a resident index and
+    re-read from the table (``lesson_candidates``). The checks on those rows are the
+    ones a full scan runs. Two differences follow from the index. A stored row with no
+    vector is never a cosine candidate, because this call embeds only its own rule (the
+    backfill sweep embeds the rest). And a cosine match is found through a 256-bit sketch
+    of the vector, so a row just above 0.85 can, with probability under 1 in 10,000, be
+    missed.
 
     Draining after the commit puts the two outcomes in the safe order, and leaves
     one window it cannot close: a drain that stops partway -- a raised error, a
@@ -140,8 +160,7 @@ def write_lesson(
     this write is detected and the vector is left NULL for the backfill
     instead of being committed into the wrong space. ``rule_emb_resolved``
     additionally distinguishes an attempted embed that returned ``None`` from
-    no attempt, and ``defer_backfills`` suppresses lazy legacy-row inference;
-    together they let a caller keep inference outside a short publication lock.
+    no attempt.
 
     Runtime model-identity assertions and recognized concrete-ID model-selection
     imperatives in either persisted field are refused here, before embedding or
@@ -150,9 +169,9 @@ def write_lesson(
     task-runner, and direct callers share the boundary.
     """
 
+    from kiro_crew import memory_lesson_dedup as _lesson_dedup
     from kiro_crew import vector_memory as vm  # circular import: the facade imports this module
 
-    _MAX_BACKFILLS_PER_CALL = vm._MAX_BACKFILLS_PER_CALL
     _lesson_key = vm._lesson_key
 
     if contains_volatile_lesson_fact(rule, negative):
@@ -242,12 +261,6 @@ def write_lesson(
         lesson_embed_generation = self._space_generation
     if rule_emb is None and not rule_emb_resolved:
         rule_emb = self.embed_lesson(rule)
-    backfills_done = 0
-    # (blob, key, space generation, exact value embedded). The generation is
-    # recorded per entry, not once for the call: these lazy backfills embed
-    # inside the dedup scan below, so a swap can land between entries.
-    pending_backfills: list[tuple[bytes, str, int, str, list[float]]] = []
-
     # PREFLIGHT the final value BEFORE the dedup scan below, which DELETES
     # superseded rows. The value was only validated by set_semantic at the very
     # end, so a value this store refuses (e.g. an injection-pattern ``negative``)
@@ -291,29 +304,17 @@ def write_lesson(
         logger.info("Lesson rejected before dedup (%s): %s", code, message)
         return LessonWriteResult(LessonWriteOutcome.REFUSED, code.value)
 
-    def _flush_backfills() -> None:
-        for blob, bk, gen, body, vector in pending_backfills:
-            with self._vector_commit(vector, best_effort=True) as current:
-                if not current or gen != self._space_generation:
-                    continue
-                self.db.execute(
-                    f"UPDATE {self._sem_rel} SET embedding = ? WHERE key = ? "
-                    f"AND value_json = ? AND embedding IS NULL AND is_deleted = 0"
-                    f"{self._sem_guard}",
-                    (blob, bk, body),
-                )
-
     # TWO PASSES, and the order is load-bearing.
     #
     # Pass 1 resolves THIS lesson. Pass 2 runs the generic dedup rules, and those
     # can claim the write on an UNRELATED row -- a superset whose text contains our
     # rule. get_lessons() orders by updated_at DESC, then by md5 key within one
-    # stamp, so whether such a row is scanned before ours is effectively random,
-    # and doing both in one loop made the outcome depend on that order: an
-    # unrelated superset seen first discarded an enrichment we had already
-    # selected, and the clause was dropped on HTTP 200.
-    # Resolving the exact match first makes the result order-independent, and
-    # pass 2 is skipped entirely once pass 1 claims the write.
+    # stamp, so whether such a row comes before ours is effectively random. In
+    # one loop, an unrelated superset seen first would discard an enrichment
+    # already selected, dropping the clause on HTTP 200. Resolving the exact
+    # match first makes the result order-independent, and pass 2 is skipped
+    # once pass 1 claims the write.
+    #
     # Deduplication is SCOPE-LOCAL, and both passes below share this list.
     #
     # A lesson scoped to one repository and a global one are different lessons
@@ -324,7 +325,24 @@ def write_lesson(
     # never addressed -- writing a repo-scoped rule could retire a global one
     # that merely shared most of its significant words.
     #
-    lesson_rows = _lessons.lesson_rows_in_scope(self.get_lessons(), repo_scope)
+    # The rows are CANDIDATES, not every lesson: ``candidate_lesson_rows`` nominates the
+    # rows that could trip a containment, overlap or cosine check below and re-reads them
+    # fresh (see ``lesson_candidates``). Without an index (no numpy) every row is read.
+    candidate_rows = _lesson_candidates.candidate_lesson_rows(
+        self,
+        rule=rule,
+        key=key,
+        repo_scope=repo_scope,
+        rule_emb=rule_emb,
+        rule_words=rule_words,
+        source=source,
+        confidence=confidence,
+    )
+    lesson_rows = (
+        candidate_rows
+        if candidate_rows is not None
+        else _lessons.lesson_rows_in_scope(self.get_lessons(), repo_scope)
+    )
 
     exact = _lessons.resolve_exact_rule(
         self,
@@ -340,7 +358,6 @@ def write_lesson(
     matched = exact is not None
     if exact is not None:
         if exact.result is not None:
-            _flush_backfills()
             return exact.result
         key, value, effective_applies = exact.key, exact.value, exact.applies
         # An enrichment is a write by this writer: the row names who changed it last.
@@ -367,6 +384,9 @@ def write_lesson(
     # emptied part of the store. Draining after ``set_semantic`` extends the
     # same guarantee to a value the store itself rejects.
     deferred_supersedes: list[tuple[str, str, str, str]] = []
+    # Cosine of each queued similarity supersede, by row key, so the merges that
+    # land can be counted for memory.member_lesson_dedup (kiro_crew.memory_lesson_dedup).
+    queued_cosines: dict[str, float] = {}
 
     # AUTHORITY PRE-PASS -- non-mutating, decided before the scan's first
     # deletion. The invariant: every refusal the authority rule can make
@@ -376,18 +396,10 @@ def write_lesson(
     # AFTER the untouched branches (or an earlier semantic supersede)
     # already deleted a row -- losing a stored lesson while storing
     # nothing. So the authority verdict is settled here, over the same
-    # rows the semantic branch below will see: the pre-pass shares
-    # ``backfills_done`` / ``pending_backfills`` with the main scan and
-    # memoizes each computed blob onto its row dict, so a row embedded
-    # here is never re-embedded or re-counted below, and the semantic
-    # branch's visible set is a subset of the pre-pass's. (The pre-pass
-    # can spend budget on rows the main scan never reaches -- it walks the
-    # whole list, while the scan can return early on a lexical claimant --
-    # so the SETS can differ even though no row is ever double-charged.)
-    # A ``user_explicit`` write can never be declined, so the pass is
-    # skipped for it entirely. The pass is non-mutating for its own reason,
-    # independent of the scan's deferral below: an authority decline must not
-    # spend the call's embed budget rewriting rows it is about to refuse.
+    # rows the semantic branch below will see. A row with no stored vector
+    # is never a semantic match: this write does not embed it (the backfill
+    # sweep does). A ``user_explicit`` write can never be declined, so the
+    # pass is skipped for it entirely.
     if (
         self.algorithm_version != "v2"
         and similarity is not None
@@ -413,44 +425,11 @@ def write_lesson(
                     len(rule_words & pre_words) / max(len(rule_words), len(pre_words)) >= 0.5
                 ):
                     continue
-            existing_emb_blob = existing.get("embedding")
-            row_blob: bytes | None = None
-            if (
-                existing_emb_blob
-                and isinstance(existing_emb_blob, bytes)
-                and len(existing_emb_blob) >= 4
-            ):
-                row_blob = existing_emb_blob
-            elif self.embed_fn and not defer_backfills and backfills_done < _MAX_BACKFILLS_PER_CALL:
-                # Same lazy-backfill contract as the main scan (count even
-                # on failure; generation sampled BEFORE the embed). The
-                # blob is memoized onto the row dict so the main scan
-                # neither re-embeds nor re-counts this row; a failure is
-                # marked so the row is attempted at most once per call,
-                # exactly as before this pass existed.
-                backfill_generation = self._space_generation
-                existing_emb = self._try_embed(
-                    _lessons._lesson_embed_text(json.loads(existing["value_json"])),
-                    PRIORITY_BULK,
-                )
-                if existing_emb:
-                    row_blob = struct.pack(f"{len(existing_emb)}f", *existing_emb)
-                    pending_backfills.append(
-                        (
-                            row_blob,
-                            existing["key"],
-                            backfill_generation,
-                            existing["value_json"],
-                            existing_emb,
-                        )
-                    )
-                    existing["embedding"] = row_blob
-                else:
-                    existing["_authority_prepass_embed_failed"] = True
-                backfills_done += 1
-            if row_blob is None:
+            row_blob = existing.get("embedding")
+            if not (isinstance(row_blob, bytes) and len(row_blob) >= 4):
                 continue
-            if similarity({"embedding": row_blob}) > 0.85:
+            pre_sim = similarity({"embedding": row_blob})
+            if pre_sim > 0.85:
                 # Outranking means a ``user_explicit`` row over this
                 # lower-authority write, or a strictly higher stored
                 # confidence -- the confidence half on its own merit: the
@@ -471,7 +450,7 @@ def write_lesson(
                     # Nothing has been deleted: this return precedes the
                     # mutating scan entirely, so a declined write costs no
                     # stored row and ``superseded`` is always empty here.
-                    _flush_backfills()
+                    _lesson_dedup.record_default_merges(self, [pre_sim])
                     return LessonWriteResult(
                         LessonWriteOutcome.DEDUPED,
                         "semantic_similarity",
@@ -512,7 +491,6 @@ def write_lesson(
             logger.info(
                 "Lesson dedup: %s already covered by %s [%s]", key, existing["key"], category
             )
-            _flush_backfills()
             return LessonWriteResult(
                 LessonWriteOutcome.DEDUPED,
                 "substring_covered",
@@ -555,7 +533,8 @@ def write_lesson(
                         )
                     continue
 
-        # Semantic dedup via embeddings (use stored embedding when available)
+        # Semantic dedup via the stored embedding. A row with none is not compared:
+        # this write never embeds another lesson (the backfill sweep does).
         if similarity is not None:
             existing_emb_blob = existing.get("embedding")
             row_blob = None
@@ -565,42 +544,6 @@ def write_lesson(
                 and len(existing_emb_blob) >= 4
             ):
                 row_blob = existing_emb_blob
-            elif (
-                self.embed_fn
-                and not defer_backfills
-                and backfills_done < _MAX_BACKFILLS_PER_CALL
-                and not existing.get("_authority_prepass_embed_failed")
-            ):
-                # Lazy backfill: compute embedding for legacy lessons (count even on failure)
-                # Sampled BEFORE the embed: _try_embed returns None when a swap
-                # spanned its own call, so this value is the blob's true space.
-                # Sampling after it returns would tag an old blob with the new
-                # generation and the flush check would wave it through.
-                # A row the authority pre-pass already attempted is skipped:
-                # the pre-pass memoized a successful blob onto the row dict
-                # (so this branch is not reached) and marked a failure, so
-                # every row is attempted at most once per call, exactly as
-                # before the pre-pass existed.
-                backfill_generation = self._space_generation
-                # Embed the canonical rule text (matching write_lesson), not
-                # the display rendering -- the vector must live in the same
-                # space as the query vectors it is compared against.
-                existing_emb = self._try_embed(
-                    _lessons._lesson_embed_text(json.loads(existing["value_json"])),
-                    PRIORITY_BULK,
-                )
-                if existing_emb:
-                    row_blob = struct.pack(f"{len(existing_emb)}f", *existing_emb)
-                    pending_backfills.append(
-                        (
-                            row_blob,
-                            existing["key"],
-                            backfill_generation,
-                            existing["value_json"],
-                            existing_emb,
-                        )
-                    )
-                backfills_done += 1
             if row_blob is not None:
                 sim = similarity({"embedding": row_blob})
                 if sim > 0.85:
@@ -609,12 +552,11 @@ def write_lesson(
                     # ``len(rule) > len(existing_text)`` would DROP the
                     # submission when it loses, making character count
                     # decide which of two near-identical rules is current.
-                    # A correction is frequently SHORTER than the stale
-                    # lesson it corrects (a retracted claim collapses to a
-                    # one-line "not installed"), so the losing case landed
-                    # exactly on corrections -- and left the stale lesson in
-                    # effect, the one outcome that actively misleads the
-                    # agent rather than merely losing information.
+                    # A correction is often SHORTER than the stale lesson it
+                    # corrects (a retracted claim becomes a one-line "not
+                    # installed"), so a length rule would drop exactly the
+                    # corrections and keep the stale lesson, which actively
+                    # misleads the agent.
                     #
                     # The non-mutating pre-pass above already returned
                     # DEDUPED if any purely-semantic row outranks the write. Like
@@ -631,15 +573,8 @@ def write_lesson(
                                 "%.2f cosine" % sim,
                             )
                         )
+                        queued_cosines[existing["key"]] = sim
                     continue
-
-    # No pending backfill is dropped for a queued row. The queue is a list of
-    # CANDIDATE deletions until the write commits, so discarding their vectors
-    # here would cost the surviving rows their embeddings on exactly the paths
-    # that delete nothing. A vector written to a row this call then retires is
-    # one spent UPDATE on a tombstone.
-
-    _flush_backfills()
 
     # ``repo_scope`` mirrors onto the ``scope`` carve axis when the caller named
     # no scope facet of its own. ``value_json`` stays authoritative -- the lesson
@@ -652,7 +587,14 @@ def write_lesson(
             facets if facets is not None else memory_schema.MemoryFacets()
         )
         facets = dataclasses.replace(prior, scope=repo_scope)
-    err = self.set_semantic(key, value, confidence, source, facets=facets)
+    err = self.set_semantic(
+        key,
+        value,
+        confidence,
+        source,
+        facets=facets,
+        metadata={"source_ref": source_ref} if source_ref else None,
+    )
     if err is not None:
         # Nothing was deleted: the scan only QUEUED its supersedes, and the
         # queue drains below this return. So a value the store rejects costs
@@ -681,8 +623,8 @@ def write_lesson(
     # retired row's tombstone and audit event, and by its "so far" count to the
     # matching ``superseded`` entry in the result. Logging the keys rather than a
     # fresh digest is deliberate: a newly computed hash would correlate with
-    # nothing. No log line here hashes anything; a weak-hash finding belongs at
-    # ``_lesson_slug``'s digest, not at a line that logs a key.
+    # nothing. No log line here hashes anything (``_lesson_slug`` owns the
+    # digest).
     #
     # The attribution is passed INTO delete_semantic (winning key + reason), so
     # the tombstone's record status and audit event record it durably in the
@@ -691,6 +633,7 @@ def write_lesson(
     # durable trace; the line below logs at WARNING so the same deletion is
     # visible to a human tailing gateway.log (a default install records WARNING+
     # to disk), not only to a query against the audit table.
+    landed_cosines: list[float] = []
     for d_key, d_report, d_body, d_reason in deferred_supersedes:
         if not self.delete_semantic(
             d_key,
@@ -714,6 +657,9 @@ def write_lesson(
             len(superseded) + 1,
         )
         superseded.append(d_report)
+        if d_key in queued_cosines:
+            landed_cosines.append(queued_cosines[d_key])
+    _lesson_dedup.record_default_merges(self, landed_cosines)
 
     if rule_emb:
         emb_blob = struct.pack(f"{len(rule_emb)}f", *rule_emb)
@@ -735,6 +681,9 @@ def write_lesson(
                     f"{self._sem_guard}",
                     (emb_blob, key, json.dumps(value, ensure_ascii=False)),
                 )
+                # The candidate index holds a sketch of each stored vector: this row has
+                # one now. Inside the commit, so a rollback leaves the key to be re-read.
+                _lesson_candidates.note_key_write(self, key)
     # ``matched`` is pass 1's verdict: it rewrote an EXISTING row under that row's
     # own key to attach a clause, which is an enrichment. Every other route here
     # wrote a new row under the submitted rule's key -- including the ones that
@@ -754,3 +703,86 @@ def embed_lesson(self: VectorMemoryStore, rule: str) -> list[float] | None:
     should wrap this in ``asyncio.to_thread()``.
     """
     return self._try_embed(rule) if self.embed_fn else None
+
+
+def update_lesson_applies(
+    self: VectorMemoryStore,
+    rule: str,
+    repo_scope: str | None = None,
+    *,
+    current: str,
+    applies: str,
+) -> str:
+    """Change only the tier of the one stored lesson whose text is *rule*.
+
+    ``write_lesson`` keeps the tier write-once, and a delete plus a re-add re-runs
+    the new-lesson dedup and stamps the new caller's source. This rewrites the
+    row in place under its own key, so its source, confidence, ``created_at`` and
+    rule vector stay. *rule* and *repo_scope* select the row as the exact
+    ``delete_lesson`` does. *current* is the tier the caller read, ``always``
+    standing for an untiered row too, because both are served as a standing rule.
+
+    Returns ``updated``, ``unchanged``, ``not_found``, ``ambiguous`` (more than one
+    row matches), ``conflict`` (the row's tier is not *current*, or the row
+    changed before the write) or ``refused`` (the store refuses the new value).
+    """
+    from kiro_crew import vector_memory as vm  # circular import: the facade imports this module
+
+    if current not in LESSON_APPLIES_VALUES or applies not in LESSON_APPLIES_VALUES:
+        raise ValueError(f"lesson tier must be one of {LESSON_APPLIES_VALUES}")
+    if repo_scope is not None and scope_selector_is_inadmissible(repo_scope):
+        raise ValueError(f"repo_scope does not name a usable scope: {repo_scope!r}")
+    wanted = rule.strip().lower()
+    matches = []
+    for row in self.get_lessons():
+        decoded = _lessons._decoded_lesson_value(row)
+        text = _lessons._lesson_display_text(decoded)
+        if not text or text.lower() != wanted:
+            continue
+        if repo_scope is not None and (
+            _lessons._lesson_scope_unusable(decoded)
+            or canonical_scope(_lessons._lesson_scope(decoded)) != canonical_scope(repo_scope)
+        ):
+            continue
+        matches.append((row, decoded))
+    if not matches:
+        return "not_found"
+    if len(matches) > 1:
+        return "ambiguous"
+    row, decoded = matches[0]
+    stored = _lessons._lesson_applies(decoded)
+    if (stored == LESSON_APPLIES_ON_TOPIC) != (current == LESSON_APPLIES_ON_TOPIC):
+        return "conflict"
+    if stored == applies:
+        return "unchanged"
+    if isinstance(decoded, dict):
+        value: dict[str, object] = {**decoded, "applies": applies}
+    else:
+        # A legacy string row cannot carry a tier, so it is rewritten as the mapping
+        # shape, as an enrichment of it is; its category reads as knowledge either way.
+        fields = _lessons._lesson_fields_for_row(decoded, row["key"])
+        assert fields is not None  # the row matched, so it is a non-blank string
+        value = {
+            "rule": fields[0],
+            "category": "knowledge",
+            "negative": fields[1],
+            "applies": applies,
+        }
+    key, old_json = row["key"], row["value_json"]
+    if self.validate_semantic(key, value, 1.0, "user_explicit") is not None:
+        return "refused"
+    new_json = json.dumps(value, ensure_ascii=False)
+    crew = self._lineage == memory_schema.LINEAGE_CREW
+    with self._db_lock, self.db:
+        # The body read above is the compare: a row that changed since is not written.
+        cursor = self.db.execute(
+            f"UPDATE {self._sem_rel} SET value_json=?, updated_at=?{', text=?' if crew else ''} "
+            f"WHERE key=? AND value_json=? AND is_deleted=0{self._sem_guard}",
+            (new_json, vm._now_iso(), *((new_json,) if crew else ()), key, old_json),
+        )
+        if not cursor.rowcount:
+            return "conflict"
+        self._record_mutation("directive", key, row, "user_explicit")
+        self._invalidate_semantic_scoring(key)
+    self._log_event("update", "semantic", key, old_json, new_json, "user_explicit")
+    return "updated"

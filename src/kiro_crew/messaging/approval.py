@@ -32,10 +32,12 @@ silently fails to act.
   keeps it from being the place someone accidentally makes approval
   world-readable.
 * **Trust reuses the session's own approval policy** rather than adding a
-  second trust store. ``slack/handler.py`` keeps an in-memory
-  ``_trusted_sessions`` set that ``dashboard/server_runtime/inherited_trust.py`` already
-  reaches across a circular-import boundary to clear; a third copy of "is this session
-  trusted" would be one more thing to keep in sync. ``SessionManager``'s
+  second trust store, and the typed reply makes that grant before it resolves
+  the request, so the receipt names what was actually granted.
+  ``slack/handler.py`` keeps an in-memory ``_trusted_sessions`` set that
+  ``dashboard/server_runtime/inherited_trust.py`` already reaches across a
+  circular-import boundary to clear; a third copy of "is this session trusted"
+  would be one more thing to keep in sync. ``SessionManager``'s
   approval policy is durable, already SEL-audited on write, and already what
   spawned subagents inherit.
 
@@ -61,7 +63,7 @@ logger = logging.getLogger(__name__)
 #: How long a pending approval waits for a typed answer before DENYING.
 #:
 #: Must stay comfortably below ``acp/client_timeouts.py``'s ``_TOOL_STALL_TIMEOUT``
-#: (600s): while a permission request is outstanding the provider emits no
+#: (720s): while a permission request is outstanding the provider emits no
 #: frames, so that watchdog is armed against this wait. Five minutes is the
 #: window for someone answering from a phone; the cost of it being too short is
 #: a denied tool the operator can retry, and the cost of it being too long is a
@@ -293,6 +295,19 @@ def pending_for(session_key: str, conversation_id: str = "") -> Optional[Pending
     return None
 
 
+def pending_count() -> int:
+    """Typed-reply approval prompts still waiting for an answer.
+
+    What the update paths read (``kiro_crew.quiescence``): a restart now would
+    deny every one of them, as a timeout does.
+    """
+    return sum(
+        1
+        for entry in list(_PENDING.values())
+        if not entry.future.done() and not entry.future.get_loop().is_closed()
+    )
+
+
 def parse_approval_reply(text: str) -> str:
     """The verdict a typed reply carries, or ``""`` when it carries none.
 
@@ -308,16 +323,25 @@ def parse_approval_reply(text: str) -> str:
     return APPROVAL_WORDS.get(token, "")
 
 
-def deliver_verdict(session_key: str, verdict: str, conversation_id: str = "") -> str:
+def deliver_verdict(
+    session_key: str, verdict: str, conversation_id: str = "", *, sessions: Any = None
+) -> str:
     """Hand *verdict* to the oldest open request; return the receipt to send.
 
     Returns :data:`RECEIPT_EXPIRED` when nothing is open, which is the case
     that must never be silent: the operator typed "yes" believing they were
-    approving something, and they need to know they were not.
+    approving something, and they need to know they were not. A request whose
+    window already closed counts as not open.
+
+    Trust is granted HERE, strictly, before the request resolves, so the receipt
+    names what was granted: with no *sessions* manager, or a grant refused or
+    failed, this one tool is approved and the receipt says "Approved.".
     """
     entry = pending_for(session_key, conversation_id)
-    if entry is None:
+    if entry is None or entry.expired:
         return RECEIPT_EXPIRED
+    if verdict == TRUST:
+        verdict = _grant_session_trust(entry.session_key, sessions)
     if not entry.future.done():
         entry.future.set_result(verdict)
     _forget(entry.session_key, entry.request_id)
@@ -326,6 +350,31 @@ def deliver_verdict(session_key: str, verdict: str, conversation_id: str = "") -
     if verdict == TRUST:
         return RECEIPT_TRUSTED
     return RECEIPT_DENIED
+
+
+def _grant_session_trust(session_key: str, sessions: Any) -> str:
+    """:data:`TRUST` when the session's Trust was granted whole, else :data:`APPROVE`.
+
+    The grant is the session's approval policy, which is what makes a spawned
+    subagent inherit it, so without a manager there is nothing to grant.
+    """
+    from kiro_crew.messaging.link import telemetry_channel_of
+    from kiro_crew.messaging.session_trust import add_trusted_session, trust_permitted
+
+    if not trust_permitted() or sessions is None:
+        # A ``permission_mode`` deny of ``trust``, or no policy to write.
+        return APPROVE
+    try:
+        # Through the shared grant, so its deny hook revokes it later (both halves).
+        add_trusted_session(session_key, sessions, strict=True)
+    except Exception:  # noqa: BLE001: a grant that failed still approves this one tool
+        logger.warning(
+            "approval: could not grant session trust on %s",
+            telemetry_channel_of(session_key),
+            exc_info=True,
+        )
+        return APPROVE
+    return TRUST
 
 
 def abandon_approval(session_key: str, request_id: Any) -> None:
@@ -423,7 +472,7 @@ class TextReplyApprovalDecider:
             return False
         verdict = await entry.wait(self._timeout_s)
         if verdict == TRUST:
-            self._grant_session_trust()
+            # Granted by the reply in :func:`deliver_verdict`.
             return True
         if entry.expired:
             self.last_deny_cause = DENY_CAUSE_APPROVAL_TIMEOUT
@@ -442,20 +491,6 @@ class TextReplyApprovalDecider:
         except Exception:  # noqa: BLE001: a read failure must not grant trust
             logger.warning("approval: trust lookup failed", exc_info=True)
             return False
-
-    def _grant_session_trust(self) -> None:
-        """Record Trust as the session's approval policy.
-
-        Reusing the session's own policy rather than a module-level set is what
-        makes a spawned subagent inherit the grant: it reads the parent's
-        approval policy, never an in-memory trust set.
-        """
-        if self._sessions is None:
-            return
-        try:
-            self._sessions.set_approval_policy(self.session_key, "auto")
-        except Exception:  # noqa: BLE001: the tool is already approved
-            logger.warning("approval: could not persist session trust", exc_info=True)
 
 
 def reset_for_tests() -> None:
@@ -593,11 +628,11 @@ class PendingApprovals:
         that arrived would find nothing pending, fall through to the mid-turn path,
         and be discarded — the user would watch their decision do nothing and the
         tool deny itself minutes later. Reserving first means the window is open
-        for the whole time the prompt is answerable.
+        for the whole time the prompt is answerable. It is also how ``decide``
+        knows a prompt was delivered: with no reservation it denies at once.
 
-        Never replaces a LIVE future, in either direction: a reservation that
-        follows ``decide`` (or a second reservation for the same address) keeps the
-        future already being awaited and only ensures a nonce exists for it.
+        Never replaces a LIVE future: a second reservation for the same address
+        keeps the future already being awaited and only ensures a nonce exists for it.
         Replacing it would orphan the object the waiter is blocked on, and a
         resolved answer would set a future nobody reads — the prompt would hang for
         its whole window and then deny.
@@ -614,25 +649,23 @@ class PendingApprovals:
         return nonce
 
     def discard_reservations(self, session_key: str) -> None:
-        """Drop *session_key*'s unawaited reservations.
+        """Drop every reservation of *session_key* as its turn ends, answered or not.
 
-        ``decide`` retires its own entry in a ``finally``, so this only matters for
-        a reservation that was never awaited — the prompt rendered and the turn
-        then failed before the driver reached the decider. Called from the
-        channel's per-turn teardown, so a reservation cannot outlive the turn that
-        opened it and be resolved by a stray answer to a LATER prompt.
+        A live ``decide`` holds the future it awaits, so it is unaffected. An answer no
+        wait adopted has no reader left, and the next request reuses its address
+        (ACP ids restart at 1): kept, it would answer a prompt nobody was shown.
         """
         prefix = f"{session_key}:"
         for k in [k for k in self._pending if k.startswith(prefix)]:
-            if not self._pending[k].done():
-                self._pending.pop(k, None)
-                self._nonces.pop(k, None)
+            self._pending.pop(k, None)
+            self._nonces.pop(k, None)
 
     async def decide_with_cause(self, session_key: str, event: Any) -> tuple[bool, str]:
         """Await the user's decision for *event*; return ``(approved, cause)``.
 
-        The cause is ``""`` for a human's answer and
-        :data:`DENY_CAUSE_APPROVAL_TIMEOUT` when the window closed unanswered.
+        The cause is ``""`` for a human's answer,
+        :data:`DENY_CAUSE_APPROVAL_TIMEOUT` when the window closed unanswered, and
+        :data:`DENY_CAUSE_APPROVAL_UNDELIVERABLE` when no prompt was delivered.
         Returned rather than stored on this object because one registry serves
         every session of a channel, so an attribute here would race between
         concurrent turns; :class:`SessionApprovalDecider` (one per session) is
@@ -642,23 +675,25 @@ class PendingApprovals:
         # Adopt the renderer's reservation. It opened this window before the prompt
         # was sent, which is the whole point: the answer may ALREADY have arrived
         # and resolved it, in which case that decision is the answer and there is
-        # nothing left to await. Creating a fresh future in either case would
-        # discard a decision the user already made and then wait out the full
-        # window before denying.
+        # nothing left to await.
         reserved = self._pending.get(k)
-        if reserved is not None and reserved.done():
+        if reserved is None:
+            # No reservation means no prompt reached anybody -- the rule at
+            # ``open_approval``: a muted conversation's SilentRenderer drops it.
+            # Deny NOW rather than wait the window for an unasked question, and
+            # signal the stall: nobody can answer here, as on a timeout.
+            logger.debug("%s: no prompt was delivered; denying immediately", self._channel_type)
+            _notify_approval_stalled(session_key)
+            return False, DENY_CAUSE_APPROVAL_UNDELIVERABLE
+        if reserved.done():
             _notify_approval_answered(session_key)
             try:
                 return bool(reserved.result()), ""
             finally:
                 self._pending.pop(k, None)
                 self._nonces.pop(k, None)
-        fut = reserved
-        if fut is None:
-            fut = asyncio.get_running_loop().create_future()
-            self._pending[k] = fut
         try:
-            answer = bool(await asyncio.wait_for(fut, APPROVAL_TIMEOUT_S))
+            answer = bool(await asyncio.wait_for(reserved, APPROVAL_TIMEOUT_S))
             _notify_approval_answered(session_key)
             return answer, ""
         except asyncio.TimeoutError:
@@ -678,7 +713,7 @@ class PendingApprovals:
 
 
 def _notify_approval_stalled(session_key: str) -> None:
-    """Tell AutoNudge that a prompt in *session_key* went unanswered.
+    """Tell AutoNudge that a prompt in *session_key* went unanswered or was never delivered.
 
     An unanswered prompt is the only evidence available that an UNATTENDED loop
     cannot act: without it a monitor loop bound to this conversation keeps

@@ -11,6 +11,8 @@ Persistence tests live in test_cron.py. This file covers:
 from __future__ import annotations
 
 import asyncio
+import tempfile
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -18,6 +20,7 @@ import pytest
 from kiro_crew.cron import CronJob, CronSchedule
 from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
 from kiro_crew.llm_helpers import ToolApprovalPolicy
+from kiro_crew.sel import SecurityEventLog
 from kiro_crew.subagent_persistence import create_agent_folder
 
 
@@ -109,10 +112,13 @@ class TestCronApprovalModeGateway:
 
         return captured
 
-    def test_auto_mode_passes_auto_approve_and_no_callback(self) -> None:
+    def test_auto_mode_passes_auto_approve_and_a_live_auto_check(self) -> None:
         captured = self._run_cron_callback("auto")
         assert captured["approval_policy"] == ToolApprovalPolicy.AUTO_APPROVE
-        assert captured["on_tool_approval"] is None
+        # The callback approves while ``auto`` holds; a mid-turn policy deny asks
+        # instead (RFC LTS edition D9).
+        approve = captured["on_tool_approval"]
+        assert asyncio.run(approve(MagicMock())) is True
 
     def test_empty_mode_passes_hook_based_and_callback(self) -> None:
         captured = self._run_cron_callback("")
@@ -377,8 +383,12 @@ class TestSubagentInheritsPolicy:
             captured = self._run_inner_and_capture("", parent_session_key="")
         assert captured["approval_policy"] == "auto"
 
-    def _run_inner_with_tool_event(self, parent_policy: str, on_tool_approval=None, parent_session_key: str = "parent-key") -> MagicMock:
-        """Invoke _run_inner with a PERMISSION_REQUEST event and return the mock client."""
+    def _run_inner_with_tool_event(self, parent_policy: str, on_tool_approval=None, parent_session_key: str = "parent-key") -> tuple[MagicMock, list[dict]]:
+        """Invoke _run_inner with a PERMISSION_REQUEST event.
+
+        Returns the mock client and the ``tool_invocation`` rows a real, synchronous
+        security event log recorded, so a test reads the audited decision itself.
+        """
         from kiro_crew.hooks import TOOL_ALLOW, ToolHookResult
         from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_PERMISSION_REQUEST, LLMEvent
         from kiro_crew.subagent import SubagentInfo, SubagentManager
@@ -423,14 +433,24 @@ class TestSubagentInheritsPolicy:
         )
 
         create_agent_folder(info.id, task=info.task, execution_context=info.execution_context)
-        with patch("kiro_crew.subagent.sel"):
-            asyncio.run(runner._run_inner(info, "subagent:sub1"))
-        return mock_client
+        # The log is a process singleton: clear it around the construction so this
+        # test gets its own log, and no other caller is handed it.
+        with tempfile.TemporaryDirectory() as sel_dir:
+            with (
+                patch.object(SecurityEventLog, "_instance", None),
+                patch.object(SecurityEventLog, "_initialized", False),
+            ):
+                audit = SecurityEventLog(base_dir=Path(sel_dir), sync=True)
+            with patch("kiro_crew.subagent.sel", return_value=audit):
+                asyncio.run(runner._run_inner(info, "subagent:sub1"))
+            rows = [e for e in audit.recent() if e["event_type"] == "tool_invocation"]
+        return mock_client, rows
 
     def test_auto_policy_approves_tool(self) -> None:
-        client = self._run_inner_with_tool_event("auto")
+        client, rows = self._run_inner_with_tool_event("auto")
         client.approve_tool.assert_called_once_with("req-1")
         client.reject_tool.assert_not_called()
+        assert [(r["operation"], r["outcome"]) for r in rows] == [("some_tool", "auto_approved")]
 
     def test_deny_by_default_rejects_tool(self) -> None:
         # With interactive approval_mode, empty parent policy stays empty
@@ -439,9 +459,13 @@ class TestSubagentInheritsPolicy:
             "kiro_crew.subagent.KiroCrewConfig.load",
             return_value=MagicMock(agent=MagicMock(approval_mode="interactive")),
         ):
-            client = self._run_inner_with_tool_event("", on_tool_approval=None, parent_session_key="")
+            client, rows = self._run_inner_with_tool_event("", on_tool_approval=None, parent_session_key="")
         client.reject_tool.assert_called_once_with("req-1")
         client.approve_tool.assert_not_called()
+        # The audit names the headless rung: no policy, no approver, refused by default.
+        assert [(r["operation"], r["outcome"], r["metadata"].get("reason")) for r in rows] == [
+            ("some_tool", "rejected", "no_policy_deny_default")
+        ]
 
     def test_empty_policy_with_parent_stays_empty(self) -> None:
         """When a real parent exists but returns empty policy, config fallback must NOT activate."""
@@ -458,11 +482,15 @@ class TestSubagentInheritsPolicy:
             "kiro_crew.subagent.KiroCrewConfig.load",
             return_value=MagicMock(agent=MagicMock(approval_mode="auto")),
         ):
-            client = self._run_inner_with_tool_event(
+            client, rows = self._run_inner_with_tool_event(
                 "", on_tool_approval=None, parent_session_key="parent-key"
             )
         client.reject_tool.assert_called_once_with("req-1")
         client.approve_tool.assert_not_called()
+        # The config's ``auto`` must not lift a real parent's empty policy.
+        assert [(r["operation"], r["outcome"], r["metadata"].get("reason")) for r in rows] == [
+            ("some_tool", "rejected", "no_policy_deny_default")
+        ]
 
 
 class TestCronSubagentInjection:
@@ -484,7 +512,8 @@ class TestCronSubagentInjection:
         gw._cron_runs_holding = set()
         gw._cfg = MagicMock()
         gw._cfg.agent.max_subagents = 5
-        gw.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), True, False))
+        # The cron run's live session: a completion continues it (``is_new`` False).
+        gw.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), False, False))
         gw.sessions.release = MagicMock()
         gw.sessions.reset = AsyncMock()
         gw.sessions.cancel_current = AsyncMock()

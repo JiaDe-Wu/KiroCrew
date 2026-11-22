@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from acp_client_helpers import _native_projection_for_fake_processes  # noqa: F401 - fixture
 from acp_client_helpers import _pin_the_installed_kiro_cli_version  # noqa: F401 - fixture
+from acp_client_helpers import _windows_cleanup_admission_passes_through  # noqa: F401
 from acp_client_helpers import _POSIX_EXEC_PATHS_ONLY, _stop_stderr_drain
 from spawn_test_helpers import strip_spawn_shim
 
@@ -69,8 +70,8 @@ class TestVendoredClaudeAcp:
         assert _resolve_vendored_claude_acp(pkg_dir=pkg_dir) is None
 
     def test_skips_incomplete_copy_missing_deps(self, tmp_path, monkeypatch):
-        # Regression: an entry script whose dependency Node could not import must
-        # be rejected (it would crash with ERR_MODULE_NOT_FOUND @agentclientprotocol/sdk),
+        # An entry script whose dependency Node cannot import must be
+        # rejected (it would crash with ERR_MODULE_NOT_FOUND @agentclientprotocol/sdk),
         # falling through to a complete copy under KIROCREW_PROJECT_DIR.
         pkg_dir = tmp_path / "site-packages" / "kiro_crew"
         pkg_dir.mkdir(parents=True)
@@ -574,6 +575,7 @@ class TestResolveKiroBinEnvOverride:
 
     @pytest.mark.asyncio
     async def test_spawn_launches_self_updated_override(self, tmp_path):
+        from kiro_crew import kiro_cli as kiro_cli_module
         from kiro_crew import sandbox as sandbox_module
         from kiro_crew.acp import client as client_module
         from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
@@ -599,6 +601,9 @@ class TestResolveKiroBinEnvOverride:
                 "resolve_kiro_cli",
                 return_value=str(fake),
             ),
+            # The engine probe runs through the sandboxed runner, which would
+            # meet the mocked create_subprocess_exec below; it lists no v2 here.
+            patch.object(kiro_cli_module, "kas_relay_help", return_value=None),
             patch(
                 "asyncio.create_subprocess_exec",
                 mock_exec,
@@ -674,10 +679,12 @@ class TestResolveKiroBinEnvOverride:
         # path is runtime-owned, so only its presence and shape are pinned here.
         extra_private = wrap_kwargs.pop("extra_private_dirs")
         assert isinstance(extra_private, (list, tuple))
-        # The default tier leaves ~/.ssh readable, so the ssh-agent socket is kept.
+        # The default tier leaves ~/.ssh readable, so the ssh-agent socket is kept;
+        # the list is where the wrap reports the forward it applied.
         assert wrap_kwargs == {
             "strip_python_env": True,
             "is_kiro_cli": True,
+            "forward_ssh_auth_sock_out": [sys.platform != "win32"],
             **({} if sys.platform == "win32" else {"forward_ssh_auth_sock": True}),
         }
         voice_guard.assert_called_once_with(client._work_dir)

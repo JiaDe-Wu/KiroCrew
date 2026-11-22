@@ -32,8 +32,10 @@ answers, told apart by membership in ``ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE``.** A
 member mounts the spec's own ``mcpServers`` by a channel other than the array --
 kiro-cli is handed ``--agent`` and reads the spec itself; KAS receives the spec's
 servers as a projected agent definition in ``_meta`` -- so for it a ref is
-satisfied by the spec's OWN definition, and the array it gets carries broker
-stubs at most. Reading a member's refs against the wire would report every single
+satisfied by the spec's OWN definition, or by a server the spec's ``includeMcpJson``
+mounts from the user's ``mcp.json`` (named by the caller, see *mcp_json* on
+:func:`unresolved_server_refs`), and the array it gets carries broker stubs at
+most. Reading a member's refs against the wire would report every single
 one as unresolved on the healthiest install there is. Every other harness is
 reached only through the array it is sent, so the wire array is the only channel
 Crew has onto the session and the only thing that can satisfy a ref -- what the
@@ -58,7 +60,7 @@ exception would cost the session over a diagnostic.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from fnmatch import fnmatchcase
 from typing import Any
 
@@ -216,17 +218,23 @@ def _spec_server_names(spec: Any) -> set[str]:
     return {str(name) for name in servers}
 
 
-def unresolved_server_refs(spec: Any, wire_servers: Any, *, backend: str) -> list[str]:
+def unresolved_server_refs(
+    spec: Any, wire_servers: Any, *, backend: str, mcp_json: Iterable[str] = ()
+) -> list[str]:
     """The spec's ``@server`` refs that no server in Crew's projection can satisfy.
 
     Crew's claim, not the session's: the harness may still mount a same-named
-    server from a configuration of its own, which this resolver never reads.
+    server from a configuration of its own that *mcp_json* does not name, which
+    this resolver never reads.
 
     *spec* is the agent spec as read from disk (``tools``, ``mcpServers``, and
     the per-entry ``disabledTools`` inside them); *wire_servers* is the FINAL
     ``mcpServers`` array about to go out on ``session/new`` / ``session/load``,
     spec projection and broker stubs together; *backend* is the id the session
-    runs on.
+    runs on. *mcp_json* names the servers the spec's opt-in mounts from the user's
+    ``mcp.json`` files (:func:`kiro_crew.agent_sdk.mcp_json_reach.mcp_json_server_names`),
+    read by the caller off the event loop. They satisfy a ref on the same hosts the
+    spec's own servers do.
 
     Returned in the ``@name`` spelling the spec used, sorted, so two readings of
     one spec produce the same line. Empty is the healthy answer.
@@ -246,8 +254,10 @@ def unresolved_server_refs(spec: Any, wire_servers: Any, *, backend: str) -> lis
         # array -- kiro-cli loads them itself from ``--agent``, KAS receives them as
         # a projected agent definition in ``_meta`` -- so the array carries broker
         # stubs at most. Judging their refs against the wire alone would report
-        # every ref on the healthiest install there is.
+        # every ref on the healthiest install there is. The mcp.json servers the
+        # spec opts in to reach these hosts off the wire as well.
         satisfied |= _spec_server_names(spec)
+        satisfied.update(name for name in mcp_json if isinstance(name, str))
     return sorted(
         f"{_MCP_PREFIX}{name}"
         for name in refs
@@ -285,6 +295,91 @@ def entry_reaches(entry: str, ref: str) -> bool:
         return _glob_hits(ref, pattern)
     _, _, verb = ref.partition("/")
     return _glob_hits(ref, entry) or (verb != "" and _glob_hits(verb, entry))
+
+
+def glob_free(entry: str) -> bool:
+    """Whether *entry* names one tool or verb, with no glob in its grant pattern."""
+    return _TOOL_GLOB_CHARS.isdisjoint(_canonical_grant_pattern(entry) or entry)
+
+
+def grant_fold(entry: str) -> str:
+    """The case-folded grant pattern a glob-free entry is matched by."""
+    return (_canonical_grant_pattern(entry) or entry).casefold()
+
+
+class OtherReach:
+    """Whether an entry of *entries* other than a glob-free *key* itself reaches *key*.
+
+    Same answer as ``any(entry_reaches(e, key) for e in entries if e != key)``,
+    without trying every entry: a glob-free entry reaches a glob-free key only
+    when it folds to the key's own pattern or, bare, to the key's verb.
+    """
+
+    def __init__(self, entries: Iterable[str]) -> None:
+        self._exact: dict[str, list[str]] = {}
+        globbed: list[str] = []
+        for entry in entries:
+            if glob_free(entry):
+                self._exact.setdefault(grant_fold(entry), []).append(entry)
+            else:
+                globbed.append(entry)
+        self._globbed = ReachIndex(globbed)
+
+    def reached_by_another(self, key: str) -> bool:
+        folded = grant_fold(key)
+        verb = folded.partition("/")[2]
+        near = [*self._exact.get(folded, ()), *(self._exact.get(verb, ()) if verb else ())]
+        return self._globbed.reaches(key) or any(e != key and entry_reaches(e, key) for e in near)
+
+
+class ReachIndex:
+    """``any(entry_reaches(entry, ref) for entry in entries)``, without trying every entry.
+
+    Same answer for every *ref*, so a reader with many entries and many refs is
+    not all-pairs. A glob-free entry matches only its own case-folded spelling
+    (``_glob_hits`` is then plain equality, either side folded), so those are set
+    lookups. An entry whose server part is glob-free can only match a ref on that
+    server, so it is tried only for refs on that server. The rest (server-part
+    globs, bare globs) are tried for every ref with :func:`entry_reaches` itself.
+    Case folding never adds or removes ``/`` or a glob character, which is what
+    lets the folded spelling pick the bucket.
+    """
+
+    def __init__(self, entries: Iterable[str] = ()) -> None:
+        self._exact_mcp: set[str] = set()
+        self._exact_bare: set[str] = set()
+        self._by_server: dict[str, list[str]] = {}
+        self._scan: list[str] = []
+        for entry in entries:
+            self.add(entry)
+
+    def add(self, entry: str) -> None:
+        pattern = _canonical_grant_pattern(entry)
+        if pattern is None:
+            if _TOOL_GLOB_CHARS.isdisjoint(entry):
+                self._exact_bare.add(entry.casefold())
+            else:
+                self._scan.append(entry)
+            return
+        folded = pattern.casefold()
+        server = folded[len(_MCP_PREFIX) :].partition("/")[0]
+        if _TOOL_GLOB_CHARS.isdisjoint(folded):
+            self._exact_mcp.add(folded)
+        elif _TOOL_GLOB_CHARS.isdisjoint(server):
+            self._by_server.setdefault(server, []).append(entry)
+        else:
+            self._scan.append(entry)
+
+    def reaches(self, ref: str) -> bool:
+        folded = (_canonical_grant_pattern(ref) or ref).casefold()
+        verb = folded.partition("/")[2]
+        if folded in self._exact_mcp or folded in self._exact_bare:
+            return True
+        if verb and verb in self._exact_bare:
+            return True
+        server = folded[len(_MCP_PREFIX) :].partition("/")[0] if folded.startswith("@") else None
+        tried = self._by_server.get(server, []) if server is not None else []
+        return any(entry_reaches(entry, ref) for entry in (*tried, *self._scan))
 
 
 #: Glob syntax kiro-cli documents in the tool part of an ``allowedTools`` entry.

@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 import pytest
+from model_registry_row_helpers import (
+    CLAUDE_ONLY_ALIAS,
+    CLAUDE_ONLY_ID,
+    CLAUDE_ONLY_KEY,
+    add_claude_only_row,
+)
 from named_cases_helpers import named_cases
 
 from kiro_crew import model_registry as mr
@@ -48,6 +55,49 @@ class TestModelRegistry:
             == "us.anthropic.claude-opus-4-8[1m]"
         )
         assert mr.to_provider_id("nonexistent-model", "claude_code") == "nonexistent-model"
+
+    def test_to_provider_id_logs_each_unregistered_pass_through_once(self, caplog):
+        # Every config load translates the same configured ids again, so the
+        # DEBUG line names each (value, provider) pair once, not once per call.
+        with caplog.at_level(logging.DEBUG, logger=mr.__name__):
+            for _ in range(3):
+                assert mr.to_provider_id("nonexistent-model", "acp") == "nonexistent-model"
+            mr.to_provider_id("nonexistent-model", "claude_code")
+            mr.to_provider_id("another-nonexistent-model", "acp")
+        assert [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == mr.__name__ and "not in registry" in r.getMessage()
+        ] == [
+            "Model 'nonexistent-model' not in registry for provider acp; passing through",
+            "Model 'nonexistent-model' not in registry for provider claude_code; passing through",
+            "Model 'another-nonexistent-model' not in registry for provider acp; passing through",
+        ]
+
+    def test_the_pass_through_log_memory_is_bounded(self, monkeypatch, caplog):
+        # Request handlers pass arbitrary ids, so neither the number of remembered
+        # pairs nor the size of one can grow with the input.
+        monkeypatch.setattr(mr, "_PASSTHROUGH_LOGGED_MAX", 2, raising=False)
+        with caplog.at_level(logging.DEBUG, logger=mr.__name__):
+            for i in range(5):
+                mr.to_provider_id(f"nonexistent-model-{i}", "acp")
+            mr.to_provider_id("x" * 100_000, "acp")
+        assert 0 < len(mr._passthrough_logged) <= 2
+        assert all(len(repr(entry)) < 200 for entry in mr._passthrough_logged)
+
+    def test_a_pass_through_while_debug_is_off_is_still_logged_once_it_is_on(self, caplog):
+        # A gateway loads its config before it raises the log level, so a call the
+        # level filtered out must not count as logged.
+        with caplog.at_level(logging.WARNING, logger=mr.__name__):
+            mr.to_provider_id("nonexistent-model", "acp")
+        with caplog.at_level(logging.DEBUG, logger=mr.__name__):
+            mr.to_provider_id("nonexistent-model", "acp")
+            mr.to_provider_id("nonexistent-model", "acp")
+        assert [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == mr.__name__ and "not in registry" in r.getMessage()
+        ] == ["Model 'nonexistent-model' not in registry for provider acp; passing through"]
 
     def test_corrupt_registry_default_translates_to_valid_provider_id(self, monkeypatch):
         # If model_registry.json is corrupt/missing, _REGISTRY is empty and the
@@ -618,6 +668,33 @@ class TestAdvertisedModelCache:
         assert mr.refresh_advertised_models("claude_code", []) is False
         assert mr.advertised_models("claude_code") == ["a"]
 
+    def test_full_read_between_shrinks_cancels_the_held_shrink(self, monkeypatch):
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": ["opus", "haiku"]})
+        mr.refresh_advertised_models("claude_code", ["haiku"], confirm_shrink=True)
+        mr.refresh_advertised_models("claude_code", ["opus", "haiku"], confirm_shrink=True)
+        assert mr.refresh_advertised_models("claude_code", ["haiku"], confirm_shrink=True) is False
+        assert mr.advertised_models("claude_code") == ["opus", "haiku"]
+
+    def test_held_shrink_keeps_cached_labels_and_takes_the_reads_new_ids(self, monkeypatch):
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": ["opus", "haiku"]})
+        monkeypatch.setattr(mr, "_ADVERTISED_META", {"claude_code": {"opus": {"name": "Opus"}}})
+        rows = [{"modelId": "haiku", "name": "Haiku"}, {"modelId": "fable", "name": "Fable"}]
+        changed = mr.refresh_advertised_models(
+            "claude_code", ["haiku", "fable"], rows=rows, confirm_shrink=True
+        )
+        assert changed is True
+        assert mr.advertised_models("claude_code") == ["opus", "haiku", "fable"]
+        names = {
+            r["model_name"]: r["display_name"] for r in mr.advertised_model_rows("claude_code")
+        }
+        assert names == {"opus": "Opus", "haiku": "Haiku", "fable": "Fable"}
+
+    def test_unfiltered_catalog_refresh_still_replaces_on_shrink(self, monkeypatch):
+        # The kiro --list-models catalog is unfiltered: a row it drops is gone.
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"acp": ["a", "b"]})
+        assert mr.refresh_advertised_models("acp", ["a"]) is True
+        assert mr.advertised_models("acp") == ["a"]
+
     def test_refresh_refuses_an_over_long_id_and_says_so_once(self, monkeypatch, caplog):
         # The id is REFUSED, not truncated: a truncated id names a different
         # model, or none. The rest of the list is retained, and the overflow is
@@ -934,8 +1011,8 @@ class TestImportDoesNotCreateTheDataHome:
 
 
 _CLAUDE_5X_ROWS = [
-    # (key, its other spellings, claude_code id, acp id ('' where kiro-cli serves none), what
-    # claude-agent-acp 0.94.0 advertises)
+    # (key, its other spellings, claude_code id, acp id, what claude-agent-acp 0.94.0
+    # advertises)
     (
         "opus-5.5-1m",
         ("claude-opus-5.5", "claude-opus-5-5", "claude-opus-5-5[1m]"),
@@ -954,7 +1031,7 @@ _CLAUDE_5X_ROWS = [
         "fable-5.1-1m",
         ("claude-fable-5.1", "claude-fable-5-1", "claude-fable-5-1[1m]"),
         "global.anthropic.claude-fable-5-1[1m]",
-        "",
+        "claude-fable-5.1",
         "claude-fable-5-1[1m]",
     ),
 ]
@@ -984,23 +1061,44 @@ class TestClaude55Rows:
         assert mr.from_provider_id("claude-fable-5-1[1m]", "claude_code") == "fable-5.1-1m"
 
     @pytest.mark.parametrize("key, aliases, pid, acp_id, wire", _CLAUDE_5X_ROWS, ids=_CLAUDE_5X_IDS)
-    def test_to_acp_id_gives_the_kiro_dotted_id_or_none(self, key, aliases, pid, acp_id, wire):
+    def test_to_acp_id_gives_the_kiro_dotted_id(self, key, aliases, pid, acp_id, wire):
         assert mr.to_acp_id(key) == acp_id
+
+    @pytest.mark.parametrize("key, aliases, pid, acp_id, wire", _CLAUDE_5X_ROWS, ids=_CLAUDE_5X_IDS)
+    def test_the_kiro_advertised_id_folds_onto_its_row(self, key, aliases, pid, acp_id, wire):
+        assert mr.from_provider_id(acp_id, "acp") == key
 
     @pytest.mark.parametrize(
         "pin",
         [
-            "claude-fable-5.1",
-            "claude-fable-5-1",
-            "claude-fable-5-1[1m]",
-            "global.anthropic.claude-fable-5-1[1m]",
+            # kiro-cli advertises claude-fable-5.1, so a kiro pin of it must not be refused.
+            *(
+                pytest.param(pin, id=f"no_fable_5_1_spelling_lacks_an_acp_id-{pin}")
+                for pin in (
+                    "claude-fable-5.1",
+                    "claude-fable-5-1",
+                    "claude-fable-5-1[1m]",
+                    "global.anthropic.claude-fable-5-1[1m]",
+                )
+            ),
+            *(
+                pytest.param(
+                    pin, id=f"a_kiro_served_row_auto_or_an_unknown_id_does_not_lack_one-{pin}"
+                )
+                for pin in (
+                    "claude-opus-4.8",
+                    "claude-opus-5-5",
+                    "auto",
+                    "",
+                    "not-a-registered-model",
+                )
+            ),
         ],
     )
-    def test_every_fable_5_1_spelling_lacks_an_acp_id(self, pin):
-        assert mr.lacks_acp_id(pin) is True
-
-    @pytest.mark.parametrize(
-        "pin", ["claude-opus-4.8", "claude-opus-5-5", "auto", "", "not-a-registered-model"]
-    )
-    def test_a_kiro_served_row_auto_or_an_unknown_id_does_not_lack_one(self, pin):
+    def test_a_pin_kiro_can_serve_does_not_lack_an_acp_id(self, pin):
         assert mr.lacks_acp_id(pin) is False
+
+    @pytest.mark.parametrize("pin", [CLAUDE_ONLY_ALIAS, CLAUDE_ONLY_ID, CLAUDE_ONLY_KEY])
+    def test_every_spelling_of_a_row_with_no_acp_id_lacks_one(self, monkeypatch, pin):
+        add_claude_only_row(monkeypatch)
+        assert mr.lacks_acp_id(pin) is True

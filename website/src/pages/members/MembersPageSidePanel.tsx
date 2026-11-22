@@ -20,7 +20,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react'
 import { type NavigateFunction, type Location, type SetURLSearchParams } from 'react-router-dom'
-import { LayoutDashboard } from 'lucide-react'
+import { LayoutDashboard, Route } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { type MemberRosterRow } from '../../api/client'
 import { crewDisplayName } from '../../components/AgentSelector'
@@ -30,9 +30,11 @@ import { threadsApi, threadsQueryKey } from '../../api/threads'
 import ThreadPanel from './ThreadPanel'
 import { useCrewmateThreadsFlag } from '../../hooks/useCrewmateThreadsFlag'
 import CrewDashboardTab from './CrewDashboardTab'
+import BotSessionsPanelTab from './BotSessionsPanelTab'
 import { isDashboardPreview, withoutDashboardPreview } from './dashboardPreview'
 import { claimDashboardOnLoad } from './dashboardOnLoad'
-import { suggestPaneDraft } from '../../utils/chatPaneDrafts'
+import { appendPaneDraftReply, suggestPaneDraft } from '../../utils/chatPaneDrafts'
+import { sendCardReply } from './sendCardReply'
 import { revealComposer } from '../chat/composerFocus'
 import { sessionTitleRoster } from '../../utils/sessionRoster'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
@@ -52,7 +54,7 @@ import { type ChatSlot } from '../../types'
 import { type MembersPageProfileFlight, type MembersPageProfileState } from './MembersPageProfile'
 import { type MembersPageRosterView } from './MembersPageRoster'
 import { type MembersPageThreadState } from './MembersPageThread'
-import { CREW_DASHBOARD_TAB_ID, CREW_PANEL_TAB_IDS, MEMBERS_UNCONFIRMED_WITHHELD_VIEWS, MEMBERS_WITHHELD_VIEWS, PANEL_GAPS_W, type ProfileCardOpen } from './membersPageModel'
+import { CREW_DASHBOARD_TAB_ID, CREW_PANEL_TAB_IDS, CREW_SESSIONS_TAB_ID, MEMBERS_UNCONFIRMED_WITHHELD_VIEWS, MEMBERS_WITHHELD_VIEWS, PANEL_GAPS_W, type ProfileCardOpen } from './membersPageModel'
 import { type MembersPageDrawers } from './useMembersPageDrawers'
 import { type MembersPageLayout } from './useMembersPageLayout'
 import { type MembersPageNavigation } from './useMembersPageNavigation'
@@ -174,7 +176,7 @@ export function useMembersPageSidePanel({
   // Changes chip on the monitoring page would assert "nothing changed" while a
   // member is editing. `summary` is withheld too: Profile Sessions and the generated
   // Dashboard already own the member-level views. So is the pinned Artifacts tab:
-  // this page's standing tabs are Dashboard + Files only, while every + menu view
+  // this page's standing tabs are Dashboard, Sessions + Files only, while every + menu view
   // stays offered (see MEMBERS_WITHHELD_VIEWS). Until the thread is confirmed, EVERY slot-bound view is
   // withheld as well, per the binding rule above — and so is Terminal: while
   // unconfirmed the strip sits in the shared no-slot bucket, so a PTY opened
@@ -237,6 +239,40 @@ export function useMembersPageSidePanel({
     if (!unmountsCard || !schedAtStakeRef.current()) { focus(); return }
     void schedGuardRef.current().then((ok) => { if (ok) focus() })
   }, [tabsCtl, beside, setDockedOpen, profile, schedAtStakeRef, schedGuardRef, setOverlayOpen, setProfile])
+  // The session open in the panel's Sessions tab, per Bot (keyed on the Bot's
+  // thread key), so it survives a tab switch and a Bot switch and back. Only the
+  // Sessions tab reads it; the Dashboard tab never does.
+  const [openSessionBy, setOpenSessionBy] = useState<Record<string, string>>({})
+  // The open session's pane holds focus: it then owns the page's one dictation
+  // key, which the Bot thread's composer gives up (MembersPageThread).
+  const [panelSessionFocused, setPanelSessionFocused] = useState(false)
+  const openPanelSession = activeMemberKey ? openSessionBy[activeMemberKey] ?? null : null
+  const setOpenPanelSession = useCallback((key: string | null) => {
+    if (!activeMemberKey) return
+    setOpenSessionBy((prev) => {
+      const next = { ...prev }
+      if (key) next[activeMemberKey] = key
+      else delete next[activeMemberKey]
+      return next
+    })
+  }, [activeMemberKey])
+  // Profile > Sessions: a row click opens that session in the panel's Sessions
+  // tab, revealing the panel. A docked Profile column holds the space the panel
+  // needs, so it closes behind the same draft question as `openCrewView`.
+  const openSessionInPanel = useCallback((key: string) => {
+    const unmountsCard = profile?.placement === 'column'
+    const focus = () => {
+      if (unmountsCard) setProfile(null)
+      // An open reply thread is drawn over the whole panel; it steps aside.
+      setOpenThreadMid(null)
+      setOpenPanelSession(key)
+      tabsCtl.setActive(CREW_SESSIONS_TAB_ID)
+      if (beside) setDockedOpen(true)
+      else setOverlayOpen(true)
+    }
+    if (!unmountsCard || !schedAtStakeRef.current()) { focus(); return }
+    void schedGuardRef.current().then((ok) => { if (ok) focus() })
+  }, [profile, setProfile, setOpenPanelSession, tabsCtl, beside, setDockedOpen, setOverlayOpen, schedAtStakeRef, schedGuardRef])
   // Session routing inside the DM transcript. A crewmate's prose names sessions
   // constantly -- "picked this up in `chat-2235-…`", a `/chat?sid=…` link to the
   // worker it dispatched -- and until now every one of those was inert here
@@ -352,10 +388,13 @@ export function useMembersPageSidePanel({
     setActionError(message)
     if (!besideRef.current) setOverlayOpen(false)
   }, [setOverlayOpen])
+  // Every caller just opened a tab for the person to look at, so an open reply
+  // thread, drawn opaque over the whole panel, steps aside for it.
   const revealPanelAfterOpen = useCallback(() => {
+    closeReplyThread()
     if (besideRef.current) setDockedOpen(true)
     else setOverlayOpen(true)
-  }, [setDockedOpen, setOverlayOpen])
+  }, [closeReplyThread, setDockedOpen, setOverlayOpen])
   const { openFile, openWorkingTreeDiff, openArtifact, saveFile } = usePanelDocumentActions({
     tabsCtl,
     slotRef: activeSlotRef,
@@ -401,6 +440,15 @@ export function useMembersPageSidePanel({
   const openFileGuarded = useCallback((...args: Parameters<typeof openFile>) => {
     void openFile(...args)
   }, [openFile])
+  // A folder a crewmate names in its reply opens as the panel's folder tab
+  // against the DM slot, the way the chat page's folder chips do. Without it
+  // the chip fell back to the OS file manager, which a remote or headless
+  // gateway can only answer by copying the path.
+  const { openFolder: openFolderTab } = tabsCtl
+  const openFolderGuarded = useCallback((path: string) => {
+    openFolderTab(path, activeSlotRef.current)
+    revealPanelAfterOpen()
+  }, [openFolderTab, revealPanelAfterOpen])
   // Same shape for an artifact a crewmate names in its reply: the panel's own
   // Artifacts opener (a document tab against the DM slot), fire-and-forget
   // like the file one. Without it the `/artifacts/<slug>` link opened the
@@ -484,8 +532,9 @@ export function useMembersPageSidePanel({
     threadsOn, openThreadMid, threadsQuery, closeReplyThread, threadHooks, setShownTabId,
     dashboardVisitedFor, closeOverlay, sidePanelOnScreen,
     sidePanelHiddenNow, actionError, setActionError, actionInfo, showActionError, revealPanelAfterOpen, openArtifact,
-    openFile, openWorkingTreeDiff, saveFile, submitComments, runInTerminalScope, openFileGuarded, openArtifactGuarded,
-    openSessionGuarded, drivingSessions,
+    openFile, openWorkingTreeDiff, saveFile, submitComments, runInTerminalScope, openFileGuarded, openFolderGuarded, openArtifactGuarded,
+    openSessionGuarded, drivingSessions, openPanelSession, setOpenPanelSession, openSessionInPanel, slotsLoaded,
+    panelSessionFocused, setPanelSessionFocused,
     dashboardPreviewLink, focusPanelTab, leaveDashboardPreview, requestCloseOverlay, activeTabId,
   }
 }
@@ -526,7 +575,8 @@ export function MembersPageSidePanel({
     panelDefaultW, activeMemberKey, tabsCtl, projectDir, hiddenViews, threadsOn, openThreadMid,
     closeReplyThread, setShownTabId, dashboardVisitedFor, closeOverlay, sidePanelOnScreen, sidePanelHiddenNow,
     openFile, openWorkingTreeDiff, saveFile, submitComments, dashboardPreviewLink, leaveDashboardPreview,
-    requestCloseOverlay,
+    requestCloseOverlay, drivingSessions, openPanelSession, setOpenPanelSession, openSessionGuarded, slotsLoaded,
+    setPanelSessionFocused,
   } = sidePanel
   const { reduceMotion } = profileFlight
   const { openArtifactInPanel } = navigation
@@ -558,11 +608,24 @@ export function MembersPageSidePanel({
           member={activeMemberName}
           displayName={crewDisplayName(activeView ?? active)}
           avatar={(activeView ?? active)?.avatar}
-          // A needs-you option or a suggested prompt lands in this crewmate's
-          // chat box; the person sends it. The composer is revealed (focused on
-          // desktop) so the result of the click is where the reader looks.
+          // A suggested prompt or a needs-you option lands in this crewmate's chat
+          // box; the person sends it. The composer is revealed (focused on
+          // desktop) so the result of the click is where the reader looks. A
+          // suggested prompt replaces the one before it while untouched...
           onAct={activeSlot ? (text: string) => { suggestPaneDraft(activeSlot, text); revealComposer() } : undefined}
-          // Badge click opens the Profile tab directly so the person can unlock.
+          // ...while a page's reply is added after the others, so several cards are answered in one message.
+          onActKeep={activeSlot ? (text: string) => { appendPaneDraftReply(activeSlot, text); revealComposer() } : undefined}
+          // One click sends it into THIS crewmate's thread, only when the person turned
+          // "Send replies in one click" on for it (off, the default: no send is offered,
+          // so a page's `send` fills the composer exactly as `act` does and nothing
+          // reaches the gateway), and only once the open was confirmed (a send cannot be
+          // recalled by the unbind that follows a refused open); never a target the page
+          // names; a refusal falls back to the line above. The gateway's own
+          // `card_send_off` check stays the enforcement point.
+          onSend={confirmedSlot && active.dashboard_card_send === true
+            ? (text: string) => sendCardReply(confirmedSlot, text)
+            : undefined}
+          // Badge click opens the Profile tab, where the one-click-send switch is.
           // Guard against an unsaved schedule form in the already-open card:
           // openProfile() increments the nonce which re-mounts the panel.
           onOpenProfileTab={() => {
@@ -575,8 +638,12 @@ export function MembersPageSidePanel({
       )}
     </div>
   )
-  // The side panel's host tabs: the dynamic Dashboard only. The Workspace
-  // file browser is the one chat view left unwithheld (see
+  // The Sessions chip counts the sessions waiting on the person (a tool
+  // approval or an open question), read from the open slots the page already
+  // holds: a closed session waits on nobody, so no list read is needed.
+  const needsYou = drivingSessions.filter((s) => s.pending_approval || s.needs_input).length
+  // The side panel's host tabs: the dynamic Dashboard, then the Bot's Sessions.
+  // The Workspace file browser is the one chat view left unwithheld (see
   // MEMBERS_WITHHELD_VIEWS); together they are the whole strip.
   const leadingTabs: SidePanelLeadingTab[] = [
     {
@@ -585,6 +652,26 @@ export function MembersPageSidePanel({
       icon: <LayoutDashboard className="lucide-inline" aria-hidden="true" />,
       keepMounted: dashboardVisitedFor === activeMemberKey,
       render: () => dashboardBody,
+    },
+    {
+      id: CREW_SESSIONS_TAB_ID,
+      title: t('pages.membersPage.profile_sessions_tab'),
+      icon: <Route className="lucide-inline" aria-hidden="true" />,
+      badge: needsYou > 0 ? needsYou : undefined,
+      render: () => (
+        <BotSessionsPanelTab
+          key={activeMemberKey}
+          root={activeMemberKey}
+          mateName={crewDisplayName(activeView ?? active)}
+          liveSlots={drivingSessions}
+          slotsLoaded={slotsLoaded}
+          openKey={openPanelSession}
+          onOpenKey={setOpenPanelSession}
+          onOpenInChat={openSessionGuarded}
+          onPaneFocusChange={setPanelSessionFocused}
+          panelHidden={sidePanelHiddenNow}
+        />
+      ),
     },
   ]
   // Everything both placements share. Two different keys do two

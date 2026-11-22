@@ -53,16 +53,22 @@ from pathlib import Path, PurePath  # noqa: F401
 from typing import BinaryIO, Callable, NamedTuple, TypeVar  # noqa: F401
 
 from aiohttp import web
-from aiohttp.client_exceptions import ClientConnectionResetError  # noqa: F401
 from aiohttp.multipart import BodyPartReader  # noqa: F401
 
-from kiro_crew import executors, pinned_fs, platform_compat, sandbox_plan  # noqa: F401
+from kiro_crew import (  # noqa: F401
+    executors,
+    pinned_fs,
+    platform_compat,
+    redaction_seams,
+    sandbox_plan,
+)
 from kiro_crew._facade_compose import compose as _facade_compose
 from kiro_crew.atomic_write import (  # noqa: F401
     atomic_write,
     open_access_control_source,
     pinned_parent_replace_supported,
 )
+from kiro_crew.bounded_read import bounded_read  # noqa: F401
 from kiro_crew.cli_commands_workspace import _ws_dir_in_use  # noqa: F401
 from kiro_crew.config import loader as config_loader  # noqa: F401
 from kiro_crew.config.loader import (  # noqa: F401
@@ -79,6 +85,7 @@ from kiro_crew.config.sections import (  # noqa: F401
     LINK_PATTERN_PATTERN_MAX_LEN,
     LINK_PATTERN_URL_MAX_LEN,
     LINK_PATTERNS_MAX,
+    PREFERRED_LANGUAGES,
     link_pattern_url_ok,
 )
 from kiro_crew.constants import WINDOWS_DEVICE_STEMS  # noqa: F401
@@ -120,7 +127,9 @@ from kiro_crew.dashboard.file_api.browse import (  # noqa: F401
     _browse_entry_is_dir,
     _browse_files_sync,
     _browse_parent,
+    _create_browse_dir_sync,
     _is_windows_drive_root,
+    api_browse_create_dir,
 )
 from kiro_crew.dashboard.file_api.channel_upload import (  # noqa: F401
     _gate_upload_file,
@@ -218,6 +227,7 @@ from kiro_crew.dashboard.file_api.pinned_io import (  # noqa: F401
     _CheckedFile,
     _classify_request_paths,
     _file_write_blocking,
+    _is_live_memory_store_file,
     _open_checked,
     _open_checked_file,
     _open_rb_nofollow,
@@ -300,6 +310,7 @@ from kiro_crew.dashboard.file_api.uploads import (  # noqa: F401
     _content_matches_ext,
     _content_mismatch_message,
     _fit_stored_name,
+    _inside_upload_dir,
     _log_upload_diagnostic,
     _name_max,
     _resolve_raster_ext,
@@ -312,7 +323,9 @@ from kiro_crew.dashboard.file_api.uploads import (  # noqa: F401
     api_upload_file,
 )
 from kiro_crew.dashboard.file_api.workspaces import (  # noqa: F401
+    _invalid_dir,
     _resolve_ws_dir,
+    _resolved_ws_dirs,
     _WorkspaceConflict,
     api_workspaces,
     api_workspaces_create,
@@ -368,11 +381,14 @@ from kiro_crew.hooks import (  # noqa: F401
     safe_read_file_bytes,
     safe_read_prefix,
 )
+from kiro_crew.image_refs import PATH_MARKS  # noqa: F401 - owner: uploads
+from kiro_crew.memory_stores import MEMORY_DB_FILE  # noqa: F401 - owner: pinned_io
 from kiro_crew.messaging.display_safety import redact_for_display  # noqa: F401
 from kiro_crew.messaging.outbound_files import OutboundFile  # noqa: F401
 from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime  # noqa: F401
-from kiro_crew.owner_only_files import (  # noqa: F401 - owner: uploads
+from kiro_crew.owner_only_files import (  # noqa: F401 - owner: uploads, pinned_io
     OWNER_ONLY_FILE_MODE,
+    SQLITE_SIDECAR_SUFFIXES,
     ensure_directory,
     is_owner_only_target,
 )
@@ -408,6 +424,7 @@ from kiro_crew.security import (  # noqa: F401
     redact_exfiltration_urls,
     redact_path_segments,
     redaction_switch,
+    refuses,
     sandbox_credential_targets,
 )
 from kiro_crew.session_environment import session_runs_remotely  # noqa: F401
@@ -419,14 +436,17 @@ from kiro_crew.validation import (  # noqa: F401
     ValidationError,
     validate_tool_args,
 )
+from kiro_crew.workbook_rows import read_workbook_rows  # noqa: F401
+from kiro_crew.zip_vet import WORKBOOK_MAX_EXPANDED_BYTES as _SHEET_MAX_EXPANDED_BYTES  # noqa: F401
+from kiro_crew.zip_vet import WORKBOOK_MAX_MEMBERS as _SHEET_MAX_MEMBERS  # noqa: F401
 from kiro_crew.zip_vet import (  # noqa: F401
     ZipInventoryRejected,
     vet_zip_inventory_bytes,
 )
 
 # Register OOXML office MIME types explicitly. The system mimetypes
-# database on AL2/AL2023 build hosts does NOT include .docx, .xlsx, or
-# .pptx by default, so mimetypes.guess_type() returns (None, None) for
+# database on AL2/AL2023 build hosts does NOT include the OOXML types
+# by default, so mimetypes.guess_type() returns (None, None) for
 # those. Registering at module import time keeps api_file_download's
 # Content-Type header correct for the most common Word/Excel/PowerPoint
 # downloads.
@@ -439,13 +459,21 @@ mimetypes.add_type(
 mimetypes.add_type(
     "application/vnd.openxmlformats-officedocument.presentationml.presentation", ".pptx",
 )
+mimetypes.add_type(
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.template", ".dotx",
+)
+mimetypes.add_type(
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.template", ".xltx",
+)
+mimetypes.add_type(
+    "application/vnd.openxmlformats-officedocument.presentationml.template", ".potx",
+)
 
 _INLINE_DISPOSITION_PREFIXES = frozenset({"audio/", "video/", "image/", "application/pdf"})
 
 #: Session-key namespace of a sub-agent run. A sub-agent has no tab of its own, so
-#: its file card belongs to the PARENT's tab — the surface every other sub-agent
-#: output already routes to (``subagent_manager.monitoring``'s completion
-#: injection, ``chat_utils.subagent_event_slot``'s WS frames).
+#: its file card belongs to the tab its ``subagent_*`` WS frames draw in
+#: (``chat_utils.subagent_event_slot``): its PARENT's, or a nested run's root chat's.
 _SUBAGENT_SESSION_PREFIX = "subagent:"
 
 
@@ -457,12 +485,20 @@ logger = logging.getLogger(__name__)
 # function-local one from ``kiro_crew.slack.handler``.
 is_tracked_channel = _owner_channel_upload.is_tracked_channel
 
+# The per-leg caption-ceiling refusal shared by the two upload legs, defined in the
+# ``channel_upload`` owner. Bound by attribute so the composed endpoints (which run
+# on this module's namespace, not the owner's) can call it by name -- the same reason
+# ``is_tracked_channel`` is bound above.
+_description_too_long = _owner_channel_upload._description_too_long
+
 
 def _subagent_parent_session_key(state: DashboardState, session_key: str) -> str:
-    """The parent session key of the sub-agent running under *session_key*, or ``""``.
+    """The session key whose tab shows the sub-agent running under *session_key*, or ``""``.
 
-    Matches on BOTH spellings a run can be keyed by — its ``conversation_key`` (a
-    continuable run) and ``subagent:<id>`` — the same comparison
+    That is the run's parent, or for a nested run the chat its spawn tree started
+    from (``SubagentInfo.root_session_key``). Matches on BOTH spellings a run can
+    be keyed by — its ``conversation_key`` (a continuable run) and
+    ``subagent:<id>`` — the same comparison
     ``subagent_manager.continuation`` makes, because a continuable run's key is not
     derivable from its id. Returns ``""`` when the manager is absent or the run is
     unknown, so the caller SUPPRESSES the card rather than guessing a tab.
@@ -471,7 +507,7 @@ def _subagent_parent_session_key(state: DashboardState, session_key: str) -> str
     if manager is None:
         return ""
     try:
-        # A PROPERTY, not a method (``subagent.py`` ``@property all_agents``).
+        # A PROPERTY, not a method (``subagent_parts/manager.py`` ``@property all_agents``).
         # Calling it invoked the returned LIST, so every lookup raised TypeError,
         # the except below swallowed it, and the card was suppressed for every
         # sub-agent -- the routing this function exists to do never happened once.
@@ -509,10 +545,15 @@ def _subagent_parent_session_key(state: DashboardState, session_key: str) -> str
         )
 
     best = max(matches, key=_rank)
-    parent = getattr(best, "parent_session_key", "")
+    # A nested run's parent is a ``subagent:<id>`` key no tab shows, so the root of
+    # its spawn tree, which admission stamps on the run, comes first; the parent
+    # answers for a record that carries none.
     # isinstance, not truthiness: a stubbed manager can hand back a
     # non-str here and dashboard_slot_key would treat it as a key.
-    return parent if isinstance(parent, str) else ""
+    for key in (getattr(best, "root_session_key", ""), getattr(best, "parent_session_key", "")):
+        if isinstance(key, str) and key:
+            return key
+    return ""
 
 
 def _sel():
@@ -692,6 +733,9 @@ _ALLOWED_TEXT_EXT = {
     # unknown extension as text, this just lets them past the upload boundary.
     ".rem",
     ".ret",
+    # Saved email messages (RFC 5322 / MIME): ASCII headers plus a body whose
+    # binary parts are base64 or quoted-printable, so they read as plain text.
+    ".eml",
     ".py",
     ".js",
     ".ts",
@@ -725,10 +769,13 @@ _ALLOWED_DOC_EXT = {
     ".pdf",
     ".doc",
     ".docx",
+    ".dotx",
     ".xls",
     ".xlsx",
+    ".xltx",
     ".ppt",
     ".pptx",
+    ".potx",
     ".odt",
     ".ods",
     ".odp",
@@ -759,6 +806,14 @@ _VIDEO_HINT_EXT = frozenset(
 #: the conversion shipped, or a client other than the dashboard). The boundary
 #: still refuses it -- no model reads HEIC -- but says how to get past it.
 _HEIC_HINT_EXT = frozenset({".heic", ".heif"})
+#: Apple iWork names. Keynote, Pages and Numbers save a closed binary format
+#: no parser here reads, so the boundary refuses them, but names the export
+#: that does upload. ``.key`` is also a PEM private key's extension, hence the "if".
+_IWORK_HINT_EXT = frozenset({".key", ".pages", ".numbers"})
+_IWORK_HINT = (
+    "If it is an Apple Keynote, Pages or Numbers document, use File > Export To "
+    "in that app to save a PowerPoint, Word, Excel or PDF copy, and upload that."
+)
 #: Media type :func:`_sniff_media_type` must report for the claimed video
 #: extension. The MP4 family (mp4/m4v/mov) all carry a ``ftyp`` box at offset 4
 #: and sniff as ``video/mp4``; QuickTime's brand differs but the box does not.
@@ -803,7 +858,9 @@ _MEDIA_EXT_MIME: dict[str, str] = {**_VIDEO_EXT_MIME, **_AUDIO_EXT_MIME}
 # at offset 8, which a bare ``RIFF`` prefix would not check). Text formats (and
 # SVG, which is XML) have no reliable magic and remain gated by the extension
 # allowlist only.
-_ZIP_CONTAINER_EXTS = {".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".zip"}
+_ZIP_CONTAINER_EXTS = {
+    ".docx", ".dotx", ".xlsx", ".xltx", ".pptx", ".potx", ".odt", ".ods", ".odp", ".zip"
+}
 #: Raster extensions and the mime :func:`sniff_raster_mime` must report for
 #: the claimed extension to be accepted.
 _RASTER_EXT_MIME: dict[str, str] = {
@@ -826,6 +883,10 @@ _READ_PATH_EXTRA_MAGIC: tuple[tuple[bytes, str], ...] = (
     (b"MM\x00\x2a", "image/tiff"),
     (b"\x00\x00\x01\x00", "image/x-icon"),
 )
+#: The ``error`` every file route answers with its 503 ``file_busy``: another
+#: program holds the file without sharing it for reading (a Windows sharing or
+#: lock violation), and the same request succeeds once that program closes it.
+_FILE_BUSY_ERROR = "the file is open in another program; close it there and retry"
 
 
 #: Canonical upload extension per sniffed raster type: the suffix a mislabelled
@@ -858,7 +919,7 @@ _ProbeT = TypeVar("_ProbeT")
 #: uses.
 _PATH_PROBE_ADMIT_TIMEOUT_SECS = 2.0
 #: Execution ceiling handed to ``run_in_cron_pool``, which requires one. It is
-#: deliberately NOT a request timeout: this change bounds how many probes can be
+#: deliberately NOT a request timeout: it bounds how many probes can be
 #: wedged, not how long a client waits on one, and a shorter figure here would
 #: add a second refusal class this endpoint family does not yet define. Large
 #: enough that no healthy transfer under the module's own caps reaches it.
@@ -1237,8 +1298,8 @@ async def api_browse_files(request: web.Request) -> web.Response:
 _SHEET_MAX_SHEETS = 20
 _SHEET_MAX_ROWS = 500
 _SHEET_MAX_COLS = 100
-_SHEET_MAX_MEMBERS = 4096
-_SHEET_MAX_EXPANDED_BYTES = 200 * 1024 * 1024
+# _SHEET_MAX_MEMBERS and _SHEET_MAX_EXPANDED_BYTES are zip_vet's workbook
+# ceilings, imported above, so every reader that opens a workbook uses one pair.
 # Text amplification caps. Shared strings are stored once in the archive but
 # referenced per cell, so the expansion cap above does not bound the RESPONSE:
 # one 32 KiB string referenced by every cell would amplify into gigabytes of

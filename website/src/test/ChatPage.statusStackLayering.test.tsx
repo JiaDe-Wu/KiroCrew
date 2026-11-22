@@ -50,17 +50,21 @@ const STACK = /<div ref=\{composerBandRef\} className="([^"]*)" data-testid="com
 /** Every component the stack renders, paired with the z-index its own outermost
  *  wrapper declares. Each value is read out of that component's real source. */
 const CHILDREN: Record<string, RegExp> = {
+  McpLoadingBar: /<div className="px-4 mx-auto w-full relative z-\[(\d+)\]" style=\{\{ maxWidth: 'var\(--mc-content-width, 900px\)' \}\}>/,
   TaskProgressBar: /<div className="px-4 mx-auto w-full relative z-\[(\d+)\]" style=\{\{ maxWidth: 'var\(--mc-content-width, 900px\)' \}\}>/,
   SubagentProgressBar: /<div className="px-4 mx-auto w-full relative z-\[(\d+)\]" style=\{\{ maxWidth: 'var\(--mc-content-width, 900px\)' \}\}>/,
   WorkflowProgressBar: /<div className="px-4 mx-auto w-full relative z-\[(\d+)\]" style=\{\{ maxWidth: 'var\(--mc-content-width, 900px\)' \}\}>/,
   SubagentDeliveryProgress: /className="relative z-\[(\d+)\] mx-auto w-full px-4"/,
+  KiroSignInPrompt: /<div className="px-4 mx-auto w-full relative z-\[(\d+)\]" style=\{\{ maxWidth: 'var\(--mc-content-width, 900px\)' \}\}>/,
   QueueStack: /className="px-4 mx-auto w-full relative" style=\{\{ maxWidth: 'var\(--mc-content-width, 900px\)', zIndex: (\d+) \}\}/,
 }
 const FILES: Record<keyof typeof CHILDREN | string, string> = {
+  McpLoadingBar: 'pages/chat/McpLoadingBar.tsx',
   TaskProgressBar: 'pages/chat/TaskProgressBar.tsx',
   SubagentProgressBar: 'pages/chat/SubagentProgressBar.tsx',
   WorkflowProgressBar: 'pages/chat/WorkflowProgressBar.tsx',
   SubagentDeliveryProgress: 'components/QueueStack.tsx',
+  KiroSignInPrompt: 'components/KiroSignInPrompt.tsx',
   QueueStack: 'components/QueueStack.tsx',
 }
 

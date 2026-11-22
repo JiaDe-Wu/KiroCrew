@@ -16,7 +16,6 @@ import pytest
 from named_cases_helpers import named_cases
 
 from kiro_crew.channel import (
-    CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATION,
     CHANNEL_AGENT_BLOCKED_DISPATCH_TOOLS,
     CHANNEL_AGENT_BLOCKED_TOOLS,
     _stream_task,
@@ -52,6 +51,19 @@ def _make_client(events):
     client.approve_tool = AsyncMock()
     client.reject_tool = AsyncMock()
     return client
+
+
+def _open_gates(monkeypatch):
+    """Let the PreToolUse gate and the spec hooks pass, so a case asserting
+    channel trust's approval reads only the trust path. Both read the live
+    config, keystone and governance state, which another test in the same
+    worker can leave set; a refusal there means ``approve_tool`` never runs."""
+
+    async def _no_spec_refusal(*_a, **_k):
+        return None
+
+    monkeypatch.setattr("kiro_crew.permission_floor.refusal_for", lambda event, **kwargs: None)
+    monkeypatch.setattr("kiro_crew.channel.pre_tool_refusal", _no_spec_refusal)
 
 
 def test_blocked_tools_cover_both_messaging_tools():
@@ -200,35 +212,6 @@ def test_dispatch_tuple_names_the_verbs_that_start_work():
     }
 
 
-def test_blocked_operation_names_the_operation_that_starts_work():
-    """A passthrough tool is held by operation, so the operation is pinned too.
-
-    ``ops_mission_control_api`` carries a whole API surface behind one name, and
-    only ``POST /rotation/arm`` starts work that outlives the turn: it arms the
-    app's crons, which fire unattended afterwards. Every other operation reads, or
-    writes a record inside the turn, so the tool itself is not on the name list.
-    """
-    assert CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATION == (
-        "ops_mission_control_api",
-        "POST",
-        "/rotation/arm",
-    )
-
-
-def test_blocked_operation_is_a_real_operation_of_its_tool():
-    """A typo here would deny nothing and read as protection.
-
-    The operation is matched against the arguments a caller sends, so a method or
-    path that the tool's own schema does not accept can never match, and the deny
-    would be silently dead. The tool's validator holds the authoritative surface,
-    so the pair is asserted against it rather than against a second spelling.
-    """
-    from kiro_crew.validation import OPS_MISSION_CONTROL_ALLOWED_CALLS
-
-    _, method, path = CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATION
-    assert (method, path) in OPS_MISSION_CONTROL_ALLOWED_CALLS
-
-
 @pytest.mark.parametrize(
     "tool",
     [
@@ -305,3 +288,68 @@ def test_session_move_to_column_is_contained():
 
     assert "session_move_to_column" in CHANNEL_AGENT_BLOCKED_TOOLS
     assert _blocked_tool_named("kirocrew-dashboard___session_move_to_column") is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("held", [True, False])
+async def test_a_held_bot_limit_is_not_approved_by_channel_trust(monkeypatch, held):
+    """``mate_held_rules``: channel trust never approves a call a held Bot limit covers."""
+    from kiro_crew import mate_held_rules
+
+    _open_gates(monkeypatch)
+    monkeypatch.setattr("kiro_crew.sel.sel", lambda: MagicMock())
+    monkeypatch.setattr(mate_held_rules, "held_for", lambda *a, **k: ["deny shell"] if held else [])
+    monkeypatch.setattr(
+        "kiro_crew.channel.session_mode_permitted", lambda mode: True, raising=False
+    )
+    events = [
+        SimpleNamespace(
+            kind=EVENT_PERMISSION_REQUEST,
+            text="Run: ls",
+            title="Run: ls",
+            request_id=8,
+            tool_input="{}",
+        ),
+        SimpleNamespace(kind=EVENT_COMPLETE),
+    ]
+    client = _make_client(events)
+    await _stream_task(_make_agent(), _make_channel(), client, "hi")
+    if held:
+        client.approve_tool.assert_not_awaited()
+    else:
+        client.approve_tool.assert_awaited_once_with(8)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("edition", ["lts", "oss"])
+async def test_an_org_ask_on_a_kas_web_call_is_not_approved_by_channel_trust(monkeypatch, edition):
+    """``web_ask_rule``: in LTS channel trust never answers KAS's ask on an
+    organisation's web rule; an ``oss`` build approves it as before."""
+    from kiro_crew import mate_held_rules, web_ask_rule
+
+    monkeypatch.setattr("kiro_crew.sel.sel", lambda: MagicMock())
+    monkeypatch.setattr(mate_held_rules, "held_for", lambda *a, **k: [])
+    _open_gates(monkeypatch)
+    monkeypatch.setattr(web_ask_rule, "edition", SimpleNamespace(is_lts=lambda: edition == "lts"))
+    monkeypatch.setattr(
+        "kiro_crew.channel.session_mode_permitted", lambda mode: True, raising=False
+    )
+    events = [
+        SimpleNamespace(
+            kind=EVENT_PERMISSION_REQUEST,
+            text="Fetching https://example.com",
+            title="Fetching https://example.com",
+            request_id=8,
+            tool_input="{}",
+            harness_tool_id="web_fetch",
+            kas_builtin_ids=True,
+            kas_managed_ask=True,
+        ),
+        SimpleNamespace(kind=EVENT_COMPLETE),
+    ]
+    client = _make_client(events)
+    await _stream_task(_make_agent(), _make_channel(), client, "hi")
+    if edition == "lts":
+        client.approve_tool.assert_not_awaited()
+    else:
+        client.approve_tool.assert_awaited_once_with(8)

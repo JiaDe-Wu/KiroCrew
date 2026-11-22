@@ -21,6 +21,8 @@ from pathlib import Path
 
 import pytest
 
+from kiro_crew.timed_out_call import TOOL_STALL_RECOVERY_PREFIX
+
 _ROOT = Path(__file__).resolve().parents[1]
 _STATE_FILES = (
     _ROOT / "src/kiro_crew/dashboard/state.py",
@@ -56,6 +58,9 @@ def _state_prefixes() -> dict[str, str]:
         for m in _PREFIX_DECL.finditer(path.read_text(encoding="utf-8"))
     }
     assert found, "no *_RECOVERY_PREFIX constants found in state.py -- regex drift"
+    # The tool-stall marker is declared once in ``timed_out_call`` with a ``\u2014`` escape,
+    # which the literal-text scan above cannot read, so take its value from the module.
+    found["TOOL_STALL_RECOVERY_PREFIX"] = TOOL_STALL_RECOVERY_PREFIX
     return found
 
 
@@ -121,8 +126,8 @@ def test_synthetic_recovery_messages_carry_a_known_marker() -> None:
         # The Stop-hook continuation card. Its own pair because the turn
         # completed: reusing an interruption label would report an event that
         # did not happen.
-        "continued_by_a_hook",
-        "hook_requested_continuing",
+        "hook_asked_for_another_turn",
+        "sent_after_the_previous_turn_ended",
         # The nudge-cap halt card. Surfaced when a Stop-hook run hits
         # agent.max_stop_hook_nudges; its own pair because no continuation
         # happened — the loop was force-stopped.

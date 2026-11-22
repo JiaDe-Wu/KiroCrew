@@ -21,12 +21,12 @@ Path arguments are resolved in the shapes these modules use:
 * a module-level constant, including one interpolated into an f-string
   (``f"{_api_base()}{COMMAND_PATH}"`` in ``mcp_tools/browser.py``)
 * a local variable built earlier in the same function, including one assembled by
-  ``+`` concatenation (``"/api/apps/ops-mission-control" + _omc_path``) or
+  ``+`` concatenation (``"/api/lessons" + (...)`` in ``mcp_tools/learn.py``) or
   extended with ``+=``
 
 An unknown span becomes ``{X}``. A whole-segment marker keeps the path concrete. A
 marker glued to a segment's tail makes it a PREFIX: some allowlist entry must start with
-the literal head (this covers the individually allowlisted Ops Mission Control routes).
+the literal head (a query string appended to a granted path reads this way).
 
 Not checked: which bucket (strict or mixed) a path is in; that a specific endpoint under
 a granted prefix is granted; bucket disjointness, which
@@ -40,6 +40,7 @@ import re
 from pathlib import Path
 
 import pytest
+import source_corpus
 
 from kiro_crew.dashboard.server import (
     _MIXED_INTERNAL_API_PATHS,
@@ -60,8 +61,8 @@ pytestmark = pytest.mark.xdist_group(name="tree_scan_test_mcp_call_site_auth_cov
 _SRC = Path(__file__).resolve().parent.parent / "src" / "kiro_crew"
 _CORE = _SRC / "mcp_core.py"
 
-# The helpers that carry X-Internal-Secret. Defined in mcp_core; called either
-# bare (imported) or qualified as ``mcp_core._get(...)``.
+# The helpers that carry X-Internal-Secret. Defined in mcp_core_parts/gateway.py and
+# served on mcp_core; called either bare (imported) or qualified as ``mcp_core._get(...)``.
 _TRANSPORT_HELPERS = frozenset({"_post", "_get", "_put", "_patch", "_delete"})
 
 # Stands in for a span of the path that is only known at runtime.
@@ -78,6 +79,7 @@ _SOURCES = (
     _SRC / "mcp_dashboard.py",
     _SRC / "mcp_shared.py",
     _SRC / "mcp_shared_policy.py",
+    _SRC / "mcp_listing_relay.py",
     _SRC / "mcp_work.py",
     _SRC / "mcp_crew_log.py",
     _SRC / "mcp_debug.py",
@@ -88,6 +90,10 @@ _SOURCES = (
     _SRC / "mcp_cron.py",
     *sorted(_SRC.glob("mcp_cron_*.py")),
     _SRC / "cli_commands_gateway_api.py",
+    _SRC / "cli_memory_provider.py",
+    _SRC / "memory_provider" / "conformance.py",
+    _SRC / "cli_models.py",
+    _SRC / "cli_resource_subs.py",
     _SRC / "cli_server.py",
     _SRC / "cli_server_peer.py",
     _SRC / "cli_server_requests.py",
@@ -132,13 +138,19 @@ _KNOWN_UNRESOLVED = frozenset(
     {
         # ``_send(path)`` is the central helper every verb now delegates to; its
         # nested ``_once(base)`` builds the Request, so the site is attributed here.
-        "mcp_core.py:_send",
-        "mcp_core.py:_post",
-        "mcp_core.py:_get",
-        "mcp_core.py:_put",
-        "mcp_core.py:_patch",
-        "mcp_core.py:_delete",
+        # They live in the core server's gateway owner, ``mcp_core_parts/gateway.py``.
+        "gateway.py:_send",
+        "gateway.py:_post",
+        "gateway.py:_get",
+        "gateway.py:_put",
+        "gateway.py:_patch",
+        "gateway.py:_delete",
         "cron_script_context.py:_post",
+        # ``kirocrew learn`` while a memory provider replaces Crew's memory: the one
+        # helper that forwards its ``path`` to the gateway. Like ``gateway._send``,
+        # its own site takes the path as a parameter; ``_wrapper_path_arg_index``
+        # checks every caller's literal (``/api/lessons``).
+        "cli_memory_provider.py:_call",
         # The gateway liveness probe: its URL is assembled from a resolved port
         # via a helper, and the endpoint (/api/ready) carries no auth by
         # design — it answers before auth middleware exists so a starting
@@ -227,7 +239,7 @@ def _resolve(
                 return scope[node.id]
         return [_UNKNOWN]
     if isinstance(node, ast.Attribute):
-        # ``mcp_core._CREW_READ_PATH`` -- resolve against mcp_core's constants.
+        # ``mcp_core.<CONSTANT>`` -- resolve against mcp_core's constants.
         return core.get(node.attr, [_UNKNOWN])
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and not node.args:
         # A zero-arg URL builder, pre-resolved into scope under ``name()``.
@@ -481,22 +493,6 @@ def _declared_dashboard_routes() -> dict[str, set[str]]:
     return out
 
 
-#: The one handler every tool a built-in declares as data runs
-#: (``mcp_tools.apps.builtin_agent_tool``). Its URL is the declared tool's own, read off
-#: the declaration, so the walk cannot resolve it from source.
-_BUILTIN_AGENT_TOOL_SITE = "apps.py:builtin_agent_tool"
-
-
-def _declared_agent_tool_routes() -> dict[str, set[str]]:
-    """``{gateway path: {"<tool>:POST"}}`` over every tool a built-in app declares."""
-    from kiro_crew.apps import builtin_agent_tools
-
-    out: dict[str, set[str]] = {}
-    for tool in builtin_agent_tools.agent_tools():
-        out.setdefault(tool.url, set()).add(f"{tool.name}:POST")
-    return out
-
-
 def _loopback_verbs() -> dict[str, str]:
     """``{"dashboard_client.py:<verb>": METHOD}`` for each verb of the loopback client.
 
@@ -552,7 +548,17 @@ def _scan() -> tuple[dict[str, set[str]], set[str]]:
                                 cands = _resolve(expr, scopes, core)
                             except _TooManyCandidates:
                                 cands = []
+                            # A Request built from the URL alone carries no header, so a
+                            # dashboard-token read of that shape (``kirocrew status``'s
+                            # owner read) sends no internal secret: out of scope. One that
+                            # passes headers may send it, so its path is checked.
+                            url_only = (
+                                called == "Request" and len(child.args) == 1 and not child.keywords
+                            )
                             for cand in cands:
+                                if url_only and "?token=" in cand:
+                                    found = True
+                                    continue
                                 norm = _normalise(cand)
                                 # Anchor at the first ``/api/``, except the app
                                 # reverse proxy ``/apps/{name}/api/{path}``
@@ -596,13 +602,6 @@ def _scan() -> tuple[dict[str, set[str]], set[str]]:
                 if site.endswith(f":{method}"):
                     paths.setdefault(path, set()).add(f"{key}<-{site}")
 
-    # The declared-tool handler posts only to a declared tool's URL, which it reads off
-    # the declaration by the tool's name, so its site reaches exactly those URLs.
-    if _BUILTIN_AGENT_TOOL_SITE in unresolved:
-        unresolved.discard(_BUILTIN_AGENT_TOOL_SITE)
-        for path, sites in _declared_agent_tool_routes().items():
-            for site in sites:
-                paths.setdefault(path, set()).add(f"{_BUILTIN_AGENT_TOOL_SITE}<-{site}")
     return paths, unresolved
 
 
@@ -640,7 +639,7 @@ def _is_prefix_path(path: str) -> bool:
 
     A marker that occupies a whole segment (``/api/artifacts/{X}/comments``) is
     an opaque id and the path is still concrete. A marker glued to text
-    (``/api/apps/ops-mission-control{X}``) means the rest of the segment is only
+    (``/api/lessons{X}``) means the rest of the segment is only
     known at runtime.
     """
     at = path.find(_UNKNOWN)
@@ -659,29 +658,6 @@ def _is_granted(path: str, methods: frozenset[str]) -> bool:
 def _methods_for(sites: set[str]) -> frozenset[str]:
     """The HTTP verbs recorded across a path's call sites (site tail ``:METHOD``)."""
     return frozenset(s.rsplit(":", 1)[1] for s in sites)
-
-
-class TestDeclaredAgentToolRoutes:
-    """The declared-tool handler's call site is every declared tool's URL."""
-
-    def test_each_declared_tool_url_is_a_resolved_post_site(self):
-        declared = _declared_agent_tool_routes()
-        assert declared, "no built-in declares an agent tool, so this check would pass free"
-        sites = _call_sites()
-        for path in declared:
-            assert path in sites, f"declared tool URL {path} is not a resolved call site"
-            assert _methods_for(sites[path]) >= {"POST"}, path
-
-    def test_the_resolved_site_is_the_handler_every_declared_tool_runs(self):
-        """A renamed handler leaves its new site unresolved, never silently granted."""
-        from kiro_crew.apps import builtin_agent_tools
-        from kiro_crew.mcp_tools import apps
-
-        handler = apps.builtin_agent_tool
-        assert _BUILTIN_AGENT_TOOL_SITE == f"apps.py:{handler.__name__}"
-        for tool in builtin_agent_tools.agent_tools():
-            assert apps.HANDLERS[tool.name] is handler
-        assert _BUILTIN_AGENT_TOOL_SITE not in _KNOWN_UNRESOLVED
 
 
 class TestDeclaredDashboardRoutes:
@@ -723,12 +699,13 @@ class TestDeclaredDashboardRoutes:
         until it is a table server in ``_TABLE_SERVERS``.
         """
         builders = set()
-        for path in sorted(_SRC.rglob("*.py")):
-            rel = path.relative_to(_SRC).as_posix()
-            if "/tests/" in f"/{rel}" or path.name.startswith("test_"):
-                continue
-            if _builds_loopback_client(ast.parse(path.read_text(encoding="utf-8"))):
-                builders.add(rel)
+        with source_corpus.untraced():
+            for path in sorted(_SRC.rglob("*.py")):
+                rel = path.relative_to(_SRC).as_posix()
+                if "/tests/" in f"/{rel}" or path.name.startswith("test_"):
+                    continue
+                if _builds_loopback_client(ast.parse(path.read_text(encoding="utf-8"))):
+                    builders.add(rel)
         assert builders - _LOOPBACK_OWNERS == set(_TABLE_SERVERS), sorted(builders)
         # Inside a table server the client is built once, for the frame the table
         # runs: a second use would send paths outside every row's declaration.
@@ -877,17 +854,17 @@ class TestMcpCallSiteAuthCoverage:
         for path, shape in (
             ("/api/spawn", "literal arg, qualified mcp_core._post"),
             ("/api/agent-panel/publish", "literal arg, bare imported _post"),
-            ("/api/apps/issue-radar/investigation", "the _put helper"),
+            ("/api/chat/tag-columns/order", "the _put helper, through the loopback client"),
             ("/api/artifacts/{X}/comments", "f-string with an interpolation"),
             ("/api/session-tool-policy", "direct urllib Request, leading f-string"),
-            ("/api/apps/issue-radar/crew", "path held in a module-level constant"),
+            ("/api/app-tools/call", "path held in a module-level constant"),
             ("/api/browser/op", "module constant interpolated into an f-string"),
             ("/api/computer-use/invoke", "own Request + header, outside mcp_tools"),
             ("/api/computer-use/frame", "path returned by a zero-arg URL builder"),
             ("/api/artifacts", "literal passed to an exempted wrapper's caller"),
             ("/api/crons/{X}/run", "a non-MCP caller (cron_trigger)"),
             ("/api/artifacts/{X}/versions/{X}", "local variable assigned in a branch"),
-            ("/api/apps/ops-mission-control{X}", "local built by + concatenation"),
+            ("/api/lessons{X}", "local built by + concatenation"),
         ):
             assert path in found, f"{path} not extracted -- {shape} is now blind"
         # The wrapper-caller shape by its own mark: a path-forwarding wrapper's verb
@@ -940,6 +917,31 @@ class TestMcpCallSiteAuthCoverage:
             f"so it is unguarded and nothing failed; unresolved={sorted(unresolved)}"
         )
 
+    def test_a_token_url_skips_only_a_request_built_from_the_url_alone(self, monkeypatch, tmp_path):
+        """A dashboard-token URL must not hide a Request that can carry the secret.
+
+        ``kirocrew status``'s owner read is ``Request(<url>)`` with a token query and
+        nothing else. A Request with the same URL and headers may send
+        ``X-Internal-Secret``, so its path is checked like every other call.
+        """
+        mod = tmp_path / "tokenshape.py"
+        mod.write_text(
+            "import urllib.request\n"
+            'H = "X-Internal-Secret"\n'
+            "def go(base, t, s):\n"
+            '    headers = {"X-Internal-Secret": s}\n'
+            '    urllib.request.Request(f"{base}/api/zz-tok-local?token={t}", headers=headers)\n'
+            '    urllib.request.Request(f"{base}/api/zz-tok-positional?token={t}", None, {H: s})\n'
+            '    urllib.request.Request(f"{base}/api/zz-tok-alone?token={t}")\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setitem(globals(), "_SOURCES", (_CORE, mod))
+        paths, _ = _scan()
+        for path in ("/api/zz-tok-local", "/api/zz-tok-positional"):
+            assert path in paths, f"a token-URL Request with headers skipped the check: {path}"
+            assert not _is_granted(path, _methods_for(paths[path])), path
+        assert "/api/zz-tok-alone" not in paths, "the URL-only token read is no longer skipped"
+
     def test_secret_header_is_detected_in_a_dict_literal(self):
         """A constant header key inside a dict literal marks a sender.
 
@@ -965,7 +967,7 @@ class TestMcpCallSiteAuthCoverage:
         """Guard the classifier: reading a prefix as concrete would false-FAIL,
         and reading a concrete path as a prefix would weaken a real check."""
         assert _is_prefix_path(
-            "/api/apps/ops-mission-control{X}"
+            "/api/lessons{X}"
         ), "a marker glued to a segment tail is a prefix, not a concrete path"
         assert not _is_prefix_path(
             "/api/artifacts/{X}/comments"
@@ -1009,58 +1011,61 @@ class TestMcpCallSiteAuthCoverage:
         """
         scanned = {p.resolve() for p in _SOURCES}
         unscanned: dict[str, list[str]] = {}
-        for path in sorted(_SRC.rglob("*.py")):
-            rel = path.relative_to(_SRC).as_posix()
-            if path.resolve() in scanned:
-                continue
-            if "/tests/" in f"/{rel}" or path.name.startswith("test_"):
-                continue
-            # OUT OF SCOPE BY SHAPE, not by exception: a container image's own source
-            # under ``apps/builtins/<app>/crew/runtime/**``. This guard exists because a
-            # module that reaches THE DASHBOARD with the internal secret must have its
-            # call sites checked. That tree is not in the dashboard's process: it is
-            # built into a Linux image and its secret header is passed between the
-            # image's OWN processes over loopback, never to the owner's gateway. It is
-            # also not importable from here, which is what
-            # ``test_spawn_audit.py::test_container_image_assets_are_not_imported``
-            # holds, so adding it to ``_SOURCES`` is not available either.
-            if "/crew/runtime/" in f"/{rel}":
-                continue
-            text = path.read_text(encoding="utf-8")
-            tree = ast.parse(text)
-            reasons: list[str] = []
-            if _sends_secret(text, tree):
-                reasons.append(f"sets {_SECRET_HEADER}")
-            aliases = {"mcp_core", "core"}
-            imported: set[str] = set()
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ImportFrom) and (node.module or "").endswith("mcp_core"):
-                    for alias in node.names:
-                        if alias.name in _TRANSPORT_HELPERS:
-                            imported.add(alias.asname or alias.name)
-                        elif alias.name == "mcp_core":
-                            aliases.add(alias.asname or alias.name)
-                elif isinstance(node, ast.Import):
-                    for alias in node.names:
-                        if alias.name.endswith("mcp_core"):
-                            aliases.add(alias.asname or alias.name.split(".")[-1])
-            if imported:
-                reasons.append(f"imports {sorted(imported)}")
-            qualified = sorted(
-                {
-                    node.func.attr
-                    for node in ast.walk(tree)
-                    if isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr in _TRANSPORT_HELPERS
-                    and isinstance(node.func.value, ast.Name)
-                    and node.func.value.id in aliases
-                }
-            )
-            if qualified:
-                reasons.append(f"calls {qualified}")
-            if reasons:
-                unscanned[rel] = reasons
+        with source_corpus.untraced():
+            for path in sorted(_SRC.rglob("*.py")):
+                rel = path.relative_to(_SRC).as_posix()
+                if path.resolve() in scanned:
+                    continue
+                if "/tests/" in f"/{rel}" or path.name.startswith("test_"):
+                    continue
+                # OUT OF SCOPE BY SHAPE, not by exception: a container image's own source
+                # under ``apps/builtins/<app>/crew/runtime/**``. This guard exists because a
+                # module that reaches THE DASHBOARD with the internal secret must have its
+                # call sites checked. That tree is not in the dashboard's process: it is
+                # built into a Linux image and its secret header is passed between the
+                # image's OWN processes over loopback, never to the owner's gateway. It is
+                # also not importable from here, which is what
+                # ``test_spawn_audit.py::test_container_image_assets_are_not_imported``
+                # holds, so adding it to ``_SOURCES`` is not available either.
+                if "/crew/runtime/" in f"/{rel}":
+                    continue
+                text = path.read_text(encoding="utf-8")
+                tree = ast.parse(text)
+                reasons: list[str] = []
+                if _sends_secret(text, tree):
+                    reasons.append(f"sets {_SECRET_HEADER}")
+                aliases = {"mcp_core", "core"}
+                imported: set[str] = set()
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.ImportFrom) and (node.module or "").endswith(
+                        "mcp_core"
+                    ):
+                        for alias in node.names:
+                            if alias.name in _TRANSPORT_HELPERS:
+                                imported.add(alias.asname or alias.name)
+                            elif alias.name == "mcp_core":
+                                aliases.add(alias.asname or alias.name)
+                    elif isinstance(node, ast.Import):
+                        for alias in node.names:
+                            if alias.name.endswith("mcp_core"):
+                                aliases.add(alias.asname or alias.name.split(".")[-1])
+                if imported:
+                    reasons.append(f"imports {sorted(imported)}")
+                qualified = sorted(
+                    {
+                        node.func.attr
+                        for node in ast.walk(tree)
+                        if isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr in _TRANSPORT_HELPERS
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id in aliases
+                    }
+                )
+                if qualified:
+                    reasons.append(f"calls {qualified}")
+                if reasons:
+                    unscanned[rel] = reasons
         assert not unscanned, (
             "module(s) reach the dashboard with the internal secret but are not "
             f"scanned by this guard, so their call sites are unchecked: "

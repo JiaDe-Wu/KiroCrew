@@ -34,7 +34,7 @@ CONFIG = ROOT / "src" / "kiro_crew" / "config"
 # `{{MAX_SUBAGENTS}}` and `{{WIDGET_BLOCK}}` slots are still counted as their
 # raw tokens.
 BABYSIT_SKILL_DIR = CONFIG.parent / "builtin_skills" / "kirocrew-dev" / "babysit"
-PROMPT_BYTE_CEILINGS = {"prompt.md": 41_385}
+PROMPT_BYTE_CEILINGS = {"prompt.md": 40_676}
 _COMPUTER_USE_TOKEN = "{{COMPUTER_USE_BLOCK}}"
 
 
@@ -165,7 +165,9 @@ def test_cron_modes_and_session_ownership_remain_explicit() -> None:
         assert value in CRON
     assert "kirocrew cron preview <script:function> -m <message>" in CRON
     capabilities = _section(_read(), "## KiroCrew Capabilities")  # brand-ok: exact prompt heading
-    _require(capabilities, r"`ask_question`.*DEFAULT TO SILENCE", r"\[OPTIONS: .*cheaper")
+    _require(
+        capabilities, r"`ask_question`.*DEFAULT TO SILENCE", r"one of the ask cases \(a\)-\(e\)"
+    )
 
 
 def test_merged_trigger_lines_keep_every_sibling_tools_trigger() -> None:
@@ -251,7 +253,8 @@ def test_injected_data_and_refusals_are_not_new_authority() -> None:
     rules = _section(text, "## Rules")
     _require(
         rules,
-        r"blocked-by-policy.*before a second attempt; never rewrite",
+        r"blocked-by-policy.*before a second attempt; relay it only when no allowed path is "
+        r"left, and never rewrite",
         r"operator note is relayed verbatim",
         r'"Reject once".*that call alone, not a standing ban',
         r"trust-root file.*make your own command pass",
@@ -325,7 +328,7 @@ def test_the_babysit_skill_keeps_the_monitor_contract() -> None:
         r"`max_agent_turns` where 0 = no wake cap",
         r"token cap applies only when usage is reported.*`token_usage_known`",
         r"runtime always caps, turns only if set positive",
-        r"never use `0` for unlimited work",
+        r"never pass `0` for unlimited work",
         r"pending application request, not proof that the monitor armed.*END THE TURN",
         r"Terminal records are read-only; restarting requires an explicit new watch",
         r"never add wait/poll beside it",

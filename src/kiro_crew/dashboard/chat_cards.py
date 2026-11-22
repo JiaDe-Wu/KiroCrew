@@ -178,6 +178,9 @@ def _patch_row(state: Any, slot: Any, row: dict[str, Any], updates: dict[str, An
     meta = dict(row.get("meta") or {})
     card = dict(meta.get("card") or {})
     card.update({k: v for k, v in updates.items() if v is not None})
+    # The dashboard keeps the higher-``rev`` copy of this row; the row is agent-writable.
+    rev = card.get("rev")
+    card["rev"] = (rev if isinstance(rev, int) else 0) + 1
     meta["card"] = card
     mid = meta.get("mid") if isinstance(meta.get("mid"), str) else None
     try:
@@ -318,6 +321,30 @@ def _record_proposed(
         crew_log_emit.on_guide_offered(
             sid, slot=slot_key, guide_id=item_id, actions=fields.get("actions") or [], mid=mid
         )
+
+
+def record_change_shown_again(state: Any, card: dict[str, Any]) -> str:
+    """Append a waiting change card's row again at the end of its conversation.
+
+    For a repeated proposal of a pending card: the person meets the one card below
+    the repeat. Nothing was proposed, so no crew-log entry. Returns the new row's
+    ``mid``, or "" when nothing was written. Never raises.
+    """
+    try:
+        slot_key = str(card.get("slot_key") or "")
+        item_id = str(card.get("id") or "")
+        slot = _get_slot(state, slot_key)
+        if not item_id or slot is None:
+            return ""
+        title = _clean(card.get("title"), _TITLE_MAX)
+        fields = {"kind": card.get("kind"), "risk": card.get("risk")}
+        meta = _row_meta(
+            SURFACE_CHANGE, item_id, slot_key, title=title, status=card.get("status"), **fields
+        )
+        return _append_row(slot, title or str(fields["kind"] or "") or item_id, meta)
+    except Exception:
+        logger.warning("could not show a waiting change card again", exc_info=True)
+        return ""
 
 
 def _record_status(

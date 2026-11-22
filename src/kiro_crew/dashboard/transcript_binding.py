@@ -11,6 +11,11 @@ object. ``_ChatSlot.project`` reads and writes it through a property, so every
 ``slot.project = x`` already writes the shared cell and every ``slot.project is token``
 rollback check reads it. A rollback therefore skips a peer's newer write (the identity
 differs) and restores the whole group otherwise, with no per-peer rollback contract.
+``_ChatSlot._project_picked`` (whether a person picked that directory),
+``_ChatSlot.autocompact_pct`` (the session's compaction threshold) and
+``_ChatSlot.turn_timeout_secs`` (its own turn time limit, with whether that limit has
+been read back yet) are held the same way, so a value set through one alias is the
+value every alias saves.
 
 :func:`bind_transcript` is the one place a slot's binding is chosen. Call it after
 anything that can change the slot's history key.
@@ -27,16 +32,49 @@ if TYPE_CHECKING:
 class TranscriptBinding:
     """The cells a slot shares with every live alias on its transcript."""
 
-    __slots__ = ("project", "assigned", "_commit")
+    __slots__ = (
+        "project",
+        "assigned",
+        "picked",
+        "_commit",
+        "autocompact_pct",
+        "autocompact_set",
+        "turn_timeout_secs",
+        "turn_timeout_hydrated",
+    )
 
-    def __init__(self, project: str = "", assigned: bool = False) -> None:
+    def __init__(
+        self,
+        project: str = "",
+        assigned: bool = False,
+        picked: bool = False,
+        autocompact_pct: float | None = None,
+        autocompact_set: bool = False,
+        turn_timeout_secs: int | None = None,
+        turn_timeout_hydrated: bool = False,
+    ) -> None:
         self.project = project
         # Whether the group has chosen its directory: it held one, or cleared one it
         # held. A slot born linked and never seeded holds "" without choosing it.
         self.assigned = assigned
-        # (token, assigned before it) for the newest provisional commit, so its
+        # Whether a person picked this directory (``api_chat_slot_project``). A write
+        # that changes the directory clears it; the pick route sets it after its write.
+        self.picked = picked
+        # (token, assigned and picked before it) for the newest provisional commit, so its
         # rollback can put ``assigned`` back. Identity-keyed, like the rollback.
-        self._commit: tuple[object, bool] | None = None
+        self._commit: tuple[object, bool, bool] | None = None
+        # The session's compaction threshold override (percent); None follows the
+        # crew's default, else the global ``session.autocompact_pct``.
+        self.autocompact_pct = autocompact_pct
+        # Whether anything wrote the threshold, a clear included, the way
+        # ``assigned`` records a directory choice.
+        self.autocompact_set = autocompact_set
+        # The session's own turn time limit (seconds); None follows the global
+        # ``agent.chat_turn_timeout_secs``.
+        self.turn_timeout_secs = turn_timeout_secs
+        # Whether anything read the limit from the transcript or set it, a clear
+        # included. Until then every save carries the on-disk value forward.
+        self.turn_timeout_hydrated = turn_timeout_hydrated
 
 
 def write_project(binding: TranscriptBinding, value: str) -> None:
@@ -49,9 +87,11 @@ def write_project(binding: TranscriptBinding, value: str) -> None:
     from kiro_crew.dashboard.chat_handlers import _CommitToken
 
     if isinstance(value, _CommitToken):
-        binding._commit = (value, binding.assigned)
+        binding._commit = (value, binding.assigned, binding.picked)
     if value or binding.project:
         binding.assigned = True
+    if value != binding.project:
+        binding.picked = False
     binding.project = value
 
 
@@ -73,6 +113,7 @@ def rollback_project(slot: Any, token: str, prior: str) -> None:
     binding.project = prior
     if commit is not None and commit[0] is token:
         binding.assigned = commit[1]
+        binding.picked = commit[2]
     binding._commit = None
 
 
@@ -80,7 +121,9 @@ def bind_transcript(state: Any, slot: _ChatSlot) -> None:
     """Point *slot* at the binding its transcript's live aliases hold.
 
     * Another live slot on the same history key: adopt that slot's binding. The live
-      peer wins, because it holds the value the shared session runs with.
+      peer wins, because it holds the value the shared session runs with, except
+      where it holds nothing yet: the joiner's directory, threshold or turn time
+      limit then fills it.
     * No live peer, but the slot's binding is still held by a slot on another key (it
       just left an alias group): give it a private copy. It keeps its value and stops
       affecting the group it left.
@@ -111,6 +154,16 @@ def bind_transcript(state: Any, slot: _ChatSlot) -> None:
                 # joiner's own value, often just read from disk, is the group's.
                 shared.project = own.project
                 shared.assigned = True
+                shared.picked = own.picked
+            if own.autocompact_set and not shared.autocompact_set:
+                # The same rule for the threshold: a peer nothing wrote takes the joiner's.
+                shared.autocompact_pct = own.autocompact_pct
+                shared.autocompact_set = True
+            if own.turn_timeout_hydrated and not shared.turn_timeout_hydrated:
+                # And for the turn time limit: a peer that never read or set one
+                # takes the joiner's.
+                shared.turn_timeout_secs = own.turn_timeout_secs
+                shared.turn_timeout_hydrated = True
             slot._binding = shared
             if seeded:
                 _reset_if_running(state, slot)
@@ -123,10 +176,17 @@ def bind_transcript(state: Any, slot: _ChatSlot) -> None:
 
                 if pending == effective_session_key(slot):
                     slot._pending_reset_history_key = pending
+                    slot._pending_reset_clears_cwd = other._pending_reset_clears_cwd
             return
     if any(other._binding is slot._binding for other in live):
         slot._binding = TranscriptBinding(
-            project=slot._binding.project, assigned=slot._binding.assigned
+            project=slot._binding.project,
+            assigned=slot._binding.assigned,
+            picked=slot._binding.picked,
+            autocompact_pct=slot._binding.autocompact_pct,
+            autocompact_set=slot._binding.autocompact_set,
+            turn_timeout_secs=slot._binding.turn_timeout_secs,
+            turn_timeout_hydrated=slot._binding.turn_timeout_hydrated,
         )
 
 
@@ -177,30 +237,81 @@ def _reset_if_running(state: Any, slot: Any) -> None:
         arm_project_reset(state, slot, key)
 
 
-def arm_project_reset(state: Any, slot: Any, key: str) -> None:
+def arm_project_reset(state: Any, slot: Any, key: str, *, clears_cwd: bool = False) -> None:
     """Arm the deferred session reset on *slot* and on every live alias.
 
     A project change on one alias is the group's change, and the aliases run one
     session. A peer whose own flag stayed clear would reuse the process in the old
     directory while its turn describes the new one. The reset is spent only on a real
     teardown, so a second consume after the first one costs at most a cold start.
+    *clears_cwd* marks a reset armed by a project clear, so whichever alias consumes
+    it retracts the stored cwd again; any other arm sets a project and drops the mark.
     """
-    slot._pending_reset_history_key = key
-    for other in _peers(state, slot):
-        other._pending_reset_history_key = key
+    for target in (slot, *_peers(state, slot)):
+        target._pending_reset_history_key = key
+        target._pending_reset_clears_cwd = clears_cwd
 
 
-def seed_project_from_disk(state: Any, slot: Any, value: str) -> None:
+def seed_project_from_disk(state: Any, slot: Any, value: str, picked: object = False) -> None:
     """Write a stored directory onto *slot* unless a live alias's choice outranks it.
 
     The one entry for disk seeds (restore read and channel surfacing). When the seed
     moves a binding live aliases share, a running session keeps its old directory
-    until teardown, so the deferred reset is armed for the group.
+    until teardown, so the deferred reset is armed for the group. *picked* is the
+    line's ``project_picked`` (only ``True`` counts): whether a person picked that
+    directory, restored only when the directory itself is.
     """
     if not value or live_project_outranks_disk(state, slot):
         return
     shared = bool(_peers(state, slot))
     changed = value != slot.project
     slot.project = value
+    if picked is True:
+        slot._project_picked = True
     if shared and changed:
         _reset_if_running(state, slot)
+
+
+def seed_project_line(state: Any, slot: Any, meta: dict) -> None:
+    """Seed a metadata line's directory, and the person's pick beside it."""
+    seed_project_from_disk(state, slot, meta.get("project") or "", meta.get("project_picked"))
+
+
+def seed_autocompact_from_disk(state: Any, slot: Any, value: float | None) -> None:
+    """Write a stored threshold onto *slot* unless a live alias's outranks it.
+
+    The disk-seed entry for the threshold, as :func:`seed_project_from_disk` is for
+    the directory: a live alias's threshold, a clear included, may be newer than the
+    line.
+    """
+    if value is None or (_peers(state, slot) and slot._binding.autocompact_set):
+        return
+    slot.autocompact_pct = value
+
+
+def seed_turn_timeout_from_disk(state: Any, slot: Any, value: int | None) -> bool:
+    """Write a stored turn time limit onto *slot* unless a live alias's outranks it.
+
+    The disk-seed entry for the limit, as :func:`seed_autocompact_from_disk` is for
+    the threshold: a live alias that holds the limit, read or set, may be newer than
+    the line, so the line only fills a binding nothing holds yet. ``None`` is a
+    value here (follow the global). Returns whether the line was applied.
+    """
+    if _peers(state, slot) and slot._turn_timeout_hydrated:
+        return False
+    slot.turn_timeout_secs = value
+    slot._turn_timeout_hydrated = True
+    return True
+
+
+def mark_turn_timeout_unread(state: Any, slot: Any) -> None:
+    """Mark a just-bound tab's limit as still on disk, unless a live alias holds it.
+
+    Until the read lands, the tab's saves carry the on-disk value forward instead of
+    writing "follow the global limit" over it. A live alias's limit is the
+    transcript's, so the tab already holds it.
+    """
+    if _peers(state, slot):
+        return
+    slot.turn_timeout_secs = None
+    slot._turn_timeout_hydrated = False

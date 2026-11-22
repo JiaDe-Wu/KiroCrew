@@ -168,7 +168,8 @@ def _ensure_agent_slice_memory_high() -> None:
             "SECURITY: could not apply MemoryHigh=%s to %s (%s); the AGGREGATE "
             "agent memory ceiling is NOT enforced on this host — per-scope "
             "MemoryMax still applies. See "
-            "docs/architecture/resource-protection.md.",
+            "https://github.com/kirodotdev/KiroCrew/blob/main/"
+            "docs/architecture/resource-protection.md",
             desired,
             _CGROUP_AGENTS_SLICE,
             exc,
@@ -256,7 +257,8 @@ def _check_slice_memory_pressure() -> None:
         "aggregate agent memory crossed the slice MemoryHigh ceiling and the "
         "kernel is throttling the whole agent subtree; agents run slowly "
         "(not hung) until aggregate memory drops. See "
-        "docs/architecture/resource-protection.md.",
+        "https://github.com/kirodotdev/KiroCrew/blob/main/"
+        "docs/architecture/resource-protection.md",
         _CGROUP_AGENTS_SLICE,
         previous,
         current,
@@ -322,11 +324,13 @@ def _reconcile_slice_memory_high_off_thread() -> None:
 # memory only, so a value set for any of these is accepted but not enforced.
 _WINDOWS_INERT_RESOURCE_LIMIT_KEYS = (
     "cpu_weight",
+    "max_address_space_mb",
     "max_cpu_percent",
     "max_cpu_seconds",
     "max_open_files",
     "max_total_memory_mb",
     "max_total_processes",
+    "max_user_processes",
     "scope_memory_high_pct",
     "slice_reclaim_trigger_pct",
 )
@@ -362,7 +366,7 @@ def _warn_windows_inert_resource_limits_once() -> None:
         )
 
 
-def apply_windows_resource_ceiling(pid: int) -> bool:
+def apply_windows_resource_ceiling(pid: int, *, background: bool = False) -> bool:
     """Windows counterpart to :func:`cgroup_scope_argv`, applied AFTER the spawn.
 
     ``cgroup_scope_argv`` bounds an agent subprocess and all its descendants by
@@ -387,16 +391,30 @@ def apply_windows_resource_ceiling(pid: int) -> bool:
     :func:`platform_compat.apply_job_limits` has already logged as a SECURITY
     warning. Never raises: a missing ceiling must not fail the spawn, matching
     how an unavailable cgroup scope is handled.
+
+    *background* names a runtime whose role is background work (a task run's
+    runtime, the sub-agent companion runtime). With ``agent.windows_background_qos``
+    on, that tree also gets a lowered Job CPU weight, ``BELOW_NORMAL`` and EcoQoS
+    (:mod:`kiro_crew.windows_background_qos`); the hints never change the return.
     """
     if not platform_compat.IS_WINDOWS:
         return False
     _warn_windows_inert_resource_limits_once()
     max_procs, max_mem_mb, _cpu_weight, _max_cpu_percent = _cgroup_limits_from_config()
-    return platform_compat.apply_job_limits(
+    # Imported here so the facade gains no name: windows_background_qos sits
+    # below platform_compat and reads the config lazily itself.
+    from kiro_crew import windows_background_qos
+
+    qos = background and windows_background_qos.enabled_in_config()
+    applied = platform_compat.apply_job_limits(
         pid,
         max_procs=max_procs,
         max_memory_bytes=max_mem_mb * 1024 * 1024,
+        cpu_weight=windows_background_qos.BACKGROUND_JOB_CPU_WEIGHT if qos else 0,
     )
+    if qos:
+        windows_background_qos.apply_background_qos(pid)
+    return applied
 
 
 # Prefix of the scope unit name a caller gets from ``scope_unit_name``. Carries
@@ -404,6 +422,10 @@ def apply_windows_resource_ceiling(pid: int) -> bool:
 # list-units`` can tell an agent scope from anything else in the slice, and is
 # the token the reverse lookup matches on.
 _SCOPE_UNIT_PREFIX = "kirocrew-rt-"
+# Prefix of the scope of one ``AcpClient`` process (one session). A prefix of its
+# own, so the readers of runtime scopes (``session_scope_reap.kept_scopes``, Shared
+# Crew's ``containment.populated_scopes``) never count a client process as a runtime.
+_CLIENT_SCOPE_UNIT_PREFIX = "kirocrew-cl-"
 # systemd unit names accept alphanumerics and ``:-_.\`` plus escapes; anything
 # else has to be escaped to be a legal name. Rather than escape, a token
 # carrying something else is REFUSED (see ``scope_unit_name``), because every
@@ -411,7 +433,7 @@ _SCOPE_UNIT_PREFIX = "kirocrew-rt-"
 _SCOPE_UNIT_TOKEN_SAFE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
 
 
-def scope_unit_name(token: str) -> str | None:
+def scope_unit_name(token: str, prefix: str = _SCOPE_UNIT_PREFIX) -> str | None:
     """The scope unit name for a spawn identified by *token*, or None.
 
     ``cgroup_scope_argv`` otherwise lets systemd auto-name the scope
@@ -430,6 +452,13 @@ def scope_unit_name(token: str) -> str | None:
     beside its pid at initialization, and sessions are logged against that same
     pid as they are created, so the join survives the process.
 
+    *prefix* is :data:`_SCOPE_UNIT_PREFIX` for a runtime. ``AcpClient`` passes
+    :data:`_CLIENT_SCOPE_UNIT_PREFIX` with its ``process_instance`` as the token,
+    so its scope admission wait has a unit to find in ``/proc/<pid>/cgroup``. Only
+    the runtime's token travels in the child's environment: a client child keeps
+    the ``KIROCREW_SPAWN_INSTANCE`` it inherited, which ties a ``kiro-cli`` an
+    agent's shell starts to that agent's runtime.
+
     Returns ``None`` when *token* cannot form a legal unit name, and the caller
     then wraps the spawn exactly as before -- anonymously, but bounded. That
     direction is deliberate: the scope's JOB is the DoS ceiling, and a naming
@@ -440,7 +469,7 @@ def scope_unit_name(token: str) -> str | None:
     """
     if not _SCOPE_UNIT_TOKEN_SAFE.match(token or ""):
         return None
-    return f"{_SCOPE_UNIT_PREFIX}{token}.scope"
+    return f"{prefix}{token}.scope"
 
 
 def cgroup_scope_argv(argv: list[str]) -> list[str]:
@@ -461,7 +490,9 @@ def cgroup_scope_argv(argv: list[str]) -> list[str]:
     descendants are bounded as one cgroup and the kernel kills the scope on
     breach. ``--scope`` execs into the target (it does NOT fork a wrapper), so
     the returned argv's eventual PID is the real child — parent PID tracking,
-    ``killpg``, and descendant scans are unaffected.
+    ``killpg``, and descendant scans are unaffected. ``--collect`` makes the
+    manager drop the unit once the scope ends, a failed scope included, so no
+    caller leaves a failed unit behind for ``reset-failed`` to clear.
 
     Every scope is parented under a per-instance child of
     :data:`_CGROUP_AGENTS_SLICE` (see :func:`_agents_slice_name`, which explains
@@ -487,7 +518,8 @@ def cgroup_scope_argv(argv: list[str]) -> list[str]:
     spawn site being taught about sessions.
 
     The scope itself is left ANONYMOUS here -- systemd auto-names it
-    ``run-u<N>.scope``. A caller that can name the runtime it is spawning passes
+    ``run-u<N>.scope``. A caller that names its spawn (``AcpRuntime``, and
+    ``AcpClient`` with its own prefix) passes
     the result through :func:`name_scope_unit`, which is a separate step so that
     this function's argv stays byte-identical for the many callers wrapping a
     one-off tool or app subprocess that no reader needs to resolve back to a
@@ -567,6 +599,15 @@ def cgroup_scope_argv(argv: list[str]) -> list[str]:
         systemd_run,
         "--user",
         "--scope",
+        # CollectMode=inactive-or-failed. Without it the manager keeps every
+        # FAILED scope loaded until someone runs ``reset-failed``, and a scope
+        # fails whenever its process is gone before the manager attaches it
+        # (``Result=resources``: the wrapper was killed while it still waited
+        # for admission) or the kernel OOM-kills it. Each retained unit is more
+        # state the user manager walks, so a slow manager whose callers time out
+        # and kill the wrapper grows that state on every call. Collecting it
+        # changes no limit: it only frees the unit record once the scope ends.
+        "--collect",
         "-q",
         f"--slice={parent_slice}",
         *props,
@@ -575,8 +616,10 @@ def cgroup_scope_argv(argv: list[str]) -> list[str]:
     ]
 
 
-def name_scope_unit(argv: list[str], token: str) -> list[str]:
+def name_scope_unit(argv: list[str], token: str, prefix: str = _SCOPE_UNIT_PREFIX) -> list[str]:
     """Name the scope in a :func:`cgroup_scope_argv` result after *token*.
+
+    The unit is ``scope_unit_name(token, prefix)``.
 
     Returns *argv* UNCHANGED unless it really is a systemd-run scope wrapper AND
     *token* forms a legal unit name (:func:`scope_unit_name`). Both degradations
@@ -595,7 +638,7 @@ def name_scope_unit(argv: list[str], token: str) -> list[str]:
     ``--unit`` goes BEFORE the ``--`` separator. After it, systemd-run reads it as
     an argument to the wrapped command instead of a property of the scope.
     """
-    unit = scope_unit_name(token)
+    unit = scope_unit_name(token, prefix)
     if unit is None or "--scope" not in argv or "--" not in argv:
         return argv
     at = argv.index("--")
@@ -718,12 +761,90 @@ def _reapply_slice_limits_for_new_session() -> None:
     ensure_agents_slice_limits()
 
 
+def _slice_limits_unit() -> str:
+    """The slice this instance's aggregate ceiling goes on: a pod's own child, else the parent.
+
+    A pod boots from an empty home, so its defaults on the shared parent would
+    replace the ceiling the host's gateway set; cgroup v2 still bounds the child by it.
+    """
+    if os.environ.get("KIROCREW_POD"):
+        return _agents_slice_name()
+    return _CGROUP_AGENTS_SLICE
+
+
+def _slice_limits_dir(parent: Path) -> Path:
+    """The cgroup directory of :func:`_slice_limits_unit`, under the parent's *parent*."""
+    unit = _slice_limits_unit()
+    return parent if unit == _CGROUP_AGENTS_SLICE else parent / unit
+
+
+def _fill_unset_parent_limits(systemctl: str, total_mem_mb: int, total_tasks: int) -> None:
+    """Put a pod's ceiling on the shared parent wherever systemd shows none set.
+
+    A pod bounds only its own child, so on a host that runs only pods nothing
+    would bound the parent and pods together could still exhaust host RAM. A
+    value already set is left alone, whoever set it, and the host's own gateway
+    replaces this one when it starts. Read from the unit, not its cgroup files:
+    an inactive parent has no cgroup directory yet still holds the ``--runtime``
+    value the host's gateway set. A failed read writes nothing.
+    """
+    try:
+        shown = subprocess.run(
+            [
+                systemctl,
+                "--user",
+                "show",
+                "--property=MemoryMax",
+                "--property=TasksMax",
+                _CGROUP_AGENTS_SLICE,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+        unset = set(shown.stdout.splitlines()) if shown.returncode == 0 else set()
+        props: list[str] = []
+        if "MemoryMax=infinity" in unset:
+            props += [f"MemoryMax={total_mem_mb}M", "MemorySwapMax=0"]
+        if "TasksMax=infinity" in unset:
+            props.append(f"TasksMax={total_tasks}")
+        if not props:
+            return
+        proc = subprocess.run(
+            [systemctl, "--user", "set-property", "--runtime", _CGROUP_AGENTS_SLICE, *props],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("could not fill the unset ceiling on %s: %s", _CGROUP_AGENTS_SLICE, exc)
+        return
+    if proc.returncode != 0:
+        logger.warning(
+            "could not fill the unset ceiling on %s (rc=%d): %s",
+            _CGROUP_AGENTS_SLICE,
+            proc.returncode,
+            (proc.stderr or "").strip(),
+        )
+        return
+    logger.info(
+        "aggregate cgroup ceiling on %s was unset; this pod set %s",
+        _CGROUP_AGENTS_SLICE,
+        " ".join(props),
+    )
+
+
 def ensure_agents_slice_limits() -> bool:
     """Apply the aggregate cgroup ceiling to the agents slice. Idempotent.
 
-    Runs ``systemctl --user set-property --runtime`` on
-    :data:`_CGROUP_AGENTS_SLICE`, setting ``MemoryMax`` (aggregate across ALL
-    concurrent agent scopes), ``MemorySwapMax=0`` (consistent with the
+    Runs ``systemctl --user set-property --runtime`` on the slice
+    :func:`_slice_limits_unit` names (the shared parent, or a pod's own child,
+    after which :func:`_fill_unset_parent_limits` runs), setting ``MemoryMax``
+    (aggregate across ALL concurrent agent scopes), ``MemorySwapMax=0`` (consistent with the
     per-scope property: a true RSS ceiling, no swap escape), and ``TasksMax``
     (aggregate fork-bomb ceiling). Called at gateway startup, and from the
     spawn path's reconcile worker when it was not applied in the current
@@ -755,6 +876,7 @@ def ensure_agents_slice_limits() -> bool:
         return False
     _SLICE_LIMITS_EPOCH = _cgroup_scope_epoch()
     total_mem_mb, total_tasks = _slice_limits_from_config()
+    unit = _slice_limits_unit()
     # PATH can legitimately lead with agent-writable directories (a worktree
     # venv's bin, ~/.local/bin), so a bare "systemctl" would let a planted
     # shim run with the gateway's environment. Resolve from fixed system
@@ -765,7 +887,7 @@ def ensure_agents_slice_limits() -> bool:
         logger.warning(
             "could not apply the aggregate cgroup ceiling to %s: no trusted "
             "systemctl binary — per-scope ceilings still apply.",
-            _CGROUP_AGENTS_SLICE,
+            unit,
         )
         return False
     cmd = [
@@ -773,11 +895,15 @@ def ensure_agents_slice_limits() -> bool:
         "--user",
         "set-property",
         "--runtime",
-        _CGROUP_AGENTS_SLICE,
+        unit,
         f"MemoryMax={total_mem_mb}M",
         "MemorySwapMax=0",
         f"TasksMax={total_tasks}",
     ]
+    parent = _agents_slice_cgroup_dir()
+    target = None if parent is None else _slice_limits_dir(parent)
+    prev_tasks = None if target is None else read_cgroup_int(target / "pids.max")
+    prev_mem = None if target is None else read_cgroup_int(target / "memory.max")
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15
@@ -787,7 +913,7 @@ def ensure_agents_slice_limits() -> bool:
             "could not apply the aggregate cgroup ceiling to %s: %s — "
             "per-scope ceilings still apply, but N concurrent spawns may "
             "collectively exceed host RAM.",
-            _CGROUP_AGENTS_SLICE,
+            unit,
             exc,
         )
         return False
@@ -796,19 +922,28 @@ def ensure_agents_slice_limits() -> bool:
             "could not apply the aggregate cgroup ceiling to %s (rc=%d): %s — "
             "per-scope ceilings still apply, but N concurrent spawns may "
             "collectively exceed host RAM.",
-            _CGROUP_AGENTS_SLICE,
+            unit,
             proc.returncode,
             (proc.stderr or "").strip(),
         )
         return False
     _SLICE_LIMITS_APPLIED = True
-    logger.info(
-        "aggregate cgroup ceiling on %s: MemoryMax=%dM MemorySwapMax=0 TasksMax=%d "
-        "(per-scope ceilings unchanged)",
-        _CGROUP_AGENTS_SLICE,
+    # A write below the ceiling the slice already had is the one that starves
+    # running agents (EAGAIN on fork once the slice fills), so default log
+    # levels must keep it.
+    lowered = (prev_tasks or 0) > total_tasks or (prev_mem or 0) > total_mem_mb * 1024 * 1024
+    logger.log(
+        logging.WARNING if lowered else logging.INFO,
+        "aggregate cgroup ceiling on %s: MemoryMax=%dM MemorySwapMax=0 TasksMax=%d, "
+        "was pids.max=%s memory.max=%s (per-scope ceilings unchanged)",
+        unit,
         total_mem_mb,
         total_tasks,
+        prev_tasks or "max",
+        prev_mem or "max",
     )
+    if unit != _CGROUP_AGENTS_SLICE:
+        _fill_unset_parent_limits(systemctl, total_mem_mb, total_tasks)
     return True
 
 
@@ -966,8 +1101,15 @@ def check_agents_slice_pressure() -> str | None:
     # applied it before: a host that never passed the delegation gate must
     # not start shelling out from the sampler.
     if _SLICE_LIMITS_APPLIED:
+        # Read where the ceiling was written: a pod writes its own child, under
+        # a parent that may rightly read "max". A new login session re-applies
+        # whatever the slice reads, because a pod that started in it first may
+        # already have filled the unset parent with its own defaults.
         try:
-            if (slice_dir / "memory.max").read_text().strip() == "max":
+            if (
+                _SLICE_LIMITS_EPOCH != _cgroup_scope_epoch()
+                or (_slice_limits_dir(slice_dir) / "memory.max").read_text().strip() == "max"
+            ):
                 _SLICE_LIMITS_APPLIED = False
                 ensure_agents_slice_limits()
         except OSError:
@@ -1229,7 +1371,8 @@ def _disarm_slice_reclaim(reason: object, *, level: int = logging.WARNING) -> No
         level,
         "agent slice %s: proactive page-cache reclaim is off for this process (%s); "
         "the slice MemoryHigh ceiling still applies. See "
-        "docs/architecture/resource-protection.md.",
+        "https://github.com/kirodotdev/KiroCrew/blob/main/"
+        "docs/architecture/resource-protection.md",
         _CGROUP_AGENTS_SLICE,
         reason,
     )
